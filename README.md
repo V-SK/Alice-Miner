@@ -36,10 +36,10 @@ pip install -r requirements.txt
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 
 # 3. Start mining
-./start_mining.sh --address YOUR_WALLET_ADDRESS --gpus all
+./start_mining.sh --gpus all
 ```
 
-A wallet is automatically created at `~/.alice/wallet.json` on first run if you don't provide an address.
+On first run, you'll be prompted to either create a new wallet or enter an existing Alice address. A wallet is optional — you just need an address to receive mining rewards.
 
 ## Usage
 

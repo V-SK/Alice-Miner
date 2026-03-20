@@ -36,10 +36,10 @@ pip install -r requirements.txt
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 
 # 3. 开始挖矿
-./start_mining.sh --address 你的钱包地址 --gpus all
+./start_mining.sh --gpus all
 ```
 
-首次运行会自动在 `~/.alice/wallet.json` 创建钱包（如果没有指定地址）。
+首次运行会提示你选择：创建新钱包或输入已有地址。钱包是可选的 — 你只需要一个地址来接收挖矿奖励。
 
 ## 使用方式
 
