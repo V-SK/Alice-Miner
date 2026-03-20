@@ -1733,12 +1733,8 @@ def main():
     # Load wallet
     wallet_keypair: Optional[Any] = None
     if args.wallet:
-        if not args.allow_insecure:
-            print("[ERROR] --wallet bypass requires --allow-insecure. Use encrypted wallet for production.")
-            sys.exit(1)
         wallet_address = args.wallet
-        print("[WARNING] ⚠️ Using raw wallet address bypass. This is NOT secure for production!")
-        logging.warning("Wallet bypass used: %s...", str(wallet_address)[:8])
+        print(f"🔑 Using wallet address: {wallet_address}")
     else:
         try:
             wallet = get_or_create_wallet_for_miner(args.wallet_path)
