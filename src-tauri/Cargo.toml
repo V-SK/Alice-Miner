@@ -1,0 +1,60 @@
+[package]
+name = "alice-miner"
+version = "0.1.0"
+description = "Desktop client for Alice Protocol decentralized AI training"
+authors = ["Alice Protocol"]
+license = "MIT"
+repository = "https://github.com/aliceprotocol/alice-miner"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.5", features = [
+    "shell-open",
+    "system-tray",
+    "updater",
+    "fs-all",
+    "path-all",
+    "process-all",
+    "notification-all"
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "stream"] }
+futures-util = "0.3"
+
+# System keychain
+keyring = "2.0"
+
+# Blockchain (address generation only)
+sp-core = { version = "28.0", default-features = false, features = ["std"] }
+bip39 = "2.0"
+hex = "0.4"
+
+# WebSocket for network diagnostics
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+
+# SHA256 for model verification
+sha2 = "0.10"
+
+# System utilities
+dirs = "5.0"
+libc = "0.2"
+sys_info = "0.9"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nvml-wrapper = "0.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nvml-wrapper = "0.9"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
