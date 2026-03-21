@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
-import { useAppStore } from "../hooks/useAppStore";
 
 interface SetupProps {
   onComplete: (address: string) => void;

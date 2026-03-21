@@ -35,7 +35,7 @@ export default function Hardware() {
     <div className="p-6 space-y-6">
       <h1 className="text-2xl font-bold">Hardware</h1>
 
-      {gpuInfo.map((gpu, i) => {
+      {gpuInfo.map((gpu) => {
         const gpuStats = stats.find((s) => s.index === gpu.index);
         
         return (
