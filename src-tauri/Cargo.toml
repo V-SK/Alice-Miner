@@ -59,6 +59,3 @@ nvml-wrapper = "0.9"
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
-# Pin wry to avoid webkit2gtk trait scope issue on latest Rust
-[dependencies.wry]
-version = "=0.24.7"

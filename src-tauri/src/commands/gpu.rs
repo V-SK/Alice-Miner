@@ -55,7 +55,11 @@ pub fn detect_gpu() -> Result<Vec<GpuInfo>, String> {
     let cuda_version = nvml
         .sys_cuda_driver_version()
         .ok()
-        .map(|v| format!("{}.{}", v.major, v.minor));
+        .map(|v| {
+            let major = nvml_wrapper::cuda_driver_version_major(v);
+            let minor = nvml_wrapper::cuda_driver_version_minor(v);
+            format!("{}.{}", major, minor)
+        });
 
     let mut gpus = Vec::new();
 
