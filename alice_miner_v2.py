@@ -1808,6 +1808,27 @@ def submit_gradient(
     return False
 
 
+def discover_aggregator(ps_url: str, address: str) -> str:
+    """Request PS to assign an aggregator node. Falls back to direct PS connection."""
+    try:
+        resp = requests.get(
+            f"{ps_url}/node/assign",
+            params={"address": address},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            aggregator_url = data.get("aggregator_url")
+            if aggregator_url:
+                print(f"[Miner] Assigned to aggregator: {aggregator_url}")
+                return aggregator_url
+            # status="direct" means PS says connect directly
+            print(f"[Miner] No aggregator available, connecting directly to PS")
+    except Exception as e:
+        print(f"[Miner] Aggregator discovery failed ({e}), falling back to PS")
+    return ps_url
+
+
 def main():
     parser = argparse.ArgumentParser(description="Alice Miner V2 - Tiered Training")
     parser.add_argument("--ps-url", required=True, help="Parameter server URL", default="https://ps.aliceprotocol.org")
@@ -1851,6 +1872,9 @@ def main():
     )
     args = parser.parse_args()
     args.ps_url = str(args.ps_url).strip().rstrip("/")
+
+    # Discover aggregator node (load balancing). Falls back to PS if none available.
+    args.ps_url = discover_aggregator(args.ps_url, args.address)
 
     # Fail fast if model runtime is missing; avoids wasting time downloading 13GB then crashing.
     if not ALICE_MODEL_AVAILABLE:
