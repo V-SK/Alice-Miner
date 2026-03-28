@@ -1810,7 +1810,7 @@ def submit_gradient(
 
 def main():
     parser = argparse.ArgumentParser(description="Alice Miner V2 - Tiered Training")
-    parser.add_argument("--ps-url", required=True, help="Parameter server URL")
+    parser.add_argument("--ps-url", required=True, help="Parameter server URL", default="https://ps.aliceprotocol.org")
     parser.add_argument("--address", required=True, help="Miner reward/identity address (a1...)")
     parser.add_argument("--instance-id", default=None, help="Optional miner instance id (for multi-GPU)")
     parser.add_argument(
