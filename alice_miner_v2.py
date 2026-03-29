@@ -1874,7 +1874,12 @@ def main():
     args.ps_url = str(args.ps_url).strip().rstrip("/")
 
     # Discover aggregator node (load balancing). Falls back to PS if none available.
-    args.ps_url = discover_aggregator(args.ps_url, args.address)
+    # aggregator_url handles gradient submission; ps_url still used for model download + tasks.
+    _original_ps_url = args.ps_url
+    args.aggregator_url = discover_aggregator(args.ps_url, args.address)
+    # Keep ps_url pointing to PS for model downloads, task requests, heartbeats.
+    # Only gradient submission (/task/complete) should go to aggregator_url.
+    args.ps_url = _original_ps_url
 
     # Fail fast if model runtime is missing; avoids wasting time downloading 13GB then crashing.
     if not ALICE_MODEL_AVAILABLE:
@@ -2413,8 +2418,10 @@ def main():
                 }
 
                 print("📤 Submitting gradient...")
+                # Submit to aggregator if assigned, otherwise directly to PS
+                _submit_url = getattr(args, "aggregator_url", args.ps_url)
                 success = submit_gradient(
-                    args.ps_url,
+                    _submit_url,
                     task_id,
                     task_nonce,
                     compressed,
