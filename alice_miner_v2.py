@@ -1782,8 +1782,17 @@ def submit_gradient(
     gradient_data: Dict,
     metrics: Dict,
     auth_token: Optional[str] = None,
+    address: str = "",          # used for backpressure fallback rediscovery
+    aggregator_url: str = "",   # current aggregator URL (submit target)
 ) -> bool:
-    """Submit compressed gradient to PS with retry for transient failures."""
+    """Submit compressed gradient to PS with retry for transient failures.
+
+    Backpressure handling: if the aggregator responds with 503/429 and a body
+    indicating backpressure (status=="backpressure" or retry_after present),
+    the function calls discover_aggregator() to find a new node and retries
+    without consuming a normal attempt slot.  At most 2 such redirects are
+    allowed before falling back to a direct PS connection.
+    """
     # Compute hash once to avoid repeated serialization work on retries.
     gradient_bytes = json.dumps(gradient_data, sort_keys=True).encode()
     gradient_hash = hashlib.sha256(gradient_bytes).hexdigest()
@@ -1797,10 +1806,13 @@ def submit_gradient(
     }
 
     max_attempts = 3
+    bp_redirects = 0                          # backpressure redirect counter
+    current_url = aggregator_url or ps_url    # actual submission target
+
     for attempt in range(1, max_attempts + 1):
         try:
             resp = requests.post(
-                f"{ps_url}/task/complete",
+                f"{current_url}/task/complete",
                 json=payload,
                 headers=_auth_headers(auth_token),
                 timeout=900,
@@ -1812,6 +1824,33 @@ def submit_gradient(
                 score_str = f"{score_val:.4f}" if isinstance(score_val, (int, float)) else str(score_val)
                 print(f"✅ Gradient accepted! Score: {score_str}")
                 return True
+
+            # Backpressure: aggregator memory pressure — rediscover node, don't burn an attempt.
+            if resp.status_code in (503, 429):
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = {}
+                if body.get("status") == "backpressure" or body.get("retry_after"):
+                    if bp_redirects < 2:
+                        bp_redirects += 1
+                        retry_after = int(body.get("retry_after", 15))
+                        print(
+                            f"⚠️ Aggregator backpressure ({body.get('reason', 'memory')}), "
+                            f"rediscovering... (redirect {bp_redirects}/2)"
+                        )
+                        time.sleep(min(retry_after, 30))
+                        if address:
+                            new_url = discover_aggregator(ps_url, address)
+                            current_url = new_url
+                            print(f"[Miner] Switched to: {current_url}")
+                        else:
+                            current_url = ps_url
+                        continue  # do NOT increment attempt counter
+                    else:
+                        print("⚠️ Too many backpressure redirects, falling back to PS direct")
+                        current_url = ps_url
+                        continue  # one more try via PS, still not a normal failure
 
             # 4xx usually means semantic rejection; no retry.
             if 400 <= resp.status_code < 500:
@@ -2468,15 +2507,19 @@ def main():
 
                 print("📤 Submitting gradient...")
                 # Submit to aggregator if assigned, otherwise directly to PS.
-                # On failure, automatically fall back to PS and re-discover aggregator next round.
+                # Backpressure (503 with backpressure body) is handled inside submit_gradient:
+                # it will rediscover a new aggregator node and retry without burning an attempt.
+                # Hard failures fall through to the external PS fallback below.
                 _submit_url = getattr(args, "aggregator_url", args.ps_url)
                 success = submit_gradient(
-                    _submit_url,
+                    args.ps_url,
                     task_id,
                     task_nonce,
                     compressed,
                     metrics,
                     auth_token=auth_token,
+                    address=getattr(args, "address", ""),
+                    aggregator_url=_submit_url,
                 )
                 # None = JWT expired (401/403) — re-register and retry once
                 if success is None:
@@ -2486,12 +2529,14 @@ def main():
                         auth_token = str(_renew_resp.get("token", "")).strip()
                         print("[Miner] JWT renewed, retrying submission...")
                         success = submit_gradient(
-                            _submit_url,
+                            args.ps_url,
                             task_id,
                             task_nonce,
                             compressed,
                             metrics,
                             auth_token=auth_token,
+                            address=getattr(args, "address", ""),
+                            aggregator_url=_submit_url,
                         )
                         if success is None:
                             success = False
@@ -2507,6 +2552,8 @@ def main():
                         compressed,
                         metrics,
                         auth_token=auth_token,
+                        address=getattr(args, "address", ""),
+                        aggregator_url=args.ps_url,
                     )
                     if success is True:
                         # Aggregator is down; reset so next gradient goes to PS
