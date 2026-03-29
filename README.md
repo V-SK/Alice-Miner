@@ -19,7 +19,7 @@ cd Alice-Miner
 pip install -r requirements.txt
 
 # 3. Run
-python alice_miner_v2.py --address YOUR_WALLET_ADDRESS
+python alice_miner_v2.py --ps-url https://ps.aliceprotocol.org --address YOUR_WALLET_ADDRESS
 ```
 
 ## Parameters

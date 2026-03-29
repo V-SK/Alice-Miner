@@ -1,6 +1,4 @@
 torch>=2.0.0
-transformers>=4.30.0
 numpy
 requests
-tqdm
-substrate-interface>=1.7.0
+substrate-interface>=1.8.0
