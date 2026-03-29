@@ -5,6 +5,13 @@ Requests tasks from PS, downloads shards on-demand, trains assigned layers, and 
 """
 
 import argparse
+import sys as _sys_utf8fix
+import io as _io_utf8fix
+# Force UTF-8 output on Windows (avoids GBK UnicodeEncodeError with emoji)
+if _sys_utf8fix.stdout.encoding and _sys_utf8fix.stdout.encoding.lower() not in ('utf-8', 'utf8'):
+    _sys_utf8fix.stdout = _io_utf8fix.TextIOWrapper(_sys_utf8fix.stdout.buffer, encoding='utf-8', errors='replace')
+    _sys_utf8fix.stderr = _io_utf8fix.TextIOWrapper(_sys_utf8fix.stderr.buffer, encoding='utf-8', errors='replace')
+
 import base64
 import contextlib
 try:
@@ -194,11 +201,11 @@ def get_hardware_info(device_override: Optional[str] = None, memory_override_gb:
             memory_gb = props.total_memory / (1024 ** 3)
             device_name = torch.cuda.get_device_name(0)
         else:
-            print("⚠️ --device cuda requested but CUDA is unavailable, falling back to CPU")
+            print("[WARN] --device cuda requested but CUDA is unavailable, falling back to CPU")
             device_type = "cpu"
     elif device_type == "mps":
         if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-            print("⚠️ --device mps requested but MPS is unavailable, falling back to CPU")
+            print("[WARN] --device mps requested but MPS is unavailable, falling back to CPU")
             device_type = "cpu"
         else:
             # Keep memory detection from auto-detect path.
@@ -206,7 +213,7 @@ def get_hardware_info(device_override: Optional[str] = None, memory_override_gb:
     elif device_type == "cpu":
         pass
     else:
-        print(f"⚠️ Unknown --device '{device_type}', using auto-detected device '{detected_device}'")
+        print(f"[WARN] Unknown --device '{device_type}', using auto-detected device '{detected_device}'")
         device_type = detected_device
 
     try:
@@ -382,7 +389,7 @@ def acquire_single_instance_lock() -> Any:
         try:
             fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            print("❌ Another miner instance is already running. Exiting.")
+            print("[ERROR] Another miner instance is already running. Exiting.")
             sys.exit(1)
     else:
         # Windows path
@@ -390,7 +397,7 @@ def acquire_single_instance_lock() -> Any:
             import msvcrt  # type: ignore
             msvcrt.locking(lock_fp.fileno(), msvcrt.LK_NBLCK, 1)
         except Exception:
-            print("❌ Another miner instance is already running. Exiting.")
+            print("[ERROR] Another miner instance is already running. Exiting.")
             sys.exit(1)
 
     lock_fp.write(str(os.getpid()))
@@ -432,17 +439,17 @@ def register_miner(
 
         resp = requests.post(f"{ps_url}/register", json=payload, timeout=10)
         if resp.status_code != 200:
-            print(f"❌ Registration failed: {resp.status_code} {resp.text}")
+            print(f"[ERROR] Registration failed: {resp.status_code} {resp.text}")
             return None
 
         data = resp.json()
         token = str(data.get("token", "")).strip()
         if not token:
-            print(f"❌ Registration failed: token missing in response {data}")
+            print(f"[ERROR] Registration failed: token missing in response {data}")
             return None
 
         reg_instance_id = str(data.get("instance_id") or data.get("miner_id") or instance_id or wallet_address)
-        print(f"✅ Registered with PS: address={wallet_address[:12]}... instance_id={reg_instance_id}")
+        print(f"[OK] Registered with PS: address={wallet_address[:12]}... instance_id={reg_instance_id}")
         print(
             f"   Hardware: {capabilities['device_type']}, "
             f"{capabilities['memory_gb']:.1f}GB device, "
@@ -450,7 +457,7 @@ def register_miner(
         )
         return data
     except Exception as e:
-        print(f"❌ Registration error: {e}")
+        print(f"[ERROR] Registration error: {e}")
         return None
 
 
@@ -484,20 +491,20 @@ def setup_tiered_training(model: nn.Module, assigned_layers: List[int], n_layers
             for param in layers_container[i].parameters():
                 param.requires_grad = True
         else:
-            print(f"   ⚠️ Layer {i} not found")
+            print(f"   [WARN] Layer {i} not found")
     
     # 3. Enable gradient checkpointing (if model supports it)
     if hasattr(model, 'gradient_checkpointing_enable'):
         model.gradient_checkpointing_enable()
-        print(f"   ✅ Gradient checkpointing enabled")
+        print(f"   [OK] Gradient checkpointing enabled")
     else:
-        print(f"   ⚠️ Gradient checkpointing not available")
+        print(f"   [WARN] Gradient checkpointing not available")
     
     # 4. Count trainable parameters
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     
-    print(f"   📊 Trainable: {trainable/1e6:.1f}M / {total/1e6:.1f}M ({100*trainable/total:.1f}%)")
+    print(f"   [STATS] Trainable: {trainable/1e6:.1f}M / {total/1e6:.1f}M ({100*trainable/total:.1f}%)")
     
     return trainable, total
 
@@ -858,7 +865,7 @@ def apply_delta_update(base_model_path: Path, output_model_path: Path, delta_dat
     """
     from src.compression import decompress_gradients
 
-    print(f"🔄 Applying delta update (v{from_version} → v{to_version})...")
+    print(f"[SYNC] Applying delta update (v{from_version} → v{to_version})...")
 
     try:
         state_dict = torch.load(base_model_path, map_location='cpu', weights_only=True)
@@ -866,7 +873,7 @@ def apply_delta_update(base_model_path: Path, output_model_path: Path, delta_dat
 
         ok, reason = _validate_delta_tensors(state_dict, delta)
         if not ok:
-            print(f"   ❌ Delta validation failed: {reason}")
+            print(f"   [ERROR] Delta validation failed: {reason}")
             return False
 
         updated_count = 0
@@ -879,11 +886,11 @@ def apply_delta_update(base_model_path: Path, output_model_path: Path, delta_dat
         torch.save(state_dict, tmp_out)
         os.replace(tmp_out, output_model_path)
 
-        print(f"   ✅ Applied delta to {updated_count} parameters")
+        print(f"   [OK] Applied delta to {updated_count} parameters")
         return True
 
     except Exception as e:
-        print(f"   ❌ Delta apply failed: {e}")
+        print(f"   [ERROR] Delta apply failed: {e}")
         return False
 
 
@@ -915,7 +922,7 @@ def request_delta_update(ps_url: str, from_version: int, auth_token: Optional[st
         return None
         
     except Exception as e:
-        print(f"   ⚠️ Delta request failed: {e}")
+        print(f"   [WARN] Delta request failed: {e}")
         return None
 
 
@@ -1104,18 +1111,18 @@ def download_model_streaming(ps_url: str, save_path: Path, auth_token: Optional[
                 tmp_path = tmp.name
         
         # Load from temp file with weights_only=True (security)
-        print(f"📦 Loading model from disk ({total_bytes / 1e6:.1f} MB)...")
+        print(f"[PKG] Loading model from disk ({total_bytes / 1e6:.1f} MB)...")
         state_dict = torch.load(tmp_path, map_location='cpu', weights_only=True)
         
         # Save to final location
         torch.save(state_dict, save_path)
         os.remove(tmp_path)
         
-        print(f"✅ Model saved to {save_path}")
+        print(f"[OK] Model saved to {save_path}")
         return True
         
     except Exception as e:
-        print(f"❌ Model download failed: {e}")
+        print(f"[ERROR] Model download failed: {e}")
         return False
 
 
@@ -1159,15 +1166,15 @@ def request_task(
             return None
         elif resp.status_code == 400:
             error = resp.json()
-            print(f"❌ Task request rejected: {error.get('error')}")
+            print(f"[ERROR] Task request rejected: {error.get('error')}")
             print(f"   {error.get('message', '')}")
             return None
         else:
-            print(f"❌ Task request failed: {resp.status_code} {resp.text}")
+            print(f"[ERROR] Task request failed: {resp.status_code} {resp.text}")
             return None
             
     except Exception as e:
-        print(f"❌ Task request error: {e}")
+        print(f"[ERROR] Task request error: {e}")
         return None
 
 
@@ -1213,15 +1220,15 @@ def request_task_detailed(
 
         if resp.status_code == 400:
             error = resp.json()
-            print(f"❌ Task request rejected: {error.get('error')}")
+            print(f"[ERROR] Task request rejected: {error.get('error')}")
             print(f"   {error.get('message', '')}")
             return None, "failed"
 
-        print(f"❌ Task request failed: {resp.status_code} {resp.text}")
+        print(f"[ERROR] Task request failed: {resp.status_code} {resp.text}")
         return None, "failed"
 
     except Exception as e:
-        print(f"❌ Task request error: {e}")
+        print(f"[ERROR] Task request error: {e}")
         return None, "failed"
 
 
@@ -1276,10 +1283,10 @@ def request_task_with_retry(
 
         fail_count += 1
         if fail_count < max_attempts:
-            print(f"⚠️ Task request failed, retrying in {retry_delay}s... (attempt {fail_count}/{max_attempts})")
+            print(f"[WARN] Task request failed, retrying in {retry_delay}s... (attempt {fail_count}/{max_attempts})")
             time.sleep(retry_delay)
 
-    print("⚠️ Task request failed repeatedly, will re-register")
+    print("[WARN] Task request failed repeatedly, will re-register")
     return None, "re_register"
 
 
@@ -1297,7 +1304,7 @@ def register_miner_with_retry(
         register_response = register_miner(ps_url, wallet_address, instance_id, capabilities)
         if register_response:
             return register_response
-        print(f"⚠️ PS unreachable, retrying in {retry_seconds}s... (attempt {attempt})")
+        print(f"[WARN] PS unreachable, retrying in {retry_seconds}s... (attempt {attempt})")
         time.sleep(retry_seconds)
 
 
@@ -1360,7 +1367,7 @@ def _stream_download_with_resume(file_url: str, tmp_path: Path, timeout_s: int =
     with requests.get(file_url, headers=headers, stream=True, timeout=timeout_s) as resp:
         if downloaded > 0 and resp.status_code == 200:
             # Server ignored Range; restart from scratch to avoid corruption.
-            print("   ⚠️ Server ignored Range, restarting download from 0")
+            print("   [WARN] Server ignored Range, restarting download from 0")
             downloaded = 0
             mode = "wb"
         elif resp.status_code not in (200, 206):
@@ -1421,7 +1428,7 @@ def _download_partial_model_from_nginx(
                         local_size = model_path.stat().st_size
                         if remote_size > 0 and remote_size == local_size:
                             _ = torch.load(model_path, map_location="cpu", mmap=True, weights_only=True)
-                            print(f"✅ Reusing cached static model: {model_path.name}")
+                            print(f"[OK] Reusing cached static model: {model_path.name}")
                             return True, local_size
 
             total_bytes = _stream_download_with_resume(file_url, tmp_path, timeout_s=600)
@@ -1430,7 +1437,7 @@ def _download_partial_model_from_nginx(
             return True, total_bytes
         except Exception as exc:
             last_error = exc
-            print(f"⚠️ Static source failed ({file_url}): {exc}")
+            print(f"[WARN] Static source failed ({file_url}): {exc}")
             # Keep tmp_path for resume on same URL retry in next outer attempt.
             continue
 
@@ -1469,10 +1476,10 @@ def download_partial_model_with_retry(
                     auth_token=auth_token,
                 )
                 if ok:
-                    print("✅ Static model download success")
+                    print("[OK] Static model download success")
                     return True, total_bytes
             except Exception as static_err:
-                print(f"⚠️ Static model download failed, fallback to PS API: {static_err}")
+                print(f"[WARN] Static model download failed, fallback to PS API: {static_err}")
 
             # Fallback path: existing PS route.
             tmp_path = model_path.with_suffix(model_path.suffix + ".tmp")
@@ -1499,7 +1506,7 @@ def download_partial_model_with_retry(
             return True, total_bytes
 
         except Exception as e:
-            print(f"⚠️ Model download failed, retrying... ({attempt}/{max_attempts}) error={e}")
+            print(f"[WARN] Model download failed, retrying... ({attempt}/{max_attempts}) error={e}")
             with contextlib.suppress(Exception):
                 tmp_path = model_path.with_suffix(model_path.suffix + ".tmp")
                 if tmp_path.exists():
@@ -1541,7 +1548,7 @@ def download_shard_streaming(ps_url: str, shard_id: int, auth_token: Optional[st
         return shard_data
         
     except Exception as e:
-        print(f"❌ Shard {shard_id} download failed: {e}")
+        print(f"[ERROR] Shard {shard_id} download failed: {e}")
         return None
 
 
@@ -1660,7 +1667,7 @@ def train_shard(
             if loss is not None:
                 if torch.isnan(loss) or torch.isinf(loss):
                     invalid_loss_batches += 1
-                    print(f"⚠️ Warning: Invalid loss {loss.item()}, skipping batch")
+                    print(f"[WARN] Warning: Invalid loss {loss.item()}, skipping batch")
                     start_idx += len(batch_inputs) * seq_len
                     continue
                 hooks: List[Any] = []
@@ -1714,12 +1721,12 @@ def train_shard(
             new_batch_size = max(1, current_batch_size // 2)
             if new_batch_size != current_batch_size:
                 current_batch_size = new_batch_size
-                print(f"⚠️ OOM, reducing batch size to {current_batch_size}")
+                print(f"[WARN] OOM, reducing batch size to {current_batch_size}")
             else:
                 oom_retries_at_bs1 += 1
-                print("⚠️ OOM at batch_size=1, retrying...")
+                print("[WARN] OOM at batch_size=1, retrying...")
                 if oom_retries_at_bs1 >= 3:
-                    print("⚠️ Repeated OOM at batch_size=1, aborting shard.")
+                    print("[WARN] Repeated OOM at batch_size=1, aborting shard.")
                     oom_aborted = True
                     break
             model.zero_grad(set_to_none=True)
@@ -1731,12 +1738,12 @@ def train_shard(
                 new_batch_size = max(1, current_batch_size // 2)
                 if new_batch_size != current_batch_size:
                     current_batch_size = new_batch_size
-                    print(f"⚠️ OOM, reducing batch size to {current_batch_size}")
+                    print(f"[WARN] OOM, reducing batch size to {current_batch_size}")
                 else:
                     oom_retries_at_bs1 += 1
-                    print("⚠️ OOM at batch_size=1, retrying...")
+                    print("[WARN] OOM at batch_size=1, retrying...")
                     if oom_retries_at_bs1 >= 3:
-                        print("⚠️ Repeated OOM at batch_size=1, aborting shard.")
+                        print("[WARN] Repeated OOM at batch_size=1, aborting shard.")
                         oom_aborted = True
                         break
                 model.zero_grad(set_to_none=True)
@@ -1757,7 +1764,7 @@ def train_shard(
             break
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-    print(f"   ✅ Training complete: {num_batches} batches, avg_loss={avg_loss:.4f}")
+    print(f"   [OK] Training complete: {num_batches} batches, avg_loss={avg_loss:.4f}")
     compressed, grad_count = finalize_sparse_gradient_parts(
         sparse_parts=sparse_parts,
         ratio=compression_ratio,
@@ -1810,17 +1817,17 @@ def submit_gradient(
                 result = resp.json()
                 score_val = result.get("score", "N/A")
                 score_str = f"{score_val:.4f}" if isinstance(score_val, (int, float)) else str(score_val)
-                print(f"✅ Gradient accepted! Score: {score_str}")
+                print(f"[OK] Gradient accepted! Score: {score_str}")
                 return True
 
             # 4xx usually means semantic rejection; no retry.
             if 400 <= resp.status_code < 500:
                 # 401/403: JWT expired or invalid — re-register and retry once
                 if resp.status_code in (401, 403) and attempt == 1:
-                    print(f"⚠️ Auth error {resp.status_code} — JWT may have expired, re-registering...")
+                    print(f"[WARN] Auth error {resp.status_code} — JWT may have expired, re-registering...")
                     return None  # Signal caller to re-register
                 error_data = resp.json() if resp.headers.get("content-type") == "application/json" else {}
-                print(f"❌ Gradient rejected: {resp.status_code}")
+                print(f"[ERROR] Gradient rejected: {resp.status_code}")
                 print(f"   Reason: {error_data.get('reason', 'Unknown')}")
                 print(f"   Score: {error_data.get('score', 'N/A')}")
                 return False
@@ -1832,10 +1839,10 @@ def submit_gradient(
 
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
             if attempt < max_attempts:
-                print(f"⚠️ Submission failed, retrying... (attempt {attempt}/{max_attempts}) error={e}")
+                print(f"[WARN] Submission failed, retrying... (attempt {attempt}/{max_attempts}) error={e}")
                 time.sleep(10)
             else:
-                print("⚠️ Submission failed after 3 attempts, discarding this gradient and requesting next task")
+                print("[WARN] Submission failed after 3 attempts, discarding this gradient and requesting next task")
                 return False
 
     return False
@@ -1929,7 +1936,7 @@ def main():
         pass
     elif ps_url_lower.startswith("http://"):
         if args.allow_insecure:
-            print("[WARNING] ⚠️ Using insecure HTTP connection. NOT for production use.")
+            print("[WARNING] [WARN] Using insecure HTTP connection. NOT for production use.")
         else:
             print("[ERROR] PS URL must use https://. Use --allow-insecure for dev/testing only.")
             sys.exit(1)
@@ -2002,7 +2009,7 @@ def main():
             miner_instance_id = str(register_response.get("instance_id") or register_response.get("miner_id") or miner_instance_id or wallet_address)
             auth_token = str(register_response.get("token", "")).strip()
             if not auth_token:
-                print("❌ Registration succeeded but no auth token returned; retrying in 30s...")
+                print("[ERROR] Registration succeeded but no auth token returned; retrying in 30s...")
                 time.sleep(30)
                 continue
 
@@ -2030,7 +2037,7 @@ def main():
 
             if pending_task is None:
                 # Could not acquire task after retries; restart registration flow.
-                print("⚠️ Could not acquire task after retries, re-registering...")
+                print("[WARN] Could not acquire task after retries, re-registering...")
                 time.sleep(30)
                 continue
 
@@ -2052,12 +2059,12 @@ def main():
                     auth_token=auth_token,
                 )
                 if changed:
-                    print(f"✅ Cached model updated to v{ps_version}: {model_path}")
+                    print(f"[OK] Cached model updated to v{ps_version}: {model_path}")
                 else:
-                    print(f"✅ Using cached model: {model_path}")
+                    print(f"[OK] Using cached model: {model_path}")
 
             # Load state_dict to detect assigned_layers if not set
-            print("📦 Loading partial model...")
+            print("[PKG] Loading partial model...")
             state_dict = torch.load(model_path, map_location="cpu", mmap=True, weights_only=True)
 
             if assigned_layers is None:
@@ -2125,9 +2132,9 @@ def main():
             missing_keys = set(load_result.missing_keys)
             unexpected_keys = load_result.unexpected_keys
             if unexpected_keys:
-                print(f"   ⚠️ Unexpected keys ignored: {len(unexpected_keys)}")
+                print(f"   [WARN] Unexpected keys ignored: {len(unexpected_keys)}")
             if missing_keys:
-                print(f"   ⚠️ Missing keys initialized: {len(missing_keys)}")
+                print(f"   [WARN] Missing keys initialized: {len(missing_keys)}")
                 for name, param in model.named_parameters():
                     if name not in missing_keys:
                         continue
@@ -2140,7 +2147,7 @@ def main():
             import gc
             gc.collect()
 
-            print(f"   ✅ Loaded {len(assigned_layers)}-layer partial model")
+            print(f"   [OK] Loaded {len(assigned_layers)}-layer partial model")
             print(f"DEBUG actual layers = {len(model.model.layers)}")
             print(f"DEBUG params = {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
 
@@ -2165,13 +2172,13 @@ def main():
                     model = model.half()
                 else:
                     model = model.float()
-                print(f"🚀 Moving model to {device}...")
+                print(f"[START] Moving model to {device}...")
                 try:
                     model = model.to(device)
                 except RuntimeError as exc:
                     if "out of memory" not in str(exc).lower():
                         raise
-                    print("⚠️ OOM on full model.to(device), falling back to per-parameter transfer...")
+                    print("[WARN] OOM on full model.to(device), falling back to per-parameter transfer...")
                     if precision_mode == "fp16":
                         model = model._apply(lambda t: t.half().to(device))
                     else:
@@ -2181,18 +2188,18 @@ def main():
                     model = model.half()
                 else:
                     model = model.float()
-                print(f"🚀 Moving model to {device}...")
+                print(f"[START] Moving model to {device}...")
                 model = model.to(device)
             else:
                 model = model.float().to(device)
 
             # Verify model is on correct device
             first_param = next(model.parameters())
-            print(f"✅ Model loaded: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params")
-            print(f"✅ Model device: {first_param.device}")
+            print(f"[OK] Model loaded: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params")
+            print(f"[OK] Model device: {first_param.device}")
             expected_dtype = torch.float16 if precision_mode == "fp16" else torch.float32
             if first_param.dtype != expected_dtype:
-                print(f"⚠️ Precision mismatch: got {first_param.dtype}, expected {expected_dtype}")
+                print(f"[WARN] Precision mismatch: got {first_param.dtype}, expected {expected_dtype}")
 
             # Freeze non-assigned layers to keep memory bounded on low-VRAM miners.
             setup_tiered_training(model, assigned_layers, n_layers=n_layers)
@@ -2208,15 +2215,15 @@ def main():
             if args.batch_size > 0:
                 batch_size_cap = max(1, min(batch_size_cap, args.batch_size))
                 dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
-                print(f"📊 Batch size cap overridden by --batch-size: {batch_size_cap}")
+                print(f"[STATS] Batch size cap overridden by --batch-size: {batch_size_cap}")
             if profile_batch_cap > 0:
                 batch_size_cap = max(1, min(batch_size_cap, profile_batch_cap))
                 dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
-                print(f"📊 Batch size cap restored from profile: {batch_size_cap}")
+                print(f"[STATS] Batch size cap restored from profile: {batch_size_cap}")
             expected_layers = calculate_layers(float(capabilities.get("memory_gb", total_memory_gb)), device.type)
             precision = precision_mode.upper()
             device_label = "CPU" if device.type == "cpu" else device.type.upper()
-            print("🖥️ Hardware detected:")
+            print("[HW] Hardware detected:")
             print(f"   Device: {device_label} ({capabilities.get('device_name', 'unknown')})")
             print(f"   Memory: {total_memory_gb:.1f} GB")
             print(f"   Layers: {len(assigned_layers)} (auto-calculated)")
@@ -2230,7 +2237,7 @@ def main():
             print(f"   Seq len: {runtime_seq_len}")
             if len(assigned_layers) != expected_layers:
                 print(
-                    f"⚠️ PS assigned {len(assigned_layers)} layers, "
+                    f"[WARN] PS assigned {len(assigned_layers)} layers, "
                     f"local estimate is {expected_layers} layers"
                 )
 
@@ -2245,11 +2252,11 @@ def main():
                 with torch.no_grad():
                     with ctx:
                         model(test_ids, test_ids)
-                print("✅ Startup forward-pass check passed")
+                print("[OK] Startup forward-pass check passed")
             except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
                 if "out of memory" in str(exc).lower():
                     if precision_mode == "fp32" and device.type in ("cuda", "mps"):
-                        print("⚠️ Startup OOM in FP32, retrying with FP16")
+                        print("[WARN] Startup OOM in FP32, retrying with FP16")
                         save_device_profile(
                             profile_path,
                             profile_key,
@@ -2263,7 +2270,7 @@ def main():
                             sys.executable,
                             [sys.executable] + with_precision_arg(sys.argv, "fp16"),
                         )
-                    print("❌ Startup OOM while keeping full assigned layer set; refusing to downshift layers.")
+                    print("[ERROR] Startup OOM while keeping full assigned layer set; refusing to downshift layers.")
                     raise
                 raise
 
@@ -2271,10 +2278,10 @@ def main():
             print("🔍 Checking model weights for NaN/Inf...")
             for name, param in model.named_parameters():
                 if torch.isnan(param).any():
-                    print(f"   ❌ NAN PARAM: {name}")
+                    print(f"   [ERROR] NAN PARAM: {name}")
                 if torch.isinf(param).any():
-                    print(f"   ❌ INF PARAM: {name}")
-            print("   ✅ Weight check complete")
+                    print(f"   [ERROR] INF PARAM: {name}")
+            print("   [OK] Weight check complete")
 
             # Initialize AMP scaler and compression settings
             scaler = (
@@ -2290,7 +2297,7 @@ def main():
             invalid_streak = 0
 
             # Task loop
-            print("\n🚀 Starting training loop...\n")
+            print("\n[START] Starting training loop...\n")
             while True:
                 if pending_task is not None:
                     task = pending_task
@@ -2309,14 +2316,14 @@ def main():
                         time.sleep(10)
                         continue
                     if status == "re_register" or task is None:
-                        print("⚠️ Re-registering after repeated task request failures...")
+                        print("[WARN] Re-registering after repeated task request failures...")
                         break
 
                 task_id = task["task_id"]
                 shard_id = task["shard_id"]
                 task_nonce = task.get("task_nonce")
                 if not isinstance(task_nonce, str) or not task_nonce.strip():
-                    print("❌ Task missing task_nonce, requesting next task...")
+                    print("[ERROR] Task missing task_nonce, requesting next task...")
                     time.sleep(1)
                     continue
 
@@ -2328,7 +2335,7 @@ def main():
                     auth_token=auth_token,
                 )
                 if shard_data is None:
-                    print("❌ Shard download failed, skipping task")
+                    print("[ERROR] Shard download failed, skipping task")
                     continue
 
                 # Train
@@ -2375,9 +2382,9 @@ def main():
                         invalid_streak += 1
                         if current_lr > min_lr:
                             current_lr = max(min_lr, current_lr * 0.5)
-                            print(f"   ⚠️ Invalid loss detected, reducing gradient scale to {current_lr:.2e}")
+                            print(f"   [WARN] Invalid loss detected, reducing gradient scale to {current_lr:.2e}")
                         elif precision_mode == "fp16" and device.type in ("cuda", "mps"):
-                            print("   ⚠️ Invalid loss persists at min gradient scale, switching to FP32")
+                            print("   [WARN] Invalid loss persists at min gradient scale, switching to FP32")
                             os.execv(
                                 sys.executable,
                                 [sys.executable] + with_precision_arg(sys.argv, "fp32"),
@@ -2385,12 +2392,12 @@ def main():
                     stable_shards = 0
                     if dynamic_batch_size > 1:
                         dynamic_batch_size = max(1, dynamic_batch_size // 2)
-                        print(f"   ⚠️ Stability fallback, reducing batch size to {dynamic_batch_size}")
+                        print(f"   [WARN] Stability fallback, reducing batch size to {dynamic_batch_size}")
                     elif oom_aborted:
                         seq_floor = 64 if device.type in ("cuda", "mps") else 32
                         if runtime_seq_len > seq_floor:
                             runtime_seq_len = max(seq_floor, runtime_seq_len // 2)
-                            print(f"   ⚠️ OOM fallback, reducing seq_len to {runtime_seq_len}")
+                            print(f"   [WARN] OOM fallback, reducing seq_len to {runtime_seq_len}")
                             save_device_profile(
                                 profile_path,
                                 profile_key,
@@ -2401,8 +2408,8 @@ def main():
                                 },
                             )
                         else:
-                            print("   ⚠️ OOM persists at min batch/seq; keeping full layer count and skipping this shard.")
-                    print("   ⚠️ No training batches completed, skipping submission.")
+                            print("   [WARN] OOM persists at min batch/seq; keeping full layer count and skipping this shard.")
+                    print("   [WARN] No training batches completed, skipping submission.")
                     time.sleep(1)
                     continue
 
@@ -2421,9 +2428,9 @@ def main():
                     invalid_streak += 1
                     if current_lr > min_lr:
                         current_lr = max(min_lr, current_lr * 0.5)
-                        print(f"   ⚠️ Gradient NaN/Inf detected, reducing gradient scale to {current_lr:.2e}")
+                        print(f"   [WARN] Gradient NaN/Inf detected, reducing gradient scale to {current_lr:.2e}")
                     elif precision_mode == "fp16" and device.type in ("cuda", "mps"):
-                        print("   ⚠️ Gradient NaN/Inf persists at min gradient scale, switching to FP32")
+                        print("   [WARN] Gradient NaN/Inf persists at min gradient scale, switching to FP32")
                         os.execv(
                             sys.executable,
                             [sys.executable] + with_precision_arg(sys.argv, "fp32"),
@@ -2431,8 +2438,8 @@ def main():
                     stable_shards = 0
                     if dynamic_batch_size > 1:
                         dynamic_batch_size = max(1, dynamic_batch_size // 2)
-                        print(f"   ⚠️ Gradient NaN/Inf fallback, reducing batch size to {dynamic_batch_size}")
-                    print(f"   ⚠️ NaN/Inf detected in gradient: {bad_param}")
+                        print(f"   [WARN] Gradient NaN/Inf fallback, reducing batch size to {dynamic_batch_size}")
+                    print(f"   [WARN] NaN/Inf detected in gradient: {bad_param}")
                     print("   ⏭️  Skipping submission, requesting next task...")
                     time.sleep(1)
                     continue
@@ -2445,7 +2452,7 @@ def main():
                     compressed_bytes += len(meta.get("data", "")) + 96
                 ratio_pct = (compressed_bytes / raw_bytes * 100.0) if raw_bytes else 0.0
                 print(
-                    f"📊 Compression: {raw_bytes / 1024 / 1024:.2f}MB -> "
+                    f"[STATS] Compression: {raw_bytes / 1024 / 1024:.2f}MB -> "
                     f"{compressed_bytes / 1024 / 1024:.2f}MB ({ratio_pct:.2f}%)"
                 )
 
@@ -2556,10 +2563,10 @@ def main():
                                     retry_seconds=30,
                                 )
                                 os.execv(sys.executable, [sys.executable] + sys.argv)
-                    print(f"✅ Task {task_id[:8]}... completed in {train_time:.1f}s\n")
+                    print(f"[OK] Task {task_id[:8]}... completed in {train_time:.1f}s\n")
                 else:
                     gradients_rejected += 1
-                    print(f"❌ Task {task_id[:8]}... failed\n")
+                    print(f"[ERROR] Task {task_id[:8]}... failed\n")
 
                 if tasks_processed % 10 == 0:
                     uptime = format_uptime(time.time() - miner_start_time)
@@ -2572,10 +2579,10 @@ def main():
                 time.sleep(2)
 
         except KeyboardInterrupt:
-            print("\n🛑 Miner stopped by user")
+            print("\n[STOP] Miner stopped by user")
             return
         except Exception as e:
-            print(f"❌ Unexpected error: {e}. Restarting in 30s...")
+            print(f"[ERROR] Unexpected error: {e}. Restarting in 30s...")
             import traceback
             traceback.print_exc()
             time.sleep(30)
