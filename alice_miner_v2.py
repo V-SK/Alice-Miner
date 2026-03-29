@@ -2449,7 +2449,7 @@ def main():
                 # None = JWT expired (401/403) — re-register and retry once
                 if success is None:
                     print("[Miner] JWT expired, re-registering with PS...")
-                    _renew_resp = register_with_ps(args.ps_url, wallet_address, capabilities, instance_id=miner_instance_id)
+                    _renew_resp = register_miner(args.ps_url, wallet_address, miner_instance_id, capabilities)
                     if _renew_resp:
                         auth_token = str(_renew_resp.get("token", "")).strip()
                         print("[Miner] JWT renewed, retrying submission...")
