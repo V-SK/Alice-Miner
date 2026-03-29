@@ -22,6 +22,20 @@ pip install -r requirements.txt
 python alice_miner_v2.py --ps-url https://ps.aliceprotocol.org --address YOUR_WALLET_ADDRESS
 ```
 
+## Device Detection
+
+The miner auto-detects your device: CUDA (NVIDIA) → MPS (Apple Silicon) → CPU.
+
+**Windows users with NVIDIA GPU — if auto-detection fails:**
+```bash
+python alice_miner_v2.py --address <YOUR_ADDRESS> --device cuda
+```
+
+**Override memory detection:**
+```bash
+python alice_miner_v2.py --address <YOUR_ADDRESS> --device cuda --memory-gb 24
+```
+
 ## Parameters
 
 | Parameter | Required | Default | Description |

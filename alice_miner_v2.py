@@ -54,64 +54,61 @@ MAX_DELTA_HOPS = 10
 KEEP_VERSIONS = 2
 DEFAULT_MODEL_DIR = Path.home() / ".alice" / "models"
 
-def auto_detect_device() -> Tuple[str, float, str]:
-    """Auto-detect best available device and memory."""
+def auto_detect_device():
+    """
+    自动检测最佳设备和可用内存。
+    优先级: CUDA > MPS > CPU
+    Returns dict with: device, device_type, device_name, memory_gb, system_memory_gb, cpu_count
+    """
+    import platform
+
+    device_type = "cpu"
+    memory_gb = 8.0
+    device_name = "Unknown"
+
+    # === CUDA (Windows/Linux NVIDIA GPU) ===
     if torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(0)
-        memory_gb = props.total_memory / (1024 ** 3)
-        return "cuda", memory_gb, torch.cuda.get_device_name(0)
-
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         try:
-            result = subprocess.run(
-                ["sysctl", "-n", "hw.memsize"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            memory_gb = int(result.stdout.strip()) / (1024 ** 3)
-        except Exception:
-            memory_gb = 16.0
-        try:
-            chip = subprocess.run(
-                ["sysctl", "-n", "machdep.cpu.brand_string"],
-                capture_output=True,
-                text=True,
-                check=False,
-            ).stdout.strip()
-        except Exception:
-            chip = "Apple Silicon"
-        return "mps", memory_gb, chip or "Apple Silicon"
+            if platform.system() == "Windows":
+                torch.cuda.init()  # Windows needs explicit init
+            device_count = torch.cuda.device_count()
+            if device_count > 0:
+                props = torch.cuda.get_device_properties(0)
+                memory_gb = props.total_memory / (1024 ** 3)
+                device_name = props.name
+                device_type = "cuda"
+                print(f"[Miner] Detected CUDA: {device_name} ({memory_gb:.1f}GB VRAM)")
+        except Exception as e:
+            print(f"[Miner] CUDA detection failed: {e}, trying MPS/CPU")
 
-    try:
-        import psutil
+    # === MPS (Apple Silicon) ===
+    if device_type == "cpu" and platform.system() == "Darwin":
+        try:
+            if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                memory_gb = psutil.virtual_memory().total / (1024 ** 3)
+                device_type = "mps"
+                device_name = "Apple Silicon"
+                print(f"[Miner] Detected MPS (Apple Silicon) ({memory_gb:.1f}GB unified memory)")
+        except Exception as e:
+            print(f"[Miner] MPS detection failed: {e}, using CPU")
+
+    # === CPU Fallback ===
+    if device_type == "cpu":
         memory_gb = psutil.virtual_memory().total / (1024 ** 3)
-    except Exception:
-        # Windows has no os.sysconf; fall back to ctypes GlobalMemoryStatusEx.
-        try:
-            if os.name == "nt":
-                import ctypes
-                class MEMORYSTATUSEX(ctypes.Structure):
-                    _fields_ = [
-                        ("dwLength", ctypes.c_ulong),
-                        ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong),
-                        ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong),
-                        ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong),
-                        ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                    ]
-                stat = MEMORYSTATUSEX()
-                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-                memory_gb = stat.ullTotalPhys / (1024 ** 3)
-            else:
-                memory_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
-        except Exception:
-            memory_gb = 16.0
-    return "cpu", memory_gb, (platform.processor() or "Unknown CPU")
+        device_name = platform.processor() or "Unknown CPU"
+        print(f"[Miner] Using CPU ({memory_gb:.1f}GB system memory)")
+
+    system_memory_gb = psutil.virtual_memory().total / (1024 ** 3)
+    cpu_count = psutil.cpu_count() or 1
+
+    return {
+        "device": device_type,
+        "device_type": device_type,
+        "device_name": device_name,
+        "memory_gb": float(memory_gb),
+        "system_memory_gb": float(system_memory_gb),
+        "cpu_count": int(cpu_count),
+    }
 
 
 def calculate_layers(memory_gb: float, device_type: str) -> int:
@@ -180,9 +177,12 @@ def with_precision_arg(argv: List[str], precision: str) -> List[str]:
     return out
 
 
-def get_hardware_info(device_override: Optional[str] = None) -> Dict[str, Any]:
+def get_hardware_info(device_override: Optional[str] = None, memory_override_gb: Optional[float] = None) -> Dict[str, Any]:
     """Detect hardware capabilities with optional device override."""
-    detected_device, detected_memory_gb, detected_name = auto_detect_device()
+    detected = auto_detect_device()
+    detected_device = detected["device_type"]
+    detected_memory_gb = detected["memory_gb"]
+    detected_name = detected["device_name"]
     device_type = (device_override or detected_device).lower()
     device_name = detected_name
     memory_gb = detected_memory_gb
@@ -209,7 +209,6 @@ def get_hardware_info(device_override: Optional[str] = None) -> Dict[str, Any]:
         device_type = detected_device
 
     try:
-        import psutil
         system_memory_gb = psutil.virtual_memory().total / (1024 ** 3)
         cpu_count = psutil.cpu_count() or 1
     except Exception:
@@ -229,7 +228,7 @@ def get_hardware_info(device_override: Optional[str] = None) -> Dict[str, Any]:
         except ValueError:
             pass
 
-    return {
+    result = {
         "device": device_type,
         "device_type": device_type,
         "device_name": device_name,
@@ -237,6 +236,13 @@ def get_hardware_info(device_override: Optional[str] = None) -> Dict[str, Any]:
         "system_memory_gb": float(system_memory_gb),
         "cpu_count": int(cpu_count),
     }
+
+    # Apply --memory-gb override last (highest priority)
+    if memory_override_gb and memory_override_gb > 0:
+        result["memory_gb"] = float(memory_override_gb)
+        print(f"[Miner] Memory override: {memory_override_gb}GB")
+
+    return result
 
 
 def calculate_batch_size(
@@ -1861,6 +1867,8 @@ def main():
     parser.add_argument("--model-path", type=Path, default=None, help="Pre-downloaded model path (skip download)")
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR, help="Model cache directory (default: ~/.alice/models)")
     parser.add_argument("--device", default=None, help="Training device override: cuda|mps|cpu")
+    parser.add_argument("--memory-gb", type=int, default=None,
+        help="Override detected memory in GB (use if auto-detection fails)")
     parser.add_argument(
         "--reward-address",
         default=None,
@@ -1944,7 +1952,8 @@ def main():
                 _last_discover_time = _now
 
             # Get hardware capabilities (auto-detect unless overridden).
-            capabilities = get_hardware_info(args.device)
+            _memory_override = float(args.memory_gb) if getattr(args, 'memory_gb', None) else None
+            capabilities = get_hardware_info(args.device, memory_override_gb=_memory_override)
             profile_key = device_profile_key(wallet_address, capabilities)
             profile = load_device_profile(profile_path, profile_key)
 
@@ -1952,7 +1961,7 @@ def main():
             profile_mem_cap = profile.get("memory_cap_gb")
             if isinstance(profile_mem_cap, (int, float)) and profile_mem_cap > 0:
                 os.environ["ALICE_MEMORY_CAP_GB"] = f"{float(profile_mem_cap):.3f}"
-                capabilities = get_hardware_info(args.device)
+                capabilities = get_hardware_info(args.device, memory_override_gb=_memory_override)
 
             runtime_seq_len = int(profile.get("stable_seq_len", args.seq_len))
             runtime_seq_len = max(64, min(int(args.seq_len), runtime_seq_len))
