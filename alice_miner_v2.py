@@ -1786,6 +1786,10 @@ def submit_gradient(
 
             # 4xx usually means semantic rejection; no retry.
             if 400 <= resp.status_code < 500:
+                # 401/403: JWT expired or invalid — re-register and retry once
+                if resp.status_code in (401, 403) and attempt == 1:
+                    print(f"⚠️ Auth error {resp.status_code} — JWT may have expired, re-registering...")
+                    return None  # Signal caller to re-register
                 error_data = resp.json() if resp.headers.get("content-type") == "application/json" else {}
                 print(f"❌ Gradient rejected: {resp.status_code}")
                 print(f"   Reason: {error_data.get('reason', 'Unknown')}")
@@ -2442,6 +2446,26 @@ def main():
                     metrics,
                     auth_token=auth_token,
                 )
+                # None = JWT expired (401/403) — re-register and retry once
+                if success is None:
+                    print("[Miner] JWT expired, re-registering with PS...")
+                    _renew_resp = register_with_ps(args.ps_url, wallet_address, capabilities, instance_id=miner_instance_id)
+                    if _renew_resp:
+                        auth_token = str(_renew_resp.get("token", "")).strip()
+                        print("[Miner] JWT renewed, retrying submission...")
+                        success = submit_gradient(
+                            _submit_url,
+                            task_id,
+                            task_nonce,
+                            compressed,
+                            metrics,
+                            auth_token=auth_token,
+                        )
+                        if success is None:
+                            success = False
+                    else:
+                        print("[Miner] Re-registration failed, skipping gradient")
+                        success = False
                 if not success and _submit_url != args.ps_url:
                     print(f"[Miner] Aggregator submit failed, falling back to PS...")
                     success = submit_gradient(
@@ -2452,7 +2476,7 @@ def main():
                         metrics,
                         auth_token=auth_token,
                     )
-                    if success:
+                    if success is True:
                         # Aggregator is down; reset so next gradient goes to PS
                         # and re-discover aggregator on next iteration
                         print(f"[Miner] PS fallback succeeded. Will re-discover aggregator.")
