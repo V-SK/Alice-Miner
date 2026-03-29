@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from core.model import LlamaNanoModel, LlamaNanoConfig
 from core.compression import TopKCompressor
+import psutil
 try:
     from src.model import AliceConfig, AliceForCausalLM
     ALICE_MODEL_AVAILABLE = True
