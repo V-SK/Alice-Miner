@@ -252,29 +252,51 @@ def calculate_batch_size(
     total_memory_gb: float,
     seq_len: int = 512,
 ) -> Tuple[int, float, float]:
-    """Calculate an initial training batch size from available memory."""
+    """Calculate batch size from available memory. Larger VRAM = larger batch = more throughput."""
     if device_type == "cpu":
         return 1, 0.0, 0.0
 
-    # Keep headroom for fragmentation, dataloader tensors, and temporary buffers.
     available_gb = max(0.0, total_memory_gb - model_memory_gb - 2.0)
     per_sample_gb = 0.5 * (max(1, seq_len) / 512.0)
     if per_sample_gb <= 0:
         return 1, available_gb, 0.0
 
     batch_size = max(1, int(available_gb / per_sample_gb))
-    batch_size = min(batch_size, 16)
-    return batch_size, available_gb, per_sample_gb
+
+    # Dynamic max batch based on available memory (larger VRAM = more throughput)
+    if total_memory_gb >= 48.0:
+        max_batch = 64
+    elif total_memory_gb >= 32.0:
+        max_batch = 32
+    elif total_memory_gb >= 20.0:
+        max_batch = 16
+    else:
+        max_batch = 8
+
+    batch_size = min(batch_size, max_batch)
+
+    model_memory_used = model_memory_gb
+    gradient_memory = batch_size * per_sample_gb
+    return batch_size, model_memory_used, gradient_memory
 
 
-def conservative_start_batch(device_type: str, batch_cap: int) -> int:
-    """Choose a stability-first starting batch size, then grow gradually."""
+def conservative_start_batch(device_type: str, batch_cap: int, total_memory_gb: float = 0.0) -> int:
+    """Choose a stability-first starting batch size, then grow gradually.
+
+    Starting batch scales with VRAM so large GPUs ramp up faster:
+      - 48GB+  → start at 8
+      - <48GB  → start at 4 (unchanged for 24GB cards)
+    """
     if device_type == "cpu":
         return 1
     if device_type == "mps":
         return max(1, min(batch_cap, 2))
-    # CUDA: empirically stable default on 24GB cards.
-    return max(1, min(batch_cap, 4))
+    # CUDA: scale starting batch with available VRAM
+    if total_memory_gb >= 48.0:
+        start = 8
+    else:
+        start = 4
+    return max(1, min(batch_cap, start))
 
 
 def memory_required_for_layers(target_layers: int, device_type: str, fallback_memory: float) -> float:
@@ -2190,7 +2212,7 @@ def main():
                 total_memory_gb=total_memory_gb,
                 seq_len=runtime_seq_len,
             )
-            dynamic_batch_size = conservative_start_batch(device.type, batch_size_cap)
+            dynamic_batch_size = conservative_start_batch(device.type, batch_size_cap, total_memory_gb)
             if args.batch_size > 0:
                 batch_size_cap = max(1, min(batch_size_cap, args.batch_size))
                 dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
