@@ -62,6 +62,38 @@ MAX_DELTA_HOPS = 10
 KEEP_VERSIONS = 2
 DEFAULT_MODEL_DIR = Path.home() / ".alice" / "models"
 
+
+def _print_epoch_summary(ps_url: str, address: str, iteration: int) -> None:
+    """Fetch and print last epoch result at the start of a new epoch."""
+    if iteration <= 1:
+        return
+    try:
+        import requests as _req
+        resp = _req.get(f"{ps_url}/miner/summary/{address}", params={"epochs": 1}, timeout=8)
+        if resp.status_code != 200:
+            return
+        data = resp.json()
+        latest = data.get("latest_epoch")
+        if not latest:
+            return
+        sub   = latest.get("shards_submitted", 0)
+        acc   = latest.get("shards_accepted", 0)
+        score = latest.get("avg_score", 0.0)
+        rew   = latest.get("reward", 0.0)
+        ep    = latest.get("epoch", "?")
+        print("")
+        print("=" * 60)
+        print(f"[EPOCH {ep} RESULT]")
+        print(f"  Shards trained:  {sub}")
+        print(f"  Accepted:        {acc} / {sub}")
+        print(f"  Avg score:       {score:.4f}")
+        print(f"  Reward:          {rew:.4f} ALICE")
+        print(f"  Wallet:          {address[:8]}...{address[-4:]}")
+        print("=" * 60)
+        print("")
+    except Exception:
+        pass
+
 def auto_detect_device():
     """
     自动检测最佳设备和可用内存。
@@ -1966,7 +1998,10 @@ def main():
     profile_path = device_profile_path()
 
     # Never exit on transient errors; only Ctrl+C stops the miner.
+    _epoch_iteration = 0
     while True:
+        _epoch_iteration += 1
+        _print_epoch_summary(args.ps_url, args.address, _epoch_iteration)
         try:
             # Re-discover best aggregator node at the start of each epoch.
             # PS returns the lowest-load node automatically; if aggregator is full
