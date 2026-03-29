@@ -4,7 +4,7 @@ Training miner for Alice Protocol. Earn ALICE tokens by contributing compute pow
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.8+
 - 24GB+ RAM/VRAM
 - Supports: CUDA / MPS / CPU
 
