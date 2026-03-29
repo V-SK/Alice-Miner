@@ -1923,9 +1923,22 @@ def main():
     gradients_rejected = 0
     profile_path = device_profile_path()
 
+    # Track last aggregator discovery time for periodic re-discovery.
+    _last_discover_time = time.time()
+    _REDISCOVER_INTERVAL_S = 300  # re-discover every 5 minutes
+
     # Never exit on transient errors; only Ctrl+C stops the miner.
     while True:
         try:
+            # Periodically re-discover aggregator (handles aggregator restarts / new nodes).
+            _now = time.time()
+            if _now - _last_discover_time >= _REDISCOVER_INTERVAL_S:
+                _new_agg = discover_aggregator(args.ps_url, args.address)
+                if _new_agg != getattr(args, "aggregator_url", args.ps_url):
+                    print(f"[Miner] Aggregator updated: {getattr(args, 'aggregator_url', args.ps_url)} → {_new_agg}")
+                args.aggregator_url = _new_agg
+                _last_discover_time = _now
+
             # Get hardware capabilities (auto-detect unless overridden).
             capabilities = get_hardware_info(args.device)
             profile_key = device_profile_key(wallet_address, capabilities)
@@ -2418,7 +2431,8 @@ def main():
                 }
 
                 print("📤 Submitting gradient...")
-                # Submit to aggregator if assigned, otherwise directly to PS
+                # Submit to aggregator if assigned, otherwise directly to PS.
+                # On failure, automatically fall back to PS and re-discover aggregator next round.
                 _submit_url = getattr(args, "aggregator_url", args.ps_url)
                 success = submit_gradient(
                     _submit_url,
@@ -2428,6 +2442,21 @@ def main():
                     metrics,
                     auth_token=auth_token,
                 )
+                if not success and _submit_url != args.ps_url:
+                    print(f"[Miner] Aggregator submit failed, falling back to PS...")
+                    success = submit_gradient(
+                        args.ps_url,
+                        task_id,
+                        task_nonce,
+                        compressed,
+                        metrics,
+                        auth_token=auth_token,
+                    )
+                    if success:
+                        # Aggregator is down; reset so next gradient goes to PS
+                        # and re-discover aggregator on next iteration
+                        print(f"[Miner] PS fallback succeeded. Will re-discover aggregator.")
+                        args.aggregator_url = args.ps_url
                 if success:
                     gradients_accepted += 1
                     save_device_profile(
