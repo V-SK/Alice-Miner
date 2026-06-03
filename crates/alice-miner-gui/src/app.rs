@@ -11,7 +11,10 @@ use std::time::Instant;
 
 use alice_miner_core::engine::{Command, EngineHandle, Event, IdentitySpec, Snapshot};
 use alice_miner_core::identity::{self, IdentityPointer};
-use alice_miner_core::{DeviceProfile, EngineState, Identity, Lane, LaneSupport, LaneViability};
+use alice_miner_core::{
+    CreditState, DashboardModel, DeviceProfile, EngineState, Identity, Lane, LaneSupport,
+    LaneViability, LocalActivity, PoolStatsClient, Reconciliation,
+};
 use eframe::egui::{self, TextureHandle};
 
 use crate::ui;
@@ -115,6 +118,17 @@ pub struct MinerApp {
     /// The word the user has chosen for each target slot (`None` = empty).
     pub confirm_filled: Vec<Option<String>>,
 
+    // ── Source B — server-confirmed credit (M5) ──────────────────────────────
+    /// The Source-B credit poller (poll discipline + source config). v1 is the
+    /// `NotExposed` configuration (no reachable public per-address endpoint today
+    /// — see [`alice_miner_core::dashboard`]), so it never touches the network; it
+    /// just yields the honest `NotExposed` panel. The fast-follow to a live
+    /// public read-model endpoint is a one-line config flip here.
+    pub credit_client: PoolStatsClient,
+    /// The latest server-confirmed credit state (Source B), kept separate from the
+    /// live local activity (Source A) so the UI never blurs the two.
+    pub credit_state: CreditState,
+
     /// Headless screenshot-mode driver. `None` on every normal run; `Some` only
     /// when `ALICE_MINER_SHOT_DIR` is set (see [`crate::shot`]). When set, the
     /// `ui()` loop is driven by the shot state machine instead of the engine.
@@ -166,8 +180,54 @@ impl MinerApp {
             confirm_targets: Vec::new(),
             confirm_pool: Vec::new(),
             confirm_filled: Vec::new(),
+            // Source B v1: the investigated reality is that no reachable public
+            // per-address credit endpoint exists, so the poller is `NotExposed`
+            // (no network, honest panel). See `alice_miner_core::dashboard`.
+            credit_client: PoolStatsClient::not_exposed(),
+            credit_state: CreditState::NotExposed,
             shot: crate::shot::ShotRunner::from_env(),
         })
+    }
+
+    /// Source-B credit tick (called each frame). The credit state is sourced from
+    /// the [`PoolStatsClient`], which in the v1 `NotExposed` configuration performs
+    /// **no network I/O** (it just yields `NotExposed`). When the fast-follow flips
+    /// `credit_client` to a live public read-model endpoint, this is where the
+    /// poll-due / single-flight / backoff logic would drive an actual GET; the
+    /// `polls_network()` guard keeps v1 a pure, server-independent no-op.
+    ///
+    /// Crucially this NEVER computes an estimated/projected reward (the #18
+    /// red-team trap) — it only reflects what the server has CONFIRMED.
+    pub fn tick_credit(&mut self) {
+        if !self.credit_client.polls_network() {
+            // v1: no reachable public per-address endpoint → the honest panel.
+            self.credit_state = self.credit_client.state();
+            return;
+        }
+        // (Fast-follow path — inert in v1.) A real implementation would check
+        // `next_poll_in_secs` against a timer, `begin_poll()` (single-flight), fire
+        // the GET on the worker, and feed the body to `complete()` / `fail()`. Here
+        // we simply surface the client's last-known state so the UI stays in sync.
+        self.credit_state = self.credit_client.state();
+    }
+
+    /// Build the M5 [`DashboardModel`] for the current frame: Source A (live local
+    /// activity, from the latest snapshot) + Source B (server-confirmed credit) +
+    /// the qualitative reconciliation badge. Used by the dashboard UI; never
+    /// performs a reward projection (the #18 red-team trap).
+    pub fn dashboard_model(&self) -> DashboardModel {
+        let activity = self
+            .snapshot
+            .as_ref()
+            .map(LocalActivity::from_snapshot)
+            .unwrap_or_else(LocalActivity::idle);
+        DashboardModel::new(activity, self.credit_state.clone())
+    }
+
+    /// The qualitative reconciliation badge (Source A vs Source B) for the current
+    /// frame.
+    pub fn reconciliation(&self) -> Reconciliation {
+        self.dashboard_model().reconciliation
     }
 
     /// Whether motion (breathing glow, gauge sweep, number tween, blinking dots)
@@ -307,6 +367,25 @@ impl MinerApp {
     /// The current reward address (the user's OWN public address), if known.
     pub fn reward_address(&self) -> Option<String> {
         self.identity.as_ref().map(|p| p.address.clone())
+    }
+
+    /// The endpoint string to display for the dashboard/Settings.
+    ///
+    /// While mining (or after a snapshot exists), the ACTIVE endpoint comes from
+    /// the snapshot (so a Layer-B failover is reflected). When **idle / not yet
+    /// connected**, it must reflect the **SELECTED lane's** default relay port —
+    /// `:3333` for XMR, `:8888` for RVN — NOT a hardcoded `:3333` (the M3
+    /// follow-up). We derive it from the SAME source the engine uses
+    /// ([`EndpointPlan::default_for_lane`]) so the relay-only honesty invariant
+    /// holds and the port can never drift from the real launch plan.
+    pub fn display_endpoint(&self) -> String {
+        if let Some(ep) = self.snapshot.as_ref().and_then(|s| s.endpoint.clone()) {
+            return ep;
+        }
+        use alice_miner_core::EndpointPlan;
+        EndpointPlan::default_for_lane(self.active_lane())
+            .current()
+            .host_port()
     }
 
     /// Current raw hashrate in kH/s from the snapshot (0 if none).
@@ -583,12 +662,18 @@ impl eframe::App for MinerApp {
             // Screenshot mode: the shot state machine poses the app + captures;
             // we skip draining real engine events so the injected demo snapshot
             // is not clobbered. `tick_anim` still runs for the breathing glow.
+            // (Shot poses set `credit_state` directly, so we DON'T tick the client
+            // here — that would overwrite a posed Confirmed/Confirming state.)
             crate::shot::drive(self, &ctx);
             self.tick_anim(&ctx);
             ui::chrome::render(ui_root, self);
             return;
         }
         self.drain_events();
+        // Source B: refresh the server-confirmed credit state from the poller
+        // (v1: a pure no-op yielding `NotExposed`; the fast-follow drives a real
+        // poll here). Kept off the screenshot path so posed states survive.
+        self.tick_credit();
         self.tick_anim(&ctx);
         ui::chrome::render(ui_root, self);
     }
@@ -656,6 +741,40 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             app.confirm_place(words[p - 1]);
         }
         assert!(app.confirm_is_correct(PHRASE));
+    }
+
+    /// THE M3 FOLLOW-UP FIX: when idle / not yet connected, the displayed endpoint
+    /// must reflect the SELECTED lane's relay port — `:8888` for RVN, `:3333` for
+    /// XMR — not a hardcoded `:3333`.
+    #[test]
+    fn idle_endpoint_reflects_selected_lane_port() {
+        use alice_miner_core::detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
+        let mut app = MinerApp::new().expect("engine spawns");
+        // Make RVN a runnable lane (a simulated NVIDIA box) so we can select it.
+        app.set_device(DeviceProfile {
+            os: OsFamily::Linux,
+            arch: "x86_64".into(),
+            apple_silicon: false,
+            logical_cores: 16,
+            cpu_model: "AMD Ryzen 9 5950X".into(),
+            gpu: GpuInfo {
+                vendor: GpuVendor::Nvidia,
+                model: "NVIDIA GeForce RTX 3070 Ti".into(),
+                vram_gb: 8,
+            },
+            memory_gb: 64,
+            display: "AMD Ryzen 9 5950X · 16 cores".into(),
+            warnings: vec![],
+        });
+        app.snapshot = None; // idle / not connected
+
+        // XMR selected → :3333.
+        app.select_lane(Lane::Xmr);
+        assert_eq!(app.display_endpoint(), "hk.aliceprotocol.org:3333");
+
+        // RVN selected → :8888 (was hardcoded to :3333 before the fix).
+        app.select_lane(Lane::GpuRvn);
+        assert_eq!(app.display_endpoint(), "hk.aliceprotocol.org:8888");
     }
 
     /// Reduced motion flips `motion_enabled`.

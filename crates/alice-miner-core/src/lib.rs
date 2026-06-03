@@ -31,6 +31,7 @@ pub use alice_release;
 pub use alice_supervise;
 
 pub mod binaries;
+pub mod dashboard;
 pub mod detect;
 pub mod endpoint;
 pub mod engine;
@@ -48,6 +49,10 @@ pub mod supervise;
 pub(crate) static MINER_BIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // Convenient top-level re-exports for the front-ends.
+pub use dashboard::{
+    CreditError, CreditScore, CreditSource, CreditState, DashboardModel, LaneActivity,
+    LocalActivity, PoolStatsClient, Reconciliation,
+};
 pub use detect::capability::{CapabilityProfile, LaneSupport, LaneViability};
 pub use detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
 pub use endpoint::{Endpoint, EndpointPlan, Transport};

@@ -90,6 +90,38 @@ pub const OB_PASTE_EYEBROW: &str = "Watch-only";
 pub const OB_PASTE_TITLE: &str = "Paste an Alice address";
 pub const OB_PASTE_SUB: &str = "Track rewards for an address you own. No keys stored.";
 
+// ── M5 dashboard depth: Source A (activity) / Source B (server-confirmed) ─────
+/// Source-A section eyebrow + caption — this is LOCAL ACTIVITY, explicitly NOT
+/// earnings (the brief's hard separation).
+pub const ACTIVITY_SECTION: &str = "Local activity";
+pub const ACTIVITY_CAPTION: &str = "What this miner is doing right now · 本机活动";
+
+/// Source-B section eyebrow + caption — server-confirmed credit (read-only).
+pub const CREDIT_SECTION: &str = "Server-confirmed credit";
+pub const CREDIT_CAPTION: &str = "Read-only · confirmed by the network · 服务端确认";
+
+/// The honest `NotExposed` panel (Option 3, the v1 path). Credit accounting is
+/// live; payout is OFF (phase-J); the per-address total is not exposed to the
+/// client yet. No fabricated number — point the user at the explorer.
+pub const CREDIT_NOTEXPOSED_TITLE: &str = "Credit accounting is live";
+pub const CREDIT_NOTEXPOSED_BODY_1: &str =
+    "Your accepted work is being counted by the network. Payout is off (phase-J).";
+pub const CREDIT_NOTEXPOSED_BODY_2: &str =
+    "A per-address total isn't exposed in the app yet — look it up in the explorer.";
+/// The explorer deep-link label + URL (PUBLIC apex; never an internal/core host).
+pub const CREDIT_EXPLORER_LABEL: &str = "Open explorer · 浏览器";
+pub const CREDIT_EXPLORER_URL: &str = "https://aliceprotocol.org/explorer.html";
+
+/// The Source-B states' short value labels (no number, ever).
+pub const CREDIT_CONFIRMING: &str = "confirming… · 确认中";
+pub const CREDIT_PENDING_VALUE: &str = "pending · 待发放";
+/// When a Source-B poll fault occurs (unreachable / withheld): a calm, neutral,
+/// NON-numeric note. We never hint at any dropped value.
+pub const CREDIT_UNCONFIRMED: &str = "unconfirmed · 待确认";
+
+/// The reconciliation badge prefix (the qualitative local-vs-server status).
+pub const RECONCILE_PREFIX: &str = "local vs network";
+
 #[cfg(test)]
 mod tests {
     /// The credit-only honesty gate: every user-facing string literal in this
@@ -134,20 +166,42 @@ mod tests {
         // disclosure (these do NOT happen), so `payout`/`settlement` are not
         // forbidden; only misleading/positive tokens are.
         let lowered = literals.to_lowercase();
-        for forbidden in ["$", "usd", "fiat", "credit", "paid", "earned", "已发放"] {
+        // BLANKET-forbidden: fiat + any positive "already-paid/earned" claim. These
+        // can never appear in user copy under any framing.
+        for forbidden in ["$", "usd", "fiat", "paid", "earned", "已发放"] {
             assert!(
                 !lowered.contains(&forbidden.to_lowercase()),
                 "user-facing strings must not contain `{forbidden}` (credit-only honesty gate)"
             );
         }
-        // And the gated-disclosure words may appear ONLY alongside "gated", never
-        // as a positive claim — assert that invariant explicitly.
+        // CONDITIONALLY-allowed words: `payout`/`settlement` may appear ONLY in a
+        // "stay gated" disclosure (an honest *negative*), and `credit` may appear
+        // ONLY in its honest, non-cash sense (the brief forbids "credit-AS-CASH",
+        // not the word itself — M5 surfaces "server-confirmed credit" / "credit
+        // accounting"). So a line mentioning `credit` must NOT also carry any
+        // cash-coding token, and `payout`/`settlement` must carry `gated`.
+        const CREDIT_AS_CASH_TOKENS: [&str; 7] =
+            ["$", "usd", "fiat", "balance", "wallet", "paid", "earned"];
         for line in literals.lines() {
             let l = line.to_lowercase();
+            if l.contains("credit") {
+                for cash in CREDIT_AS_CASH_TOKENS {
+                    assert!(
+                        !l.contains(cash),
+                        "`credit` must not be used as cash (found `{cash}` on the same line): {line:?}"
+                    );
+                }
+            }
+            // `payout`/`settlement` may appear ONLY as an honest *negative*
+            // disclosure — the thing does NOT happen. Accept the equivalent
+            // phrasings "gated" / "off" / "disabled" (e.g. "Payout is off
+            // (phase-J)"), but never a positive claim.
             if l.contains("payout") || l.contains("settlement") {
+                let is_negative_disclosure =
+                    l.contains("gated") || l.contains("off") || l.contains("disabled");
                 assert!(
-                    l.contains("gated"),
-                    "`payout`/`settlement` may only appear in a 'stay gated' disclosure: {line:?}"
+                    is_negative_disclosure,
+                    "`payout`/`settlement` may only appear as a negative disclosure (gated/off/disabled): {line:?}"
                 );
             }
         }

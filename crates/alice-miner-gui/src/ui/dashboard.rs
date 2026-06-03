@@ -12,7 +12,7 @@ use super::theme::THEME;
 use super::widgets::{self, Tone};
 use super::{lane_accent, lane_chip_label};
 use crate::app::MinerApp;
-use alice_miner_core::{Lane, LaneSupport};
+use alice_miner_core::{CreditState, Lane, LaneSupport, Reconciliation};
 
 /// One boxed stat-card painter, so the grid can lay the four cards out in either
 /// one row of four or two rows of two without duplicating their bodies.
@@ -89,6 +89,10 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
                         ui.label(widgets::mono(up, 12.0, THEME.text2));
                     });
                 });
+            // M5: the qualitative reconciliation badge (local activity vs
+            // server-confirmed credit) — never a number, only an honest word.
+            ui.add_space(8.0);
+            reconciliation_badge(ui, app.reconciliation());
         });
     });
 
@@ -99,6 +103,12 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
         egui::Stroke::new(1.0, THEME.line),
     );
     ui.add_space(18.0);
+
+    // ── SOURCE A — local activity (what the miner is doing locally, NOT earnings).
+    // Label it explicitly so the user (and the honesty audit) can never mistake
+    // these live figures for confirmed earnings.
+    source_label(ui, strings::ACTIVITY_SECTION, strings::ACTIVITY_CAPTION, Tone::Live);
+    ui.add_space(12.0);
 
     // ── Stat grid (4 cards) ───────────────────────────────────────────────────
     // Reflows 1×4 → 2×2 when 4 cards would get too narrow (mockup
@@ -277,6 +287,13 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
         rvn_active,
     );
 
+    // ── SOURCE B — server-confirmed credit (read-only). Clearly separated from
+    // the live activity above; honest by construction (no fabricated number).
+    ui.add_space(24.0);
+    source_label(ui, strings::CREDIT_SECTION, strings::CREDIT_CAPTION, Tone::Off);
+    ui.add_space(10.0);
+    credit_panel(ui, app);
+
     // ── Connection ─────────────────────────────────────────────────────────────
     ui.add_space(22.0);
     widgets::section_label(ui, "Connection");
@@ -373,10 +390,9 @@ fn lane_row(
 fn connection_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
     let snap = app.snapshot.clone();
     // The PUBLIC relay endpoint only (never the upstream pool / collection addr).
-    let endpoint = snap
-        .as_ref()
-        .and_then(|s| s.endpoint.clone())
-        .unwrap_or_else(|| "hk.aliceprotocol.org:3333".into());
+    // M3 follow-up: while idle this reflects the SELECTED lane's port (:3333 XMR /
+    // :8888 RVN) — not a hardcoded :3333 — via `display_endpoint()`.
+    let endpoint = app.display_endpoint();
     let worker = snap.as_ref().and_then(|s| s.worker_id.clone());
     let connected = app.is_mining();
     let motion = app.motion_enabled();
@@ -460,6 +476,174 @@ fn kv_key(ui: &mut egui::Ui, key: &str) {
     );
 }
 
+/// A two-line SOURCE header (M5): a small dot + bold title + a caption underneath,
+/// with a trailing rule. Used to clearly delineate **Source A (local activity)**
+/// from **Source B (server-confirmed credit)** so the two are never blurred.
+fn source_label(ui: &mut egui::Ui, title: &str, caption: &str, tone: Tone) {
+    ui.horizontal(|ui| {
+        let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+        ui.painter().circle_filled(dot.center(), 4.0, tone.fg());
+        ui.add_space(8.0);
+        ui.label(RichText::new(title).size(13.0).strong().color(THEME.text));
+        ui.add_space(10.0);
+        ui.label(RichText::new(caption).size(11.0).color(THEME.text3));
+        // Trailing rule.
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+        ui.painter().hline(rect.x_range(), rect.center().y, egui::Stroke::new(1.0, THEME.line));
+    });
+}
+
+/// The qualitative reconciliation badge (M5): a tinted pill reading a single
+/// honest word ("in sync" / "confirming…" / "activity flowing" / "unconfirmed").
+/// Never a number/percentage/amount. Tone: green when in-sync/confirmed, warn on
+/// a Source-B fault, neutral otherwise.
+fn reconciliation_badge(ui: &mut egui::Ui, recon: Reconciliation) {
+    let tone = if recon.is_positive() {
+        Tone::Live
+    } else if recon.is_warn() {
+        Tone::Warn
+    } else {
+        Tone::Off
+    };
+    let fg = tone.fg();
+    egui::Frame::NONE
+        .fill(egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 22))
+        .corner_radius(255)
+        .inner_margin(egui::Margin::symmetric(11, 6))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 80)))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 7.0;
+                ui.label(RichText::new(strings::RECONCILE_PREFIX).size(10.0).color(THEME.text3));
+                ui.label(RichText::new(recon.label()).size(11.0).strong().color(fg));
+            });
+        });
+}
+
+/// SOURCE B — the server-confirmed credit panel (M5). For v1 this renders the
+/// honest [`CreditState::NotExposed`] panel (credit accounting is live, payout is
+/// off, the per-address total isn't exposed here yet) with an explorer deep-link
+/// and ZERO server dependency. The other variants are handled so the fast-follow
+/// (a live public read-model endpoint) needs no UI change — and the value, when
+/// present, is rendered ONLY as "pending" (never a number/`$`).
+fn credit_panel(ui: &mut egui::Ui, app: &MinerApp) {
+    let state = app.credit_state.clone();
+    egui::Frame::NONE
+        .fill(THEME.surface)
+        .corner_radius(14)
+        .inner_margin(egui::Margin::symmetric(16, 15))
+        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            match &state {
+                CreditState::NotExposed => {
+                    // The honest Option-3 panel.
+                    ui.horizontal(|ui| {
+                        super::icons::show(ui, Icon::Globe, 14.0, THEME.brand300);
+                        ui.add_space(9.0);
+                        ui.label(
+                            RichText::new(strings::CREDIT_NOTEXPOSED_TITLE)
+                                .size(13.5)
+                                .strong()
+                                .color(THEME.text),
+                        );
+                        // The pending tag on the right (no number).
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            pending_chip(ui);
+                        });
+                    });
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(strings::CREDIT_NOTEXPOSED_BODY_1).size(12.0).color(THEME.text2));
+                    ui.add_space(3.0);
+                    ui.label(RichText::new(strings::CREDIT_NOTEXPOSED_BODY_2).size(12.0).color(THEME.text3));
+                    ui.add_space(12.0);
+                    explorer_link(ui);
+                }
+                CreditState::Confirming => {
+                    credit_status_row(
+                        ui,
+                        Tone::Off,
+                        strings::CREDIT_SECTION,
+                        strings::CREDIT_CONFIRMING,
+                        app.motion_enabled(),
+                    );
+                    ui.add_space(10.0);
+                    explorer_link(ui);
+                }
+                CreditState::Confirmed { score } => {
+                    // CREDIT-ONLY: render the confirmed score ONLY as its pending
+                    // label — never the magnitude. The presence of confirmed credit
+                    // is shown with a live dot; the amount stays "pending".
+                    let _ = score; // intentionally NOT rendered as a number ($-trap)
+                    credit_status_row(
+                        ui,
+                        Tone::Live,
+                        "Confirmed by the network",
+                        strings::CREDIT_PENDING_VALUE,
+                        app.motion_enabled(),
+                    );
+                    ui.add_space(10.0);
+                    explorer_link(ui);
+                }
+                CreditState::Error { reason } => {
+                    // A calm, NON-numeric fault note; Source A stays the live UX.
+                    credit_status_row(
+                        ui,
+                        Tone::Warn,
+                        strings::CREDIT_SECTION,
+                        strings::CREDIT_UNCONFIRMED,
+                        false,
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(reason.message()).size(11.5).color(THEME.text3));
+                    ui.add_space(10.0);
+                    explorer_link(ui);
+                }
+            }
+        });
+}
+
+/// A small "pending · 待发放" chip (brand-tinted) — the ONLY way a credit value is
+/// shown (never a number/`$`).
+fn pending_chip(ui: &mut egui::Ui) {
+    egui::Frame::NONE
+        .fill(egui::Color32::from_rgba_unmultiplied(THEME.brand.r(), THEME.brand.g(), THEME.brand.b(), 22))
+        .corner_radius(255)
+        .inner_margin(egui::Margin::symmetric(10, 4))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(THEME.brand.r(), THEME.brand.g(), THEME.brand.b(), 70)))
+        .show(ui, |ui| {
+            ui.label(RichText::new(strings::CREDIT_PENDING_VALUE).size(11.0).strong().color(THEME.brand300));
+        });
+}
+
+/// A one-line credit status row: a (optionally blinking) dot + a title + a
+/// right-aligned status word.
+fn credit_status_row(ui: &mut egui::Ui, tone: Tone, title: &str, status: &str, blink: bool) {
+    ui.horizontal(|ui| {
+        widgets::status_dot(ui, tone.fg(), 8.0, blink);
+        ui.add_space(9.0);
+        ui.label(RichText::new(title).size(13.0).strong().color(THEME.text));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(status).size(12.0).color(tone.fg()));
+        });
+    });
+}
+
+/// The explorer deep-link (PUBLIC apex — never an internal/core host). A ghost
+/// button that opens the explorer where the user can look up their address.
+fn explorer_link(ui: &mut egui::Ui) {
+    let btn = egui::Button::new(
+        RichText::new(strings::CREDIT_EXPLORER_LABEL).size(12.0).color(THEME.text2),
+    )
+    .fill(THEME.well)
+    .stroke(egui::Stroke::new(1.0, THEME.line_strong))
+    .corner_radius(9);
+    if ui.add(btn).on_hover_text(strings::CREDIT_EXPLORER_URL).clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(strings::CREDIT_EXPLORER_URL));
+    }
+}
+
 fn log_panel(ui: &mut egui::Ui, app: &MinerApp) {
     egui::Frame::NONE
         .fill(THEME.well)
@@ -524,11 +708,9 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
             // Network panel.
             panel(ui, "Network", Icon::Globe, |ui| {
                 srow(ui, "Endpoint", "Primary relay. The client handles failover automatically.", |ui| {
-                    let ep = app
-                        .snapshot
-                        .as_ref()
-                        .and_then(|s| s.endpoint.clone())
-                        .unwrap_or_else(|| "hk.aliceprotocol.org:3333".into());
+                    // Lane-aware while idle (:3333 XMR / :8888 RVN) — see
+                    // `display_endpoint()` (the M3 follow-up fix).
+                    let ep = app.display_endpoint();
                     ui.horizontal(|ui| {
                         ui.label(widgets::mono(ep, 12.5, THEME.text2));
                         ui.label(RichText::new("read-only").size(10.0).extra_letter_spacing(0.8).color(THEME.text4));

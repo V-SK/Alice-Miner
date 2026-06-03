@@ -108,6 +108,22 @@ impl ShotRunner {
                 // The dual-mine dashboard (NVIDIA box): BOTH lane rows live + an
                 // active "failed over" endpoint note.
                 Shot { file: "dashboard-dual-failover.png", pose: pose_dashboard_dual_failover },
+                // ── M5: dashboard depth + Source-B credit ───────────────────
+                // The deepened dashboard while mining: Source-A "Local activity"
+                // section + the Source-B "Server-confirmed credit" NotExposed panel
+                // (honest: accounting live, payout off, explorer deep-link) + the
+                // reconciliation badge ("activity flowing").
+                Shot { file: "dashboard-m5-mining.png", pose: pose_dashboard_m5_mining },
+                // The M3 follow-up FIX, visualised: dashboard IDLE on an NVIDIA box
+                // with RVN selected → RVN row reads "ready" + the Connection
+                // endpoint reflects the lane. Reconciliation badge reads "idle".
+                Shot { file: "dashboard-m5-idle-rvn-endpoint.png", pose: pose_dashboard_m5_idle_rvn },
+                // The DEFINITIVE :8888 proof (short page): Settings → Network on an
+                // NVIDIA box, RVN selected → Endpoint reads :8888, not :3333.
+                Shot { file: "settings-m5-rvn-endpoint.png", pose: pose_settings_rvn_endpoint },
+                // The Source-B fast-follow path rendered honestly: a CONFIRMED
+                // credit state shows ONLY "pending" (never the number) + "in sync".
+                Shot { file: "dashboard-m5-credit-confirmed.png", pose: pose_dashboard_m5_confirmed },
             ],
             idx: 0,
             phase: Phase::Settling,
@@ -590,6 +606,75 @@ fn pose_dashboard_dual_failover(app: &mut MinerApp) {
     // display so the header/cards read a stable big number.
     pin_mining_anim(app, (8_400.0 + 25_430_000.0) / 1000.0);
     seed_log(app);
+}
+
+// ── M5 poses (dashboard depth + Source-B credit) ─────────────────────────────
+
+/// M5: the deepened dashboard while mining (this Mac, XMR lane). Shows the
+/// Source-A "Local activity" section + the Source-B "Server-confirmed credit"
+/// NotExposed panel + the "activity flowing" reconciliation badge.
+fn pose_dashboard_m5_mining(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Dashboard;
+    app.set_device(demo_device());
+    install_demo_identity(app);
+    app.error = None;
+    app.snapshot = Some(demo_mining_snapshot());
+    pin_mining_anim(app, 8.4);
+    seed_log(app);
+    // v1 Source-B reality: no public per-address endpoint → the honest panel.
+    app.credit_state = alice_miner_core::CreditState::NotExposed;
+}
+
+/// M5 (the M3 follow-up FIX visualised): dashboard IDLE on a simulated NVIDIA box
+/// with the RVN lane SELECTED — the Connection endpoint must read :8888, NOT the
+/// old hardcoded :3333. Not mining, so the lane rows + endpoint show the idle
+/// (selected-lane) state.
+fn pose_dashboard_m5_idle_rvn(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Dashboard;
+    app.set_device(demo_nvidia_device()); // RVN becomes runnable
+    install_demo_identity(app);
+    app.error = None;
+    app.snapshot = None; // idle / not connected → display_endpoint uses the lane
+    app.select_lane(Lane::GpuRvn); // → :8888 (the fix)
+    app.hr_display_khs = 0.0;
+    app.credit_state = alice_miner_core::CreditState::NotExposed;
+}
+
+/// M5 (the M3 follow-up FIX, definitive visual proof): the Settings → Network
+/// panel on a simulated NVIDIA box with RVN selected. Settings is a short page so
+/// the Network "Endpoint" row — which uses the SAME lane-aware `display_endpoint()`
+/// — is clearly in view, reading `hk.aliceprotocol.org:8888` (NOT the old
+/// hardcoded :3333) while idle.
+fn pose_settings_rvn_endpoint(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Settings;
+    app.set_device(demo_nvidia_device()); // RVN runnable
+    install_demo_identity(app);
+    app.error = None;
+    app.snapshot = None; // idle → endpoint reflects the selected lane
+    app.select_lane(Lane::GpuRvn); // → :8888 (the fix)
+}
+
+/// M5: the Source-B fast-follow path rendered honestly — a CONFIRMED credit state
+/// (as if a live public read-model endpoint had confirmed credit for this
+/// address). The panel shows ONLY "pending" (NEVER the magnitude) + the
+/// reconciliation badge reads "in sync". Proves the credit-only rendering holds
+/// even on the confirmed path. (Posed only; the live client ships NotExposed.)
+fn pose_dashboard_m5_confirmed(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Dashboard;
+    app.set_device(demo_device());
+    install_demo_identity(app);
+    app.error = None;
+    app.snapshot = Some(demo_mining_snapshot());
+    pin_mining_anim(app, 8.4);
+    seed_log(app);
+    // A confirmed (non-zero) credit score — but the UI renders only "pending".
+    app.credit_state = alice_miner_core::CreditState::Confirmed {
+        score: alice_miner_core::CreditScore::new(12.56),
+    };
 }
 
 // ── PNG writer ────────────────────────────────────────────────────────────────
