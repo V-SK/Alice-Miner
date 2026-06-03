@@ -2,21 +2,39 @@
 //!
 //! This crate is the single source of truth that both front-ends — the eframe
 //! GUI (`alice-miner-gui`) and the headless CLI (`alice-miner-cli`) — drive over
-//! a `Command`/`Event` channel pair, so the two can never drift (PLAN §2.2).
+//! a [`engine::Command`]/[`engine::Event`] channel pair, so the two can never
+//! drift (PLAN §2.2).
 //!
-//! M0 placeholder: the crate exists to wire the workspace graph and the shared
-//! path dependencies (`alice-crypto`, `alice-supervise`, `alice-release`) and to
-//! prove they compile together. The real pipeline — device detection, lane
-//! selection, the per-lane `LaneSupervisor`, stats collection, the `~/.alice/`
-//! identity contract, and the credit-only `Snapshot` (which by construction has
-//! NO `paid_acu` field) — lands from M1 onward.
+//! M1a modules:
+//!   * [`detect`]     — fail-safe device probe → [`detect::DeviceProfile`]
+//!   * [`identity`]   — create/import/paste + the `~/.alice/identity.json` pointer
+//!   * [`lane`]       — per-lane launch plans (M1: [`lane::xmr`], the proven path)
+//!   * [`binaries`]   — resolve the bundled engine (sibling-of-exe + dev fallback)
+//!   * [`supervise`]  — [`supervise::LaneSupervisor`]: one supervised child + stats
+//!   * [`engine`]     — the worker-thread engine + the credit-only [`engine::Snapshot`]
+//!
+//! Hard invariants enforced here (PLAN §3, the brief):
+//!   * **Credit-only** — [`engine::Snapshot`] has NO `paid_acu` (tested).
+//!   * **Honesty gate** — the XMR argv carries the user's OWN address and no
+//!     collection-address / upstream-pool / seed substring (tested in [`lane::xmr`]);
+//!     the collection address const is never even imported into this crate.
+//!   * **Security** — `unlock_wallet` runs exactly once at create/import; mining
+//!     consumes only the public address (see [`identity`]).
 
-// Pull the shared crates into the dependency graph so M0 proves they build and
-// link together as the engine will consume them.
+// Pull the shared crates into the dependency graph + re-export for downstreams.
 pub use alice_crypto;
 pub use alice_release;
 pub use alice_supervise;
 
-/// Placeholder for the mining engine handle. Replaced in M1 by the real
-/// worker-thread-backed engine exposing `Command`/`Event` channels.
-pub struct Engine;
+pub mod binaries;
+pub mod detect;
+pub mod engine;
+pub mod identity;
+pub mod lane;
+pub mod supervise;
+
+// Convenient top-level re-exports for the front-ends.
+pub use detect::{DeviceProfile, OsFamily};
+pub use engine::{Command, EngineHandle, EngineState, Event, IdentitySpec, Snapshot};
+pub use identity::{Identity, IdentityPointer};
+pub use lane::Lane;

@@ -1,0 +1,13 @@
+{
+  "_comment": "Pinned bundled mining engines for the Alice Miner. Each entry records the engine kind, target triple, on-disk filename, and the SHA-256 of the committed bytes so the resolver / packaging can verify integrity. M1 ships only the macOS arm64 xmrig (CPU-XMR lane); linux + the GPU KawPowMiner land in later milestones (M3/M7).",
+  "engines": [
+    {
+      "kind": "cpu-xmr",
+      "engine": "xmrig",
+      "target": "aarch64-apple-darwin",
+      "filename": "xmrig",
+      "sha256": "bdbfe1dc9c8660adb462c055ec2a12bb75a7630487fe926f67e9263548b4e933",
+      "source": "alice-wallet/gui/release-assets/aarch64-apple-darwin/xmrig (proven, live-validated against hk.aliceprotocol.org:3333)"
+    }
+  ]
+}

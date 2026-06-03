@@ -12,3 +12,15 @@ edition = "2021"
 alice-crypto = { path = "../alice-crypto" }
 alice-supervise = { path = "../alice-supervise" }
 alice-release = { path = "../alice-release" }
+
+# Engine deps. Versions match the Wallet's `gui/Cargo.toml` so the ported logic
+# (blake2/bs58/hex address validation, the tokio runtime+child supervision,
+# serde snapshots) compiles byte-identically.
+tokio = { version = "1.37.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0.1"
+blake2 = "0.10.6"
+bs58 = "0.5.1"
+hex = "0.4.3"
+zeroize = { version = "1.8.2", features = ["derive"] }
