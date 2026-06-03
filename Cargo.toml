@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/alice-crypto",
+    "crates/alice-supervise",
+    "crates/alice-release",
+    "crates/alice-miner-core",
+    "crates/alice-miner-gui",
+    "crates/alice-miner-cli",
+]

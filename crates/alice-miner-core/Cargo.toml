@@ -1,0 +1,14 @@
+[package]
+name = "alice-miner-core"
+version = "0.1.0"
+edition = "2021"
+
+# The UI-agnostic mining engine library (detect / lane-select / supervise /
+# stats / identity / endpoint / config). M0 ships only a placeholder so the
+# crate graph and the shared-crate path dependencies are wired and compiling;
+# the real engine lands in M1+.
+
+[dependencies]
+alice-crypto = { path = "../alice-crypto" }
+alice-supervise = { path = "../alice-supervise" }
+alice-release = { path = "../alice-release" }

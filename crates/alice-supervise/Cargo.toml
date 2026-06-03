@@ -1,0 +1,16 @@
+[package]
+name = "alice-supervise"
+version = "0.1.0"
+edition = "2021"
+
+# Process-supervision primitives shared with the Alice Wallet. `src/child.rs`
+# (OS child spawn/own/stop, pgid, log pump) and the pure policy types in
+# `src/lib.rs` (ProcState/ProcStatus/sanitize_log_line/RestartPolicy/LogRing)
+# are lifted VERBATIM from `alice-wallet/gui/src/supervise/{child.rs,mod.rs}`.
+# The only change is that `lib.rs` drops the wallet-only `miner_supervisor` /
+# `node_supervisor` submodule declarations (not part of M0) and re-exports the
+# public items. `tokio` uses the same `full` feature set the Wallet does so the
+# verbatim async code compiles identically.
+
+[dependencies]
+tokio = { version = "1.37.0", features = ["full"] }

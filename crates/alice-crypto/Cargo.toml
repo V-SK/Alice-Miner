@@ -1,0 +1,29 @@
+[package]
+name = "alice-crypto"
+version = "0.1.0"
+edition = "2021"
+
+# Crypto / keystore primitives shared with the Alice Wallet. The body of
+# `src/lib.rs` is lifted VERBATIM from `alice-wallet/gui/src/crypto.rs`; the
+# only edits are import/path tweaks (an inlined `config` module providing the
+# data-root helpers `crypto.rs` referenced via `crate::config`). The dependency
+# versions below match the Wallet's `gui/Cargo.toml` exactly so the on-disk
+# keystore is byte-for-byte identical (one mnemonic unlocks both apps).
+
+[dependencies]
+aes-gcm = "0.10.3"
+argon2 = "0.5.3"
+base64 = "0.22.1"
+bip39 = "2.0.0"
+blake2 = "0.10.6"
+bs58 = "0.5.1"
+dirs = "5.0.1"
+hex = "0.4.3"
+pbkdf2 = "0.12.2"
+rand = "0.8.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10.8"
+subxt-signer = { version = "0.50.0", default-features = false, features = ["native", "sr25519", "std", "subxt"] }
+substrate-bip39 = "0.6.1"
+zeroize = { version = "1.8.2", features = ["derive"] }

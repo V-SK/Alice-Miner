@@ -1,0 +1,17 @@
+[package]
+name = "alice-miner-cli"
+version = "0.1.0"
+edition = "2021"
+
+# Headless Alice Miner client (PLAN §2.2, C2). Drives the SAME `alice-miner-core`
+# engine as the GUI, with NO egui/eframe anywhere in its dependency tree. M0
+# ships a placeholder subcommand stub; full CLI parity (detect / identity /
+# start / status / stop) is M6.
+
+[[bin]]
+name = "alice-miner-cli"
+path = "src/main.rs"
+
+[dependencies]
+alice-miner-core = { path = "../alice-miner-core" }
+clap = { version = "4.5", features = ["derive"] }

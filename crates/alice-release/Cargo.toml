@@ -1,0 +1,24 @@
+[package]
+name = "alice-release"
+version = "0.1.0"
+edition = "2021"
+
+# Signed self-update kernel shared with the Alice Wallet. `src/lib.rs` is the
+# Wallet's `gui/src/update.rs` copied with exactly two edits:
+#   * `PRODUCT` is "alice-miner" (the manifest `product` field that isolates this
+#     app's releases from the Wallet's, verified against the SAME embedded
+#     ed25519 key `RELEASE_PUBKEY_B64`); and
+#   * an inlined `config` module + test `TEST_ENV_LOCK` replacing the wallet-only
+#     `crate::config::*` references (data-dir safety guard), copied byte-identical
+#     from the Wallet so the no-write-into-keystore invariant is unchanged.
+# Dependency versions match the Wallet's `gui/Cargo.toml`.
+
+[dependencies]
+base64 = "0.22.1"
+dirs = "5.0.1"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+hex = "0.4.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10.8"
+ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }

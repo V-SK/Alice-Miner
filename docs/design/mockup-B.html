@@ -1,0 +1,1191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Alice Miner — mockup B (Focal &amp; atmospheric)</title>
+<!-- =============================================================================
+     Alice Miner — mockup B. Aesthetic: "Focal & atmospheric" (Raycast / Arc tier).
+     Self-contained. No external deps / CDN / fonts. Tokens lifted verbatim from
+     alice-website/assets/alice-theme.html and ELEVATED (depth, focus, hero) — not
+     reinvented. Brand orange #F97316 spine, zinc/near-black surfaces, JetBrains
+     Mono for all numerals via a system-mono fallback stack.
+
+     One gallery page: Onboarding · Home (idle + mining) · Dashboard · Settings.
+     Click the hero squircle on the "mining" Home card to toggle the live gauge.
+
+     ── egui-reproducibility flags (search "EGUI-FLAG" below) ───────────────────
+     Everything here is engineered to transcribe into egui/eframe. The few things
+     egui CANNOT do verbatim are flagged inline and listed in the closing comment.
+     Depth is built from LAYERED OPAQUE/near-opaque surfaces + linear/radial
+     gradients + crisp 1px borders + layered soft drop-shadows + additive radial
+     glow — NOT backdrop-blur / glassmorphism (egui can't blur cheaply).
+   ============================================================================= -->
+<style>
+:root{
+  /* ---- Brand orange (the spine) — verbatim from alice-theme ---- */
+  --a-brand-50:#FFF7ED;--a-brand-100:#FFEDD5;--a-brand-200:#FED7AA;--a-brand-300:#FDBA74;
+  --a-brand-400:#FB923C;--a-brand-500:#F97316;--a-brand-600:#EA580C;--a-brand-700:#C2410C;--a-brand-800:#9A3412;
+  --a-brand:var(--a-brand-500);--a-brand-strong:var(--a-brand-600);
+
+  /* ---- Surfaces. ELEVATED: near-opaque so depth survives without blur (egui-safe). ---- */
+  --a-bg:#050505;--a-bg-2:#0A0A0A;
+  --a-surface:#161618;          /* card base — opaque zinc, was rgba .62 */
+  --a-surface-2:#1E1E22;        /* hover / nested / selected chip */
+  --a-surface-3:#242429;        /* top of an elevated card gradient */
+  --a-elevate:linear-gradient(180deg,#232327,#0C0C0E);
+  --a-well:#08080A;             /* recessed wells (logs, inputs) */
+
+  /* ---- Lines / borders ---- */
+  --a-line:rgba(63,63,70,0.55);--a-line-strong:rgba(82,82,91,0.65);--a-line-brand:rgba(249,115,22,0.32);
+  --a-hair-top:rgba(255,255,255,0.06);  /* faint top inner-highlight on cards */
+
+  /* ---- Text ---- */
+  --a-text:#FAFAFA;--a-text-2:#A1A1AA;--a-text-3:#71717A;--a-text-4:#52525B;--a-text-brand:#FDBA74;
+
+  /* ---- Status & lanes ---- */
+  --a-live:#22C55E;--a-warn:#F59E0B;--a-info:#3B82F6;--a-violet:#A855F7;--a-off:#52525B;--a-err:#EF4444;
+  --lane-xmr:#FB923C;--lane-gpu:#3B82F6;--lane-mac:#22D3EE;--lane-asic:#34D399;--lane-ai:#A855F7;
+
+  /* ---- Radius ---- */
+  --a-radius:1rem;--a-radius-sm:.625rem;--a-radius-lg:1.25rem;--a-radius-xl:1.5rem;
+
+  /* ---- Elevation: layered soft drop-shadows + inset top highlight (the tactile feel) ---- */
+  --a-card:0 0 0 1px rgba(0,0,0,.4), 0 1px 0 var(--a-hair-top) inset,
+           0 2px 4px rgba(0,0,0,.30), 0 12px 28px -8px rgba(0,0,0,.55);
+  --a-card-lg:0 0 0 1px rgba(0,0,0,.45), 0 1px 0 rgba(255,255,255,.07) inset,
+           0 4px 10px rgba(0,0,0,.35), 0 30px 70px -22px rgba(0,0,0,.7);
+  --a-glow:0 0 30px rgba(249,115,22,.42);
+  --a-glow-soft:0 0 18px rgba(249,115,22,.22);
+
+  --a-ease:cubic-bezier(.22,1,.36,1);--a-dur:.2s;
+  --a-font-sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,system-ui,sans-serif;
+  --a-font-mono:'JetBrains Mono','SF Mono',ui-monospace,'Cascadia Code',Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{height:100%}
+body{
+  min-height:100%;
+  font-family:var(--a-font-sans);
+  color:var(--a-text);
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+  line-height:1.5;letter-spacing:-0.003em;
+  /* EGUI-FLAG[atmosphere-OK]: page vignette + dual brand/blue auras are static radial
+     gradients painted under content. egui CAN paint these as Mesh/radial fills behind
+     the central panel — reproducible. */
+  background:
+    radial-gradient(1100px 620px at 50% -8%, rgba(249,115,22,.10), transparent 60%),
+    radial-gradient(900px 520px at 100% 108%, rgba(59,130,246,.06), transparent 55%),
+    radial-gradient(700px 700px at -5% 60%, rgba(168,85,247,.045), transparent 60%),
+    radial-gradient(1200px 900px at 50% 40%, #0A0A0C, #050505 70%),
+    var(--a-bg);
+  padding:46px 28px 90px;
+}
+.mono{font-family:var(--a-font-mono);font-variant-numeric:tabular-nums;letter-spacing:0}
+::selection{background:rgba(249,115,22,.30);color:#fff}
+
+/* ================= page scaffold ================= */
+.wrap{max-width:1480px;margin-inline:auto}
+.masthead{display:flex;align-items:center;gap:16px;margin-bottom:10px}
+.masthead .mark{width:38px;height:38px;display:grid;place-items:center;border-radius:11px;
+  background:radial-gradient(120% 120% at 50% 0%, #1c1c20, #0c0c0e);
+  box-shadow:var(--a-card);position:relative}
+.masthead .mark::after{content:"";position:absolute;inset:0;border-radius:11px;
+  box-shadow:0 0 22px rgba(249,115,22,.22)}
+.masthead h1{font-size:19px;font-weight:700;letter-spacing:-.02em}
+.masthead .tag{font-size:12.5px;color:var(--a-text-3);font-weight:500}
+.masthead .spacer{flex:1}
+.masthead .legend{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.lg-chip{display:inline-flex;align-items:center;gap:7px;font-size:11px;color:var(--a-text-2);font-weight:500;
+  padding:5px 10px;border-radius:999px;border:1px solid var(--a-line);background:rgba(20,20,22,.6)}
+.lg-chip .ldot{width:7px;height:7px;border-radius:50%}
+.subhead{color:var(--a-text-3);font-size:13px;margin:2px 0 34px 54px;max-width:760px;line-height:1.6}
+.subhead b{color:var(--a-text-brand);font-weight:600}
+
+.gallery{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:30px;align-items:start}
+@media (max-width:1180px){.gallery{grid-template-columns:1fr}}
+.cell{min-width:0}
+.cell.wide{grid-column:1 / -1}
+.cap{display:flex;align-items:baseline;gap:10px;margin:0 0 12px 6px}
+.cap .n{font-family:var(--a-font-mono);font-size:11px;color:var(--a-brand-300);font-weight:600;letter-spacing:.04em}
+.cap .t{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--a-text-3);font-weight:600}
+.cap .d{font-size:12px;color:var(--a-text-4);margin-left:auto;font-weight:500;letter-spacing:0}
+
+/* ================= the faux app window ================= */
+.win{position:relative;background:var(--a-bg);border:1px solid var(--a-line-strong);
+  border-radius:var(--a-radius-xl);overflow:hidden;box-shadow:var(--a-card-lg)}
+/* faint outer brand rim — additive, reads as the app "catching" light */
+.win::before{content:"";position:absolute;inset:0;border-radius:var(--a-radius-xl);pointer-events:none;
+  box-shadow:0 1px 0 rgba(255,255,255,.05) inset;z-index:5}
+.titlebar{height:54px;display:flex;align-items:center;gap:12px;padding:0 16px 0 18px;position:relative;
+  background:linear-gradient(180deg,#101012,#0a0a0c);border-bottom:1px solid var(--a-line)}
+/* EGUI-FLAG[atmosphere-OK]: titlebar is a flat 2-stop vertical gradient — egui paints directly. */
+.tl-lights{display:flex;gap:8px}
+.tl-lights i{width:11px;height:11px;border-radius:50%;display:block;box-shadow:0 0 0 .5px rgba(0,0,0,.3) inset}
+.tl-lights i:nth-child(1){background:#ff5f57}.tl-lights i:nth-child(2){background:#febc2e}.tl-lights i:nth-child(3){background:#28c840}
+.tl-brand{display:flex;align-items:center;gap:9px;font-weight:600;font-size:13px;letter-spacing:-.01em;margin-left:6px}
+.tl-brand .logo svg{display:block;filter:drop-shadow(0 0 6px rgba(249,115,22,.35))}
+.tl-spacer{flex:1}
+.tl-pill{display:inline-flex;align-items:center;gap:7px;font-size:11.5px;font-weight:600;
+  padding:5px 11px 5px 9px;border-radius:999px;border:1px solid var(--a-line);
+  background:linear-gradient(180deg,#1a1a1d,#121214);color:var(--a-text-2);box-shadow:0 1px 0 rgba(255,255,255,.04) inset}
+.tl-pill.live{color:#86efac;border-color:rgba(34,197,94,.32);background:linear-gradient(180deg,rgba(34,197,94,.12),rgba(34,197,94,.05))}
+.tl-ico{width:30px;height:30px;display:grid;place-items:center;border-radius:9px;color:var(--a-text-3);
+  cursor:default;transition:var(--a-dur) var(--a-ease)}
+.tl-ico:hover{background:var(--a-surface-2);color:var(--a-text)}
+.tl-ico.lang{font-size:11px;font-weight:700;letter-spacing:.02em;width:auto;padding:0 9px}
+.tl-ico svg{width:17px;height:17px}
+
+.body{display:flex;min-height:600px}
+/* left rail */
+.rail{width:68px;flex:none;background:linear-gradient(180deg,#0b0b0d,#08080a);
+  border-right:1px solid var(--a-line);display:flex;flex-direction:column;align-items:center;padding:16px 0 14px;gap:7px}
+.rail .logo{margin-bottom:16px}
+.rail .logo svg{filter:drop-shadow(0 0 8px rgba(249,115,22,.4))}
+.rail .nav{position:relative;width:42px;height:42px;border-radius:12px;display:grid;place-items:center;
+  color:var(--a-text-3);cursor:default;transition:var(--a-dur) var(--a-ease)}
+.rail .nav svg{width:19px;height:19px}
+.rail .nav:hover{background:var(--a-surface-2);color:var(--a-text-2)}
+.rail .nav.on{color:var(--a-brand-300);
+  background:linear-gradient(180deg,rgba(249,115,22,.16),rgba(249,115,22,.06));
+  box-shadow:0 0 0 1px rgba(249,115,22,.18) inset, 0 0 16px rgba(249,115,22,.14)}
+.rail .nav.on::before{content:"";position:absolute;left:-16px;top:10px;bottom:10px;width:3px;border-radius:3px;
+  background:var(--a-brand);box-shadow:0 0 10px rgba(249,115,22,.7)}
+.rail .grow{flex:1}
+.rail .lang{font-size:11px;font-weight:700;color:var(--a-text-3);cursor:default;padding:4px 0}
+.rail .ver{font-size:9px;color:var(--a-text-4);margin-top:6px;font-family:var(--a-font-mono)}
+.content{flex:1;position:relative;min-width:0}
+
+/* logo mark */
+.logo svg{display:block}
+
+/* shared bits */
+.eyebrow{font-size:10.5px;letter-spacing:.22em;text-transform:uppercase;color:var(--a-text-brand);font-weight:600}
+.ldot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:none}
+.dot.idle{background:var(--a-off)}
+.dot.checking{background:var(--a-warn);box-shadow:0 0 12px rgba(245,158,11,.65);animation:blink 1.1s ease-in-out infinite}
+.dot.online{background:var(--a-live);box-shadow:0 0 14px rgba(34,197,94,.65);animation:blink 2.6s ease-in-out infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.45}}
+.pending-tag{color:var(--a-brand-300);font-weight:600}
+
+/* monoline icon helper */
+.ic{stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;fill:none;display:block}
+
+/* ===================================================================
+   HOME (one-click) — idle + mining variants
+   =================================================================== */
+.home{height:100%;display:flex;align-items:center;justify-content:center;padding:34px 30px}
+.card-hero{position:relative;width:100%;max-width:392px;text-align:center;
+  background:
+    radial-gradient(120% 80% at 50% -10%, rgba(249,115,22,.07), transparent 60%),
+    linear-gradient(180deg,var(--a-surface-3),var(--a-surface) 32%,#121214);
+  border:1px solid var(--a-line);border-radius:var(--a-radius-xl);
+  padding:30px 30px 24px;box-shadow:var(--a-card);}
+/* faint top inner-highlight — the "lit glass" cue without blur */
+.card-hero::before{content:"";position:absolute;left:0;right:0;top:0;height:1px;border-radius:var(--a-radius-xl) var(--a-radius-xl) 0 0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.12),transparent)}
+
+.dev-block{margin-top:16px}
+.dev-line{display:inline-flex;align-items:center;gap:11px;font-size:15.5px;font-weight:650;letter-spacing:-.01em}
+.dev-line .chip-ic{width:30px;height:30px;flex:none;border-radius:9px;display:grid;place-items:center;
+  background:linear-gradient(180deg,#202024,#141416);color:var(--a-text-2);
+  box-shadow:0 1px 0 rgba(255,255,255,.05) inset, 0 1px 2px rgba(0,0,0,.4)}
+.dev-line .chip-ic svg{width:17px;height:17px}
+.dev-line .nm{color:var(--a-text)}
+.dev-line .nm small{color:var(--a-text-2);font-weight:500;font-size:13px}
+.lane-row{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:12px}
+.lane-chip{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--a-text-2);font-weight:500;
+  background:linear-gradient(180deg,#1b1b1f,#141416);border:1px solid var(--a-line);border-radius:999px;padding:6px 12px;
+  box-shadow:0 1px 0 rgba(255,255,255,.04) inset}
+.change{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--a-text-3);font-weight:500;
+  border:1px solid var(--a-line);border-radius:999px;padding:5px 11px;cursor:default;transition:var(--a-dur) var(--a-ease);
+  background:rgba(20,20,22,.5)}
+.change svg{width:12px;height:12px}
+.change:hover{border-color:var(--a-line-brand);color:var(--a-text-brand)}
+
+/* the hero one-click squircle + conic gauge — the CENTERPIECE */
+.hero-wrap{position:relative;width:170px;height:170px;margin:34px auto 26px}
+/* EGUI-FLAG[atmosphere-OK]: the big atmospheric glow pad behind the hero. In egui this is a
+   radial Mesh fill, alpha-animated for the "breathing" effect — reproducible. */
+.hero-aura{position:absolute;inset:-30px;border-radius:50%;pointer-events:none;
+  background:radial-gradient(closest-side, rgba(249,115,22,.28), rgba(249,115,22,.10) 55%, transparent 72%);
+  opacity:.34;filter:blur(2px);transition:opacity .5s var(--a-ease)}
+/* EGUI-FLAG[blur-2px]: this 2px blur is purely a softening nicety on a STATIC glow pad.
+   egui can't blur — drop it and use a smoother multi-stop radial gradient (visually ~identical
+   for a soft aura). NOT load-bearing. */
+
+/* conic gauge ring. --p = 0..1 fill. */
+.ring{position:absolute;inset:-8px;border-radius:50%;
+  background:conic-gradient(from -90deg,
+     var(--a-brand-300) 0deg,
+     var(--a-brand-500) calc(var(--p,0)*200deg),
+     var(--a-brand-600) calc(var(--p,0)*360deg),
+     rgba(63,63,70,.30) 0);
+  -webkit-mask:radial-gradient(farthest-side, transparent calc(100% - 7px), #000 calc(100% - 6px));
+          mask:radial-gradient(farthest-side, transparent calc(100% - 7px), #000 calc(100% - 6px));
+  opacity:0;transition:opacity .4s var(--a-ease);
+  filter:drop-shadow(0 0 8px rgba(249,115,22,.45))}
+/* EGUI-FLAG[conic-OK]: conic-gradient + radial mask = a ring gauge. egui has NO conic-gradient
+   and NO CSS mask, BUT this is exactly the documented hashrate_ring() — draw it as an arc with
+   epaint (Painter::circle / a thick Stroke arc, or a triangle-fan annulus) sweeping --p*360°.
+   Fully reproducible; the look matches. */
+/* a faint full-circle track sits under the gauge so the unfilled arc reads as a groove */
+.ring-track{position:absolute;inset:-8px;border-radius:50%;border:6px solid rgba(255,255,255,.03);
+  box-shadow:0 0 0 1px rgba(0,0,0,.4) inset;opacity:0;transition:opacity .4s var(--a-ease)}
+
+.start-btn{position:absolute;inset:0;width:170px;height:170px;border:none;border-radius:50%;cursor:pointer;
+  background:radial-gradient(128% 128% at 50% 14%, #202024, #161618 44%, #0d0d0f 80%, #09090a);
+  display:grid;place-items:center;
+  box-shadow:0 1px 0 rgba(255,255,255,.06) inset,0 -16px 32px rgba(0,0,0,.55) inset,0 0 0 1px rgba(249,115,22,.10) inset,0 18px 42px -16px rgba(0,0,0,.85);
+  transition:transform var(--a-dur) var(--a-ease),box-shadow var(--a-dur) var(--a-ease)}
+/* the Alice mark glowing inside the dark core — the brand IS the hero */
+.start-btn .mark{width:88px;height:88px;display:block;line-height:0;
+  filter:drop-shadow(0 0 13px rgba(249,115,22,.42)) drop-shadow(0 2px 3px rgba(0,0,0,.5));
+  transition:filter .55s var(--a-ease),transform var(--a-dur) var(--a-ease)}
+.start-btn .mark svg{width:100%;height:100%;display:block}
+.start-btn .mark svg path{fill:#FB923C}
+.start-btn:hover{box-shadow:0 1px 0 rgba(255,255,255,.08) inset,0 -16px 32px rgba(0,0,0,.55) inset,0 0 0 1px rgba(249,115,22,.2) inset,0 20px 46px -16px rgba(0,0,0,.9)}
+.start-btn:hover .mark{transform:scale(1.035);filter:drop-shadow(0 0 22px rgba(249,115,22,.62)) drop-shadow(0 2px 3px rgba(0,0,0,.5))}
+.start-btn:active{transform:scale(.99)}
+@keyframes markBreathe{0%,100%{filter:drop-shadow(0 0 15px rgba(249,115,22,.5)) drop-shadow(0 2px 3px rgba(0,0,0,.5))}
+  50%{filter:drop-shadow(0 0 30px rgba(249,115,22,.85)) drop-shadow(0 2px 3px rgba(0,0,0,.5))}}
+/* readout BELOW the core: number when mining, CTA when idle */
+.hero-readout{text-align:center;margin:0 auto 14px;min-height:44px;display:flex;flex-direction:column;justify-content:center}
+.ro-num{display:flex;align-items:baseline;justify-content:center;gap:5px}
+.hero-readout .big{font-family:var(--a-font-mono);font-size:33px;font-weight:700;line-height:1;letter-spacing:-.02em;color:var(--a-text)}
+.hero-readout .unit{font-size:13px;font-weight:700;color:var(--a-text-3);letter-spacing:.02em}
+.ro-cta{display:inline-flex;align-items:center;justify-content:center;gap:8px;font-size:15px;font-weight:800;letter-spacing:.16em;color:var(--a-text-brand,#FB923C)}
+.ro-cta .play{width:13px;height:13px;fill:var(--a-text-brand,#FB923C)}
+.ro-sub{font-size:10.5px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--a-text-4);margin-top:6px}
+/* EGUI-FLAG[radial-fill-OK]: the squircle uses a radial gradient + inset sheen/shadow. egui can
+   approximate with a circle filled by a vertical 2-3 stop gradient + a lighter inner stroke top +
+   a darker inner shadow bottom. The exact radial center-highlight needs a small mesh, but a
+   2-stop vertical gradient reads nearly identical. Reproducible. */
+.start-btn:hover{box-shadow:0 1px 0 rgba(255,255,255,.45) inset,0 -10px 24px rgba(124,45,18,.45) inset,var(--a-glow),0 16px 36px -8px rgba(124,45,18,.7)}
+.start-btn:active{transform:scale(.984)}
+.start-btn .glyph{display:grid;place-items:center;margin-bottom:2px;filter:drop-shadow(0 1px 0 rgba(255,255,255,.35))}
+.start-btn .glyph svg{width:28px;height:28px;stroke:none;fill:#2A0E00}
+.start-btn .lab{font-size:13px;font-weight:800;letter-spacing:.12em}
+.start-btn .big{font-family:var(--a-font-mono);font-size:31px;font-weight:700;line-height:1;letter-spacing:-.02em}
+.start-btn .unit{font-size:11px;font-weight:700;opacity:.72;margin-top:1px;letter-spacing:.02em}
+.start-btn .tiny{font-size:9.5px;font-weight:800;letter-spacing:.24em;text-transform:uppercase;opacity:.6;margin-top:4px}
+@keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.014)}}
+/* mining: a calm breathing glow on the aura + a brighter pulse on the squircle */
+@keyframes auraPulse{0%,100%{opacity:.6}50%{opacity:1}}
+@keyframes minePulse{0%,100%{box-shadow:0 1px 0 rgba(255,255,255,.4) inset,0 -10px 24px rgba(124,45,18,.45) inset,0 0 20px rgba(249,115,22,.4),0 10px 24px -10px rgba(124,45,18,.55)}
+  50%{box-shadow:0 1px 0 rgba(255,255,255,.45) inset,0 -10px 24px rgba(124,45,18,.45) inset,0 0 40px rgba(249,115,22,.66),0 12px 28px -10px rgba(124,45,18,.65)}}
+@keyframes spinarc{to{transform:rotate(360deg)}}
+
+/* state machine (class on .app) */
+.app.mining .ring,.app.mining .ring-track{opacity:1}
+.app.mining .hero-aura{animation:auraPulse 3.4s ease-in-out infinite}
+.app.mining .start-btn{box-shadow:0 1px 0 rgba(255,255,255,.07) inset,0 -16px 32px rgba(0,0,0,.55) inset,0 0 0 1px rgba(249,115,22,.24) inset,0 18px 42px -16px rgba(0,0,0,.85)}
+.app.mining .start-btn .mark{animation:markBreathe 3.4s ease-in-out infinite}
+.app.mining .start-btn .mark svg path{fill:#FDBA74}
+.app.connecting .ring{opacity:1;background:conic-gradient(from 0deg,transparent 0 270deg,var(--a-warn) 304deg 360deg);
+  animation:spinarc 1.3s linear infinite;filter:drop-shadow(0 0 8px rgba(245,158,11,.5))}
+.app.connecting .ring-track{opacity:1}
+.app.connecting .hero-aura{background:radial-gradient(closest-side,rgba(245,158,11,.2),transparent 70%)}
+.app.connecting .start-btn{animation:none;cursor:default;color:var(--a-text-2);
+  background:linear-gradient(180deg,#2a2a2e,#1a1a1d);
+  box-shadow:0 1px 0 rgba(255,255,255,.05) inset,0 8px 22px -8px rgba(0,0,0,.6)}
+/* EGUI-FLAG[anim-OK]: breathe / auraPulse / minePulse / spinarc are per-frame animations.
+   egui reproduces all via ctx.request_repaint() + time-driven lerps (scale, alpha, arc angle). */
+
+.ident{margin-top:4px;display:inline-flex;align-items:center;gap:9px;font-size:12.5px;color:var(--a-text-2)}
+.ident .addr{font-family:var(--a-font-mono);color:var(--a-text);font-weight:500}
+.ident .act{width:24px;height:24px;display:grid;place-items:center;border-radius:7px;color:var(--a-text-4);
+  cursor:default;transition:var(--a-dur) var(--a-ease)}
+.ident .act svg{width:13px;height:13px}
+.ident .act:hover{color:var(--a-text-brand);background:var(--a-surface-2)}
+.status-line{margin-top:13px;display:inline-flex;align-items:center;gap:9px;font-size:12.5px;color:var(--a-text-2);font-weight:500}
+.status-line .mono{color:var(--a-text)}
+.dash-link{display:inline-flex;align-items:center;gap:6px;margin-top:15px;font-size:12px;color:var(--a-text-brand);
+  text-decoration:none;font-weight:600;letter-spacing:.01em}
+.dash-link svg{width:13px;height:13px}
+.stop-row{margin-top:15px}
+.btn-stop{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--a-text-2);
+  border:1px solid var(--a-line);border-radius:999px;padding:7px 16px;cursor:default;background:rgba(20,20,22,.6);
+  transition:var(--a-dur) var(--a-ease)}
+.btn-stop svg{width:13px;height:13px;fill:currentColor;stroke:none}
+.btn-stop:hover{border-color:rgba(239,68,68,.4);color:#fca5a5}
+.foot{margin-top:18px;padding-top:15px;border-top:1px solid var(--a-line);
+  font-size:10.5px;color:var(--a-text-3);line-height:1.65;letter-spacing:.005em}
+
+/* ===================================================================
+   ONBOARDING
+   =================================================================== */
+.ob{padding:30px 30px;height:100%;display:flex;align-items:center;justify-content:center}
+.ob-card{position:relative;width:100%;max-width:420px;
+  background:linear-gradient(180deg,var(--a-surface-3),var(--a-surface) 30%,#121214);
+  border:1px solid var(--a-line);border-radius:var(--a-radius-xl);padding:28px 28px 24px;box-shadow:var(--a-card)}
+.ob-card::before{content:"";position:absolute;left:0;right:0;top:0;height:1px;border-radius:var(--a-radius-xl) var(--a-radius-xl) 0 0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.12),transparent)}
+.ob-steps{display:flex;align-items:center;gap:8px;justify-content:center;margin:14px 0 4px}
+.ob-steps i{width:7px;height:7px;border-radius:50%;background:rgba(82,82,91,.5)}
+.ob-steps i.on{background:var(--a-brand);box-shadow:0 0 10px rgba(249,115,22,.6);width:22px;border-radius:99px}
+.ob-steps i.done{background:var(--a-brand-700)}
+.ob-h{font-size:19px;font-weight:700;letter-spacing:-.015em;margin-top:14px;text-align:center}
+.ob-sub{font-size:12.5px;color:var(--a-text-3);margin-top:6px;text-align:center;line-height:1.6}
+.ob-sub b{color:var(--a-text-2);font-weight:600}
+
+/* mnemonic grid */
+.warn-banner{display:flex;align-items:flex-start;gap:10px;margin-top:18px;padding:11px 13px;border-radius:var(--a-radius-sm);
+  background:linear-gradient(180deg,rgba(245,158,11,.10),rgba(245,158,11,.04));border:1px solid rgba(245,158,11,.28);
+  font-size:11.5px;color:#fcd9a0;line-height:1.5;text-align:left}
+.warn-banner svg{width:15px;height:15px;flex:none;color:var(--a-warn);margin-top:1px}
+.warn-banner b{color:#fde7bd;font-weight:700}
+.mnem{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:14px}
+.mnem .w{display:flex;align-items:baseline;gap:7px;padding:9px 10px;border-radius:9px;
+  background:var(--a-well);border:1px solid var(--a-line);font-size:12.5px}
+.mnem .w .i{font-family:var(--a-font-mono);font-size:10px;color:var(--a-text-4);width:14px;text-align:right;flex:none}
+.mnem .w .t{font-family:var(--a-font-mono);color:var(--a-text);font-weight:500;letter-spacing:.01em}
+.mnem-acts{display:flex;align-items:center;gap:10px;margin-top:12px}
+.ck{display:inline-flex;align-items:center;gap:9px;font-size:12px;color:var(--a-text-2);cursor:default;font-weight:500}
+.ck .box{width:17px;height:17px;border-radius:5px;border:1.5px solid var(--a-line-strong);display:grid;place-items:center;flex:none;
+  background:var(--a-well);transition:var(--a-dur) var(--a-ease)}
+.ck.checked .box{background:var(--a-brand);border-color:var(--a-brand)}
+.ck.checked .box svg{width:11px;height:11px;stroke:#2A0E00;stroke-width:2.5}
+.ck .box svg{opacity:0}.ck.checked .box svg{opacity:1}
+.mini-btn{margin-left:auto;display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;color:var(--a-text-3);
+  border:1px solid var(--a-line);border-radius:8px;padding:6px 11px;cursor:default;background:rgba(20,20,22,.5);transition:var(--a-dur) var(--a-ease)}
+.mini-btn svg{width:13px;height:13px}
+.mini-btn:hover{border-color:var(--a-line-brand);color:var(--a-text-brand)}
+
+/* confirm-by-retyping chips */
+.confirm-prompt{font-size:12px;color:var(--a-text-2);margin-top:16px;text-align:left;line-height:1.5}
+.confirm-prompt b{color:var(--a-text);font-family:var(--a-font-mono)}
+.slots{display:flex;gap:8px;margin-top:10px}
+.slot{flex:1;height:40px;border-radius:9px;border:1px dashed var(--a-line-strong);display:flex;align-items:center;
+  justify-content:center;gap:7px;font-size:12.5px;background:var(--a-well);color:var(--a-text-4)}
+.slot .si{font-family:var(--a-font-mono);font-size:10px;color:var(--a-text-4)}
+.slot.filled{border-style:solid;border-color:var(--a-line-brand);background:linear-gradient(180deg,rgba(249,115,22,.08),rgba(249,115,22,.03));color:var(--a-text)}
+.slot.filled .t{font-family:var(--a-font-mono);font-weight:600}
+.chip-pool{display:flex;flex-wrap:wrap;gap:7px;margin-top:12px;justify-content:center}
+.wchip{font-family:var(--a-font-mono);font-size:12px;color:var(--a-text-2);padding:7px 13px;border-radius:8px;
+  border:1px solid var(--a-line);background:linear-gradient(180deg,#1b1b1f,#141416);cursor:default;
+  box-shadow:0 1px 0 rgba(255,255,255,.04) inset;transition:var(--a-dur) var(--a-ease)}
+.wchip:hover{border-color:var(--a-line-brand);color:var(--a-text)}
+.wchip.used{opacity:.32;text-decoration:line-through}
+
+.ob-btn{width:100%;margin-top:18px;display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  font-size:14px;font-weight:700;letter-spacing:.01em;padding:13px;border-radius:var(--a-radius-sm);cursor:pointer;border:none;
+  color:#2A0E00;background:linear-gradient(180deg,#FDBA74,var(--a-brand-500) 55%,var(--a-brand-600));
+  box-shadow:0 1px 0 rgba(255,255,255,.35) inset,var(--a-glow-soft),0 8px 22px -8px rgba(124,45,18,.6);
+  transition:var(--a-dur) var(--a-ease)}
+.ob-btn svg{width:15px;height:15px;fill:currentColor;stroke:none}
+.ob-btn:hover{box-shadow:0 1px 0 rgba(255,255,255,.4) inset,var(--a-glow),0 10px 26px -8px rgba(124,45,18,.7)}
+.ob-btn.ghost{color:var(--a-text);background:transparent;border:1px solid var(--a-line-strong);box-shadow:none}
+.ob-btn.ghost:hover{border-color:var(--a-line-brand);color:var(--a-text-brand);box-shadow:none}
+.ob-btn[disabled]{opacity:.45;cursor:not-allowed;box-shadow:none}
+
+/* compact variants (import + watch-only) */
+.variant-row{display:grid;grid-template-columns:1fr;gap:12px;margin-top:14px}
+.variant{position:relative;padding:14px 15px;border-radius:var(--a-radius);border:1px solid var(--a-line);
+  background:linear-gradient(180deg,var(--a-surface-2),#141416);box-shadow:0 1px 0 rgba(255,255,255,.04) inset}
+.variant .vh{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:650}
+.variant .vh .vic{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;color:var(--a-text-2);
+  background:linear-gradient(180deg,#202024,#141416);box-shadow:0 1px 2px rgba(0,0,0,.4)}
+.variant .vh .vic svg{width:15px;height:15px}
+.variant .vh .badge{margin-left:auto;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--a-text-3);
+  border:1px solid var(--a-line);border-radius:999px;padding:3px 8px;font-weight:600}
+.variant .vsub{font-size:11.5px;color:var(--a-text-3);margin-top:7px;line-height:1.5}
+.field{display:flex;align-items:center;gap:9px;margin-top:11px;background:var(--a-well);border:1px solid var(--a-line-strong);
+  border-radius:var(--a-radius-sm);padding:9px 11px;font-family:var(--a-font-mono);font-size:12px;color:var(--a-text-3)}
+.field svg{width:14px;height:14px;color:var(--a-text-4);flex:none}
+.field .ph{color:var(--a-text-4)}
+.field.ok{border-color:rgba(34,197,94,.3)}
+.field.ok .vstate{margin-left:auto;display:inline-flex;align-items:center;gap:5px;color:var(--a-live);font-size:11px;font-weight:600}
+.field.ok .vstate svg{color:var(--a-live);width:13px;height:13px}
+.field.brand{border-color:var(--a-line-brand);box-shadow:0 0 0 3px rgba(249,115,22,.10)}
+
+/* ===================================================================
+   DASHBOARD
+   =================================================================== */
+.dash{padding:24px 26px 28px;height:100%;overflow:auto}
+.dash-head{display:flex;align-items:center;gap:12px}
+.dash-head h2{font-size:21px;font-weight:700;letter-spacing:-.02em}
+.dash-head .sub{font-size:12px;color:var(--a-text-3);font-weight:500}
+.dash-head .up{margin-left:auto;display:inline-flex;align-items:center;gap:9px;font-size:12px;color:var(--a-text-2);font-weight:500;
+  padding:6px 12px;border-radius:999px;border:1px solid rgba(34,197,94,.28);
+  background:linear-gradient(180deg,rgba(34,197,94,.10),rgba(34,197,94,.04))}
+.dash-head .up .mono{color:#86efac}
+.rule{height:1px;background:linear-gradient(90deg,transparent,var(--a-line) 12%,var(--a-line) 88%,transparent);margin:16px 0 18px}
+
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:13px}
+@media (max-width:760px){.grid{grid-template-columns:repeat(2,1fr)}}
+.stat{position:relative;background:var(--a-elevate);border:1px solid var(--a-line-strong);border-radius:var(--a-radius);
+  padding:15px 16px 14px;box-shadow:0 1px 0 rgba(255,255,255,.05) inset, 0 6px 16px -8px rgba(0,0,0,.5);overflow:hidden}
+/* lane top-accent for the hero stat */
+.stat.accent::after{content:"";position:absolute;left:0;right:0;top:0;height:2px;background:var(--lane-mac);opacity:.9;
+  box-shadow:0 0 10px var(--lane-mac)}
+.stat .lab{font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--a-text-3);font-weight:600;display:flex;align-items:center;gap:6px}
+.stat .lab svg{width:12px;height:12px;color:var(--a-text-4)}
+.stat .val{font-family:var(--a-font-mono);font-size:25px;font-weight:600;line-height:1.12;margin-top:9px;letter-spacing:-.01em}
+.stat .val small{font-size:13px;color:var(--a-text-2);font-weight:600}
+.stat .val.pend{color:var(--a-brand-300);font-size:20px}
+.stat .meta{font-size:11px;color:var(--a-text-3);margin-top:7px;font-weight:500}
+.stat .meta.good{color:var(--a-live)}
+.stat .meta .mn{font-family:var(--a-font-mono);color:var(--a-text-2)}
+/* sparkline */
+.spark{display:flex;align-items:flex-end;gap:2.5px;height:26px;margin-top:9px}
+.spark i{flex:1;background:linear-gradient(180deg,var(--a-brand-300),rgba(249,115,22,.18));border-radius:2px 2px 1px 1px;min-height:2px;
+  box-shadow:0 0 6px rgba(249,115,22,.18)}
+.spark i:last-child{background:linear-gradient(180deg,#fff,var(--a-brand-400));box-shadow:0 0 10px rgba(249,115,22,.55)}
+
+.sect-lab{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--a-text-3);font-weight:600;margin:22px 0 10px;
+  display:flex;align-items:center;gap:8px}
+.sect-lab .ln{flex:1;height:1px;background:var(--a-line)}
+.lane{display:flex;align-items:center;gap:13px;padding:13px 15px;border:1px solid var(--a-line);border-radius:var(--a-radius);
+  background:linear-gradient(180deg,var(--a-surface),#121214);margin-bottom:9px;font-size:13px;position:relative;overflow:hidden;
+  box-shadow:0 1px 0 rgba(255,255,255,.04) inset}
+.lane::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--lane-mac)}
+.lane.gpu::before{background:var(--lane-gpu)}
+.lane .name{display:flex;align-items:center;gap:10px;min-width:248px;font-weight:600}
+.lane .name .role{color:var(--a-text-3);font-weight:500;font-size:12px}
+.lane .hr{font-family:var(--a-font-mono);min-width:100px;color:var(--a-text);font-weight:500}
+.lane .sh{font-family:var(--a-font-mono);min-width:70px;color:var(--a-text-2)}
+.lane .liveind{margin-left:auto;display:inline-flex;align-items:center;gap:8px;font-size:11px;color:var(--a-text-2);font-weight:500}
+.lane.off{opacity:.55}
+.lane.off::before{background:var(--a-off)}
+.lane.off .hr,.lane.off .sh{color:var(--a-text-4)}
+.bars{display:inline-flex;gap:2px;align-items:flex-end;height:14px}
+.bars i{width:3.5px;background:var(--a-live);border-radius:1px;box-shadow:0 0 5px rgba(34,197,94,.5)}
+.bars i:nth-child(1){height:6px}.bars i:nth-child(2){height:10px}.bars i:nth-child(3){height:14px}
+.bars i:nth-child(4){height:9px}.bars i:nth-child(5){height:12px}
+.bars.dim i{background:var(--a-off);box-shadow:none;height:7px!important;opacity:.5}
+
+.kv{display:grid;grid-template-columns:auto 1fr auto;gap:12px 20px;align-items:center;
+  border:1px solid var(--a-line);border-radius:var(--a-radius);background:linear-gradient(180deg,var(--a-surface),#121214);
+  padding:15px 16px;font-size:13px;box-shadow:0 1px 0 rgba(255,255,255,.04) inset}
+.kv .k{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--a-text-3);font-weight:600}
+.kv .v{font-family:var(--a-font-mono);color:var(--a-text);font-weight:500}
+.kv .v .muted{color:var(--a-text-4)}
+.kv .end{justify-self:end;display:inline-flex;align-items:center;gap:8px;color:var(--a-text-2);font-size:12px;font-weight:500}
+.kv .end .mono{color:#86efac}
+.kv .copy{font-size:11px;color:var(--a-text-3);border:1px solid var(--a-line);border-radius:8px;padding:5px 11px;cursor:default;
+  display:inline-flex;align-items:center;gap:6px;transition:var(--a-dur) var(--a-ease);font-weight:500}
+.kv .copy svg{width:12px;height:12px}
+.kv .copy:hover{border-color:var(--a-line-brand);color:var(--a-text-brand)}
+
+.log-head{display:flex;align-items:center;margin:22px 0 10px}
+.log-head .sect-lab{margin:0}
+.log-head .acts{margin-left:auto;display:flex;gap:7px}
+.log-head .acts span{font-size:11px;color:var(--a-text-3);border:1px solid var(--a-line);border-radius:8px;padding:5px 11px;
+  cursor:default;display:inline-flex;align-items:center;gap:5px;transition:var(--a-dur) var(--a-ease);font-weight:500}
+.log-head .acts span svg{width:12px;height:12px}
+.log-head .acts span:hover{border-color:var(--a-line-brand);color:var(--a-text-brand)}
+.log{position:relative;background:var(--a-well);border:1px solid var(--a-line-strong);border-radius:var(--a-radius);padding:14px 16px;
+  font-family:var(--a-font-mono);font-size:11.5px;line-height:1.8;color:var(--a-text-4);max-height:166px;overflow:auto;
+  box-shadow:0 2px 8px rgba(0,0,0,.4) inset}
+.log .ln{white-space:pre-wrap;overflow-wrap:anywhere}
+.log .ln.hot{color:var(--a-text-2)}
+.log .ln .ts{color:#3f3f46}
+.log .ln .ok{color:var(--a-live)}
+.log .ln .num{color:var(--a-brand-300)}
+.log .ln .tag{color:var(--a-text-3)}
+
+/* ===================================================================
+   SETTINGS
+   =================================================================== */
+.set{padding:24px 26px 28px;height:100%;overflow:auto}
+.set-head h2{font-size:21px;font-weight:700;letter-spacing:-.02em}
+.set-head .sub{font-size:12px;color:var(--a-text-3);margin-top:3px;font-weight:500}
+.panel{background:linear-gradient(180deg,var(--a-surface),#121214);border:1px solid var(--a-line);border-radius:var(--a-radius);
+  margin-top:16px;overflow:hidden;box-shadow:0 1px 0 rgba(255,255,255,.04) inset, 0 8px 20px -10px rgba(0,0,0,.5)}
+.panel-h{padding:13px 17px;font-size:11px;letter-spacing:.13em;text-transform:uppercase;color:var(--a-text-3);font-weight:600;
+  border-bottom:1px solid var(--a-line);background:linear-gradient(180deg,rgba(255,255,255,.015),transparent);display:flex;align-items:center;gap:8px}
+.panel-h svg{width:13px;height:13px;color:var(--a-text-4)}
+.srow{display:flex;align-items:center;gap:16px;padding:15px 17px;border-bottom:1px solid var(--a-line)}
+.srow:last-child{border-bottom:none}
+.srow .lhs{min-width:0;flex:1}
+.srow .lhs .t{font-size:13.5px;font-weight:600}
+.srow .lhs .h{font-size:11.5px;color:var(--a-text-3);margin-top:3px;line-height:1.5}
+.srow .lhs .h.warn{color:#d6a35a}
+.srow .rhs{flex:none;display:flex;align-items:center;gap:10px}
+
+/* slider */
+.slider{width:188px}
+.slider .track{height:6px;border-radius:99px;background:var(--a-well);position:relative;box-shadow:0 1px 2px rgba(0,0,0,.4) inset;
+  border:1px solid var(--a-line)}
+.slider .fill{position:absolute;left:0;top:0;bottom:0;width:72%;border-radius:99px;
+  background:linear-gradient(90deg,var(--a-brand-600),var(--a-brand-400));box-shadow:0 0 10px rgba(249,115,22,.4)}
+.slider .knob{position:absolute;left:72%;top:50%;width:16px;height:16px;border-radius:50%;transform:translate(-50%,-50%);
+  background:radial-gradient(120% 120% at 50% 25%,#fff,#FDBA74 60%,var(--a-brand-500));
+  box-shadow:0 1px 3px rgba(0,0,0,.6),0 0 10px rgba(249,115,22,.5)}
+.slider .scale{display:flex;justify-content:space-between;font-family:var(--a-font-mono);font-size:10px;color:var(--a-text-4);margin-top:7px}
+.thread-val{font-family:var(--a-font-mono);font-size:14px;font-weight:600;color:var(--a-text);min-width:54px;text-align:right}
+.thread-val small{color:var(--a-text-3);font-weight:500;font-size:11px}
+
+/* segmented control */
+.seg{display:inline-flex;background:var(--a-well);border:1px solid var(--a-line-strong);border-radius:10px;padding:3px;gap:2px;
+  box-shadow:0 1px 2px rgba(0,0,0,.4) inset}
+.seg button{border:none;background:transparent;color:var(--a-text-3);font-size:12px;font-weight:600;padding:6px 13px;border-radius:7px;
+  cursor:default;font-family:inherit;transition:var(--a-dur) var(--a-ease)}
+.seg button.on{color:#2A0E00;background:linear-gradient(180deg,#FDBA74,var(--a-brand-500));box-shadow:0 1px 2px rgba(0,0,0,.4),0 0 10px rgba(249,115,22,.3)}
+.seg.zinc button.on{color:var(--a-text);background:linear-gradient(180deg,var(--a-surface-3),var(--a-surface-2));box-shadow:0 1px 2px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.05) inset}
+
+/* toggle */
+.tog{width:42px;height:24px;border-radius:99px;background:var(--a-well);border:1px solid var(--a-line-strong);position:relative;
+  cursor:default;transition:var(--a-dur) var(--a-ease);box-shadow:0 1px 2px rgba(0,0,0,.4) inset}
+.tog i{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#52525b;
+  transition:var(--a-dur) var(--a-ease);box-shadow:0 1px 2px rgba(0,0,0,.5)}
+.tog.on{background:linear-gradient(180deg,var(--a-brand-500),var(--a-brand-600));border-color:transparent;box-shadow:0 0 12px rgba(249,115,22,.35)}
+.tog.on i{left:20px;background:#fff}
+
+.set-field{font-family:var(--a-font-mono);font-size:12.5px;color:var(--a-text-2);background:var(--a-well);
+  border:1px solid var(--a-line-strong);border-radius:9px;padding:8px 12px;display:inline-flex;align-items:center;gap:9px;font-weight:500}
+.set-field .lock{color:var(--a-text-4);font-size:10px;text-transform:uppercase;letter-spacing:.08em;font-family:var(--a-font-sans);font-weight:600}
+.set-field svg{width:13px;height:13px;color:var(--a-text-4)}
+.upd-row{display:flex;align-items:center;gap:16px;padding:15px 17px;
+  background:linear-gradient(180deg,rgba(249,115,22,.07),transparent);border-bottom:1px solid var(--a-line)}
+.upd-btn{flex:none;display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:700;color:#2A0E00;
+  background:linear-gradient(180deg,#FDBA74,var(--a-brand-500));border:none;border-radius:9px;padding:8px 15px;cursor:default;
+  box-shadow:0 1px 0 rgba(255,255,255,.3) inset,var(--a-glow-soft)}
+.upd-btn svg{width:13px;height:13px}
+.ver-pill{font-family:var(--a-font-mono);font-size:11px;color:var(--a-text-3);border:1px solid var(--a-line);border-radius:8px;padding:5px 10px}
+
+/* footnote shared */
+.global-foot{margin-top:26px;text-align:center;font-size:11px;color:var(--a-text-4);line-height:1.7;letter-spacing:.005em}
+.global-foot .pending-tag{color:var(--a-brand-300)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ====================== MASTHEAD ====================== -->
+  <div class="masthead">
+    <span class="mark">
+      <span class="logo">
+        <svg viewBox="0 0 1024 1024" width="24" height="24" aria-label="Alice">
+          <g transform="translate(0,1024) scale(0.1,-0.1)" fill="#F97316">
+            <path d="M5635 7050 c112 -184 252 -416 312 -515 60 -99 224 -369 365 -600 140 -231 373 -616 518 -855 144 -239 273 -452 286 -472 13 -20 193 -317 400 -660 207 -343 428 -707 490 -810 63 -103 114 -189 114 -192 0 -3 -525 -6 -1167 -6 l-1168 0 81 33 c91 37 197 109 262 177 261 272 330 674 181 1055 -43 110 -53 128 -315 550 -181 292 -334 542 -501 820 -201 336 -356 591 -367 602 -8 9 -29 -19 -87 -115 -95 -160 -269 -446 -431 -712 -69 -113 -168 -275 -220 -360 -52 -85 -141 -229 -198 -320 -277 -440 -323 -555 -336 -820 -7 -145 8 -250 57 -384 52 -145 181 -316 309 -412 47 -35 157 -90 197 -99 18 -3 35 -10 37 -13 4 -8 -2325 -5 -2332 3 -2 2 69 125 158 272 89 147 214 354 278 458 63 105 170 280 237 390 115 188 222 364 740 1220 117 193 276 456 355 585 170 280 516 850 833 1375 126 209 267 442 314 517 l85 138 155 -258 c86 -141 247 -408 358 -592z m-505 -1770 c0 -29 49 -159 83 -220 46 -84 123 -184 178 -234 109 -98 254 -173 384 -199 l70 -14 -73 -16 c-280 -63 -541 -316 -631 -612 -7 -22 -15 -47 -18 -55 -3 -8 -11 9 -19 38 -35 134 -126 286 -238 398 -119 118 -250 194 -401 231 l-66 16 88 22 c157 40 260 98 374 210 116 115 208 272 241 414 11 48 28 61 28 21z"/>
+          </g>
+        </svg>
+      </span>
+    </span>
+    <div>
+      <h1>Alice Miner</h1>
+      <div class="tag">Design mockup B · "Focal &amp; atmospheric" · dark</div>
+    </div>
+    <span class="spacer"></span>
+    <div class="legend">
+      <span class="lg-chip"><span class="ldot" style="background:var(--lane-xmr)"></span>XMR</span>
+      <span class="lg-chip"><span class="ldot" style="background:var(--lane-gpu)"></span>GPU</span>
+      <span class="lg-chip"><span class="ldot" style="background:var(--lane-mac)"></span>Mac</span>
+      <span class="lg-chip"><span class="ldot" style="background:var(--lane-asic)"></span>ASIC</span>
+      <span class="lg-chip"><span class="ldot" style="background:var(--lane-ai)"></span>AI</span>
+    </div>
+  </div>
+  <p class="subhead">One-click crypto mining + earn, sibling of the Alice Wallet. Rewards accrue as <b>pending (待发放)</b> only. Tap the hero on screen 2b to run the live hashrate gauge.</p>
+
+  <div class="gallery">
+
+    <!-- ============================================================
+         1 — ONBOARDING
+         ============================================================ -->
+    <div class="cell">
+      <div class="cap"><span class="n">01</span><span class="t">Onboarding · create</span><span class="d">generate → back up → confirm</span></div>
+      <div class="win">
+        <div class="titlebar">
+          <span class="tl-lights"><i></i><i></i><i></i></span>
+          <span class="tl-brand">Alice Miner</span>
+          <span class="tl-spacer"></span>
+          <span class="tl-ico"><svg viewBox="0 0 24 24" class="ic"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 13.5a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.56V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.56 1z"/></svg></span>
+          <span class="tl-ico"><svg viewBox="0 0 24 24" class="ic"><circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg></span>
+          <span class="tl-ico lang">EN</span>
+        </div>
+        <div class="body">
+          <div class="rail">
+            <span class="logo"><svg viewBox="0 0 1024 1024" width="26" height="26"><g transform="translate(0,1024) scale(0.1,-0.1)" fill="#F97316"><path d="M5635 7050 c112 -184 252 -416 312 -515 60 -99 224 -369 365 -600 140 -231 373 -616 518 -855 144 -239 273 -452 286 -472 13 -20 193 -317 400 -660 207 -343 428 -707 490 -810 63 -103 114 -189 114 -192 0 -3 -525 -6 -1167 -6 l-1168 0 81 33 c91 37 197 109 262 177 261 272 330 674 181 1055 -43 110 -53 128 -315 550 -181 292 -334 542 -501 820 -201 336 -356 591 -367 602 -8 9 -29 -19 -87 -115 -95 -160 -269 -446 -431 -712 -69 -113 -168 -275 -220 -360 -52 -85 -141 -229 -198 -320 -277 -440 -323 -555 -336 -820 -7 -145 8 -250 57 -384 52 -145 181 -316 309 -412 47 -35 157 -90 197 -99 18 -3 35 -10 37 -13 4 -8 -2325 -5 -2332 3 -2 2 69 125 158 272 89 147 214 354 278 458 63 105 170 280 237 390 115 188 222 364 740 1220 117 193 276 456 355 585 170 280 516 850 833 1375 126 209 267 442 314 517 l85 138 155 -258 c86 -141 247 -408 358 -592z m-505 -1770 c0 -29 49 -159 83 -220 46 -84 123 -184 178 -234 109 -98 254 -173 384 -199 l70 -14 -73 -16 c-280 -63 -541 -316 -631 -612 -7 -22 -15 -47 -18 -55 -3 -8 -11 9 -19 38 -35 134 -126 286 -238 398 -119 118 -250 194 -401 231 l-66 16 88 22 c157 40 260 98 374 210 116 115 208 272 241 414 11 48 28 61 28 21z"/></g></svg></span>
+            <span class="nav"><svg viewBox="0 0 24 24" class="ic"><path d="M3 11.2 12 4l9 7.2"/><path d="M5 9.6V20h14V9.6"/></svg></span>
+            <span class="nav"><svg viewBox="0 0 24 24" class="ic"><rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5"/></svg></span>
+            <span class="nav"><svg viewBox="0 0 24 24" class="ic"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 13.5a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.56V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.56 1z"/></svg></span>
+            <span class="grow"></span>
+            <span class="lang">中</span>
+            <span class="ver">v0.1.0</span>
+          </div>
+          <div class="content">
+            <div class="ob">
+              <div class="ob-card">
+                <div class="ob-steps"><i class="done"></i><i class="on"></i><i></i></div>
+                <div style="text-align:center;margin-top:6px"><span class="eyebrow">Step 2 of 3 · back up</span></div>
+                <div class="ob-h">Write down your recovery phrase</div>
+                <div class="ob-sub">24 words. One mnemonic works in Wallet, Miner &amp; AI.</div>
+
+                <div class="warn-banner">
+                  <svg viewBox="0 0 24 24" class="ic"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+                  <span><b>This is the only way to recover.</b> Anyone with these words controls the address. Store offline — never paste it online.</span>
+                </div>
+
+                <div class="mnem">
+                  <div class="w"><span class="i">1</span><span class="t">harvest</span></div>
+                  <div class="w"><span class="i">2</span><span class="t">copper</span></div>
+                  <div class="w"><span class="i">3</span><span class="t">lunar</span></div>
+                  <div class="w"><span class="i">4</span><span class="t">ribbon</span></div>
+                  <div class="w"><span class="i">5</span><span class="t">orbit</span></div>
+                  <div class="w"><span class="i">6</span><span class="t">tundra</span></div>
+                  <div class="w"><span class="i">7</span><span class="t">cipher</span></div>
+                  <div class="w"><span class="i">8</span><span class="t">meadow</span></div>
+                  <div class="w"><span class="i">9</span><span class="t">violet</span></div>
+                  <div class="w"><span class="i">10</span><span class="t">anchor</span></div>
+                  <div class="w"><span class="i">11</span><span class="t">summit</span></div>
+                  <div class="w"><span class="i">12</span><span class="t">frost</span></div>
+                </div>
+                <div class="mnem-acts">
+                  <span class="ck" style="font-size:11.5px;color:var(--a-text-4)">+ 12 more words below</span>
+                  <span class="mini-btn"><svg viewBox="0 0 24 24" class="ic"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>Copy all</span>
+                </div>
+
+                <div style="margin-top:16px">
+                  <span class="ck checked"><span class="box"><svg viewBox="0 0 24 24" class="ic"><path d="M20 6 9 17l-5-5"/></svg></span>I've written down all 24 words and stored them safely.</span>
+                </div>
+                <button class="ob-btn">Continue to confirm
+                  <svg viewBox="0 0 24 24" class="ic" style="stroke:#2A0E00;fill:none;stroke-width:2"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg></button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================================
+         1b — ONBOARDING confirm + import + watch-only
+         ============================================================ -->
+    <div class="cell">
+      <div class="cap"><span class="n">01b</span><span class="t">Confirm · import · watch-only</span><span class="d">retype to verify · alt entry points</span></div>
+      <div class="win">
+        <div class="titlebar">
+          <span class="tl-lights"><i></i><i></i><i></i></span>
+          <span class="tl-brand">Alice Miner</span>
+          <span class="tl-spacer"></span>
+          <span class="tl-pill"><span class="dot idle"></span>Setup</span>
+          <span class="tl-ico lang">EN</span>
+        </div>
+        <div class="body">
+          <div class="rail">
+            <span class="logo"><svg viewBox="0 0 1024 1024" width="26" height="26"><g transform="translate(0,1024) scale(0.1,-0.1)" fill="#F97316"><path d="M5635 7050 c112 -184 252 -416 312 -515 60 -99 224 -369 365 -600 140 -231 373 -616 518 -855 144 -239 273 -452 286 -472 13 -20 193 -317 400 -660 207 -343 428 -707 490 -810 63 -103 114 -189 114 -192 0 -3 -525 -6 -1167 -6 l-1168 0 81 33 c91 37 197 109 262 177 261 272 330 674 181 1055 -43 110 -53 128 -315 550 -181 292 -334 542 -501 820 -201 336 -356 591 -367 602 -8 9 -29 -19 -87 -115 -95 -160 -269 -446 -431 -712 -69 -113 -168 -275 -220 -360 -52 -85 -141 -229 -198 -320 -277 -440 -323 -555 -336 -820 -7 -145 8 -250 57 -384 52 -145 181 -316 309 -412 47 -35 157 -90 197 -99 18 -3 35 -10 37 -13 4 -8 -2325 -5 -2332 3 -2 2 69 125 158 272 89 147 214 354 278 458 63 105 170 280 237 390 115 188 222 364 740 1220 117 193 276 456 355 585 170 280 516 850 833 1375 126 209 267 442 314 517 l85 138 155 -258 c86 -141 247 -408 358 -592z m-505 -1770 c0 -29 49 -159 83 -220 46 -84 123 -184 178 -234 109 -98 254 -173 384 -199 l70 -14 -73 -16 c-280 -63 -541 -316 -631 -612 -7 -22 -15 -47 -18 -55 -3 -8 -11 9 -19 38 -35 134 -126 286 -238 398 -119 118 -250 194 -401 231 l-66 16 88 22 c157 40 260 98 374 210 116 115 208 272 241 414 11 48 28 61 28 21z"/></g></svg></span>
+            <span class="nav"><svg viewBox="0 0 24 24" class="ic"><path d="M3 11.2 12 4l9 7.2"/><path d="M5 9.6V20h14V9.6"/></svg></span>
+            <span class="grow"></span>
+            <span class="lang">中</span>
+            <span class="ver">v0.1.0</span>
+          </div>
+          <div class="content">
+            <div class="ob" style="padding:24px 26px">
+              <div class="ob-card" style="max-width:440px">
+                <div class="ob-steps"><i class="done"></i><i class="done"></i><i class="on"></i></div>
+                <div style="text-align:center;margin-top:6px"><span class="eyebrow">Step 3 of 3 · confirm</span></div>
+                <div class="ob-h">Confirm your phrase</div>
+                <div class="confirm-prompt">Tap the right words for positions <b>#3</b>, <b>#9</b>, and <b>#11</b>.</div>
+                <div class="slots">
+                  <div class="slot filled"><span class="si">#3</span><span class="t">lunar</span></div>
+                  <div class="slot"><span class="si">#9</span><span style="color:var(--a-text-4)">tap word</span></div>
+                  <div class="slot"><span class="si">#11</span><span style="color:var(--a-text-4)">tap word</span></div>
+                </div>
+                <div class="chip-pool">
+                  <span class="wchip used">lunar</span>
+                  <span class="wchip">summit</span>
+                  <span class="wchip">violet</span>
+                  <span class="wchip">frost</span>
+                  <span class="wchip">cipher</span>
+                  <span class="wchip">orbit</span>
+                  <span class="wchip">anchor</span>
+                  <span class="wchip">meadow</span>
+                </div>
+
+                <div class="variant-row" style="margin-top:22px">
+                  <div class="variant">
+                    <div class="vh">
+                      <span class="vic"><svg viewBox="0 0 24 24" class="ic"><path d="M4 7V5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2"/><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M3 11h18"/></svg></span>
+                      Import existing
+                      <span class="badge">mnemonic / seed</span>
+                    </div>
+                    <div class="vsub">Paste a 12 or 24-word phrase. BIP-39 checksum is validated live.</div>
+                    <div class="field ok">
+                      <svg viewBox="0 0 24 24" class="ic"><path d="M4 7V5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2"/><rect x="3" y="7" width="18" height="13" rx="2"/></svg>
+                      harvest copper lunar ribbon orbit…
+                      <span class="vstate"><svg viewBox="0 0 24 24" class="ic"><path d="M20 6 9 17l-5-5"/></svg>24 words · valid</span>
+                    </div>
+                  </div>
+                  <div class="variant">
+                    <div class="vh">
+                      <span class="vic"><svg viewBox="0 0 24 24" class="ic"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span>
+                      Paste address
+                      <span class="badge">watch-only</span>
+                    </div>
+                    <div class="vsub">Track rewards for an address you already own. No keys stored — view only.</div>
+                    <div class="field brand">
+                      <svg viewBox="0 0 24 24" class="ic"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>
+                      <span style="color:var(--a-text)">a2x9k4…7fQk</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================================
+         2a — HOME idle
+         ============================================================ -->
+    <div class="cell">
+      <div class="cap"><span class="n">02a</span><span class="t">Home · idle</span><span class="d">device + lane auto-detected · one click</span></div>
+      <div class="win">
+        <div class="titlebar">
+          <span class="tl-lights"><i></i><i></i><i></i></span>
+          <span class="tl-brand">Alice Miner</span>
+          <span class="tl-spacer"></span>
+          <span class="tl-pill"><span class="dot idle"></span>Idle</span>
+          <span class="tl-ico"><svg viewBox="0 0 24 24" class="ic"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 13.5a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.56V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.56 1z"/></svg></span>
+          <span class="tl-ico lang">EN</span>
+        </div>
+        <div class="body">
+          <div class="rail">
+            <span class="logo"><svg viewBox="0 0 1024 1024" width="26" height="26"><g transform="translate(0,1024) scale(0.1,-0.1)" fill="#F97316"><path d="M5635 7050 c112 -184 252 -416 312 -515 60 -99 224 -369 365 -600 140 -231 373 -616 518 -855 144 -239 273 -452 286 -472 13 -20 193 -317 400 -660 207 -343 428 -707 490 -810 63 -103 114 -189 114 -192 0 -3 -525 -6 -1167 -6 l-1168 0 81 33 c91 37 197 109 262 177 261 272 330 674 181 1055 -43 110 -53 128 -315 550 -181 292 -334 542 -501 820 -201 336 -356 591 -367 602 -8 9 -29 -19 -87 -115 -95 -160 -269 -446 -431 -712 -69 -113 -168 -275 -220 -360 -52 -85 -141 -229 -198 -320 -277 -440 -323 -555 -336 -820 -7 -145 8 -250 57 -384 52 -145 181 -316 309 -412 47 -35 157 -90 197 -99 18 -3 35 -10 37 -13 4 -8 -2325 -5 -2332 3 -2 2 69 125 158 272 89 147 214 354 278 458 63 105 170 280 237 390 115 188 222 364 740 1220 117 193 276 456 355 585 170 280 516 850 833 1375 126 209 267 442 314 517 l85 138 155 -258 c86 -141 247 -408 358 -592z m-505 -1770 c0 -29 49 -159 83 -220 46 -84 123 -184 178 -234 109 -98 254 -173 384 -199 l70 -14 -73 -16 c-280 -63 -541 -316 -631 -612 -7 -22 -15 -47 -18 -55 -3 -8 -11 9 -19 38 -35 134 -126 286 -238 398 -119 118 -250 194 -401 231 l-66 16 88 22 c157 40 260 98 374 210 116 115 208 272 241 414 11 48 28 61 28 21z"/></g></svg></span>
+            <span class="nav on"><svg viewBox="0 0 24 24" class="ic"><path d="M3 11.2 12 4l9 7.2"/><path d="M5 9.6V20h14V9.6"/></svg></span>
+            <span class="nav"><svg viewBox="0 0 24 24" class="ic"><rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5"/></svg></span>
+            <span class="nav"><svg viewBox="0 0 24 24" class="ic"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 13.5a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.56V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.56 1z"/></svg></span>
+            <span class="grow"></span>
+            <span class="lang">中</span>
+            <span class="ver">v0.1.0</span>
+          </div>
+          <div class="content">
+            <div class="home">
+              <div class="app">
+                <div class="card-hero">
+                  <div style="text-align:center"><span class="eyebrow">Device auto-detected</span></div>
+                  <div class="dev-block">
+                    <div class="dev-line">
+                      <span class="chip-ic"><svg viewBox="0 0 24 24" class="ic"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v2M12 2v2M15 2v2M9 20v2M12 20v2M15 20v2M2 9h2M2 12h2M2 15h2M20 9h2M20 12h2M20 15h2"/></svg></span>
+                      <span class="nm">Apple M2 Max <small>· 12 cores</small></span>
+                    </div>
+                    <div class="lane-row">
+                      <span class="lane-chip"><span class="ldot" style="background:var(--lane-mac)"></span>XMR · RandomX</span>
+                      <span class="change">change <svg viewBox="0 0 24 24" class="ic"><path d="m6 9 6 6 6-6"/></svg></span>
+                    </div>
+                  </div>
+
+                  <div class="hero-wrap">
+                    <div class="hero-aura"></div>
+                    <div class="ring-track"></div>
+                    <div class="ring"></div>
+                    <button class="start-btn" aria-label="Start mining"><span class="mark"><svg viewBox="0 0 1024 1024"><g transform="translate(0,1024) scale(0.1,-0.1)"><path d="M5635 7050 c112 -184 252 -416 312 -515 60 -99 224 -369 365 -600 140 -231 373 -616 518 -855 144 -239 273 -452 286 -472 13 -20 193 -317 400 -660 207 -343 428 -707 490 -810 63 -103 114 -189 114 -192 0 -3 -525 -6 -1167 -6 l-1168 0 81 33 c91 37 197 109 262 177 261 272 330 674 181 1055 -43 110 -53 128 -315 550 -181 292 -334 542 -501 820 -201 336 -356 591 -367 602 -8 9 -29 -19 -87 -115 -95 -160 -269 -446 -431 -712 -69 -113 -168 -275 -220 -360 -52 -85 -141 -229 -198 -320 -277 -440 -323 -555 -336 -820 -7 -145 8 -250 57 -384 52 -145 181 -316 309 -412 47 -35 157 -90 197 -99 18 -3 35 -10 37 -13 4 -8 -2325 -5 -2332 3 -2 2 69 125 158 272 89 147 214 354 278 458 63 105 170 280 237 390 115 188 222 364 740 1220 117 193 276 456 355 585 170 280 516 850 833 1375 126 209 267 442 314 517 l85 138 155 -258 c86 -141 247 -408 358 -592z m-505 -1770 c0 -29 49 -159 83 -220 46 -84 123 -184 178 -234 109 -98 254 -173 384 -199 l70 -14 -73 -16 c-280 -63 -541 -316 -631 -612 -7 -22 -15 -47 -18 -55 -3 -8 -11 9 -19 38 -35 134 -126 286 -238 398 -119 118 -250 194 -401 231 l-66 16 88 22 c157 40 260 98 374 210 116 115 208 272 241 414 11 48 28 61 28 21z"/></g></svg></span></button>
+                  </div>
+                  <div class="hero-readout">
+                    <div class="ro-cta"><svg viewBox="0 0 24 24" class="play"><path d="M7 5.5 19 12 7 18.5z"/></svg>START</div>
+                    <div class="ro-sub">press to begin · 点击开始</div>
+                  </div>
+
+                  <div class="ident">
+                    Rewards to <span class="addr">a2x9…7fQk</span>
+                    <span class="act"><svg viewBox="0 0 24 24" class="ic"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></span>
+                    <span class="act"><svg viewBox="0 0 24 24" class="ic"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></span>
+                  </div>
+                  <div class="status-line"><span class="dot idle"></span>Idle — press Start to begin</div>
+
+                  <div class="foot">
+                    Rewards accrue as <span class="pending-tag">pending (待发放)</span>.<br />
+                    Payout, settlement &amp; on-chain transfer stay gated.
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================================
+         2b — HOME mining (LIVE — the hero moment)
+         ============================================================ -->
+    <div class="cell">
+      <div class="cap"><span class="n">02b</span><span class="t">Home · mining</span><span class="d">live gauge · breathing glow · tap hero to toggle</span></div>
+      <div class="win">
+        <div class="titlebar">
+          <span class="tl-lights"><i></i><i></i><i></i></span>
+          <span class="tl-brand">Alice Miner</span>
+          <span class="tl-spacer"></span>
+          <span class="tl-pill live" id="topPill"><span class="dot online"></span><span id="topPillTxt">Mining · XMR</span></span>
+          <span class="tl-ico lang">EN</span>
+        </div>
+        <div class="body">
+          <div class="rail">
+            <span class="logo"><svg viewBox="0 0 1024 1024" width="26" height="26"><g transform="translate(0,1024) scale(0.1,-0.1)" fill="#F97316"><path d="M5635 7050 c112 -184 252 -416 312 -515 60 -99 224 -369 365 -600 140 -231 373 -616 518 -855 144 -239 273 -452 286 -472 13 -20 193 -317 400 -660 207 -343 428 -707 490 -810 63 -103 114 -189 114 -192 0 -3 -525 -6 -1167 -6 l-1168 0 81 33 c91 37 197 109 262 177 261 272 330 674 181 1055 -43 110 -53 128 -315 550 -181 292 -334 542 -501 820 -201 336 -356 591 -367 602 -8 9 -29 -19 -87 -115 -95 -160 -269 -446 -431 -712 -69 -113 -168 -275 -220 -360 -52 -85 -141 -229 -198 -320 -277 -440 -323 -555 -336 -820 -7 -145 8 -250 57 -384 52 -145 181 -316 309 -412 47 -35 157 -90 197 -99 18 -3 35 -10 37 -13 4 -8 -2325 -5 -2332 3 -2 2 69 125 158 272 89 147 214 354 278 458 63 105 170 280 237 390 115 188 222 364 740 1220 117 193 276 456 355 585 170 280 516 850 833 1375 126 209 267 442 314 517 l85 138 155 -258 c86 -141 247 -408 358 -592z m-505 -1770 c0 -29 49 -159 83 -220 46 -84 123 -184 178 -234 109 -98 254 -173 384 -199 l70 -14 -73 -16 c-280 -63 -541 -316 -631 -612 -7 -22 -15 -47 -18 -55 -3 -8 -11 9 -19 38 -35 134 -126 286 -238 398 -119 118 -250 194 -401 231 l-66 16 88 22 c157 40 260 98 374 210 116 115 208 272 241 414 11 48 28 61 28 21z"/></g></svg></span>
+            <span class="nav on"><svg viewBox="0 0 24 24" class="ic"><path d="M3 11.2 12 4l9 7.2"/><path d="M5 9.6V20h14V9.6"/></svg></span>
+            <span class="nav"><svg viewBox="0 0 24 24" class="ic"><rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5"/></svg></span>
+            <span class="nav"><svg viewBox="0 0 24 24" class="ic"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 13.5a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.56V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.56 1z"/></svg></span>
+            <span class="grow"></span>
+            <span class="lang">中</span>
+            <span class="ver">v0.1.0</span>
+          </div>
+          <div class="content">
+            <div class="home">
+              <div class="app mining" id="homeApp">
+                <div class="card-hero">
+                  <div style="text-align:center"><span class="eyebrow">Mining · live</span></div>
+                  <div class="dev-block">
+                    <div class="dev-line">
+                      <span class="chip-ic"><svg viewBox="0 0 24 24" class="ic"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v2M12 2v2M15 2v2M9 20v2M12 20v2M15 20v2M2 9h2M2 12h2M2 15h2M20 9h2M20 12h2M20 15h2"/></svg></span>
+                      <span class="nm">Apple M2 Max <small>· 8 threads</small></span>
+                    </div>
+                    <div class="lane-row">
+                      <span class="lane-chip"><span class="ldot" style="background:var(--lane-mac)"></span>XMR · RandomX</span>
+                    </div>
+                  </div>
+
+                  <div class="hero-wrap">
+                    <div class="hero-aura"></div>
+                    <div class="ring-track"></div>
+                    <div class="ring" id="ring" style="--p:0.9"></div>
+                    <button class="start-btn" id="startBtn" onclick="toggleMine()" aria-label="Stop mining"><span class="mark"><svg viewBox="0 0 1024 1024"><g transform="translate(0,1024) scale(0.1,-0.1)"><path d="M5635 7050 c112 -184 252 -416 312 -515 60 -99 224 -369 365 -600 140 -231 373 -616 518 -855 144 -239 273 -452 286 -472 13 -20 193 -317 400 -660 207 -343 428 -707 490 -810 63 -103 114 -189 114 -192 0 -3 -525 -6 -1167 -6 l-1168 0 81 33 c91 37 197 109 262 177 261 272 330 674 181 1055 -43 110 -53 128 -315 550 -181 292 -334 542 -501 820 -201 336 -356 591 -367 602 -8 9 -29 -19 -87 -115 -95 -160 -269 -446 -431 -712 -69 -113 -168 -275 -220 -360 -52 -85 -141 -229 -198 -320 -277 -440 -323 -555 -336 -820 -7 -145 8 -250 57 -384 52 -145 181 -316 309 -412 47 -35 157 -90 197 -99 18 -3 35 -10 37 -13 4 -8 -2325 -5 -2332 3 -2 2 69 125 158 272 89 147 214 354 278 458 63 105 170 280 237 390 115 188 222 364 740 1220 117 193 276 456 355 585 170 280 516 850 833 1375 126 209 267 442 314 517 l85 138 155 -258 c86 -141 247 -408 358 -592z m-505 -1770 c0 -29 49 -159 83 -220 46 -84 123 -184 178 -234 109 -98 254 -173 384 -199 l70 -14 -73 -16 c-280 -63 -541 -316 -631 -612 -7 -22 -15 -47 -18 -55 -3 -8 -11 9 -19 38 -35 134 -126 286 -238 398 -119 118 -250 194 -401 231 l-66 16 88 22 c157 40 260 98 374 210 116 115 208 272 241 414 11 48 28 61 28 21z"/></g></svg></span></button>
+                  </div>
+                  <div class="hero-readout" id="heroReadout">
+                    <div class="ro-num"><span class="big" id="hrBig">8.42</span><span class="unit">kH/s</span></div>
+                    <div class="ro-sub">hashing · 待发放</div>
+                  </div>
+
+                  <div class="ident">
+                    Rewards to <span class="addr">a2x9…7fQk</span>
+                    <span class="act"><svg viewBox="0 0 24 24" class="ic"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></span>
+                  </div>
+                  <div class="status-line"><span class="dot online"></span>Mining · M2 Max · 8 threads · <span class="mono">142/1</span> shares</div>
+                  <div class="stop-row">
+                    <span class="btn-stop" onclick="toggleMine()"><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>Stop mining</span>
+                  </div>
+                  <div style="margin-top:11px"><a class="dash-link" href="#">Open dashboard <svg viewBox="0 0 24 24" class="ic"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg></a></div>
+
+                  <div class="foot">
+                    Rewards accrue as <span class="pending-tag">pending (待发放)</span>.<br />
+                    Payout, settlement &amp; on-chain transfer stay gated.
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================================
+         3 — DASHBOARD (wide)
+         ============================================================ -->
+    <div class="cell wide">
+      <div class="cap"><span class="n">03</span><span class="t">Live dashboard</span><span class="d">hashrate · shares · lanes · connection · log</span></div>
+      <div class="win">
+        <div class="titlebar">
+          <span class="tl-lights"><i></i><i></i><i></i></span>
+          <span class="tl-brand">Alice Miner</span>
+          <span class="tl-spacer"></span>
+          <span class="tl-pill live"><span class="dot online"></span>Mining · XMR</span>
+          <span class="tl-ico"><svg viewBox="0 0 24 24" class="ic"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 13.5a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.56V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.56 1z"/></svg></span>
+          <span class="tl-ico lang">EN</span>
+        </div>
+        <div class="body" style="min-height:auto">
+          <div class="rail">
+            <span class="logo"><svg viewBox="0 0 1024 1024" width="26" height="26"><g transform="translate(0,1024) scale(0.1,-0.1)" fill="#F97316"><path d="M5635 7050 c112 -184 252 -416 312 -515 60 -99 224 -369 365 -600 140 -231 373 -616 518 -855 144 -239 273 -452 286 -472 13 -20 193 -317 400 -660 207 -343 428 -707 490 -810 63 -103 114 -189 114 -192 0 -3 -525 -6 -1167 -6 l-1168 0 81 33 c91 37 197 109 262 177 261 272 330 674 181 1055 -43 110 -53 128 -315 550 -181 292 -334 542 -501 820 -201 336 -356 591 -367 602 -8 9 -29 -19 -87 -115 -95 -160 -269 -446 -431 -712 -69 -113 -168 -275 -220 -360 -52 -85 -141 -229 -198 -320 -277 -440 -323 -555 -336 -820 -7 -145 8 -250 57 -384 52 -145 181 -316 309 -412 47 -35 157 -90 197 -99 18 -3 35 -10 37 -13 4 -8 -2325 -5 -2332 3 -2 2 69 125 158 272 89 147 214 354 278 458 63 105 170 280 237 390 115 188 222 364 740 1220 117 193 276 456 355 585 170 280 516 850 833 1375 126 209 267 442 314 517 l85 138 155 -258 c86 -141 247 -408 358 -592z m-505 -1770 c0 -29 49 -159 83 -220 46 -84 123 -184 178 -234 109 -98 254 -173 384 -199 l70 -14 -73 -16 c-280 -63 -541 -316 -631 -612 -7 -22 -15 -47 -18 -55 -3 -8 -11 9 -19 38 -35 134 -126 286 -238 398 -119 118 -250 194 -401 231 l-66 16 88 22 c157 40 260 98 374 210 116 115 208 272 241 414 11 48 28 61 28 21z"/></g></svg></span>
+            <span class="nav"><svg viewBox="0 0 24 24" class="ic"><path d="M3 11.2 12 4l9 7.2"/><path d="M5 9.6V20h14V9.6"/></svg></span>
+            <span class="nav on"><svg viewBox="0 0 24 24" class="ic"><rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5"/></svg></span>
+            <span class="nav"><svg viewBox="0 0 24 24" class="ic"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 13.5a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.56V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.56 1z"/></svg></span>
+            <span class="grow"></span>
+            <span class="lang">中</span>
+            <span class="ver">v0.1.0</span>
+          </div>
+          <div class="content">
+            <div class="dash">
+              <div class="dash-head">
+                <div>
+                  <h2>Dashboard</h2>
+                  <div class="sub">Apple M2 Max · XMR · RandomX</div>
+                </div>
+                <span class="up"><span class="dot online"></span>Mining · <span class="mono" id="uptime">02:14:30</span> uptime</span>
+              </div>
+              <div class="rule"></div>
+
+              <div class="grid">
+                <div class="stat accent">
+                  <div class="lab"><svg viewBox="0 0 24 24" class="ic"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>Hashrate</div>
+                  <div class="val" id="dHr">8.42 <small>kH/s</small></div>
+                  <div class="spark" id="spark"></div>
+                </div>
+                <div class="stat">
+                  <div class="lab"><svg viewBox="0 0 24 24" class="ic"><path d="M20 6 9 17l-5-5"/></svg>Shares A / R</div>
+                  <div class="val">142 <small>/ 1</small></div>
+                  <div class="meta">last share <span class="mn">12s</span> ago</div>
+                </div>
+                <div class="stat">
+                  <div class="lab"><svg viewBox="0 0 24 24" class="ic"><path d="M22 11.1V12a10 10 0 1 1-5.9-9.1"/><path d="M22 4 12 14.1l-3-3"/></svg>Accepted</div>
+                  <div class="val">99.3<small>%</small></div>
+                  <div class="meta good">rolling · healthy</div>
+                </div>
+                <div class="stat">
+                  <div class="lab"><svg viewBox="0 0 24 24" class="ic"><path d="M12 2v20M5 12l7-9 7 9"/></svg>Est. rewards</div>
+                  <div class="val pend">— pending</div>
+                  <div class="meta">待发放 · rate pending</div>
+                </div>
+              </div>
+
+              <div class="sect-lab">Lanes<span class="ln"></span></div>
+              <div class="lane">
+                <span class="name"><span class="ldot" style="background:var(--lane-mac)"></span>XMR · RandomX <span class="role">· CPU · 8 threads</span></span>
+                <span class="hr">8.42 kH/s</span>
+                <span class="sh">142 / 1</span>
+                <span class="liveind"><span class="bars"><i></i><i></i><i></i><i></i><i></i></span>live</span>
+              </div>
+              <div class="lane off gpu">
+                <span class="name"><span class="ldot" style="background:var(--lane-gpu)"></span>RVN · KawPoW <span class="role">· GPU · idle</span></span>
+                <span class="hr">—</span>
+                <span class="sh">— / —</span>
+                <span class="liveind"><span class="bars dim"><i></i><i></i><i></i><i></i><i></i></span>off</span>
+              </div>
+
+              <div class="sect-lab">Connection<span class="ln"></span></div>
+              <div class="kv">
+                <span class="k">Endpoint</span>
+                <span class="v">hk.aliceprotocol.org <span class="muted">:</span> 3333</span>
+                <span class="end"><span class="dot online"></span>connected · <span class="mono">41ms</span></span>
+                <span class="k">Worker</span>
+                <span class="v">rig-a2x9…7fQk <span class="muted">· rig-id derived</span></span>
+                <span class="copy"><svg viewBox="0 0 24 24" class="ic"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>copy address</span>
+              </div>
+
+              <div class="log-head">
+                <span class="sect-lab">Log</span>
+                <span class="acts">
+                  <span><svg viewBox="0 0 24 24" class="ic"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>copy</span>
+                  <span><svg viewBox="0 0 24 24" class="ic"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>clear</span>
+                </span>
+              </div>
+              <div class="log" id="log">
+                <div class="ln"><span class="ts">[12s]</span> <span class="tag">miner</span>    speed 10s/60s/15m <span class="num">8420</span> 8390 8200 H/s  max 8600 H/s</div>
+                <div class="ln"><span class="ts">[12s]</span> <span class="tag">net</span>      <span class="ok">accepted</span> (<span class="num">142</span>/1) diff 24010 (38 ms)</div>
+                <div class="ln"><span class="ts">[02s]</span> <span class="tag">net</span>      new job from hk.aliceprotocol.org:3333 diff 24010</div>
+                <div class="ln"><span class="ts">[00s]</span> <span class="tag">cpu</span>      READY threads 8/12  (af-mode auto, 1-gb pages)</div>
+                <div class="ln hot"><span class="ts">[00s]</span> <span class="tag">net</span>      use pool hk.aliceprotocol.org:3333  algo rx/0</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================================
+         4 — SETTINGS (wide)
+         ============================================================ -->
+    <div class="cell wide">
+      <div class="cap"><span class="n">04</span><span class="t">Settings</span><span class="d">threads · lane · dual-mine · endpoint · theme · update</span></div>
+      <div class="win">
+        <div class="titlebar">
+          <span class="tl-lights"><i></i><i></i><i></i></span>
+          <span class="tl-brand">Alice Miner</span>
+          <span class="tl-spacer"></span>
+          <span class="tl-pill live"><span class="dot online"></span>Mining · XMR</span>
+          <span class="tl-ico lang">EN</span>
+        </div>
+        <div class="body" style="min-height:auto">
+          <div class="rail">
+            <span class="logo"><svg viewBox="0 0 1024 1024" width="26" height="26"><g transform="translate(0,1024) scale(0.1,-0.1)" fill="#F97316"><path d="M5635 7050 c112 -184 252 -416 312 -515 60 -99 224 -369 365 -600 140 -231 373 -616 518 -855 144 -239 273 -452 286 -472 13 -20 193 -317 400 -660 207 -343 428 -707 490 -810 63 -103 114 -189 114 -192 0 -3 -525 -6 -1167 -6 l-1168 0 81 33 c91 37 197 109 262 177 261 272 330 674 181 1055 -43 110 -53 128 -315 550 -181 292 -334 542 -501 820 -201 336 -356 591 -367 602 -8 9 -29 -19 -87 -115 -95 -160 -269 -446 -431 -712 -69 -113 -168 -275 -220 -360 -52 -85 -141 -229 -198 -320 -277 -440 -323 -555 -336 -820 -7 -145 8 -250 57 -384 52 -145 181 -316 309 -412 47 -35 157 -90 197 -99 18 -3 35 -10 37 -13 4 -8 -2325 -5 -2332 3 -2 2 69 125 158 272 89 147 214 354 278 458 63 105 170 280 237 390 115 188 222 364 740 1220 117 193 276 456 355 585 170 280 516 850 833 1375 126 209 267 442 314 517 l85 138 155 -258 c86 -141 247 -408 358 -592z m-505 -1770 c0 -29 49 -159 83 -220 46 -84 123 -184 178 -234 109 -98 254 -173 384 -199 l70 -14 -73 -16 c-280 -63 -541 -316 -631 -612 -7 -22 -15 -47 -18 -55 -3 -8 -11 9 -19 38 -35 134 -126 286 -238 398 -119 118 -250 194 -401 231 l-66 16 88 22 c157 40 260 98 374 210 116 115 208 272 241 414 11 48 28 61 28 21z"/></g></svg></span>
+            <span class="nav"><svg viewBox="0 0 24 24" class="ic"><path d="M3 11.2 12 4l9 7.2"/><path d="M5 9.6V20h14V9.6"/></svg></span>
+            <span class="nav"><svg viewBox="0 0 24 24" class="ic"><rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5"/></svg></span>
+            <span class="nav on"><svg viewBox="0 0 24 24" class="ic"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 13.5a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.56V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.56 1z"/></svg></span>
+            <span class="grow"></span>
+            <span class="lang">中</span>
+            <span class="ver">v0.1.0</span>
+          </div>
+          <div class="content">
+            <div class="set">
+              <div class="set-head">
+                <h2>Settings</h2>
+                <div class="sub">The product resists knobs — only what matters.</div>
+              </div>
+
+              <!-- Mining -->
+              <div class="panel">
+                <div class="panel-h"><svg viewBox="0 0 24 24" class="ic"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>Mining</div>
+                <div class="srow">
+                  <div class="lhs">
+                    <div class="t">Worker threads</div>
+                    <div class="h">Only runs while you've pressed Start. Full-power leaves the machine warm.</div>
+                  </div>
+                  <div class="rhs">
+                    <div class="slider">
+                      <div class="track"><div class="fill"></div><div class="knob"></div></div>
+                      <div class="scale"><span>1</span><span>12</span></div>
+                    </div>
+                    <span class="thread-val">8 <small>/ 12</small></span>
+                  </div>
+                </div>
+                <div class="srow">
+                  <div class="lhs">
+                    <div class="t">Lane override</div>
+                    <div class="h">Auto picks the best lane for your device. XMR uses the CPU; GPU uses RandomX/KawPoW.</div>
+                  </div>
+                  <div class="rhs">
+                    <div class="seg zinc"><button class="on">Auto</button><button>XMR</button><button>GPU</button></div>
+                  </div>
+                </div>
+                <div class="srow">
+                  <div class="lhs">
+                    <div class="t">Dual-mine (CPU + GPU)</div>
+                    <div class="h warn">Runs both lanes at once — expect higher heat &amp; fan noise. Off by default.</div>
+                  </div>
+                  <div class="rhs"><div class="tog"><i></i></div></div>
+                </div>
+              </div>
+
+              <!-- Network -->
+              <div class="panel">
+                <div class="panel-h"><svg viewBox="0 0 24 24" class="ic"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>Network</div>
+                <div class="srow">
+                  <div class="lhs">
+                    <div class="t">Endpoint</div>
+                    <div class="h">Primary relay. The client handles failover automatically.</div>
+                  </div>
+                  <div class="rhs">
+                    <span class="set-field"><svg viewBox="0 0 24 24" class="ic"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/></svg>hk.aliceprotocol.org : 3333 <span class="lock">read-only</span></span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Appearance -->
+              <div class="panel">
+                <div class="panel-h"><svg viewBox="0 0 24 24" class="ic"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>Appearance</div>
+                <div class="srow">
+                  <div class="lhs"><div class="t">Theme</div><div class="h">Dark is the native Alice theme.</div></div>
+                  <div class="rhs"><div class="seg zinc"><button class="on">Dark</button><button>System</button></div></div>
+                </div>
+                <div class="srow">
+                  <div class="lhs"><div class="t">Language · 语言</div><div class="h">Numbers stay mono in both languages.</div></div>
+                  <div class="rhs"><div class="seg"><button class="on">EN</button><button>中文</button></div></div>
+                </div>
+                <div class="srow">
+                  <div class="lhs"><div class="t">Reduce motion</div><div class="h">Disables pulses &amp; the gauge sweep; keeps color states.</div></div>
+                  <div class="rhs"><div class="tog"><i></i></div></div>
+                </div>
+              </div>
+
+              <!-- Updates -->
+              <div class="panel">
+                <div class="panel-h"><svg viewBox="0 0 24 24" class="ic"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v4h-4"/></svg>Updates</div>
+                <div class="upd-row">
+                  <div class="lhs">
+                    <div class="t">Update available · <span class="mono" style="color:var(--a-text-brand)">v0.1.1</span></div>
+                    <div class="h">Signed release (ed25519). Current <span class="mono">v0.1.0</span> · checked 4m ago.</div>
+                  </div>
+                  <button class="upd-btn"><svg viewBox="0 0 24 24" class="ic"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>Update now</button>
+                </div>
+                <div class="srow">
+                  <div class="lhs"><div class="t">Version</div><div class="h">Build <span class="mono">a1b2c3d</span> · stable channel</div></div>
+                  <div class="rhs"><span class="ver-pill">v0.1.0</span><span class="copy" style="font-size:11px;color:var(--a-text-3);border:1px solid var(--a-line);border-radius:8px;padding:5px 11px;display:inline-flex;align-items:center;gap:6px"><svg viewBox="0 0 24 24" class="ic" style="width:12px;height:12px"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v4h-4"/></svg>Check for update</span></div>
+                </div>
+              </div>
+
+              <div class="global-foot" style="margin-top:18px;text-align:left;padding:0 2px">
+                Rewards accrue as <span class="pending-tag">pending (待发放)</span>. Payout, settlement &amp; on-chain transfer stay gated — contribution score only.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="global-foot">
+    Alice Miner — visual contract · self-contained · no external deps. Rewards shown as <span class="pending-tag">pending (待发放)</span> only.
+  </div>
+</div>
+
+<script>
+/* =====================================================================
+   Home · mining — live hashrate tween + conic gauge sweep + sparkline.
+   EGUI-FLAG[anim-OK]: all of this maps to egui per-frame updates:
+     - number tween  → lerp a displayed f32 toward target each frame
+     - gauge --p     → arc angle = (hr/max) painted with epaint
+     - sparkline     → ring buffer of last-60 samples, drawn as bars
+   ===================================================================== */
+(function(){
+  var app=document.getElementById('homeApp');
+  var ring=document.getElementById('ring');
+  var hrBig=document.getElementById('hrBig');
+  var startBtn=document.getElementById('startBtn');
+  var heroReadout=document.getElementById('heroReadout');
+  var topPill=document.getElementById('topPill');
+  var topPillTxt=document.getElementById('topPillTxt');
+  var mining=true, hr=8.42, target=8.42, tmr=null;
+
+  function loop(){
+    target=8.42+(Math.random()-0.5)*0.55;
+    hr+=(target-hr)*0.16;                 // ease toward target — the "fluid" tween
+    hrBig.textContent=hr.toFixed(2);
+    ring.style.setProperty('--p',Math.min(1,(hr/9.2)).toFixed(3));
+  }
+  function start(){ mining=true; app.classList.add('mining');
+    topPill.classList.add('live'); topPillTxt.textContent='Mining · XMR';
+    heroReadout.innerHTML='<div class="ro-num"><span class="big" id="hrBig">'+hr.toFixed(2)+'</span><span class="unit">kH/s</span></div><div class="ro-sub">hashing · 待发放</div>';
+    hrBig=document.getElementById('hrBig');
+    clearInterval(tmr); tmr=setInterval(loop,95);
+  }
+  function stop(){ mining=false; app.classList.remove('mining');
+    topPill.classList.remove('live'); topPillTxt.textContent='Idle';
+    clearInterval(tmr);
+    ring.style.setProperty('--p',0);
+    heroReadout.innerHTML='<div class="ro-cta"><svg viewBox="0 0 24 24" class="play"><path d="M7 5.5 19 12 7 18.5z"/></svg>START</div><div class="ro-sub">press to begin · 点击开始</div>';
+  }
+  window.toggleMine=function(){ mining?stop():start(); };
+  tmr=setInterval(loop,95);
+})();
+
+/* Dashboard — sparkline fill + live hashrate read + uptime ticker. */
+(function(){
+  var spark=document.getElementById('spark');
+  var seed=[5,6,7,5,8,9,8,7,9,8,6,7,8,9,9,8,7,8,9,8,7,8,9,9,8];
+  seed.forEach(function(v){var i=document.createElement('i');i.style.height=(v/9*26)+'px';spark.appendChild(i);});
+  var dHr=document.getElementById('dHr'), cur=8.42;
+  setInterval(function(){
+    var t=8.42+(Math.random()-0.5)*0.4; cur+=(t-cur)*0.2;
+    dHr.innerHTML=cur.toFixed(2)+' <small>kH/s</small>';
+    var bars=spark.querySelectorAll('i');
+    for(var i=0;i<bars.length-1;i++){bars[i].style.height=bars[i+1].style.height;}
+    bars[bars.length-1].style.height=((cur-7.7)/1.6*18+7)+'px';
+  },900);
+  var up=document.getElementById('uptime'),s=2*3600+14*60+30;
+  setInterval(function(){s++;var h=Math.floor(s/3600),m=Math.floor(s%3600/60),sec=s%60;
+    up.textContent=String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');},1000);
+})();
+</script>
+
+<!-- =============================================================================
+     EGUI-REPRODUCIBILITY SUMMARY (what egui/eframe canNOT do verbatim)
+     -----------------------------------------------------------------------------
+     The design is deliberately blur-free and built from layered opaque surfaces,
+     gradients, 1px borders, layered drop-shadows, and additive radial glow — all
+     of which egui reproduces. Specifically flagged:
+
+       1. [blur-2px]  The hero-aura has a cosmetic `filter: blur(2px)` softening a
+          STATIC radial glow pad. egui has no blur → drop it and use a smoother
+          multi-stop radial Mesh; visually ~identical. NOT load-bearing.
+
+       2. [conic-OK / mask] The hashrate ring uses `conic-gradient` + a radial CSS
+          `mask` to make an annulus gauge. egui has NEITHER → draw the documented
+          hashrate_ring() with epaint: a thick stroked arc (or triangle-fan
+          annulus) swept by --p*360°, with a faint full-circle groove behind it.
+          Fully reproducible — same look.
+
+       3. [radial-fill] The Start squircle + buttons use radial gradients with an
+          inner top sheen + inner bottom shadow. egui has no radial paint for a
+          Rect fill; approximate with a 2–3 stop VERTICAL gradient + a light inner
+          top stroke + dark inner bottom shadow. Reads nearly identical at this
+          size. The mocked circle is fine as a true circle in egui.
+
+       4. CSS `mask: radial-gradient(...)` (ring only) — not in egui; see #2.
+
+     Everything else — vignette/auras, titlebar/rail gradients, card top-highlight,
+     all drop-shadows, the breathing/pulse/sweep animations, the number tween, the
+     sparkline, segmented controls, toggles, slider — transcribes directly via
+     Frame/Stroke/CornerRadius/Shadow + ctx.request_repaint() time-driven lerps.
+   ============================================================================= -->
+</body>
+</html>
