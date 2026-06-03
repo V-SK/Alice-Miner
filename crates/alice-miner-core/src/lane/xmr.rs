@@ -7,6 +7,7 @@
 //!   * `validate_alice_address` + `ss58_prefix_bytes` (Wallet ~L238-286)
 //!   * `derive_worker_id`         (Wallet ~L298-318)
 //!   * `miner_thread_count`       (Wallet ~L336)
+//!
 //! and the credit-only gate consts (Wallet L12-25).
 //!
 //! ── CRITICAL HONESTY INVARIANT (PLAN §3 / the brief) ────────────────────────

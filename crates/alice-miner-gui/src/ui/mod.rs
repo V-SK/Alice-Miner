@@ -11,3 +11,25 @@ pub mod onboarding;
 pub mod strings;
 pub mod theme;
 pub mod widgets;
+
+use alice_miner_core::Lane;
+use eframe::egui::Color32;
+
+/// UI presentation for a mining [`Lane`]: the chip label (`XMR · RandomX` /
+/// `RVN · KawPoW`), the role sub-line, and the accent colour (matching
+/// `mine.html`: XMR orange, GPU blue — kept in one place so Home + Dashboard +
+/// Settings never disagree).
+pub fn lane_chip_label(lane: Lane) -> &'static str {
+    match lane {
+        Lane::Xmr => "XMR · RandomX",
+        Lane::GpuRvn => "RVN · KawPoW",
+    }
+}
+
+/// The lane's accent colour (the `mine.html` lane palette).
+pub fn lane_accent(lane: Lane) -> Color32 {
+    match lane {
+        Lane::Xmr => theme::THEME.lane_xmr,
+        Lane::GpuRvn => theme::THEME.lane_gpu,
+    }
+}

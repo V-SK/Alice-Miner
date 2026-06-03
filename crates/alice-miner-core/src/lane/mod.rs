@@ -2,17 +2,21 @@
 //! lane ([`xmr`]); the GPU-RVN (KawPoW) lane is M3. Each lane owns its own
 //! verbatim-ported argv builder, address validation, and (later) log parsers.
 
+pub mod gpu_rvn;
 pub mod xmr;
 
-/// Which mining lane a [`crate::engine::Command::Start`] selects. M1 supports
-/// only [`Lane::Xmr`]; [`Lane::GpuRvn`] is reserved for M3 (declared here so the
-/// `Command`/`Snapshot` shape is stable across the engine from M1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Which mining lane a [`crate::engine::Command::Start`] selects. CPU→XMR (the
+/// proven path) and NVIDIA-GPU→RVN (KawPoW, M3). `Ord`/`Hash` are derived so the
+/// lane can key the viability matrix's `BTreeMap` (see
+/// [`crate::detect::capability`]).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Lane {
     /// CPU RandomX/XMR against `hk.aliceprotocol.org:3333` (the proven path).
     Xmr,
-    /// NVIDIA-GPU KawPoW/RVN — reserved for M3 (not buildable in M1).
+    /// NVIDIA-GPU KawPoW/RVN against `hk.aliceprotocol.org:8888` (M3).
     GpuRvn,
 }
 

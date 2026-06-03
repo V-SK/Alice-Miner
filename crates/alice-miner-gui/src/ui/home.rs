@@ -12,8 +12,9 @@ use super::icons::Icon;
 use super::strings;
 use super::theme::THEME;
 use super::widgets::{self, Tone};
+use super::{lane_accent, lane_chip_label};
 use crate::app::MinerApp;
-use alice_miner_core::EngineState;
+use alice_miner_core::{EngineState, Lane, LaneSupport};
 
 pub fn render(ui: &mut egui::Ui, app: &mut MinerApp) {
     // Vertically + horizontally centre the hero card with a modest top inset; the
@@ -70,10 +71,12 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     });
 
     ui.add_space(10.0);
-    // Lane chip (XMR · RandomX).
-    centered(ui, |ui| {
-        widgets::chip(ui, Some(THEME.lane_xmr), "XMR · RandomX");
-    });
+    // Lane row: the selected lane chip + (when the device supports it) a
+    // selectable/"coming soon" chip for the other lane. Reflects viability:
+    // on a non-NVIDIA box the RVN chip reads "coming soon" and is inert; XMR
+    // stays the default. Only shown while NOT mid-run (so it can't change lanes
+    // under a running child).
+    lane_selector(ui, app);
 
     // ── The Alice Core hero ───────────────────────────────────────────────────
     ui.add_space(14.0);
@@ -276,6 +279,137 @@ fn status_line(ui: &mut egui::Ui, app: &MinerApp) {
         ui.add_space(9.0);
         ui.label(RichText::new(text.clone()).size(12.5).color(THEME.text2));
     });
+}
+
+/// The lane row beneath the device line: the SELECTED lane as a filled chip,
+/// plus the *other* lane as either a selectable chip (when runnable on this
+/// device) or a muted "coming soon" / "Apple → XMR" chip (when not). On this
+/// non-NVIDIA Mac the RVN chip reads "RVN · coming soon" and is inert, while XMR
+/// stays selected — the honest M3 viability behaviour.
+fn lane_selector(ui: &mut egui::Ui, app: &mut MinerApp) {
+    let selected = app.active_lane();
+    // While a run is in flight, the lane is locked (can't switch under a child).
+    let locked = matches!(
+        app.state(),
+        EngineState::Running | EngineState::Starting | EngineState::Stopping
+    );
+    // Deterministic order: XMR then RVN.
+    let lanes = [Lane::Xmr, Lane::GpuRvn];
+    let pick = std::cell::Cell::new(None);
+    centered(ui, |ui| {
+        ui.spacing_mut().item_spacing.x = 7.0;
+        for lane in lanes {
+            let support = app.lane_support(lane);
+            let is_sel = lane == selected;
+            let resp = lane_chip(ui, lane, support, is_sel, locked);
+            if resp.clicked() && !locked && support.is_runnable() && !is_sel {
+                pick.set(Some(lane));
+            }
+        }
+    });
+    if let Some(lane) = pick.get() {
+        app.select_lane(lane);
+    }
+}
+
+/// One lane chip. Selected → filled with the lane accent + a dot. Runnable but
+/// unselected → a normal selectable chip (pointer cursor). Coming-soon →
+/// muted, with a "coming soon" tail, NON-interactive. Unavailable (e.g. RVN on
+/// Apple) → dim "XMR only"/"not supported" tail, NON-interactive.
+fn lane_chip(
+    ui: &mut egui::Ui,
+    lane: Lane,
+    support: LaneSupport,
+    selected: bool,
+    locked: bool,
+) -> egui::Response {
+    let accent = lane_accent(lane);
+    let base = lane_chip_label(lane); // "XMR · RandomX" / "RVN · KawPoW"
+    let runnable = support.is_runnable();
+
+    // Compose the chip text: the base label, plus a state tail for non-runnable.
+    let (text, text_color, dot, stroke) = match support {
+        LaneSupport::Viable => {
+            if selected {
+                (
+                    base.to_string(),
+                    THEME.text,
+                    Some(accent),
+                    egui::Stroke::new(1.0, accent.gamma_multiply(0.8)),
+                )
+            } else {
+                (
+                    base.to_string(),
+                    THEME.text2,
+                    Some(accent.gamma_multiply(0.6)),
+                    egui::Stroke::new(1.0, THEME.line),
+                )
+            }
+        }
+        LaneSupport::ComingSoon => (
+            // "RVN · coming soon" (drop the algo to make room for the state).
+            format!("{} · coming soon", lane_short(lane)),
+            THEME.text4,
+            None,
+            egui::Stroke::new(1.0, THEME.line),
+        ),
+        LaneSupport::Unavailable => (
+            format!("{} · {}", lane_short(lane), unavailable_tail(lane)),
+            THEME.text4,
+            None,
+            egui::Stroke::new(1.0, THEME.line),
+        ),
+    };
+
+    let fill = if selected && runnable {
+        // A subtle accent-tinted fill so the selected lane reads as "active".
+        egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 26)
+    } else {
+        THEME.surface2
+    };
+
+    let frame = egui::Frame::NONE
+        .fill(fill)
+        .corner_radius(255)
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .stroke(stroke)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if let Some(c) = dot {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
+                    ui.painter().circle_filled(r.center(), 3.5, c);
+                }
+                ui.label(RichText::new(text).size(12.5).color(text_color));
+            });
+        });
+
+    // Make runnable, unselected, unlocked chips clickable (pointer cursor).
+    let resp = frame.response;
+    if runnable && !selected && !locked {
+        resp.clone()
+            .interact(egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp.interact(egui::Sense::hover())
+    }
+}
+
+/// The short lane tag (no algo), for the constrained "coming soon" chips.
+fn lane_short(lane: Lane) -> &'static str {
+    match lane {
+        Lane::Xmr => "XMR",
+        Lane::GpuRvn => "RVN",
+    }
+}
+
+/// The honest tail for an Unavailable lane (why it can't run here).
+fn unavailable_tail(lane: Lane) -> &'static str {
+    match lane {
+        // RVN unavailable means no NVIDIA (Apple/CPU-only) → XMR is the lane.
+        Lane::GpuRvn => "needs NVIDIA",
+        Lane::Xmr => "not supported",
+    }
 }
 
 /// Centre a row of inline widgets horizontally within the card (delegates to the

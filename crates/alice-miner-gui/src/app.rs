@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use alice_miner_core::engine::{Command, EngineHandle, Event, IdentitySpec, Snapshot};
 use alice_miner_core::identity::{self, IdentityPointer};
-use alice_miner_core::{DeviceProfile, EngineState, Identity, Lane};
+use alice_miner_core::{DeviceProfile, EngineState, Identity, Lane, LaneSupport, LaneViability};
 use eframe::egui::{self, TextureHandle};
 
 use crate::ui;
@@ -48,6 +48,16 @@ pub struct MinerApp {
     pub snapshot: Option<Snapshot>,
     /// Detected device (model string line). Filled by the `Detect` reply.
     pub device: Option<DeviceProfile>,
+    /// The lane-viability matrix for the detected device (which lanes are
+    /// runnable / coming-soon / unavailable). `None` until `Detect` replies.
+    pub viability: Option<LaneViability>,
+    /// The lane the user has selected to mine. Defaults to the recommended lane
+    /// once the device is known (RVN on NVIDIA, else XMR); the user can switch it
+    /// via the Home "change lane" affordance (only to a runnable lane).
+    pub selected_lane: Lane,
+    /// Whether the user has manually picked a lane (so we stop auto-defaulting to
+    /// the recommended one when a fresh `Detect` lands).
+    pub lane_user_picked: bool,
     /// The active reward identity pointer (address etc.), if one exists.
     pub identity: Option<IdentityPointer>,
     /// The active screen.
@@ -119,6 +129,11 @@ impl MinerApp {
             engine,
             snapshot: None,
             device: None,
+            viability: None,
+            // Sensible default before detection lands; recomputed to the
+            // recommended lane when the device arrives (unless the user picked).
+            selected_lane: Lane::Xmr,
+            lane_user_picked: false,
             identity,
             screen: Screen::Home,
             onboarding,
@@ -171,11 +186,49 @@ impl MinerApp {
     pub fn drain_events(&mut self) {
         while let Some(evt) = self.engine.try_recv() {
             match evt {
-                Event::Device(p) => self.device = Some(p),
+                Event::Device(p) => self.set_device(p),
                 Event::Identity { identity, mnemonic } => self.on_identity(identity, mnemonic),
                 Event::Snapshot(s) => self.on_snapshot(s),
                 Event::Error(e) => self.error = Some(e),
             }
+        }
+    }
+
+    /// Record the detected device, derive its lane-viability matrix, and (unless
+    /// the user has manually picked) default the selected lane to the recommended
+    /// one. The override-applied capability bundle is used so an operator
+    /// `ALICE_MINER_LANES` env restriction is honoured in the UI too.
+    pub fn set_device(&mut self, p: DeviceProfile) {
+        let cap = alice_miner_core::CapabilityProfile::from_profile(p.clone());
+        if !self.lane_user_picked {
+            self.selected_lane = cap.recommended_lane();
+        }
+        self.viability = Some(cap.viability);
+        self.device = Some(p);
+    }
+
+    /// The support level of a lane on the detected device (defaults to `Viable`
+    /// for XMR / `Unavailable` for the GPU lane before detection completes, so
+    /// the UI is honest even on the very first frame).
+    pub fn lane_support(&self, lane: Lane) -> LaneSupport {
+        match &self.viability {
+            Some(v) => v.support(lane),
+            None => {
+                if lane == Lane::Xmr {
+                    LaneSupport::Viable
+                } else {
+                    LaneSupport::Unavailable
+                }
+            }
+        }
+    }
+
+    /// Select `lane` to mine (only honoured if the lane is runnable). Marks the
+    /// choice as user-picked so a later `Detect` won't override it.
+    pub fn select_lane(&mut self, lane: Lane) {
+        if self.lane_support(lane).is_runnable() {
+            self.selected_lane = lane;
+            self.lane_user_picked = true;
         }
     }
 
@@ -214,9 +267,11 @@ impl MinerApp {
     }
 
     fn on_snapshot(&mut self, s: Snapshot) {
-        // Keep device in sync (the snapshot also carries it).
+        // Keep device + viability in sync (the snapshot also carries the device).
         if let Some(d) = &s.device {
-            self.device = Some(d.clone());
+            if self.device.as_ref() != Some(d) {
+                self.set_device(d.clone());
+            }
         }
         // Push the last-line into the rolling log (deduped against the tail).
         if let Some(line) = &s.last_line {
@@ -311,9 +366,26 @@ impl MinerApp {
 
     pub fn start_mining(&mut self) {
         self.error = None;
-        if let Err(e) = self.engine.send(Command::Start { lane: Lane::Xmr, address: None }) {
+        // Mine the selected lane (defaults to the recommended one for the device).
+        // If somehow not runnable, fall back to XMR (always viable) — defensive.
+        let lane = if self.lane_support(self.selected_lane).is_runnable() {
+            self.selected_lane
+        } else {
+            Lane::Xmr
+        };
+        if let Err(e) = self.engine.send(Command::Start { lane, address: None }) {
             self.error = Some(e);
         }
+    }
+
+    /// The lane currently active/selected, and its accent colour — used by the
+    /// Home lane chip + hero so the UI reflects the chosen lane.
+    pub fn active_lane(&self) -> Lane {
+        // While running, trust the snapshot's lane; otherwise the selection.
+        self.snapshot
+            .as_ref()
+            .and_then(|s| s.lane)
+            .unwrap_or(self.selected_lane)
     }
 
     pub fn stop_mining(&mut self) {

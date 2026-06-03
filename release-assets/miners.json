@@ -1,5 +1,5 @@
 {
-  "_comment": "Pinned bundled mining engines for the Alice Miner. Each entry records the engine kind, target triple, on-disk filename, and the SHA-256 of the committed bytes so the resolver / packaging can verify integrity. M1 ships only the macOS arm64 xmrig (CPU-XMR lane); linux + the GPU KawPowMiner land in later milestones (M3/M7).",
+  "_comment": "Pinned bundled mining engines for the Alice Miner. Each entry records the engine kind, target triple, on-disk filename, and the SHA-256 of the committed bytes so the resolver / packaging can verify integrity. The macOS arm64 xmrig (CPU-XMR lane) is PROVEN/live-validated against hk.aliceprotocol.org:3333. The kawpowminer (GPU-RVN/KawPoW lane) entries carry a PLACEHOLDER sha256 of all-zeros: the real binaries + their pinned SHAs are obtained at packaging time (M7). KawPowMiner is GPL-3.0, 0% fee, NVIDIA+AMD, cross-OS (PLAN section 6 D-GPU-miner); T-Rex is supported only via the ALICE_MINER_GPU_BIN override, never bundled. If a GPU binary is absent at runtime the resolver fails gracefully with a clear 'GPU miner not installed' status (no panic) and the RVN lane stays unavailable.",
   "engines": [
     {
       "kind": "cpu-xmr",
@@ -8,6 +8,24 @@
       "filename": "xmrig",
       "sha256": "bdbfe1dc9c8660adb462c055ec2a12bb75a7630487fe926f67e9263548b4e933",
       "source": "alice-wallet/gui/release-assets/aarch64-apple-darwin/xmrig (proven, live-validated against hk.aliceprotocol.org:3333)"
+    },
+    {
+      "kind": "gpu-rvn",
+      "engine": "kawpowminer",
+      "target": "x86_64-unknown-linux-gnu",
+      "filename": "kawpowminer",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "_placeholder": true,
+      "source": "PLACEHOLDER — KawPowMiner (GPL-3.0) Linux x86_64 build, pinned + signed at packaging (M7). RVN lane live-tested later on an NVIDIA box."
+    },
+    {
+      "kind": "gpu-rvn",
+      "engine": "kawpowminer",
+      "target": "x86_64-pc-windows-msvc",
+      "filename": "kawpowminer.exe",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "_placeholder": true,
+      "source": "PLACEHOLDER — KawPowMiner (GPL-3.0) Windows x86_64 build, pinned + signed at packaging (M7). Windows is GPU-first (no bundled xmrig)."
     }
   ]
 }

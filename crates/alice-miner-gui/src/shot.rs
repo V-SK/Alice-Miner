@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use alice_miner_core::{DeviceProfile, EngineState, Lane, OsFamily};
+use alice_miner_core::{DeviceProfile, EngineState, GpuInfo, GpuVendor, Lane, OsFamily};
 use alice_miner_core::engine::Snapshot;
 use eframe::egui;
 
@@ -91,6 +91,13 @@ impl ShotRunner {
                 // Reduced-motion variants (same states, motion off) — proves the
                 // colour/state semantics survive without pulses/sweeps/tween.
                 Shot { file: "home-mining-reduced-motion.png", pose: pose_home_mining_rm },
+                // ── M3: lane viability on Home ──────────────────────────────
+                // This Mac (Apple Silicon): RVN shows "coming soon", XMR default.
+                Shot { file: "home-idle-lanes-apple.png", pose: pose_home_idle },
+                // A simulated NVIDIA box: RVN becomes selectable + recommended.
+                Shot { file: "home-idle-lanes-nvidia.png", pose: pose_home_idle_nvidia },
+                // The same NVIDIA box's dashboard (RVN row reads "ready").
+                Shot { file: "dashboard-nvidia.png", pose: pose_dashboard_nvidia },
             ],
             idx: 0,
             phase: Phase::Settling,
@@ -203,7 +210,8 @@ pub fn drive(app: &mut MinerApp, ctx: &egui::Context) {
 // it overrides `screen`, `onboarding`, `snapshot`, and the animation fields so
 // the hero/cards read exactly as designed. Re-applied every shot frame.
 
-/// A demo device line so the model row reads like a real machine.
+/// A demo device line so the model row reads like a real machine (this Mac:
+/// Apple Silicon, unified-memory GPU → RVN is "coming soon", XMR is the lane).
 fn demo_device() -> DeviceProfile {
     DeviceProfile {
         os: OsFamily::Macos,
@@ -211,7 +219,33 @@ fn demo_device() -> DeviceProfile {
         apple_silicon: true,
         logical_cores: 12,
         cpu_model: "Apple M2 Max".into(),
+        gpu: GpuInfo {
+            vendor: GpuVendor::Apple,
+            model: "Apple M2 Max".into(),
+            vram_gb: 0,
+        },
+        memory_gb: 32,
         display: "Apple M2 Max · 12 cores".into(),
+        warnings: vec![],
+    }
+}
+
+/// A simulated NVIDIA box (for the M3 lane-select shot): RVN becomes selectable
+/// and recommended. NOT this Mac — purely a posed capture to prove the UI flips.
+fn demo_nvidia_device() -> DeviceProfile {
+    DeviceProfile {
+        os: OsFamily::Linux,
+        arch: "x86_64".into(),
+        apple_silicon: false,
+        logical_cores: 16,
+        cpu_model: "AMD Ryzen 9 5950X".into(),
+        gpu: GpuInfo {
+            vendor: GpuVendor::Nvidia,
+            model: "NVIDIA GeForce RTX 3070 Ti".into(),
+            vram_gb: 8,
+        },
+        memory_gb: 64,
+        display: "AMD Ryzen 9 5950X · 16 cores".into(),
         warnings: vec![],
     }
 }
@@ -304,7 +338,7 @@ fn pose_home_idle(app: &mut MinerApp) {
     app.onboarding = None; // identity exists on disk → skip onboarding
     app.screen = Screen::Home;
     app.snapshot = None; // no snapshot ⇒ EngineState::Idle ⇒ START readout
-    app.device = Some(demo_device());
+    app.set_device(demo_device());
     install_demo_identity(app);
     app.error = None;
     app.hr_display_khs = 0.0;
@@ -313,7 +347,7 @@ fn pose_home_idle(app: &mut MinerApp) {
 fn pose_home_connecting(app: &mut MinerApp) {
     app.onboarding = None;
     app.screen = Screen::Home;
-    app.device = Some(demo_device());
+    app.set_device(demo_device());
     install_demo_identity(app);
     app.error = None;
     app.snapshot = Some(demo_state_snapshot(EngineState::Starting, None));
@@ -323,7 +357,7 @@ fn pose_home_connecting(app: &mut MinerApp) {
 fn pose_home_error(app: &mut MinerApp) {
     app.onboarding = None;
     app.screen = Screen::Home;
-    app.device = Some(demo_device());
+    app.set_device(demo_device());
     install_demo_identity(app);
     app.error = None;
     // A calm, human reason — not a stack dump.
@@ -337,7 +371,7 @@ fn pose_home_error(app: &mut MinerApp) {
 fn pose_home_stopping(app: &mut MinerApp) {
     app.onboarding = None;
     app.screen = Screen::Home;
-    app.device = Some(demo_device());
+    app.set_device(demo_device());
     install_demo_identity(app);
     app.error = None;
     app.snapshot = Some(demo_state_snapshot(EngineState::Stopping, None));
@@ -348,7 +382,7 @@ fn pose_home_stopping(app: &mut MinerApp) {
 
 fn pose_ob_create(app: &mut MinerApp) {
     app.screen = Screen::Home;
-    app.device = Some(demo_device());
+    app.set_device(demo_device());
     app.identity = None;
     app.error = None;
     app.snapshot = None; // engine idle during onboarding → titlebar pill "Idle"
@@ -359,7 +393,7 @@ fn pose_ob_create(app: &mut MinerApp) {
 /// key — screenshot tooling only).
 fn pose_ob_backup(app: &mut MinerApp) {
     app.screen = Screen::Home;
-    app.device = Some(demo_device());
+    app.set_device(demo_device());
     app.identity = None;
     app.error = None;
     app.snapshot = None;
@@ -373,7 +407,7 @@ fn pose_ob_backup(app: &mut MinerApp) {
 /// the slots + chip pool + the "tap word" placeholders are all visible.
 fn pose_ob_confirm(app: &mut MinerApp) {
     app.screen = Screen::Home;
-    app.device = Some(demo_device());
+    app.set_device(demo_device());
     app.identity = None;
     app.error = None;
     app.snapshot = None;
@@ -402,7 +436,7 @@ fn pose_ob_confirm(app: &mut MinerApp) {
 fn pose_settings(app: &mut MinerApp) {
     app.onboarding = None;
     app.screen = Screen::Settings;
-    app.device = Some(demo_device());
+    app.set_device(demo_device());
     install_demo_identity(app);
     app.error = None;
     app.snapshot = Some(demo_mining_snapshot());
@@ -421,7 +455,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
 fn pose_home_mining(app: &mut MinerApp) {
     app.onboarding = None;
     app.screen = Screen::Home;
-    app.device = Some(demo_device());
+    app.set_device(demo_device());
     app.error = None;
     app.snapshot = Some(demo_mining_snapshot());
     pin_mining_anim(app, 8.4);
@@ -430,10 +464,36 @@ fn pose_home_mining(app: &mut MinerApp) {
 fn pose_dashboard_mining(app: &mut MinerApp) {
     app.onboarding = None;
     app.screen = Screen::Dashboard;
-    app.device = Some(demo_device());
+    app.set_device(demo_device());
     app.error = None;
     app.snapshot = Some(demo_mining_snapshot());
     pin_mining_anim(app, 8.4);
+    seed_log(app);
+}
+
+/// M3: Home idle on a SIMULATED NVIDIA box — RVN becomes selectable + the
+/// recommended/default lane (proves the viability matrix flips the UI). NOT this
+/// Mac; a posed capture only.
+fn pose_home_idle_nvidia(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Home;
+    app.set_device(demo_nvidia_device()); // recomputes viability → RVN recommended
+    install_demo_identity(app);
+    app.error = None;
+    app.snapshot = None;
+    app.hr_display_khs = 0.0;
+}
+
+/// M3: the NVIDIA box's dashboard — the RVN lane row reads "ready" (viable).
+fn pose_dashboard_nvidia(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Dashboard;
+    app.set_device(demo_nvidia_device());
+    install_demo_identity(app);
+    app.error = None;
+    // Idle (not mining) so both lane rows show their viability state cleanly.
+    app.snapshot = None;
+    app.hr_display_khs = 0.0;
     seed_log(app);
 }
 

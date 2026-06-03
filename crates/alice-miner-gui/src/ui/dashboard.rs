@@ -10,7 +10,9 @@ use super::icons::Icon;
 use super::strings;
 use super::theme::THEME;
 use super::widgets::{self, Tone};
+use super::{lane_accent, lane_chip_label};
 use crate::app::MinerApp;
+use alice_miner_core::{Lane, LaneSupport};
 
 /// One boxed stat-card painter, so the grid can lay the four cards out in either
 /// one row of four or two rows of two without duplicating their bodies.
@@ -61,11 +63,12 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.label(RichText::new("Dashboard").size(21.0).strong().color(THEME.text));
+            let lane_label = lane_chip_label(app.active_lane());
             let sub = app
                 .device
                 .as_ref()
-                .map(|d| format!("{} · XMR · RandomX", d.display))
-                .unwrap_or_else(|| "XMR · RandomX".into());
+                .map(|d| format!("{} · {}", d.display, lane_label))
+                .unwrap_or_else(|| lane_label.to_string());
             ui.label(RichText::new(sub).size(12.0).color(THEME.text3));
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -225,16 +228,33 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     ui.add_space(22.0);
     widgets::section_label(ui, "Lanes");
     ui.add_space(10.0);
+    let xmr_active = mining && app.active_lane() == Lane::Xmr;
+    let rvn_active = mining && app.active_lane() == Lane::GpuRvn;
     lane_row(
         ui,
         THEME.lane_xmr,
         "XMR · RandomX",
         &format!("· CPU · {} threads", app.device.as_ref().map(|d| d.logical_cores).unwrap_or(0)),
-        if mining { Some(app.hr_display_khs) } else { None },
-        (a, r),
-        mining,
+        if xmr_active { Some(app.hr_display_khs) } else { None },
+        if xmr_active { (a, r) } else { (0, 0) },
+        xmr_active,
     );
-    lane_row(ui, THEME.lane_gpu, "RVN · KawPoW", "· GPU · idle (M3)", None, (0, 0), false);
+    // The RVN row reflects the device's lane viability honestly: "available" on
+    // an NVIDIA box, "coming soon" on AMD, "needs NVIDIA" on Apple/CPU-only.
+    let rvn_role = match app.lane_support(Lane::GpuRvn) {
+        LaneSupport::Viable => "· GPU · NVIDIA · ready",
+        LaneSupport::ComingSoon => "· GPU · AMD · coming soon",
+        LaneSupport::Unavailable => "· GPU · needs NVIDIA",
+    };
+    lane_row(
+        ui,
+        THEME.lane_gpu,
+        "RVN · KawPoW",
+        rvn_role,
+        if rvn_active { Some(app.hr_display_khs) } else { None },
+        if rvn_active { (a, r) } else { (0, 0) },
+        rvn_active,
+    );
 
     // ── Connection ─────────────────────────────────────────────────────────────
     ui.add_space(22.0);
@@ -429,8 +449,9 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                     let n = app.device.as_ref().map(|d| d.logical_cores).unwrap_or(0);
                     ui.label(widgets::mono(format!("{n} threads"), 13.0, THEME.text));
                 });
-                srow(ui, "Lane", "Auto picks the best lane for your device. XMR uses the CPU (RandomX).", |ui| {
-                    widgets::chip(ui, Some(THEME.lane_xmr), "XMR · RandomX");
+                srow(ui, "Lane", "Auto picks the best lane for your device. XMR uses the CPU (RandomX); RVN uses an NVIDIA GPU (KawPoW).", |ui| {
+                    let lane = app.active_lane();
+                    widgets::chip(ui, Some(lane_accent(lane)), lane_chip_label(lane));
                 });
             });
 

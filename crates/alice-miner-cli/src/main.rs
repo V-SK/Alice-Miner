@@ -60,7 +60,8 @@ struct IdentityArgs {
 
 #[derive(clap::Args)]
 struct StartArgs {
-    /// Which lane to mine. M1 supports `xmr`.
+    /// Which lane to mine: `xmr` (CPU/RandomX), `gpu`/`rvn` (NVIDIA/KawPoW), or
+    /// `auto` (the recommended lane for this device).
     #[arg(long, default_value = "xmr")]
     lane: String,
     /// Override the reward address (defaults to the active `~/.alice` identity).
@@ -104,8 +105,23 @@ fn cmd_detect() -> i32 {
             if !p.cpu_model.is_empty() {
                 println!("  cpu_model:     {}", p.cpu_model);
             }
+            println!("  gpu:           {}", fmt_gpu(&p.gpu));
+            println!("  memory_gb:     {}", p.memory_gb);
             if !p.warnings.is_empty() {
                 println!("  warnings:      {}", p.warnings.join(", "));
+            }
+            // The lane-viability matrix (which lanes this device can run).
+            let cap = alice_miner_core::CapabilityProfile::from_profile(p.clone());
+            println!("Lanes:");
+            for lane in alice_miner_core::detect::capability::ALL_LANES {
+                let support = cap.support(lane);
+                let marker = if lane == cap.recommended_lane() { " (recommended)" } else { "" };
+                println!(
+                    "  {:<10} {}{}",
+                    lane.label(),
+                    support.label(),
+                    marker
+                );
             }
             engine.shutdown();
             0
@@ -203,15 +219,29 @@ fn cmd_identity(args: IdentityArgs) -> i32 {
 fn cmd_start(args: StartArgs) -> i32 {
     let lane = match args.lane.to_ascii_lowercase().as_str() {
         "xmr" | "cpu" => Lane::Xmr,
-        "gpu" | "rvn" => {
-            eprintln!("error: the GPU-RVN lane is not available in this build (M3)");
-            return 2;
+        "gpu" | "rvn" => Lane::GpuRvn,
+        "auto" => {
+            // Pick the recommended lane for this device (RVN on NVIDIA, else XMR).
+            alice_miner_core::CapabilityProfile::detect().recommended_lane()
         }
         other => {
-            eprintln!("error: unknown lane `{other}` (M1 supports `xmr`)");
+            eprintln!("error: unknown lane `{other}` (use xmr | gpu | auto)");
             return 2;
         }
     };
+    // If the chosen lane isn't runnable on this device, say so up front (the
+    // engine would also error, but a clear pre-flight message is friendlier).
+    let cap = alice_miner_core::CapabilityProfile::detect();
+    if !cap.support(lane).is_runnable() {
+        eprintln!(
+            "error: the {} lane is {} on this device ({}). Recommended lane: {}.",
+            lane.label(),
+            cap.support(lane).label(),
+            cap.viability.reason(lane).unwrap_or("not viable"),
+            cap.recommended_lane().label(),
+        );
+        return 2;
+    }
 
     let engine = match EngineHandle::spawn() {
         Ok(e) => e,
@@ -318,6 +348,24 @@ fn print_snapshot(snap: &alice_miner_core::Snapshot) {
             .map(|l| format!("  | {l}"))
             .unwrap_or_default(),
     );
+}
+
+/// Human-friendly one-line GPU description for `detect` (model + VRAM, or the
+/// vendor when no model was probed; `none` when CPU-only).
+fn fmt_gpu(gpu: &alice_miner_core::GpuInfo) -> String {
+    use alice_miner_core::GpuVendor;
+    match gpu.vendor {
+        GpuVendor::None => "none (CPU-only)".to_string(),
+        GpuVendor::Nvidia => {
+            if gpu.vram_gb > 0 {
+                format!("{} · {} GB VRAM", gpu.model, gpu.vram_gb)
+            } else {
+                gpu.model.clone()
+            }
+        }
+        GpuVendor::Amd => format!("{} (lane coming soon)", gpu.model),
+        GpuVendor::Apple => format!("{} (unified memory)", gpu.model),
+    }
 }
 
 /// Resolve a keystore passphrase: use the flag if given, else prompt securely.

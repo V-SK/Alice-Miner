@@ -5,10 +5,14 @@
 //! a [`engine::Command`]/[`engine::Event`] channel pair, so the two can never
 //! drift (PLAN §2.2).
 //!
-//! M1a modules:
-//!   * [`detect`]     — fail-safe device probe → [`detect::DeviceProfile`]
+//! Modules:
+//!   * [`detect`]     — fail-safe device probe → [`detect::DeviceProfile`] +
+//!     [`detect::capability::CapabilityProfile`] (the M3 lane-viability matrix:
+//!     NVIDIA/AMD/Apple/CPU detection → which lanes are runnable)
 //!   * [`identity`]   — create/import/paste + the `~/.alice/identity.json` pointer
-//!   * [`lane`]       — per-lane launch plans (M1: [`lane::xmr`], the proven path)
+//!   * [`lane`]       — per-lane launch plans ([`lane::xmr`] proven path +
+//!     [`lane::gpu_rvn`] KawPoW/RVN, M3)
+//!   * [`stats`]      — per-lane log parsers ([`stats::parse_kawpow`], M3)
 //!   * [`binaries`]   — resolve the bundled engine (sibling-of-exe + dev fallback)
 //!   * [`supervise`]  — [`supervise::LaneSupervisor`]: one supervised child + stats
 //!   * [`engine`]     — the worker-thread engine + the credit-only [`engine::Snapshot`]
@@ -31,10 +35,12 @@ pub mod detect;
 pub mod engine;
 pub mod identity;
 pub mod lane;
+pub mod stats;
 pub mod supervise;
 
 // Convenient top-level re-exports for the front-ends.
-pub use detect::{DeviceProfile, OsFamily};
+pub use detect::capability::{CapabilityProfile, LaneSupport, LaneViability};
+pub use detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
 pub use engine::{Command, EngineHandle, EngineState, Event, IdentitySpec, Snapshot};
 pub use identity::{Identity, IdentityPointer};
 pub use lane::Lane;

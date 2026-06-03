@@ -26,8 +26,8 @@ use tokio::sync::mpsc::unbounded_channel;
 use alice_supervise::child::{spawn_supervised, LogLine, OwnedChild};
 use alice_supervise::{sanitize_log_line, ProcState};
 
-use crate::lane::xmr::MinerLaunchPlan;
 use crate::lane::Lane;
+use crate::stats::parse_kawpow;
 
 /// Grace period for a graceful miner stop before SIGKILL (verbatim from Wallet).
 const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -157,11 +157,13 @@ impl LaneSupervisor {
         self.inner.lock().expect("mutex").pid
     }
 
-    /// Start the lane from a validated launch plan. MUST be called inside a
-    /// tokio runtime context (it spawns child I/O tasks) — the engine enters the
-    /// runtime before calling. Resets the per-run stats counters. (Logic
-    /// verbatim from the Wallet `MinerSupervisor::start`.)
-    pub fn start(&self, plan: MinerLaunchPlan) -> Result<(), String> {
+    /// Start the lane from a validated `(program, args)` launch plan (lane-agnostic
+    /// — the XMR lane passes `MinerLaunchPlan`, the GPU lane passes `GpuLaunchPlan`,
+    /// each destructured to its program + args by the engine). MUST be called
+    /// inside a tokio runtime context (it spawns child I/O tasks) — the engine
+    /// enters the runtime before calling. Resets the per-run stats counters.
+    /// (Logic verbatim from the Wallet `MinerSupervisor::start`.)
+    pub fn start(&self, program: std::path::PathBuf, args: Vec<String>) -> Result<(), String> {
         let gen = {
             let mut g = self.inner.lock().expect("mutex");
             if matches!(
@@ -185,7 +187,7 @@ impl LaneSupervisor {
 
         let (log_tx, mut log_rx) = unbounded_channel::<LogLine>();
         // No extra env, no PID file — the miner is fully ephemeral.
-        let owned = match spawn_supervised(&plan.program, &plan.args, &[], None, log_tx) {
+        let owned = match spawn_supervised(&program, &args, &[], None, log_tx) {
             Ok(c) => c,
             Err(e) => {
                 let mut g = self.inner.lock().expect("mutex");
@@ -202,15 +204,16 @@ impl LaneSupervisor {
             g.state = ProcState::Running;
         }
 
-        // Log pump → parse hashrate / shares into the snapshot.
+        // Log pump → parse hashrate / shares into the snapshot (per-lane parser).
         let inner_for_logs = self.inner.clone();
+        let lane = self.lane;
         tokio::spawn(async move {
             while let Some(line) = log_rx.recv().await {
                 let mut g = inner_for_logs.lock().expect("mutex");
                 if g.generation != gen {
                     break; // superseded by a newer run
                 }
-                apply_log_line(&mut g, &line.text);
+                apply_log_line(&mut g, lane, &line.text);
             }
         });
 
@@ -276,19 +279,39 @@ impl LaneSupervisor {
     }
 }
 
-/// Update the snapshot from one raw engine output line: parse hashrate + shares.
-/// (Verbatim from the Wallet `apply_log_line`.)
-fn apply_log_line(g: &mut Inner, raw: &str) {
+/// Update the snapshot from one raw engine output line, dispatching to the
+/// PER-LANE parser: the XMR/RandomX line parsers ([`parse_hashrate_hs`] /
+/// [`parse_share_counts`], verbatim from the Wallet) for [`Lane::Xmr`], and the
+/// generalized KawPoW parser ([`crate::stats::parse_kawpow`], tolerating both
+/// kawpowminer and T-Rex) for [`Lane::GpuRvn`]. Both yield hashrate in H/s +
+/// cumulative accepted/rejected shares, so the [`LaneStats`] shape is identical
+/// across lanes.
+fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
     let line = sanitize_log_line(raw);
     if line.is_empty() {
         return;
     }
-    if let Some(hr) = parse_hashrate_hs(&line) {
-        g.hashrate_hs = Some(hr);
-    }
-    if let Some((accepted, rejected)) = parse_share_counts(&line) {
-        g.accepted = accepted;
-        g.rejected = rejected;
+    match lane {
+        Lane::Xmr => {
+            if let Some(hr) = parse_hashrate_hs(&line) {
+                g.hashrate_hs = Some(hr);
+            }
+            if let Some((accepted, rejected)) = parse_share_counts(&line) {
+                g.accepted = accepted;
+                g.rejected = rejected;
+            }
+        }
+        Lane::GpuRvn => {
+            if let Some(sample) = parse_kawpow(&line) {
+                if let Some(hr) = sample.hashrate_hs {
+                    g.hashrate_hs = Some(hr);
+                }
+                if let (Some(a), Some(r)) = (sample.accepted, sample.rejected) {
+                    g.accepted = a;
+                    g.rejected = r;
+                }
+            }
+        }
     }
     g.last_line = line;
 }
@@ -404,14 +427,33 @@ mod tests {
         let s = LaneSupervisor::new(Lane::Xmr);
         {
             let mut g = s.inner.lock().unwrap();
-            apply_log_line(&mut g, "\u{1b}[1;32maccepted\u{1b}[0m (7/1) diff 900 (40 ms)");
-            apply_log_line(&mut g, "miner    speed 10s/60s/15m 555.5 540.0 n/a H/s");
+            apply_log_line(&mut g, Lane::Xmr, "\u{1b}[1;32maccepted\u{1b}[0m (7/1) diff 900 (40 ms)");
+            apply_log_line(&mut g, Lane::Xmr, "miner    speed 10s/60s/15m 555.5 540.0 n/a H/s");
         }
         let st = s.stats();
         assert_eq!(st.accepted, 7);
         assert_eq!(st.rejected, 1);
         assert_eq!(st.hashrate_hs, Some(555.5));
         assert!(!st.last_line.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn apply_log_line_uses_kawpow_parser_on_gpu_lane() {
+        // The GPU lane routes lines through `parse_kawpow` (MH/s → H/s + shares).
+        let s = LaneSupervisor::new(Lane::GpuRvn);
+        {
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(
+                &mut g,
+                Lane::GpuRvn,
+                "m 12:01:42 kawpowminer Speed 25.43 Mh/s gpu0 [A4+0:R0+0:F0]",
+            );
+        }
+        let st = s.stats();
+        assert_eq!(st.lane, Lane::GpuRvn);
+        assert_eq!(st.hashrate_hs, Some(25_430_000.0));
+        assert_eq!(st.accepted, 4);
+        assert_eq!(st.rejected, 0);
     }
 
     #[cfg(unix)]
@@ -421,17 +463,15 @@ mod tests {
         rt.block_on(async {
             // Stand-in "miner": emit an accepted-share line + a speed line then
             // idle, so we observe Running + parsed stats, then stop cleanly.
-            let plan = MinerLaunchPlan {
-                program: std::path::PathBuf::from("/bin/sh"),
-                args: vec![
-                    "-c".into(),
-                    "echo 'net      accepted (3/0) diff 100 (10 ms)'; \
-                     echo 'miner    speed 10s/60s/15m 42.0 40.0 n/a H/s'; sleep 10"
-                        .into(),
-                ],
-            };
+            let program = std::path::PathBuf::from("/bin/sh");
+            let args = vec![
+                "-c".into(),
+                "echo 'net      accepted (3/0) diff 100 (10 ms)'; \
+                 echo 'miner    speed 10s/60s/15m 42.0 40.0 n/a H/s'; sleep 10"
+                    .into(),
+            ];
             let s = LaneSupervisor::new(Lane::Xmr);
-            s.start(plan).expect("start");
+            s.start(program, args).expect("start");
             assert!(s.is_active());
 
             let mut saw = false;
@@ -462,15 +502,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn gpu_lane_start_parses_kawpow_then_stops() {
+        let rt = rt();
+        rt.block_on(async {
+            // Stand-in kawpowminer: emit a Speed line with a share block, then idle.
+            let program = std::path::PathBuf::from("/bin/sh");
+            let args = vec![
+                "-c".into(),
+                "echo 'm 12:01:42 kawpowminer Speed 30.00 Mh/s gpu0 [A9+0:R1+0:F0]'; sleep 10"
+                    .into(),
+            ];
+            let s = LaneSupervisor::new(Lane::GpuRvn);
+            s.start(program, args).expect("start");
+            assert!(s.is_active());
+
+            let mut saw = false;
+            for _ in 0..30 {
+                let st = s.stats();
+                if st.accepted == 9 && st.hashrate_hs == Some(30_000_000.0) {
+                    saw = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(saw, "expected parsed kawpow hashrate + shares on the GPU lane");
+            assert_eq!(s.stats().rejected, 1);
+
+            s.request_stop();
+            let mut stopped = false;
+            for _ in 0..40 {
+                if s.stats().state == ProcState::Stopped {
+                    stopped = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(stopped, "GPU lane should reach Stopped after request_stop");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unexpected_exit_lands_in_error_not_restart_loop() {
         let rt = rt();
         rt.block_on(async {
-            let plan = MinerLaunchPlan {
-                program: std::path::PathBuf::from("/bin/sh"),
-                args: vec!["-c".into(), "echo starting; exit 1".into()],
-            };
+            let program = std::path::PathBuf::from("/bin/sh");
+            let args = vec!["-c".into(), "echo starting; exit 1".into()];
             let s = LaneSupervisor::new(Lane::Xmr);
-            s.start(plan).expect("start");
+            s.start(program, args).expect("start");
             let mut reached_error = false;
             for _ in 0..40 {
                 if s.stats().state == ProcState::Error {

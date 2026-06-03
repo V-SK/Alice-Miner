@@ -25,7 +25,7 @@ use tokio::runtime::Runtime;
 
 use crate::detect::DeviceProfile;
 use crate::identity::{self, Identity};
-use crate::lane::xmr;
+use crate::lane::{gpu_rvn, xmr};
 use crate::lane::Lane;
 use crate::supervise::LaneSupervisor;
 
@@ -390,16 +390,30 @@ fn start_lane(
     address: &str,
     supervisor: &mut Option<LaneSupervisor>,
 ) -> Result<(String, String), String> {
-    let (plan, endpoint, worker_id) = match lane {
+    let (program, args, endpoint, worker_id) = match lane {
         Lane::Xmr => {
             let program = crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::CpuXmr)?;
             let plan = xmr::build_miner_launch_plan(program, address)?;
             let endpoint = format!("{}:{}", xmr::ALICE_POOL_HOST, xmr::ALICE_POOL_PORT);
             let worker_id = xmr::derive_worker_id(address)?;
-            (plan, endpoint, worker_id)
+            (plan.program, plan.args, endpoint, worker_id)
         }
         Lane::GpuRvn => {
-            return Err("GPU-RVN lane is not available in this build (M3)".into());
+            // Resolve the bundled KawPowMiner (env override → sibling →
+            // release-assets). If it's absent the resolver returns a clear
+            // "GPU miner not installed" error and we land in Error — NOT a panic.
+            // T-Rex is supported only via the `ALICE_MINER_GPU_BIN` override; we
+            // detect that the override points at a T-Rex binary by its filename so
+            // the correct arg shape is built.
+            let program = crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::GpuRvn)?;
+            let plan = if is_trex_binary(&program) {
+                gpu_rvn::build_trex_launch_plan(program, address)?
+            } else {
+                gpu_rvn::build_kawpowminer_launch_plan(program, address)?
+            };
+            let endpoint = format!("{}:{}", gpu_rvn::ALICE_POOL_HOST, gpu_rvn::ALICE_POOL_PORT);
+            let worker_id = xmr::derive_worker_id(address)?; // one worker-id fn for both lanes
+            (plan.program, plan.args, endpoint, worker_id)
         }
     };
 
@@ -422,8 +436,23 @@ fn start_lane(
     // Enter the runtime before start() — it spawns tokio child-I/O tasks (the
     // exact Wallet pattern: `let _guard = rt.enter();` before `sup.start(...)`).
     let _guard = rt.enter();
-    sup.start(plan)?;
+    sup.start(program, args)?;
     Ok((endpoint, worker_id))
+}
+
+/// Heuristic: does this resolved GPU-miner path look like T-Rex (so the engine
+/// builds the T-Rex `-a kawpow -o -u -p -w` arg shape) rather than the bundled
+/// kawpowminer (the ethminer-style `-P` URL)? Only reachable via the
+/// `ALICE_MINER_GPU_BIN` override (the bundled binary is always kawpowminer).
+fn is_trex_binary(program: &std::path::Path) -> bool {
+    program
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| {
+            let n = n.to_ascii_lowercase();
+            n.contains("t-rex") || n.contains("trex")
+        })
+        .unwrap_or(false)
 }
 
 /// Assemble a [`Snapshot`] from the current engine state + the supervisor's

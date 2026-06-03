@@ -1,23 +1,29 @@
 //! `core/binaries` — resolve the bundled miner engine on disk.
 //!
 //! Generalizes `alice-wallet/gui/src/node.rs::resolve_miner_binary` over a
-//! [`MinerKind`] (M1 = `CpuXmr`; `GpuRvn` is M3). Resolution order mirrors the
-//! Wallet:
-//!   1. an explicit `ALICE_MINER_<KIND>_BIN` env override (tests / advanced);
+//! [`MinerKind`] (`CpuXmr` = xmrig; `GpuRvn` = kawpowminer, M3). Resolution order
+//! mirrors the Wallet:
+//!   1. an explicit `ALICE_MINER_<KIND>_BIN` env override (tests / advanced;
+//!      `ALICE_MINER_GPU_BIN` also selects T-Rex over the bundled kawpowminer);
 //!   2. a **sibling of this executable** (the packaged layout: the engine ships
-//!      next to the binary — `…/MacOS/xmrig`, `…/AliceMiner/xmrig`, …);
+//!      next to the binary — `…/MacOS/xmrig`, `…/AliceMiner/kawpowminer`, …);
 //!   3. **dev fallback** (debug builds only): the committed asset under
 //!      `release-assets/<target-triple>/<filename>` relative to this crate's
 //!      `CARGO_MANIFEST_DIR`, so `cargo run`/`cargo test` works in a checkout
 //!      without packaging.
-//! Returns `Ok(path)` only when the file actually exists.
+//!
+//! Returns `Ok(path)` only when the file actually exists; otherwise a clear,
+//! kind-specific "not installed" error (the GPU lane uses this to stay
+//! gracefully unavailable — see [`resolve_miner_binary`]). **Never panics.**
 
 #![allow(dead_code)]
 
 use std::path::PathBuf;
 
-/// The bundled engine kinds. M1 builds only [`MinerKind::CpuXmr`]; the GPU lane
-/// is declared for forward-compatibility (M3) but has no bundled binary yet.
+/// The bundled engine kinds. [`MinerKind::CpuXmr`] = xmrig (the proven CPU lane);
+/// [`MinerKind::GpuRvn`] = kawpowminer (the M3 GPU lane). The kawpowminer binary
+/// is obtained at packaging (M7) — until then `resolve_miner_binary` fails
+/// gracefully with a "GPU miner not installed" status (no panic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MinerKind {
     CpuXmr,
@@ -115,11 +121,23 @@ pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
         }
     }
 
-    Err(format!(
-        "miner binary not bundled (expected `{}` beside the executable at {}).",
-        kind.binary_name(),
-        candidate.display()
-    ))
+    // Graceful, kind-specific "not installed" status (NEVER a panic). The GPU
+    // lane in particular ships no bundled binary on this dev machine, so the lane
+    // must surface a clear, user-facing reason and stay unavailable.
+    Err(match kind {
+        MinerKind::CpuXmr => format!(
+            "CPU miner not installed (expected `{}` beside the executable at {}).",
+            kind.binary_name(),
+            candidate.display()
+        ),
+        MinerKind::GpuRvn => format!(
+            "GPU miner not installed: the KawPowMiner engine `{}` was not found \
+             (set {} to a kawpowminer/T-Rex binary, or install the bundled engine). \
+             The RVN lane stays unavailable.",
+            kind.binary_name(),
+            kind.env_override(),
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -169,5 +187,44 @@ mod tests {
         assert!(resolved.is_file());
         assert_eq!(resolved.file_name().unwrap(), "xmrig");
         assert!(resolved.to_string_lossy().contains("aarch64-apple-darwin"));
+    }
+
+    #[test]
+    fn gpu_kind_has_distinct_binary_name_and_override() {
+        // kawpowminer (not xmrig) + its own env override.
+        assert_eq!(MinerKind::GpuRvn.binary_name(), KAWPOW_BINARY_NAME);
+        assert!(MinerKind::GpuRvn.binary_name().starts_with("kawpowminer"));
+        assert_eq!(MinerKind::GpuRvn.env_override(), "ALICE_MINER_GPU_BIN");
+        assert_ne!(MinerKind::GpuRvn.binary_name(), MinerKind::CpuXmr.binary_name());
+    }
+
+    #[test]
+    fn gpu_resolution_without_binary_fails_gracefully_not_panic() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // No override, and no bundled kawpowminer on this dev machine (none is
+        // committed) → a clear "GPU miner not installed" error, NOT a panic.
+        std::env::remove_var(MinerKind::GpuRvn.env_override());
+        let err = resolve_miner_binary(MinerKind::GpuRvn).expect_err("no GPU binary on this box");
+        assert!(
+            err.contains("GPU miner not installed"),
+            "expected a clear GPU-not-installed status, got: {err}"
+        );
+        // The message tells the user the override knob + that the lane stays off.
+        assert!(err.contains("ALICE_MINER_GPU_BIN"));
+        assert!(err.contains("unavailable"));
+    }
+
+    #[test]
+    fn gpu_env_override_to_existing_file_is_honored() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The override path (e.g. a user-supplied kawpowminer / T-Rex) resolves.
+        let tmp =
+            std::env::temp_dir().join(format!("alice-miner-gpustub-{}", std::process::id()));
+        std::fs::write(&tmp, b"#!/bin/sh\n").unwrap();
+        std::env::set_var(MinerKind::GpuRvn.env_override(), &tmp);
+        let resolved = resolve_miner_binary(MinerKind::GpuRvn).expect("override resolves");
+        assert_eq!(resolved, tmp);
+        std::env::remove_var(MinerKind::GpuRvn.env_override());
+        let _ = std::fs::remove_file(&tmp);
     }
 }
