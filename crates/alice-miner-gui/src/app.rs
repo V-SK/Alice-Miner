@@ -78,6 +78,11 @@ pub struct MinerApp {
     pub copied_at: Option<Instant>,
     /// Language toggle (display-only; copy is bilingual already).
     pub lang_zh: bool,
+
+    /// Headless screenshot-mode driver. `None` on every normal run; `Some` only
+    /// when `ALICE_MINER_SHOT_DIR` is set (see [`crate::shot`]). When set, the
+    /// `ui()` loop is driven by the shot state machine instead of the engine.
+    pub shot: Option<crate::shot::ShotRunner>,
 }
 
 impl MinerApp {
@@ -114,6 +119,7 @@ impl MinerApp {
             last_spark_push: None,
             copied_at: None,
             lang_zh: false,
+            shot: crate::shot::ShotRunner::from_env(),
         })
     }
 
@@ -342,6 +348,15 @@ impl eframe::App for MinerApp {
     fn ui(&mut self, ui_root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui_root.ctx().clone();
         ui::theme::apply_style(&ctx);
+        if self.shot.is_some() {
+            // Screenshot mode: the shot state machine poses the app + captures;
+            // we skip draining real engine events so the injected demo snapshot
+            // is not clobbered. `tick_anim` still runs for the breathing glow.
+            crate::shot::drive(self, &ctx);
+            self.tick_anim(&ctx);
+            ui::chrome::render(ui_root, self);
+            return;
+        }
         self.drain_events();
         self.tick_anim(&ctx);
         ui::chrome::render(ui_root, self);

@@ -13,6 +13,7 @@
 //! `alice-wallet/gui/src/main.rs` (~L52).
 
 mod app;
+mod shot;
 mod ui;
 
 use eframe::egui::IconData;
@@ -40,8 +41,16 @@ fn load_icon() -> Option<IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    // Shot mode frames to the mockup size (~1040×720) so captures match; normal
+    // runs keep the default size. (Only the inner size changes — the custom
+    // titlebar + rail still render so the screenshot reflects the real chrome.)
+    let inner_size = if std::env::var_os("ALICE_MINER_SHOT_DIR").is_some() {
+        shot::ShotRunner::window_size()
+    } else {
+        [1040.0, 760.0]
+    };
     let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_inner_size([1040.0, 760.0])
+        .with_inner_size(inner_size)
         .with_min_inner_size([920.0, 660.0])
         .with_title("Alice Miner")
         // Draw our own dark header flush to the window top instead of a
