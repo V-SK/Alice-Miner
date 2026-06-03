@@ -220,9 +220,8 @@ pub fn apply_style(ctx: &egui::Context) {
 
 /// Paint the page atmosphere: the near-black base + a faint warm aura at the top
 /// and a cool aura bottom-right, transcribing the mockup `body` radial stack
-/// (EGUI-FLAG[atmosphere-OK]). egui can't do true radial gradients on a rect, so
-/// we approximate each aura with a small stack of concentric translucent circles
-/// (a hand-rolled radial), which reads ~identical for a soft glow pad.
+/// (EGUI-FLAG[atmosphere-OK]). The auras are smooth radial [`egui::Mesh`] fans
+/// (see [`radial_glow`]) so there is no concentric banding.
 pub fn paint_backdrop(painter: &egui::Painter, rect: egui::Rect) {
     let t = THEME;
     painter.rect_filled(rect, 0.0, t.bg);
@@ -244,9 +243,11 @@ pub fn paint_backdrop(painter: &egui::Painter, rect: egui::Rect) {
     );
 }
 
-/// A soft additive radial glow approximated by N concentric translucent circles
-/// (outer→inner, alpha ramping up). egui has no blur / radial Rect fill, so this
-/// is the documented stand-in (mockup EGUI-REPRODUCIBILITY note #1/#3).
+/// A smooth additive radial glow drawn as a triangle-fan [`egui::Mesh`]: ONE
+/// center vertex at full `color`·`peak_alpha`, and a rim of vertices at alpha 0.
+/// The GPU interpolates a clean radial gradient, so there is NO concentric
+/// banding (the documented egui way; mockup EGUI-FLAG[atmosphere-OK] "radial
+/// Mesh fill"). Replaces the old stacked-circles approximation which banded.
 pub fn radial_glow(
     painter: &egui::Painter,
     center: egui::Pos2,
@@ -254,19 +255,31 @@ pub fn radial_glow(
     color: Color32,
     peak_alpha: u8,
 ) {
-    let steps = 26;
-    for i in 0..steps {
-        let f = i as f32 / steps as f32; // 0 outer .. 1 inner
-        let r = radius * (1.0 - f);
-        // Ease the alpha so the falloff is smooth (quadratic), like a gaussian-ish pad.
-        let a = (peak_alpha as f32 * f * f).round() as u8;
-        if a == 0 || r <= 0.0 {
-            continue;
-        }
-        painter.circle_filled(
-            center,
-            r,
-            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a),
-        );
+    if peak_alpha == 0 || radius <= 0.0 {
+        return;
     }
+    const RIM: usize = 56;
+    let mut mesh = egui::Mesh::default();
+    // Center vertex: full warm colour at the peak alpha.
+    let core = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), peak_alpha);
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: center,
+        uv: egui::epaint::WHITE_UV,
+        color: core,
+    });
+    // Rim vertices: same hue, alpha 0 → premultiplied (0,0,0,0), a clean fade to
+    // true transparency at the edge (no dark fringe).
+    let transparent = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 0);
+    for i in 0..=RIM {
+        let a = (i as f32 / RIM as f32) * std::f32::consts::TAU;
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(center.x + a.cos() * radius, center.y + a.sin() * radius),
+            uv: egui::epaint::WHITE_UV,
+            color: transparent,
+        });
+    }
+    for i in 1..=RIM as u32 {
+        mesh.add_triangle(0, i, i + 1);
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }

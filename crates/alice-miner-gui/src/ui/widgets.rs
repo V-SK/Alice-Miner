@@ -303,6 +303,13 @@ pub fn stat_card(
         .stroke(Stroke::new(1.0, t.line_strong))
         .show(ui, |ui| {
             ui.set_width(width);
+            // WRAP (don't extend) so a long label/value/meta can never widen the
+            // card past `width` in a horizontal grid — it wraps to a second line
+            // instead, so text (incl. the honesty-critical "pending") is always
+            // fully visible and the card footprint stays `width + inner_margin`.
+            // (egui labels otherwise EXTEND inside a horizontal-ancestor layout,
+            // which was letting "Est. rewards" balloon and clip off the right.)
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.label(
                 RichText::new(label.to_uppercase())
                     .size(10.0)

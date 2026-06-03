@@ -99,12 +99,12 @@ impl ShotRunner {
         })
     }
 
-    /// The window size to request in shot mode. Taller than the mockup framing so
-    /// the FULL hero card (hero orb + readout + identity row + footer) and the
-    /// onboarding wizards are captured without clipping — the screenshots are a
-    /// faithful, complete render of each screen.
+    /// The window size to request in shot mode — the SAME as the real default
+    /// (see `main.rs`), so the captures show exactly what the owner sees on first
+    /// run. The scroll areas in each screen body guarantee nothing clips at this
+    /// size (or at the smaller `min_inner_size`).
     pub fn window_size() -> [f32; 2] {
-        [1040.0, 820.0]
+        [1120.0, 800.0]
     }
 }
 

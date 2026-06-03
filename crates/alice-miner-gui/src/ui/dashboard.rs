@@ -12,23 +12,39 @@ use super::theme::THEME;
 use super::widgets::{self, Tone};
 use crate::app::MinerApp;
 
+/// One boxed stat-card painter, so the grid can lay the four cards out in either
+/// one row of four or two rows of two without duplicating their bodies.
+type CardFn<'a> = Box<dyn Fn(&mut egui::Ui) + 'a>;
+
 pub fn render(ui: &mut egui::Ui, app: &mut MinerApp) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.add_space(22.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), ui.available_height()),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.set_max_width(1000.0);
-                    ui.add_space(0.0);
-                    let pad = ((ui.available_width() - 1000.0_f32.min(ui.available_width())) * 0.0).max(0.0);
-                    ui.add_space(pad);
-                    dashboard_inner(ui, app);
-                    ui.add_space(28.0);
-                },
-            );
+            // A 26px side inset (mockup `.dash` padding) + 22/28 top/bottom, applied
+            // via a frame so the CONTENT width below is exact (no edge-to-edge spill
+            // and no scrollbar-gutter ambiguity). Content is capped at 1000px and
+            // left-indented to centre it so it never feels stretched on a wide
+            // monitor; `dashboard_inner` computes the grid against `content_w`.
+            egui::Frame::NONE
+                .inner_margin(egui::Margin { left: 26, right: 26, top: 22, bottom: 28 })
+                .show(ui, |ui| {
+                    let avail = ui.available_width();
+                    let content_w = avail.min(1000.0);
+                    let indent = ((avail - content_w) * 0.5).max(0.0);
+                    ui.horizontal(|ui| {
+                        if indent > 0.0 {
+                            ui.add_space(indent);
+                        }
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(content_w, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_max_width(content_w);
+                                dashboard_inner(ui, app);
+                            },
+                        );
+                    });
+                });
         });
 }
 
@@ -82,75 +98,128 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     ui.add_space(18.0);
 
     // ── Stat grid (4 cards) ───────────────────────────────────────────────────
+    // Reflows 1×4 → 2×2 when 4 cards would get too narrow (mockup
+    // `@media(max-width:760px){repeat(2,1fr)}`), so all 4 — especially
+    // "Est. rewards · pending" (honesty-critical) — are ALWAYS fully visible and
+    // never spill past the right edge. The per-card frame inner margin (32px) is
+    // subtracted so the CONTENT width passed to `stat_card` keeps the OUTER card
+    // (content + margin) inside the available width.
     let total_w = ui.available_width();
     let gap = 13.0;
-    let card_w = ((total_w - gap * 3.0) / 4.0).max(120.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
+    // Per-card chrome eaten OUTSIDE the content width: 32px inner margin (16 each
+    // side) + ~8px stroke/rounding/rounding-to-pixel slack measured empirically.
+    // Subtracting the full budget keeps the OUTER card footprint inside `total_w`
+    // so the row can never spill past the right edge (was clipping "Est. rewards").
+    const CARD_CHROME_X: f32 = 40.0;
+    /// Minimum comfortable CONTENT width before we wrap to two rows (enough for
+    /// the "— pending" value + its "待发放 · rate pending" meta to read cleanly).
+    const MIN_CARD_CONTENT: f32 = 172.0;
+    let four_up_content = (total_w - gap * 3.0) / 4.0 - CARD_CHROME_X;
+    let two_up = four_up_content < MIN_CARD_CONTENT;
+    let cols = if two_up { 2.0 } else { 4.0 };
+    // Floor so rounding never pushes the summed row past `total_w`.
+    let card_w = (((total_w - gap * (cols - 1.0)) / cols - CARD_CHROME_X).floor()).max(96.0);
 
+    let spark: Vec<f32> = app.spark.iter().cloned().collect();
+    // The four card painters, in order. Boxed so we can lay them out in either
+    // one row of four or two rows of two without duplicating the bodies.
+    let hr_val = if mining {
+        widgets::mono(format!("{:.2}", app.hr_display_khs), 25.0, THEME.text).strong()
+    } else {
+        widgets::mono("—", 25.0, THEME.text3)
+    };
+    let pct = if a + r > 0 {
+        format!("{:.1}", a as f64 / (a + r) as f64 * 100.0)
+    } else {
+        "—".to_string()
+    };
+    let cards: Vec<CardFn> = vec![
         // Hashrate (accent, with sparkline).
-        let hr_val = if mining {
-            widgets::mono(format!("{:.2}", app.hr_display_khs), 25.0, THEME.text).strong()
-        } else {
-            widgets::mono("—", 25.0, THEME.text3)
-        };
-        let spark: Vec<f32> = app.spark.iter().cloned().collect();
-        let spark_ref = &spark;
-        widgets::stat_card(
-            ui,
-            card_w,
-            "Hashrate",
-            hr_val,
-            None,
-            Some(THEME.lane_xmr),
-            Some(&move |ui: &mut egui::Ui| {
-                if spark_ref.is_empty() {
-                    ui.label(RichText::new("kH/s").size(11.0).color(THEME.text3));
-                } else {
-                    widgets::sparkline(ui, spark_ref, ui.available_width().min(card_w - 4.0), 26.0);
-                }
-            }),
-        );
-
+        Box::new({
+            let spark = spark.clone();
+            let hr_val = hr_val.clone();
+            move |ui: &mut egui::Ui| {
+                let spark_ref = &spark;
+                widgets::stat_card(
+                    ui,
+                    card_w,
+                    "Hashrate",
+                    hr_val.clone(),
+                    None,
+                    Some(THEME.lane_xmr),
+                    Some(&move |ui: &mut egui::Ui| {
+                        if spark_ref.is_empty() {
+                            ui.label(RichText::new("kH/s").size(11.0).color(THEME.text3));
+                        } else {
+                            widgets::sparkline(ui, spark_ref, ui.available_width().min(card_w - 4.0), 26.0);
+                        }
+                    }),
+                );
+            }
+        }),
         // Shares A / R.
-        let shares_val = widgets::mono(format!("{a}"), 25.0, THEME.text).strong();
-        widgets::stat_card(
-            ui,
-            card_w,
-            "Shares A / R",
-            shares_val,
-            Some(widgets::mono(format!("/ {r} rejected"), 11.5, THEME.text3)),
-            None,
-            None,
-        );
-
+        Box::new(move |ui: &mut egui::Ui| {
+            widgets::stat_card(
+                ui,
+                card_w,
+                "Shares A / R",
+                widgets::mono(format!("{a}"), 25.0, THEME.text).strong(),
+                Some(widgets::mono(format!("/ {r} rejected"), 11.5, THEME.text3)),
+                None,
+                None,
+            );
+        }),
         // Accepted %.
-        let pct = if a + r > 0 {
-            format!("{:.1}", a as f64 / (a + r) as f64 * 100.0)
-        } else {
-            "—".to_string()
-        };
-        widgets::stat_card(
-            ui,
-            card_w,
-            "Accepted",
-            widgets::mono(format!("{pct}%"), 25.0, THEME.text).strong(),
-            Some(RichText::new(if a + r > 0 { "rolling · healthy" } else { "no shares yet" }).size(11.0).color(if a + r > 0 { THEME.live } else { THEME.text3 })),
-            None,
-            None,
-        );
-
+        Box::new({
+            let pct = pct.clone();
+            move |ui: &mut egui::Ui| {
+                widgets::stat_card(
+                    ui,
+                    card_w,
+                    "Accepted",
+                    widgets::mono(format!("{pct}%"), 25.0, THEME.text).strong(),
+                    Some(RichText::new(if a + r > 0 { "rolling · healthy" } else { "no shares yet" }).size(11.0).color(if a + r > 0 { THEME.live } else { THEME.text3 })),
+                    None,
+                    None,
+                );
+            }
+        }),
         // Est. rewards — PENDING ONLY (never a number / $).
-        widgets::stat_card(
-            ui,
-            card_w,
-            "Est. rewards",
-            RichText::new(strings::REWARD_PENDING_SHORT).size(20.0).strong().color(THEME.brand300),
-            Some(RichText::new(strings::REWARD_RATE_PENDING).size(11.0).color(THEME.text3)),
-            None,
-            None,
-        );
-    });
+        Box::new(move |ui: &mut egui::Ui| {
+            widgets::stat_card(
+                ui,
+                card_w,
+                "Est. rewards",
+                RichText::new(strings::REWARD_PENDING_SHORT).size(20.0).strong().color(THEME.brand300),
+                Some(RichText::new(strings::REWARD_RATE_PENDING).size(11.0).color(THEME.text3)),
+                None,
+                None,
+            );
+        }),
+    ];
+
+    let per_row = if two_up { 2 } else { 4 };
+    // Each card lives in a FIXED-width cell so its Frame can't balloon to claim a
+    // horizontal row's leftover space (egui's last-child-grabs-remainder trap).
+    let cell_w = card_w + CARD_CHROME_X;
+    for (row_i, row) in cards.chunks(per_row).enumerate() {
+        if row_i > 0 {
+            ui.add_space(gap);
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for card in row {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(cell_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(cell_w);
+                        card(ui);
+                    },
+                );
+            }
+        });
+    }
 
     // ── Lanes ─────────────────────────────────────────────────────────────────
     ui.add_space(22.0);

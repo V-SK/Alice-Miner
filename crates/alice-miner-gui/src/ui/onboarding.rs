@@ -18,16 +18,25 @@ use crate::app::{MinerApp, Onboarding};
 
 pub fn render(ui: &mut egui::Ui, app: &mut MinerApp) {
     let step = app.onboarding.clone().unwrap_or(Onboarding::Choose);
-    ui.vertical_centered(|ui| {
-        ui.add_space((ui.available_height() * 0.5 - 250.0).max(18.0));
-        widgets::card(ui, 440.0, |ui| match step {
-            Onboarding::Choose => choose(ui, app),
-            Onboarding::Backup { mnemonic, acknowledged } => backup(ui, app, &mnemonic, acknowledged),
-            Onboarding::Confirm { mnemonic } => confirm(ui, app, &mnemonic),
-            Onboarding::Import => import(ui, app),
-            Onboarding::Paste => paste(ui, app),
+    // Wrap in a vertical ScrollArea so the taller wizard steps (backup / confirm)
+    // are never clipped at the min window size — they scroll instead.
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                // Only enough top inset to centre on a tall window; on a short one
+                // it collapses to a small margin and the ScrollArea takes over.
+                ui.add_space((ui.available_height() * 0.5 - 250.0).max(18.0));
+                widgets::card(ui, 440.0, |ui| match step {
+                    Onboarding::Choose => choose(ui, app),
+                    Onboarding::Backup { mnemonic, acknowledged } => backup(ui, app, &mnemonic, acknowledged),
+                    Onboarding::Confirm { mnemonic } => confirm(ui, app, &mnemonic),
+                    Onboarding::Import => import(ui, app),
+                    Onboarding::Paste => paste(ui, app),
+                });
+                ui.add_space(24.0);
+            });
         });
-    });
 }
 
 /// The 3-dot progress rail at the top of a wizard step. `step` is 1-based; dots

@@ -16,19 +16,18 @@ use crate::app::MinerApp;
 use alice_miner_core::EngineState;
 
 pub fn render(ui: &mut egui::Ui, app: &mut MinerApp) {
-    // Vertically + horizontally centre the hero card. The card is tall (hero orb
-    // + readout + footer ≈ 600px), so we only add a modest top inset and let the
-    // surrounding panel scroll if a very short window clips it.
+    // Vertically + horizontally centre the hero card with a modest top inset; the
+    // surrounding ScrollArea is the safety net so NOTHING (incl. the error status
+    // line + footer) is ever cut at the default OR the min window size.
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                let slack = (ui.available_height() - 600.0).max(0.0);
-                ui.add_space((slack * 0.5).clamp(8.0, 40.0));
+                ui.add_space(10.0);
                 widgets::card(ui, 392.0, |ui| {
                     hero_card_body(ui, app);
                 });
-                ui.add_space(20.0);
+                ui.add_space(16.0);
             });
         });
 }
@@ -48,7 +47,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
         EngineState::Idle => "Device auto-detected",
     };
     centered(ui, |ui| widgets::eyebrow(ui, eyebrow));
-    ui.add_space(14.0);
+    ui.add_space(12.0);
 
     // Device line: chip + model string (model only, e.g. "Apple M2 Max · 12 cores").
     let model = app
@@ -70,14 +69,14 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
         ui.label(RichText::new(model.clone()).size(15.5).strong().color(THEME.text));
     });
 
-    ui.add_space(12.0);
+    ui.add_space(10.0);
     // Lane chip (XMR · RandomX).
     centered(ui, |ui| {
         widgets::chip(ui, Some(THEME.lane_xmr), "XMR · RandomX");
     });
 
     // ── The Alice Core hero ───────────────────────────────────────────────────
-    ui.add_space(18.0);
+    ui.add_space(14.0);
     let mode = match state {
         EngineState::Running => HeroMode::Mining,
         EngineState::Starting => HeroMode::Connecting,
@@ -89,7 +88,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     let motion = app.motion_enabled();
     let tex = app.mark_tex.clone().expect("mark texture loaded by chrome");
     let resp = ui
-        .vertical_centered(|ui| hero::alice_core(ui, 150.0, mode, gauge, motion, &tex))
+        .vertical_centered(|ui| hero::alice_core(ui, 134.0, mode, gauge, motion, &tex))
         .inner;
     if resp.clicked() {
         match state {
@@ -100,11 +99,11 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     }
 
     // ── Readout BELOW the orb ─────────────────────────────────────────────────
-    ui.add_space(14.0);
+    ui.add_space(12.0);
     readout(ui, app, mode);
 
     // ── Rewards-to line ───────────────────────────────────────────────────────
-    ui.add_space(12.0);
+    ui.add_space(11.0);
     if let Some(addr) = app.reward_address() {
         // `center_row` runs its builder twice (a measure pass + the real pass),
         // so the click flag uses interior mutability (the sizing pass never
@@ -130,7 +129,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     }
 
     // ── Status line ───────────────────────────────────────────────────────────
-    ui.add_space(13.0);
+    ui.add_space(11.0);
     status_line(ui, app);
 
     // ── Stop button + dashboard link while mining/connecting/stopping ─────────
@@ -180,10 +179,10 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     }
 
     // ── Honest footer ─────────────────────────────────────────────────────────
-    ui.add_space(14.0);
+    ui.add_space(12.0);
     let r = ui.available_rect_before_wrap();
     ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0, THEME.line));
-    ui.add_space(12.0);
+    ui.add_space(11.0);
     footer(ui);
 }
 

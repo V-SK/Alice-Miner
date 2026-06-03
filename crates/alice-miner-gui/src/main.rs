@@ -41,19 +41,25 @@ fn load_icon() -> Option<IconData> {
 }
 
 fn main() -> eframe::Result<()> {
-    // Shot mode frames to the mockup size (~1040×720) so captures match; normal
-    // runs keep the default size. (Only the inner size changes — the custom
-    // titlebar + rail still render so the screenshot reflects the real chrome.)
+    // Shot mode frames to the real default size so captures reflect what the
+    // owner sees on first run; normal runs use the same default. (Only the inner
+    // size changes — the custom titlebar + rail still render so the screenshot
+    // reflects the real chrome.)
     let inner_size = if std::env::var_os("ALICE_MINER_SHOT_DIR").is_some() {
         shot::ShotRunner::window_size()
     } else {
-        // Tall enough that the full hero card (orb + readout + identity + footer)
-        // is visible without scrolling on first run; still resizable smaller.
-        [1040.0, 800.0]
+        // Comfortably above the mockup's 1040×720 so the full hero card (orb +
+        // readout + identity + status line + footer) — in EVERY Home state incl.
+        // the tallest (error, which stacks "Start again" + the reason line + the
+        // honest footer) — and the 4-up dashboard grid are visible without
+        // scrolling on first run; still resizable down to `min` below, where the
+        // scroll areas guarantee nothing is clipped.
+        [1120.0, 800.0]
     };
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size(inner_size)
-        .with_min_inner_size([920.0, 660.0])
+        // Sane floor so the hero never clips; below this the screen bodies scroll.
+        .with_min_inner_size([960.0, 680.0])
         .with_title("Alice Miner")
         // Draw our own dark header flush to the window top instead of a
         // system-coloured title bar clashing with the dark theme. The bar stays
