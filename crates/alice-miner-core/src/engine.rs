@@ -24,9 +24,10 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
 use crate::detect::DeviceProfile;
+use crate::endpoint::{Endpoint, EndpointPlan};
 use crate::identity::{self, Identity};
-use crate::lane::{gpu_rvn, xmr};
 use crate::lane::Lane;
+use crate::lane::{gpu_rvn, xmr};
 use crate::supervise::LaneSupervisor;
 
 /// How a [`Command::Identity`] establishes the reward identity.
@@ -51,8 +52,18 @@ pub enum Command {
     /// Establish the reward identity → emits [`Event::Identity`].
     Identity(IdentitySpec),
     /// Start mining `lane` to `address` (defaults to the active identity's
-    /// address when `address` is `None`).
-    Start { lane: Lane, address: Option<String> },
+    /// address when `address` is `None`). When `dual` is set, the engine runs
+    /// BOTH lanes together (CPU-XMR + GPU-RVN), each in its own crash-isolated
+    /// supervisor, with `cores-2` XMR thread headroom (PLAN §5 M4 / D-dual). The
+    /// caller must only request dual when ≥2 lanes are viable (the GUI gates this
+    /// on [`crate::CapabilityProfile`]); the engine still validates and falls back
+    /// to single-lane if a lane can't start.
+    Start {
+        lane: Lane,
+        address: Option<String>,
+        #[doc(hidden)]
+        dual: bool,
+    },
     /// Stop the running lane (SIGTERM→SIGKILL on the owned child).
     Stop,
     /// Ask the engine to emit a fresh [`Event::Snapshot`] now.
@@ -115,6 +126,10 @@ pub struct Snapshot {
     /// Cumulative rejected shares this run.
     pub shares_rejected: u64,
     /// The stratum endpoint the lane targets (e.g. `hk.aliceprotocol.org:3333`).
+    /// This is the ACTIVE endpoint — after a Layer-B failover it reflects the
+    /// rotated-to endpoint (PLAN §5 M4). Only ever the PUBLIC relay (or, under an
+    /// operator override, whatever the operator declared); never the upstream
+    /// pool / collection address.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     /// The on-wire worker/rig id (derived from the PUBLIC address).
@@ -122,12 +137,46 @@ pub struct Snapshot {
     pub worker_id: Option<String>,
     /// Seconds since the current run started.
     pub uptime_s: u64,
+    /// How many times Layer B has rotated the endpoint cursor this run (0 = never
+    /// failed over). The dashboard shows a "failed over" note when > 0.
+    pub failovers: u64,
+    /// Whether dual-mine is active (both lanes running). Drives the dashboard's
+    /// two-row lane stack.
+    pub dual: bool,
+    /// Per-lane breakdown (one entry per running supervisor). In single-lane mode
+    /// this has one entry; in dual-mine it has two (CPU-XMR + GPU-RVN). The
+    /// top-level `state`/`hashrate_hs`/shares mirror the PRIMARY lane for the
+    /// existing single-lane UI; the dashboard reads `lanes` for the breakdown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lanes: Vec<LaneSnapshot>,
     /// Last sanitised engine output line (an at-a-glance hint).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_line: Option<String>,
     /// Short, sanitised reason for an `Error`/`Stopping` state, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// One lane's live activity within a (possibly dual) run — the dashboard's
+/// per-lane row. Credit-only (activity figures only); no payout field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LaneSnapshot {
+    /// Which lane this row is.
+    pub lane: Lane,
+    /// This lane's lifecycle state.
+    pub state: EngineState,
+    /// This lane's live hashrate in H/s (`None` until the first speed line).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hashrate_hs: Option<f64>,
+    /// This lane's cumulative accepted shares.
+    pub shares_accepted: u64,
+    /// This lane's cumulative rejected shares.
+    pub shares_rejected: u64,
+    /// This lane's ACTIVE (post-failover) endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// This lane's Layer-B failover count this run.
+    pub failovers: u64,
 }
 
 impl Snapshot {
@@ -142,6 +191,9 @@ impl Snapshot {
             endpoint: None,
             worker_id: None,
             uptime_s: 0,
+            failovers: 0,
+            dual: false,
+            lanes: Vec::new(),
             last_line: None,
             message: None,
         }
@@ -240,11 +292,10 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
     let mut device: Option<DeviceProfile> = None;
     // The active identity address (the ONLY thing the mining path needs).
     let mut active_address: Option<String> = None;
-    // The active lane supervisor (M1 owns at most one; the engine generalizes to
-    // N in M4). Created lazily on the first Start.
-    let mut supervisor: Option<LaneSupervisor> = None;
-    let mut active_lane: Option<Lane> = None;
-    let mut active_endpoint: Option<String> = None;
+    // The active run: the engine owns N `LaneSupervisor`s (M4) — one in
+    // single-lane mode, two in dual-mine (CPU-XMR + GPU-RVN), each crash-isolated
+    // in its own process group. Empty when idle.
+    let mut run = RunSet::default();
     let mut active_worker_id: Option<String> = None;
 
     loop {
@@ -274,7 +325,7 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
                     }
                 }
             }
-            Some(Command::Start { lane, address }) => {
+            Some(Command::Start { lane, address, dual }) => {
                 // Resolve the reward address: the explicit one, else the active
                 // identity's, else the on-disk pointer's.
                 let addr = address
@@ -286,20 +337,18 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
                     ));
                     continue;
                 };
+                if run.is_active() {
+                    let _ = evt_tx
+                        .send(Event::Error("a lane is already running; Stop it first".into()));
+                    continue;
+                }
 
-                match start_lane(&rt, lane, &addr, &mut supervisor) {
-                    Ok((endpoint, worker_id)) => {
+                match start_run(&rt, lane, dual, &addr) {
+                    Ok((new_run, worker_id)) => {
+                        run = new_run;
                         active_address = Some(addr);
-                        active_lane = Some(lane);
-                        active_endpoint = Some(endpoint);
                         active_worker_id = Some(worker_id);
-                        let snap = build_snapshot(
-                            &device,
-                            active_lane,
-                            &active_endpoint,
-                            &active_worker_id,
-                            supervisor.as_ref(),
-                        );
+                        let snap = build_snapshot(&device, &run, &active_worker_id);
                         let _ = evt_tx.send(Event::Snapshot(snap));
                     }
                     Err(e) => {
@@ -308,29 +357,15 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
                 }
             }
             Some(Command::Stop) => {
-                if let Some(s) = supervisor.as_ref() {
-                    s.request_stop();
-                }
-                let snap = build_snapshot(
-                    &device,
-                    active_lane,
-                    &active_endpoint,
-                    &active_worker_id,
-                    supervisor.as_ref(),
-                );
+                run.request_stop_all();
+                let snap = build_snapshot(&device, &run, &active_worker_id);
                 let _ = evt_tx.send(Event::Snapshot(snap));
             }
             Some(Command::Poll) | None => {
-                // Periodic / explicit snapshot. Only emit while we have a lane
+                // Periodic / explicit snapshot. Only emit while we have a run
                 // (otherwise the front-end already knows we're idle).
-                if supervisor.is_some() {
-                    let snap = build_snapshot(
-                        &device,
-                        active_lane,
-                        &active_endpoint,
-                        &active_worker_id,
-                        supervisor.as_ref(),
-                    );
+                if !run.is_empty() {
+                    let snap = build_snapshot(&device, &run, &active_worker_id);
                     let _ = evt_tx.send(Event::Snapshot(snap));
                 }
             }
@@ -338,16 +373,52 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
         }
     }
 
-    // Teardown: stop the child and let the runtime drop (kill_on_drop is the
+    // Teardown: stop every child and let the runtime drop (kill_on_drop is the
     // backstop). Give the graceful stop a moment to complete.
-    if let Some(s) = supervisor.as_ref() {
-        s.request_stop();
-        // Let the supervision loop run its SIGTERM→SIGKILL on the owned child.
+    if run.is_active() {
+        run.request_stop_all();
+        // Let each supervision loop run its SIGTERM→SIGKILL on its owned child.
         std::thread::sleep(Duration::from_millis(700));
     }
-    drop(supervisor);
+    drop(run);
     // Dropping `rt` (the last Arc) shuts the runtime down, dropping any child
     // task and the `OwnedChild` (kill_on_drop ensures no orphan).
+}
+
+/// The set of lane supervisors the engine drives concurrently (PLAN §2.2: "the
+/// engine owns N of them"). One in single-lane mode; two in dual-mine (CPU-XMR +
+/// GPU-RVN), each crash-isolated in its own process group.
+#[derive(Default)]
+struct RunSet {
+    /// The running supervisors, primary first (the primary drives the top-level
+    /// Snapshot fields for the existing single-lane UI).
+    supervisors: Vec<LaneSupervisor>,
+    /// Whether this run is dual-mine (both lanes).
+    dual: bool,
+}
+
+impl RunSet {
+    fn is_empty(&self) -> bool {
+        self.supervisors.is_empty()
+    }
+
+    /// Whether ANY supervisor in the set is still active.
+    fn is_active(&self) -> bool {
+        self.supervisors.iter().any(|s| s.is_active())
+    }
+
+    /// The primary supervisor (drives the top-level Snapshot).
+    fn primary(&self) -> Option<&LaneSupervisor> {
+        self.supervisors.first()
+    }
+
+    /// Request a graceful stop on every supervisor (each tears down its OWN child
+    /// independently — crash-isolated).
+    fn request_stop_all(&self) {
+        for s in &self.supervisors {
+            s.request_stop();
+        }
+    }
 }
 
 /// Establish the identity for an [`IdentitySpec`], zeroizing passwords as we go.
@@ -380,64 +451,124 @@ fn run_identity(spec: IdentitySpec) -> Result<(Identity, Option<String>), String
     }
 }
 
-/// Build the launch plan for `lane` to `address`, create-or-reuse the
-/// supervisor, and start it inside the runtime context. Returns
-/// `(endpoint, worker_id)` for the snapshot. The reward `address` is the user's
-/// PUBLIC Alice address — no secret crosses this boundary.
-fn start_lane(
+/// In dual-mine mode, leave this many cores free for the GPU lane's host
+/// overhead (driver / DAG feeder threads): XMR runs at `cores - DUAL_XMR_HEADROOM`
+/// (PLAN §5 M4 / §6 D-dual). Single-lane mode stays "拉满" (all cores).
+const DUAL_XMR_HEADROOM: usize = 2;
+
+/// The XMR thread count under dual-mine: `cores - 2` (GPU host headroom), floored
+/// at 1 (a 1-2 core box still runs XMR on at least one thread). Single-lane mode
+/// does NOT call this (it stays "拉满" / all cores). Pure + testable.
+fn dual_xmr_threads(cores: usize) -> usize {
+    cores.saturating_sub(DUAL_XMR_HEADROOM).max(1)
+}
+
+/// Start a run for `lane` (or BOTH lanes when `dual`), to `address`. Returns the
+/// populated [`RunSet`] + the derived worker id. The reward `address` is the
+/// user's PUBLIC Alice address — no secret crosses this boundary.
+///
+/// **Dual-mine** = a CPU-XMR supervisor (with `cores-2` thread headroom) AND a
+/// GPU-RVN supervisor, each crash-isolated in its own process group. If a lane
+/// fails to start (e.g. no GPU binary on this box), the whole start errors with
+/// that lane's reason rather than silently running one lane (the GUI gates dual
+/// on viability, so this is a defensive guard, not the normal path).
+fn start_run(
     rt: &Arc<Runtime>,
     lane: Lane,
+    dual: bool,
     address: &str,
-    supervisor: &mut Option<LaneSupervisor>,
-) -> Result<(String, String), String> {
-    let (program, args, endpoint, worker_id) = match lane {
-        Lane::Xmr => {
-            let program = crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::CpuXmr)?;
-            let plan = xmr::build_miner_launch_plan(program, address)?;
-            let endpoint = format!("{}:{}", xmr::ALICE_POOL_HOST, xmr::ALICE_POOL_PORT);
-            let worker_id = xmr::derive_worker_id(address)?;
-            (plan.program, plan.args, endpoint, worker_id)
-        }
-        Lane::GpuRvn => {
-            // Resolve the bundled KawPowMiner (env override → sibling →
-            // release-assets). If it's absent the resolver returns a clear
-            // "GPU miner not installed" error and we land in Error — NOT a panic.
-            // T-Rex is supported only via the `ALICE_MINER_GPU_BIN` override; we
-            // detect that the override points at a T-Rex binary by its filename so
-            // the correct arg shape is built.
-            let program = crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::GpuRvn)?;
-            let plan = if is_trex_binary(&program) {
-                gpu_rvn::build_trex_launch_plan(program, address)?
-            } else {
-                gpu_rvn::build_kawpowminer_launch_plan(program, address)?
-            };
-            let endpoint = format!("{}:{}", gpu_rvn::ALICE_POOL_HOST, gpu_rvn::ALICE_POOL_PORT);
-            let worker_id = xmr::derive_worker_id(address)?; // one worker-id fn for both lanes
-            (plan.program, plan.args, endpoint, worker_id)
-        }
-    };
-
-    // Reuse a stopped supervisor for the same lane, else make a fresh one.
-    let sup = match supervisor.as_ref() {
-        Some(s) if s.lane() == lane && !s.is_active() => s.clone(),
-        Some(s) if s.is_active() => return Err("a lane is already running; Stop it first".into()),
-        _ => {
-            let s = LaneSupervisor::new(lane);
-            *supervisor = Some(s.clone());
-            s
-        }
-    };
-    // If we reused an existing (stopped, same-lane) supervisor, ensure it's the
-    // one stored.
-    if supervisor.as_ref().map(|s| s.lane()) != Some(lane) {
-        *supervisor = Some(sup.clone());
-    }
-
-    // Enter the runtime before start() — it spawns tokio child-I/O tasks (the
-    // exact Wallet pattern: `let _guard = rt.enter();` before `sup.start(...)`).
+) -> Result<(RunSet, String), String> {
+    let worker_id = xmr::derive_worker_id(address)?; // one worker-id fn for both lanes
+    // Enter the runtime ONCE for all the start()s — they spawn tokio child-I/O +
+    // watchdog tasks (the Wallet pattern: `let _guard = rt.enter();`).
     let _guard = rt.enter();
-    sup.start(program, args)?;
-    Ok((endpoint, worker_id))
+
+    if dual {
+        // Both lanes together. XMR gets `cores-2` headroom; RVN runs full.
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let xmr_threads = dual_xmr_threads(cores);
+        let xmr_sup = start_one_lane(Lane::Xmr, address, Some(xmr_threads))?;
+        let rvn_sup = match start_one_lane(Lane::GpuRvn, address, None) {
+            Ok(s) => s,
+            Err(e) => {
+                // The XMR lane already started; tear it back down so we don't leave
+                // a half-started dual run, then surface the GPU reason.
+                xmr_sup.request_stop();
+                return Err(format!("dual-mine: GPU lane could not start ({e})"));
+            }
+        };
+        Ok((
+            RunSet {
+                supervisors: vec![xmr_sup, rvn_sup],
+                dual: true,
+            },
+            worker_id,
+        ))
+    } else {
+        let sup = start_one_lane(lane, address, None)?;
+        Ok((
+            RunSet {
+                supervisors: vec![sup],
+                dual: false,
+            },
+            worker_id,
+        ))
+    }
+}
+
+/// Build the per-lane [`EndpointPlan`] + Layer-A multi-endpoint launch plan,
+/// create a [`LaneSupervisor`] bound to that plan, and start it with a rebuild
+/// closure (so the supervisor's Layer-B watchdog can rotate endpoints). Must be
+/// called inside a runtime context (the caller holds `rt.enter()`).
+fn start_one_lane(
+    lane: Lane,
+    address: &str,
+    threads_override: Option<usize>,
+) -> Result<LaneSupervisor, String> {
+    let plan = EndpointPlan::for_lane(lane);
+    let address = address.to_string();
+
+    // The engine-supplied rebuild closure: given an ordered endpoint list (the
+    // EndpointPlan rotated to a new cursor), re-derive `(program, args)` for THIS
+    // lane (Layer-A multi-endpoint argv). The supervisor's watchdog calls this on
+    // a Layer-B failover. Resolves the binary each time so a freshly-installed
+    // engine is picked up; the honesty invariant holds (relay-only endpoints).
+    let addr_for_rebuild = address.clone();
+    let rebuild: crate::supervise::RebuildFn = match lane {
+        Lane::Xmr => Arc::new(move |eps: &[Endpoint]| {
+            let program =
+                crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::CpuXmr)?;
+            let p = xmr::build_miner_launch_plan_with_endpoints(
+                program,
+                &addr_for_rebuild,
+                eps,
+                threads_override,
+            )?;
+            Ok((p.program, p.args))
+        }),
+        Lane::GpuRvn => Arc::new(move |eps: &[Endpoint]| {
+            let program =
+                crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::GpuRvn)?;
+            let p = if is_trex_binary(&program) {
+                // T-Rex (override path) takes a single endpoint; use the first.
+                gpu_rvn::build_trex_launch_plan(program, &addr_for_rebuild)?
+            } else {
+                gpu_rvn::build_kawpowminer_launch_plan_with_endpoints(
+                    program,
+                    &addr_for_rebuild,
+                    eps,
+                )?
+            };
+            Ok((p.program, p.args))
+        }),
+    };
+
+    // Build the initial launch plan (Layer A: all endpoints, primary first).
+    let (program, args) = rebuild(&plan.ordered_from_cursor())?;
+
+    let sup = LaneSupervisor::with_endpoints(lane, plan);
+    sup.start(program, args, rebuild)?;
+    Ok(sup)
 }
 
 /// Heuristic: does this resolved GPU-miner path look like T-Rex (so the engine
@@ -455,31 +586,73 @@ fn is_trex_binary(program: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Assemble a [`Snapshot`] from the current engine state + the supervisor's
-/// live stats. Never carries a `paid_acu` (credit-only — see [`Snapshot`]).
+/// Assemble a [`Snapshot`] from the current engine state + the run set's live
+/// stats. The top-level fields mirror the PRIMARY lane (so the existing
+/// single-lane UI is unchanged); `lanes` carries the per-lane breakdown for the
+/// dual-mine two-row stack. Never carries a `paid_acu` (credit-only — see
+/// [`Snapshot`]).
 fn build_snapshot(
     device: &Option<DeviceProfile>,
-    lane: Option<Lane>,
-    endpoint: &Option<String>,
+    run: &RunSet,
     worker_id: &Option<String>,
-    supervisor: Option<&LaneSupervisor>,
 ) -> Snapshot {
     let mut snap = Snapshot::idle();
     snap.device = device.clone();
-    snap.lane = lane;
-    snap.endpoint = endpoint.clone();
     snap.worker_id = worker_id.clone();
+    snap.dual = run.dual;
 
-    if let Some(s) = supervisor {
+    // Per-lane breakdown (every supervisor in the set).
+    for s in &run.supervisors {
         let st = s.stats();
-        snap.state = st.state.into();
+        snap.lanes.push(LaneSnapshot {
+            lane: st.lane,
+            state: st.state.into(),
+            hashrate_hs: st.hashrate_hs,
+            shares_accepted: st.accepted,
+            shares_rejected: st.rejected,
+            endpoint: st.endpoint.clone(),
+            failovers: st.failovers,
+        });
+    }
+
+    // Top-level mirror = the primary lane (single-lane UI compatibility). For the
+    // top-level lifecycle state in dual mode, prefer "Running" if ANY lane runs,
+    // else the primary's state (so the hero reads "mining" while either lane is up).
+    if let Some(p) = run.primary() {
+        let st = p.stats();
+        snap.lane = Some(st.lane);
         snap.hashrate_hs = st.hashrate_hs;
         snap.shares_accepted = st.accepted;
         snap.shares_rejected = st.rejected;
+        snap.endpoint = st.endpoint.clone();
         snap.uptime_s = st.uptime_s;
-        snap.message = st.message;
+        snap.failovers = st.failovers;
+        snap.message = st.message.clone();
         if !st.last_line.is_empty() {
             snap.last_line = Some(st.last_line);
+        }
+        snap.state = if run.dual && run.is_active() {
+            EngineState::Running
+        } else {
+            st.state.into()
+        };
+        // In dual mode, the top-level hashrate is the SUM of both lanes' rates
+        // (the GUI's combined readout); shares too. Endpoint stays the primary's.
+        if run.dual {
+            let (mut hr, mut acc, mut rej, mut fo) = (None::<f64>, 0u64, 0u64, 0u64);
+            for s in &run.supervisors {
+                let st = s.stats();
+                if let Some(h) = st.hashrate_hs {
+                    hr = Some(hr.unwrap_or(0.0) + h);
+                }
+                acc += st.accepted;
+                rej += st.rejected;
+                fo += st.failovers;
+            }
+            snap.hashrate_hs = hr;
+            snap.shares_accepted = acc;
+            snap.shares_rejected = rej;
+            snap.failovers = fo;
         }
     }
     snap
@@ -493,7 +666,8 @@ mod tests {
     /// any payout/claim/settlement) field — by construction (PLAN §2.2).
     #[test]
     fn snapshot_has_no_paid_acu_field() {
-        // A fully-populated snapshot (to catch any optional field too).
+        // A fully-populated snapshot (to catch any optional field too), incl. the
+        // M4 dual-mine per-lane breakdown.
         let snap = Snapshot {
             state: EngineState::Running,
             device: Some(DeviceProfile::detect()),
@@ -504,6 +678,28 @@ mod tests {
             endpoint: Some("hk.aliceprotocol.org:3333".into()),
             worker_id: Some("worker".into()),
             uptime_s: 42,
+            failovers: 1,
+            dual: true,
+            lanes: vec![
+                LaneSnapshot {
+                    lane: Lane::Xmr,
+                    state: EngineState::Running,
+                    hashrate_hs: Some(1234.5),
+                    shares_accepted: 7,
+                    shares_rejected: 1,
+                    endpoint: Some("hk.aliceprotocol.org:3333".into()),
+                    failovers: 1,
+                },
+                LaneSnapshot {
+                    lane: Lane::GpuRvn,
+                    state: EngineState::Running,
+                    hashrate_hs: Some(25_000_000.0),
+                    shares_accepted: 3,
+                    shares_rejected: 0,
+                    endpoint: Some("hk.aliceprotocol.org:8888".into()),
+                    failovers: 0,
+                },
+            ],
             last_line: Some("net accepted (7/1)".into()),
             message: None,
         };
@@ -564,7 +760,7 @@ mod tests {
         std::env::set_var("ALICE_IDENTITY_DIR", &empty);
 
         engine
-            .send(Command::Start { lane: Lane::Xmr, address: None })
+            .send(Command::Start { lane: Lane::Xmr, address: None, dual: false })
             .expect("send start");
         let evt = engine
             .recv_timeout(Duration::from_secs(5))
@@ -577,5 +773,125 @@ mod tests {
         std::env::remove_var("ALICE_IDENTITY_DIR");
         let _ = std::fs::remove_dir_all(&empty);
         engine.shutdown();
+    }
+
+    /// DUAL gating math (the M4 gate): under dual-mine the XMR lane gets `cores-2`
+    /// headroom, floored at 1; single-lane stays full power (not via this fn).
+    #[test]
+    fn dual_xmr_threads_applies_cores_minus_two_floored_at_one() {
+        assert_eq!(dual_xmr_threads(16), 14);
+        assert_eq!(dual_xmr_threads(12), 10);
+        assert_eq!(dual_xmr_threads(4), 2);
+        assert_eq!(dual_xmr_threads(3), 1);
+        // A 1- or 2-core box still runs XMR on at least one thread.
+        assert_eq!(dual_xmr_threads(2), 1);
+        assert_eq!(dual_xmr_threads(1), 1);
+    }
+
+    /// DUAL-MINE end-to-end (engine-level): with BOTH lane binaries overridden to
+    /// a long-lived stand-in (so no real GPU is needed), a `Start { dual: true }`
+    /// brings up TWO crash-isolated supervisors; the snapshot reports `dual`, two
+    /// per-lane rows (CPU-XMR + GPU-RVN), and the SUMMED hashrate. Then a clean
+    /// Stop tears BOTH down. (The per-supervisor crash-isolation + failover gates
+    /// are proven in `supervise::tests`; this proves the engine wires N of them.)
+    #[cfg(unix)]
+    #[test]
+    fn dual_mine_runs_two_lanes_then_stops() {
+        let _g = crate::MINER_BIN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // A stand-in "miner" that ignores its args and emits one accepted-share +
+        // speed line per lane, then idles — so BOTH lanes reach Running with stats.
+        let stub = std::env::temp_dir().join(format!("alice-dual-stub-{}.sh", std::process::id()));
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n\
+             echo 'net      accepted (5/0) diff 100 (10 ms)'\n\
+             echo 'miner    speed 10s/60s/15m 100.0 90.0 n/a H/s'\n\
+             echo 'm kawpowminer Speed 20.00 Mh/s gpu0 [A5+0:R0+0:F0]'\n\
+             sleep 30\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&stub).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&stub, perm).unwrap();
+
+        // Point BOTH lane resolvers at the stub.
+        std::env::set_var("ALICE_MINER_XMR_BIN", &stub);
+        std::env::set_var("ALICE_MINER_GPU_BIN", &stub);
+
+        // A watch-only identity so no keystore is needed (a real SS58-300 address
+        // derived through the shared keystore — mining only needs the address).
+        let address = alice_crypto::create_wallet_payload(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "dual-test",
+        )
+        .unwrap()
+        .address;
+
+        let engine = EngineHandle::spawn().expect("spawn");
+        engine
+            .send(Command::Start {
+                lane: Lane::Xmr,
+                address: Some(address),
+                dual: true,
+            })
+            .expect("send dual start");
+
+        // Drain snapshots until BOTH lanes are Running (or a timeout).
+        let mut saw_dual_both = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            // Nudge a fresh snapshot.
+            let _ = engine.send(Command::Poll);
+            if let Ok(Event::Snapshot(s)) = engine.recv_timeout(Duration::from_millis(300)) {
+                {
+                    // Wait until BOTH lanes are running AND have parsed their
+                    // hashrate (the log pump is async, so a fresh all-Running
+                    // snapshot may not have the speed line parsed yet).
+                    let xmr = s.lanes.iter().find(|l| l.lane == Lane::Xmr);
+                    let rvn = s.lanes.iter().find(|l| l.lane == Lane::GpuRvn);
+                    let ready = s.dual
+                        && s.lanes.len() == 2
+                        && s.lanes.iter().all(|l| l.state == EngineState::Running)
+                        && xmr.and_then(|l| l.hashrate_hs).is_some()
+                        && rvn.and_then(|l| l.hashrate_hs).is_some();
+                    if ready {
+                        let xmr = xmr.unwrap();
+                        let rvn = rvn.unwrap();
+                        assert_eq!(xmr.hashrate_hs, Some(100.0));
+                        assert_eq!(rvn.hashrate_hs, Some(20_000_000.0));
+                        // Top-level summed hashrate = xmr + rvn.
+                        assert_eq!(s.hashrate_hs, Some(100.0 + 20_000_000.0));
+                        // Each lane targets its OWN relay port (honesty: relay only).
+                        assert_eq!(xmr.endpoint.as_deref(), Some("hk.aliceprotocol.org:3333"));
+                        assert_eq!(rvn.endpoint.as_deref(), Some("hk.aliceprotocol.org:8888"));
+                        saw_dual_both = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(saw_dual_both, "both lanes should reach Running under dual-mine");
+
+        // Clean stop → both lanes torn down.
+        engine.send(Command::Stop).expect("stop");
+        let mut both_down = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            let _ = engine.send(Command::Poll);
+            if let Ok(Event::Snapshot(s)) = engine.recv_timeout(Duration::from_millis(300)) {
+                if s.lanes.iter().all(|l| l.state == EngineState::Idle || l.state == EngineState::Error) {
+                    both_down = true;
+                    break;
+                }
+            }
+        }
+        assert!(both_down, "both lanes should tear down on Stop");
+
+        engine.shutdown();
+        std::env::remove_var("ALICE_MINER_XMR_BIN");
+        std::env::remove_var("ALICE_MINER_GPU_BIN");
+        let _ = std::fs::remove_file(&stub);
     }
 }

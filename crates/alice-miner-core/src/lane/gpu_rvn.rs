@@ -32,6 +32,7 @@ use std::path::PathBuf;
 
 use super::xmr::{derive_worker_id, MINING_EXECUTION_ALLOWED};
 use super::Lane;
+use crate::endpoint::{Endpoint, EndpointPlan};
 
 // ── Mining engine wiring (Alice re-hash relay, KawPoW/RVN) ──────────────────
 
@@ -56,13 +57,26 @@ pub struct GpuLaunchPlan {
     pub args: Vec<String>,
 }
 
-/// The stratum connection URL for kawpowminer's `-P` flag:
-/// `stratum+tcp://<alice_addr>.<rig_id>@<host>:<port>`. The login user is the
-/// user's OWN Alice address; the rig id ([`derive_worker_id`]) is the
+/// The stratum connection URL for kawpowminer's `-P` flag against the DEFAULT
+/// relay endpoint: `stratum+tcp://<alice_addr>.<rig_id>@<host>:<port>`. The login
+/// user is the user's OWN Alice address; the rig id ([`derive_worker_id`]) is the
 /// per-device worker name. NO password segment (the relay's open enrollment
 /// needs none; XMR uses `-p x`, kawpowminer encodes the worker in the URL).
 fn connection_url(reward: &str, rig_id: &str) -> String {
     format!("stratum+tcp://{reward}.{rig_id}@{ALICE_POOL_HOST}:{ALICE_POOL_PORT}")
+}
+
+/// The kawpowminer `-P` connection URL for an ARBITRARY [`Endpoint`] (Layer-A
+/// failover): `<scheme>://<alice_addr>.<rig_id>@<host>:<port>`, where `<scheme>`
+/// is `stratum+tcp` (plaintext, T0) or `stratum+ssl` (TLS, T1) — transport-aware
+/// so M9 is additive. Same credential shape as [`connection_url`].
+fn connection_url_for(reward: &str, rig_id: &str, ep: &Endpoint) -> String {
+    format!(
+        "{}://{reward}.{rig_id}@{}:{}",
+        ep.transport.stratum_scheme(),
+        ep.host,
+        ep.port
+    )
 }
 
 /// The plain `stratum+tcp://host:port` pool URL (no credentials) — used by the
@@ -108,6 +122,65 @@ pub fn build_kawpowminer_launch_plan(
         "10".into(),
     ];
     Ok(GpuLaunchPlan { program, args })
+}
+
+/// Build the **KawPowMiner** launch plan with **multi-endpoint failover (Layer A)
+/// and transport awareness** — the M4 generalization of
+/// [`build_kawpowminer_launch_plan`].
+///
+/// kawpowminer accepts MULTIPLE `-P` connection URLs and fails over between them
+/// itself (its native fast failover). We emit one `-P <url>` per endpoint IN
+/// ORDER (the supervisor passes them rotated to the active cursor — see
+/// [`EndpointPlan::ordered_from_cursor`]); each URL embeds the user's OWN address
+/// + rig id and uses the endpoint's transport scheme (`stratum+tcp`/`stratum+ssl`).
+///
+/// Same HONESTY invariant as the single-endpoint builder: every `-P` URL targets
+/// an Alice-relay endpoint with the user's address as the login; no collection /
+/// seed / upstream-pool string is present. (Endpoints come from an
+/// [`EndpointPlan`]; the default is relay-only, the only non-relay source is the
+/// operator override.)
+pub fn build_kawpowminer_launch_plan_with_endpoints(
+    program: PathBuf,
+    reward_identity: &str,
+    endpoints: &[Endpoint],
+) -> Result<GpuLaunchPlan, String> {
+    if !MINING_EXECUTION_ALLOWED {
+        return Err("mining execution is not enabled in this build".into());
+    }
+    if endpoints.is_empty() {
+        return Err("kawpowminer launch plan needs at least one endpoint".into());
+    }
+    let reward = reward_identity.trim();
+    let rig_id = derive_worker_id(reward)?; // fail-closed Alice-address validation
+
+    let mut args: Vec<String> = Vec::with_capacity(endpoints.len() * 2 + 4);
+    // Layer A: one `-P <url>` per endpoint, in order.
+    for ep in endpoints {
+        args.push("-P".into());
+        args.push(connection_url_for(reward, &rig_id, ep));
+    }
+    args.extend([
+        "--report-hashrate".into(),
+        "--stratum-protocol".into(),
+        "2".into(),
+        "--display-interval".into(),
+        "10".into(),
+    ]);
+    Ok(GpuLaunchPlan { program, args })
+}
+
+/// Convenience: build the kawpowminer plan from an [`EndpointPlan`] (rotated to
+/// its current cursor). The engine calls this for the GPU lane.
+pub fn build_kawpowminer_launch_plan_for(
+    program: PathBuf,
+    reward_identity: &str,
+    plan: &EndpointPlan,
+) -> Result<GpuLaunchPlan, String> {
+    build_kawpowminer_launch_plan_with_endpoints(
+        program,
+        reward_identity,
+        &plan.ordered_from_cursor(),
+    )
 }
 
 /// Build a **T-Rex**-style launch plan (the `ALICE_MINER_GPU_BIN` override path).
@@ -299,5 +372,110 @@ mod tests {
         // And it is embedded verbatim in the kawpowminer URL.
         let plan = build_kawpowminer_launch_plan(PathBuf::from("kawpowminer"), addr).unwrap();
         assert!(plan.args.iter().any(|a| a.contains(&rvn_rig)));
+    }
+
+    /// M4 Layer A (GPU): the multi-endpoint kawpowminer builder emits one `-P`
+    /// URL per endpoint IN ORDER, each embedding the user's address + rig id, so
+    /// kawpowminer fails over between them itself.
+    #[test]
+    fn multi_endpoint_kawpow_emits_one_dash_p_per_endpoint_in_order() {
+        let addr = valid_address();
+        let rig = derive_worker_id(addr).unwrap();
+        let eps = vec![
+            Endpoint::plaintext("blackhole.invalid", 65000),
+            Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT),
+        ];
+        let plan =
+            build_kawpowminer_launch_plan_with_endpoints(PathBuf::from("kawpowminer"), addr, &eps)
+                .unwrap();
+        let p_values: Vec<&String> = plan
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && plan.args[i - 1] == "-P")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(p_values.len(), 2);
+        // Primary = the bogus endpoint; secondary = the relay. Both carry the
+        // user's address + rig id.
+        assert_eq!(
+            p_values[0],
+            &format!("stratum+tcp://{addr}.{rig}@blackhole.invalid:65000")
+        );
+        assert_eq!(
+            p_values[1],
+            &format!("stratum+tcp://{addr}.{rig}@{ALICE_POOL_HOST}:{ALICE_POOL_PORT}")
+        );
+    }
+
+    /// A TLS (T1) endpoint yields a `stratum+ssl://` URL (transport-aware → M9
+    /// additive); plaintext yields `stratum+tcp://`.
+    #[test]
+    fn tls_endpoint_yields_ssl_scheme_in_kawpow_url() {
+        let addr = valid_address();
+        let eps = vec![Endpoint::tls(ALICE_POOL_HOST, 8889)];
+        let plan =
+            build_kawpowminer_launch_plan_with_endpoints(PathBuf::from("kawpowminer"), addr, &eps)
+                .unwrap();
+        let p = plan.args.iter().position(|a| a == "-P").unwrap();
+        assert!(plan.args[p + 1].starts_with("stratum+ssl://"));
+        assert!(plan.args[p + 1].ends_with("@hk.aliceprotocol.org:8889"));
+    }
+
+    /// `build_kawpowminer_launch_plan_for` rotates the EndpointPlan to its cursor.
+    #[test]
+    fn build_for_kawpow_endpoint_plan_respects_cursor() {
+        let addr = valid_address();
+        let mut ep_plan = EndpointPlan::new(vec![
+            Endpoint::plaintext("blackhole.invalid", 65000),
+            Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT),
+        ])
+        .unwrap();
+        ep_plan.advance(); // cursor → the relay
+        let plan =
+            build_kawpowminer_launch_plan_for(PathBuf::from("kawpowminer"), addr, &ep_plan).unwrap();
+        let first_p = plan.args.iter().position(|a| a == "-P").unwrap();
+        assert!(plan.args[first_p + 1].contains(&format!("@{ALICE_POOL_HOST}:{ALICE_POOL_PORT}")));
+    }
+
+    /// HONESTY (multi-endpoint, GPU): a relay-only multi-endpoint plan still
+    /// carries the user's address, targets only the relay host, and contains no
+    /// core IP / collection / upstream string.
+    #[test]
+    fn honesty_gate_multi_endpoint_kawpow_relay_only() {
+        let addr = valid_address();
+        let eps = vec![
+            Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT),
+            Endpoint::tls(ALICE_POOL_HOST, 8889),
+        ];
+        let plan =
+            build_kawpowminer_launch_plan_with_endpoints(PathBuf::from("kawpowminer"), addr, &eps)
+                .unwrap();
+        let joined = plan.args.join(" ");
+        assert!(joined.contains(addr));
+        assert!(!joined.contains("203.0.113.10"));
+        assert!(!joined.contains("pool.") && !joined.contains(".pool"));
+        // Only the relay host appears.
+        for url in plan.args.iter().filter(|a| a.starts_with("stratum+")) {
+            assert!(url.contains(&format!("@{ALICE_POOL_HOST}:")));
+        }
+    }
+
+    #[test]
+    fn multi_endpoint_kawpow_fails_closed_on_empty_and_bad_address() {
+        let addr = valid_address();
+        assert!(build_kawpowminer_launch_plan_with_endpoints(
+            PathBuf::from("kawpowminer"),
+            addr,
+            &[]
+        )
+        .is_err());
+        let eps = vec![Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT)];
+        assert!(build_kawpowminer_launch_plan_with_endpoints(
+            PathBuf::from("kawpowminer"),
+            "not-an-address",
+            &eps
+        )
+        .is_err());
     }
 }

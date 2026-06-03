@@ -228,31 +228,52 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     ui.add_space(22.0);
     widgets::section_label(ui, "Lanes");
     ui.add_space(10.0);
-    let xmr_active = mining && app.active_lane() == Lane::Xmr;
-    let rvn_active = mining && app.active_lane() == Lane::GpuRvn;
+    // M4: in dual-mine BOTH lanes run, so read each lane's row from the snapshot's
+    // per-lane breakdown (`snap.lanes`) when present. In single-lane mode only the
+    // active lane is live (the existing behaviour).
+    let dual = snap.as_ref().map(|s| s.dual).unwrap_or(false);
+    let per_lane = |lane: Lane| -> Option<&alice_miner_core::engine::LaneSnapshot> {
+        snap.as_ref().and_then(|s| s.lanes.iter().find(|l| l.lane == lane))
+    };
+    let xmr_ls = per_lane(Lane::Xmr);
+    let rvn_ls = per_lane(Lane::GpuRvn);
+    // XMR row: live when dual (and it has a lane snapshot) OR single-XMR mining.
+    let xmr_active = if dual {
+        xmr_ls.map(|l| matches!(l.state, alice_miner_core::EngineState::Running | alice_miner_core::EngineState::Starting)).unwrap_or(false)
+    } else {
+        mining && app.active_lane() == Lane::Xmr
+    };
+    let (xmr_hr, xmr_sh) = lane_live_figures(app, dual, xmr_ls, xmr_active, (a, r));
     lane_row(
         ui,
         THEME.lane_xmr,
         "XMR · RandomX",
         &format!("· CPU · {} threads", app.device.as_ref().map(|d| d.logical_cores).unwrap_or(0)),
-        if xmr_active { Some(app.hr_display_khs) } else { None },
-        if xmr_active { (a, r) } else { (0, 0) },
+        xmr_hr,
+        xmr_sh,
         xmr_active,
     );
-    // The RVN row reflects the device's lane viability honestly: "available" on
-    // an NVIDIA box, "coming soon" on AMD, "needs NVIDIA" on Apple/CPU-only.
+    // RVN row: live when dual (with a lane snapshot) OR single-RVN mining. The
+    // role reflects the device's lane viability honestly: "available" on an
+    // NVIDIA box, "coming soon" on AMD, "needs NVIDIA" on Apple/CPU-only.
+    let rvn_active = if dual {
+        rvn_ls.map(|l| matches!(l.state, alice_miner_core::EngineState::Running | alice_miner_core::EngineState::Starting)).unwrap_or(false)
+    } else {
+        mining && app.active_lane() == Lane::GpuRvn
+    };
     let rvn_role = match app.lane_support(Lane::GpuRvn) {
         LaneSupport::Viable => "· GPU · NVIDIA · ready",
         LaneSupport::ComingSoon => "· GPU · AMD · coming soon",
         LaneSupport::Unavailable => "· GPU · needs NVIDIA",
     };
+    let (rvn_hr, rvn_sh) = lane_live_figures(app, dual, rvn_ls, rvn_active, (a, r));
     lane_row(
         ui,
         THEME.lane_gpu,
         "RVN · KawPoW",
         rvn_role,
-        if rvn_active { Some(app.hr_display_khs) } else { None },
-        if rvn_active { (a, r) } else { (0, 0) },
+        rvn_hr,
+        rvn_sh,
         rvn_active,
     );
 
@@ -267,6 +288,32 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     widgets::section_label(ui, "Log");
     ui.add_space(10.0);
     log_panel(ui, app);
+}
+
+/// The (hashrate kH/s, shares) to show for a lane row. In dual-mine each lane
+/// shows its OWN per-lane figures from the snapshot (so the two rows are
+/// independent); in single-lane mode the active lane uses the smoothed display
+/// hashrate + the top-level shares (the existing behaviour).
+fn lane_live_figures(
+    app: &MinerApp,
+    dual: bool,
+    ls: Option<&alice_miner_core::engine::LaneSnapshot>,
+    active: bool,
+    single_shares: (u64, u64),
+) -> (Option<f32>, (u64, u64)) {
+    if dual {
+        match ls {
+            Some(l) if active => (
+                l.hashrate_hs.map(|h| (h / 1000.0) as f32),
+                (l.shares_accepted, l.shares_rejected),
+            ),
+            _ => (None, (0, 0)),
+        }
+    } else if active {
+        (Some(app.hr_display_khs), single_shares)
+    } else {
+        (None, (0, 0))
+    }
 }
 
 fn lane_row(
@@ -348,6 +395,25 @@ fn connection_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                     kv_key(ui, "Endpoint");
                     ui.horizontal(|ui| {
                         ui.label(widgets::mono(endpoint, 13.0, THEME.text));
+                        // M4: a "failed over" note when Layer B has rotated the
+                        // endpoint cursor this run (so the user knows the active
+                        // endpoint differs from the primary).
+                        let failovers = snap.as_ref().map(|s| s.failovers).unwrap_or(0);
+                        if failovers > 0 {
+                            ui.add_space(8.0);
+                            egui::Frame::NONE
+                                .fill(egui::Color32::from_rgba_unmultiplied(THEME.warn.r(), THEME.warn.g(), THEME.warn.b(), 26))
+                                .corner_radius(6)
+                                .inner_margin(egui::Margin::symmetric(7, 2))
+                                .show(ui, |ui| {
+                                    let label = if failovers == 1 {
+                                        "failed over".to_string()
+                                    } else {
+                                        format!("failed over ×{failovers}")
+                                    };
+                                    ui.label(RichText::new(label).size(10.5).color(THEME.warn));
+                                });
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let (tone, label) = if connected {
                                 (Tone::Live, "connected")

@@ -58,6 +58,14 @@ pub struct MinerApp {
     /// Whether the user has manually picked a lane (so we stop auto-defaulting to
     /// the recommended one when a fresh `Detect` lands).
     pub lane_user_picked: bool,
+    /// Whether the user has turned the dual-mine toggle ON (run BOTH lanes). Only
+    /// honoured when [`MinerApp::dual_viable`] (≥2 viable lanes); the toggle is
+    /// rendered disabled otherwise. Default OFF (PLAN §5 M4 / D-dual).
+    pub dual_requested: bool,
+    /// Whether the dual-mine "heat / fan" confirmation has been shown+accepted for
+    /// the current enable (a brief acknowledgement that dual-mine pushes the
+    /// device harder). Resets when dual is turned off.
+    pub dual_confirm_open: bool,
     /// The active reward identity pointer (address etc.), if one exists.
     pub identity: Option<IdentityPointer>,
     /// The active screen.
@@ -134,6 +142,8 @@ impl MinerApp {
             // recommended lane when the device arrives (unless the user picked).
             selected_lane: Lane::Xmr,
             lane_user_picked: false,
+            dual_requested: false,
+            dual_confirm_open: false,
             identity,
             screen: Screen::Home,
             onboarding,
@@ -373,8 +383,23 @@ impl MinerApp {
         } else {
             Lane::Xmr
         };
-        if let Err(e) = self.engine.send(Command::Start { lane, address: None }) {
+        // Dual-mine only when the user opted in AND it's actually viable (≥2 lanes).
+        // The GUI gates the toggle on viability, but re-check here defensively.
+        let dual = self.dual_requested && self.dual_viable();
+        if let Err(e) = self.engine.send(Command::Start { lane, address: None, dual }) {
             self.error = Some(e);
+        }
+    }
+
+    /// Whether dual-mine is VIABLE on this device — at least two lanes are
+    /// runnable (CPU-XMR is always viable; the GPU-RVN lane must also be viable,
+    /// i.e. a real NVIDIA GPU). On this Mac only XMR is viable, so this is `false`
+    /// and the dual toggle renders disabled ("needs a supported GPU").
+    pub fn dual_viable(&self) -> bool {
+        use alice_miner_core::detect::capability::ALL_LANES;
+        match &self.viability {
+            Some(v) => ALL_LANES.iter().filter(|&&l| v.is_runnable(l)).count() >= 2,
+            None => false,
         }
     }
 
@@ -640,5 +665,46 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         assert!(app.motion_enabled(), "motion on by default");
         app.reduce_motion = true;
         assert!(!app.motion_enabled());
+    }
+
+    /// DUAL gating (the M4 gate): `dual_viable()` is `false` with a single viable
+    /// lane (this Mac: XMR only → the toggle renders disabled), and `true` once a
+    /// second lane (a simulated NVIDIA RVN) is viable (→ the toggle enables).
+    #[test]
+    fn dual_viable_requires_two_runnable_lanes() {
+        use alice_miner_core::detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
+        let mut app = MinerApp::new().expect("engine spawns");
+
+        // Apple Silicon (no NVIDIA): only XMR viable → dual NOT viable.
+        app.set_device(DeviceProfile {
+            os: OsFamily::Macos,
+            arch: "aarch64".into(),
+            apple_silicon: true,
+            logical_cores: 12,
+            cpu_model: "Apple M2 Max".into(),
+            gpu: GpuInfo { vendor: GpuVendor::Apple, model: "Apple M2 Max".into(), vram_gb: 0 },
+            memory_gb: 32,
+            display: "Apple M2 Max · 12 cores".into(),
+            warnings: vec![],
+        });
+        assert!(!app.dual_viable(), "Apple/CPU-only → dual disabled (one viable lane)");
+
+        // Simulated NVIDIA box: XMR + RVN both viable → dual viable.
+        app.set_device(DeviceProfile {
+            os: OsFamily::Linux,
+            arch: "x86_64".into(),
+            apple_silicon: false,
+            logical_cores: 16,
+            cpu_model: "AMD Ryzen 9 5950X".into(),
+            gpu: GpuInfo {
+                vendor: GpuVendor::Nvidia,
+                model: "NVIDIA GeForce RTX 3070 Ti".into(),
+                vram_gb: 8,
+            },
+            memory_gb: 64,
+            display: "AMD Ryzen 9 5950X · 16 cores".into(),
+            warnings: vec![],
+        });
+        assert!(app.dual_viable(), "NVIDIA box → dual enabled (two viable lanes)");
     }
 }

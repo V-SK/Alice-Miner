@@ -78,6 +78,12 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     // under a running child).
     lane_selector(ui, app);
 
+    // Dual-mine toggle: run BOTH lanes (CPU-XMR + GPU-RVN) together. Gated on
+    // viability (≥2 runnable lanes) — DISABLED on this Mac ("needs a supported
+    // GPU"). Default OFF. Shown only when not mid-run.
+    ui.add_space(9.0);
+    dual_mine_row(ui, app);
+
     // ── The Alice Core hero ───────────────────────────────────────────────────
     ui.add_space(14.0);
     let mode = match state {
@@ -309,6 +315,137 @@ fn lane_selector(ui: &mut egui::Ui, app: &mut MinerApp) {
     });
     if let Some(lane) = pick.get() {
         app.select_lane(lane);
+    }
+}
+
+/// The dual-mine toggle row beneath the lane selector. Runs BOTH lanes together
+/// (CPU-XMR + GPU-RVN), each crash-isolated, `cores-2` XMR headroom. The toggle
+/// is **gated on viability**: enabled only when ≥2 lanes are runnable. On this
+/// Mac (Apple Silicon, no NVIDIA) only XMR is viable, so it renders DISABLED with
+/// an honest "needs a supported GPU" hint — the user can't even flip it. When it
+/// IS enabled and the user turns it on, a brief heat/fan confirmation is shown.
+/// Hidden while a run is in flight (can't change topology under running children).
+fn dual_mine_row(ui: &mut egui::Ui, app: &mut MinerApp) {
+    let mid_run = matches!(
+        app.state(),
+        EngineState::Running | EngineState::Starting | EngineState::Stopping
+    );
+    if mid_run {
+        // While mining, just reflect the active mode (no toggling).
+        if app.snapshot.as_ref().map(|s| s.dual).unwrap_or(false) {
+            centered(ui, |ui| {
+                widgets::status_dot(ui, THEME.lane_gpu, 7.0, false);
+                ui.add_space(7.0);
+                ui.label(RichText::new("Dual-mine active · CPU + GPU").size(11.5).color(THEME.text3));
+            });
+        }
+        return;
+    }
+
+    let viable = app.dual_viable();
+    let on = app.dual_requested && viable;
+    let toggled = std::cell::Cell::new(false);
+
+    centered(ui, |ui| {
+        ui.spacing_mut().item_spacing.x = 9.0;
+        // Label + sub.
+        ui.label(RichText::new("Dual-mine").size(12.5).strong().color(if viable { THEME.text2 } else { THEME.text4 }));
+        ui.label(
+            RichText::new(if viable { "CPU + GPU" } else { "needs a supported GPU" })
+                .size(11.0)
+                .color(THEME.text4),
+        );
+        // The toggle itself — only interactive when viable.
+        if viable {
+            if widgets::toggle(ui, on).clicked() {
+                toggled.set(true);
+            }
+        } else {
+            // A visibly disabled toggle (off, dimmed, no pointer / no click).
+            let (rect, _resp) =
+                ui.allocate_exact_size(egui::vec2(42.0, 24.0), egui::Sense::hover());
+            let p = ui.painter_at(rect);
+            p.rect_filled(rect, 255.0, THEME.well);
+            p.rect_stroke(
+                rect,
+                255.0,
+                egui::Stroke::new(1.0, THEME.line),
+                egui::epaint::StrokeKind::Inside,
+            );
+            p.circle_filled(
+                egui::pos2(rect.left() + 12.0, rect.center().y),
+                9.0,
+                THEME.off.gamma_multiply(0.6),
+            );
+        }
+    });
+
+    if toggled.get() {
+        if app.dual_requested {
+            // Turning OFF → clear the confirm too.
+            app.dual_requested = false;
+            app.dual_confirm_open = false;
+        } else {
+            // Turning ON → open the heat/fan confirmation (require an explicit ack).
+            app.dual_confirm_open = true;
+        }
+    }
+
+    // The brief heat/fan confirmation (shown until acknowledged). A calm, honest
+    // note that dual-mine pushes the device harder; "Enable" commits, "Cancel"
+    // reverts to single-lane.
+    if app.dual_confirm_open && viable {
+        ui.add_space(8.0);
+        let commit = std::cell::Cell::new(false);
+        let cancel = std::cell::Cell::new(false);
+        egui::Frame::NONE
+            .fill(THEME.well)
+            .corner_radius(11)
+            .inner_margin(egui::Margin::symmetric(13, 11))
+            .stroke(egui::Stroke::new(1.0, THEME.line_strong))
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("Dual-mine runs CPU and GPU together")
+                            .size(12.0)
+                            .strong()
+                            .color(THEME.text),
+                    );
+                    ui.add_space(3.0);
+                    ui.label(
+                        RichText::new("More heat + fan noise; XMR drops 2 cores for the GPU. You can stop anytime.")
+                            .size(11.0)
+                            .color(THEME.text3),
+                    );
+                    ui.add_space(9.0);
+                    ui.horizontal(|ui| {
+                        let cancel_btn = egui::Button::new(RichText::new("Cancel").size(12.0).color(THEME.text2))
+                            .fill(THEME.surface2)
+                            .stroke(egui::Stroke::new(1.0, THEME.line))
+                            .corner_radius(8)
+                            .min_size(egui::vec2(84.0, 30.0));
+                        if ui.add(cancel_btn).clicked() {
+                            cancel.set(true);
+                        }
+                        ui.add_space(8.0);
+                        let ok_btn = egui::Button::new(RichText::new("Enable dual-mine").size(12.0).strong().color(THEME.ink_on_brand))
+                            .fill(THEME.brand)
+                            .corner_radius(8)
+                            .min_size(egui::vec2(140.0, 30.0));
+                        if ui.add(ok_btn).clicked() {
+                            commit.set(true);
+                        }
+                    });
+                });
+            });
+        if commit.get() {
+            app.dual_requested = true;
+            app.dual_confirm_open = false;
+        }
+        if cancel.get() {
+            app.dual_requested = false;
+            app.dual_confirm_open = false;
+        }
     }
 }
 

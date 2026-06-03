@@ -23,6 +23,8 @@
 
 use std::path::PathBuf;
 
+use crate::endpoint::{Endpoint, EndpointPlan, Transport};
+
 // ── Credit-only capability gates (ported VERBATIM from Wallet miner.rs L12-25) ──
 // The miner may RUN (opt-in Start), but every payout/settlement/mint/custom-pool
 // gate stays closed. A `const _` assertion test fails the BUILD if any is flipped.
@@ -230,6 +232,94 @@ pub fn build_miner_launch_plan(
     Ok(MinerLaunchPlan { program, args })
 }
 
+/// Build the validated XMRig launch plan with **multi-endpoint failover (Layer A)
+/// + a thread override** — the M4 generalization of [`build_miner_launch_plan`].
+///
+/// The single-endpoint, default-threads [`build_miner_launch_plan`] stays the
+/// proven path (byte-faithful); this variant adds exactly two things, both
+/// additive:
+///   * **Layer A failover:** xmrig accepts MULTIPLE `-o` pools and fails over
+///     between them itself (fast, in-process). We emit one `-o <host:port>` per
+///     endpoint in `endpoints` IN ORDER (the supervisor passes them rotated so
+///     the active endpoint is primary — see [`EndpointPlan::ordered_from_cursor`]).
+///     A `stratum+ssl` (TLS, T1) endpoint also gets `--tls` appended for that
+///     pool (xmrig's per-pool TLS flag); plaintext (T0) endpoints don't.
+///   * **`threads_override`:** when `Some(n)`, pins `--threads n` (dual-mine
+///     uses `cores-2` headroom). `None` keeps the single-lane "拉满" default
+///     ([`miner_thread_count`]).
+///
+/// Same HONESTY invariant as [`build_miner_launch_plan`]: every `-o` value is an
+/// Alice-relay endpoint, the login `-u` is the user's OWN address, and no
+/// collection / seed / upstream-pool string is present. (The endpoints come from
+/// an [`EndpointPlan`], whose default is relay-only and whose only non-relay
+/// source is the operator `ALICE_MINER_ENDPOINTS_JSON` override.)
+pub fn build_miner_launch_plan_with_endpoints(
+    program: PathBuf,
+    reward_identity: &str,
+    endpoints: &[Endpoint],
+    threads_override: Option<usize>,
+) -> Result<MinerLaunchPlan, String> {
+    if !MINING_EXECUTION_ALLOWED {
+        return Err("mining execution is not enabled in this build".into());
+    }
+    if endpoints.is_empty() {
+        return Err("xmr launch plan needs at least one endpoint".into());
+    }
+    let reward = reward_identity.trim();
+    let rig_id = derive_worker_id(reward)?;
+    let threads = threads_override
+        .map(|n| n.clamp(1, MINER_MAX_THREADS))
+        .unwrap_or_else(miner_thread_count);
+
+    let mut args: Vec<String> = Vec::with_capacity(endpoints.len() * 3 + 16);
+    // Layer A: one `-o` per endpoint, in order. A TLS endpoint gets `--tls`
+    // appended immediately after its `-o` (xmrig applies per-pool flags to the
+    // most-recent `-o`).
+    for ep in endpoints {
+        args.push("-o".into());
+        args.push(ep.host_port());
+        if ep.transport == Transport::Tls {
+            args.push("--tls".into());
+        }
+    }
+    args.extend([
+        "-u".into(),
+        reward.to_string(),
+        "-p".into(),
+        "x".into(),
+        "--rig-id".into(),
+        rig_id,
+        "--coin".into(),
+        "monero".into(),
+        "--no-color".into(),
+        "--print-time".into(),
+        "10".into(),
+        "--donate-level".into(),
+        "0".into(),
+        "--cpu-priority".into(),
+        "1".into(),
+        "--threads".into(),
+        threads.to_string(),
+    ]);
+    Ok(MinerLaunchPlan { program, args })
+}
+
+/// Convenience: build the XMR plan from an [`EndpointPlan`] (rotated to its
+/// current cursor) with an optional thread override. The engine calls this.
+pub fn build_miner_launch_plan_for(
+    program: PathBuf,
+    reward_identity: &str,
+    plan: &EndpointPlan,
+    threads_override: Option<usize>,
+) -> Result<MinerLaunchPlan, String> {
+    build_miner_launch_plan_with_endpoints(
+        program,
+        reward_identity,
+        &plan.ordered_from_cursor(),
+        threads_override,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,5 +502,114 @@ mod tests {
     #[test]
     fn miner_launch_plan_fails_closed_on_bad_reward_identity() {
         assert!(build_miner_launch_plan(PathBuf::from("xmrig"), "not-an-address").is_err());
+    }
+
+    /// M4 Layer A: the multi-endpoint builder emits one `-o` per endpoint IN
+    /// ORDER, so xmrig fails over between them itself. The single default-plan
+    /// case stays byte-identical to the proven `build_miner_launch_plan` (modulo
+    /// the equality of args).
+    #[test]
+    fn multi_endpoint_plan_emits_one_dash_o_per_endpoint_in_order() {
+        let addr = valid_address();
+        let eps = vec![
+            Endpoint::plaintext("blackhole.invalid", 65000),
+            Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT),
+        ];
+        let plan = build_miner_launch_plan_with_endpoints(
+            PathBuf::from("/usr/local/bin/xmrig"),
+            addr,
+            &eps,
+            None,
+        )
+        .expect("plan");
+        // Two `-o` flags, in order: the bogus primary first, the relay second.
+        let o_values: Vec<&String> = plan
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && plan.args[i - 1] == "-o")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(o_values.len(), 2);
+        assert_eq!(o_values[0], "blackhole.invalid:65000");
+        assert_eq!(o_values[1], &format!("{ALICE_POOL_HOST}:{ALICE_POOL_PORT}"));
+        // Login + power flags still present once.
+        let u = plan.args.iter().position(|a| a == "-u").expect("-u");
+        assert_eq!(plan.args[u + 1].as_str(), addr);
+        assert!(plan.args.iter().any(|a| a == "--threads"));
+    }
+
+    /// A TLS (T1) endpoint gets a per-pool `--tls` right after its `-o`;
+    /// plaintext endpoints do not. (Transport-aware Layer-A arg building — makes
+    /// M9 additive.)
+    #[test]
+    fn tls_endpoint_appends_per_pool_tls_flag() {
+        let addr = valid_address();
+        let eps = vec![
+            Endpoint::tls(ALICE_POOL_HOST, 3334),
+            Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT),
+        ];
+        let plan =
+            build_miner_launch_plan_with_endpoints(PathBuf::from("xmrig"), addr, &eps, None).unwrap();
+        // The first `-o` (the TLS one) is immediately followed by `--tls`.
+        let first_o = plan.args.iter().position(|a| a == "-o").unwrap();
+        assert_eq!(plan.args[first_o + 1], "hk.aliceprotocol.org:3334");
+        assert_eq!(plan.args[first_o + 2], "--tls");
+        // Exactly one `--tls` (the plaintext relay endpoint added none).
+        assert_eq!(plan.args.iter().filter(|a| *a == "--tls").count(), 1);
+    }
+
+    /// The thread override pins `--threads n` (dual-mine `cores-2` headroom);
+    /// `None` keeps the full-power default.
+    #[test]
+    fn thread_override_pins_thread_count() {
+        let addr = valid_address();
+        let eps = vec![Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT)];
+        let plan =
+            build_miner_launch_plan_with_endpoints(PathBuf::from("xmrig"), addr, &eps, Some(6))
+                .unwrap();
+        let t = plan.args.iter().position(|a| a == "--threads").unwrap();
+        assert_eq!(plan.args[t + 1], "6");
+        // None → the "拉满" default (all cores).
+        let plan2 =
+            build_miner_launch_plan_with_endpoints(PathBuf::from("xmrig"), addr, &eps, None).unwrap();
+        let t2 = plan2.args.iter().position(|a| a == "--threads").unwrap();
+        assert_eq!(plan2.args[t2 + 1], miner_thread_count().to_string());
+    }
+
+    /// `build_miner_launch_plan_for` rotates the EndpointPlan to its cursor, so
+    /// after a Layer-B advance the now-active endpoint is the primary `-o`.
+    #[test]
+    fn build_for_endpoint_plan_respects_cursor() {
+        let addr = valid_address();
+        let mut ep_plan = EndpointPlan::new(vec![
+            Endpoint::plaintext("blackhole.invalid", 65000),
+            Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT),
+        ])
+        .unwrap();
+        ep_plan.advance(); // cursor → the relay
+        let plan =
+            build_miner_launch_plan_for(PathBuf::from("xmrig"), addr, &ep_plan, None).unwrap();
+        let first_o = plan.args.iter().position(|a| a == "-o").unwrap();
+        // The rotated order puts the relay first now.
+        assert_eq!(
+            plan.args[first_o + 1],
+            format!("{ALICE_POOL_HOST}:{ALICE_POOL_PORT}")
+        );
+    }
+
+    #[test]
+    fn multi_endpoint_plan_fails_closed_on_empty_and_bad_address() {
+        let addr = valid_address();
+        assert!(build_miner_launch_plan_with_endpoints(PathBuf::from("xmrig"), addr, &[], None)
+            .is_err());
+        let eps = vec![Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT)];
+        assert!(build_miner_launch_plan_with_endpoints(
+            PathBuf::from("xmrig"),
+            "not-an-address",
+            &eps,
+            None
+        )
+        .is_err());
     }
 }

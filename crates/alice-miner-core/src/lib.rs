@@ -32,15 +32,25 @@ pub use alice_supervise;
 
 pub mod binaries;
 pub mod detect;
+pub mod endpoint;
 pub mod engine;
 pub mod identity;
 pub mod lane;
 pub mod stats;
 pub mod supervise;
 
+/// Test-only: a single process-global lock guarding the `ALICE_MINER_*_BIN` env
+/// vars. Both [`binaries`] and [`engine`] tests set/read these, and Rust runs
+/// tests in a crate in parallel, so they MUST serialize through one mutex (two
+/// separate mutexes would not prevent the cross-module race). Lives here so both
+/// modules share the exact same lock.
+#[cfg(test)]
+pub(crate) static MINER_BIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // Convenient top-level re-exports for the front-ends.
 pub use detect::capability::{CapabilityProfile, LaneSupport, LaneViability};
 pub use detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
+pub use endpoint::{Endpoint, EndpointPlan, Transport};
 pub use engine::{Command, EngineHandle, EngineState, Event, IdentitySpec, Snapshot};
 pub use identity::{Identity, IdentityPointer};
 pub use lane::Lane;

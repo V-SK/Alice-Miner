@@ -98,6 +98,16 @@ impl ShotRunner {
                 Shot { file: "home-idle-lanes-nvidia.png", pose: pose_home_idle_nvidia },
                 // The same NVIDIA box's dashboard (RVN row reads "ready").
                 Shot { file: "dashboard-nvidia.png", pose: pose_dashboard_nvidia },
+                // ── M4: dual-mine + failover ────────────────────────────────
+                // This Mac (Apple Silicon): the dual-mine toggle renders DISABLED
+                // ("needs a supported GPU") — honest gating. (Same Home-idle shot
+                // but named so it's easy to inspect the disabled toggle row.)
+                Shot { file: "home-idle-dual-disabled-apple.png", pose: pose_home_idle },
+                // A simulated NVIDIA box: the dual-mine toggle is ENABLED.
+                Shot { file: "home-idle-dual-enabled-nvidia.png", pose: pose_home_dual_enabled_nvidia },
+                // The dual-mine dashboard (NVIDIA box): BOTH lane rows live + an
+                // active "failed over" endpoint note.
+                Shot { file: "dashboard-dual-failover.png", pose: pose_dashboard_dual_failover },
             ],
             idx: 0,
             phase: Phase::Settling,
@@ -263,6 +273,9 @@ fn demo_mining_snapshot() -> Snapshot {
         endpoint: Some("hk.aliceprotocol.org:3333".into()),
         worker_id: Some("rig-7f3a9c21".into()),
         uptime_s: 2 * 3600 + 14 * 60 + 9, // 02:14:09
+        failovers: 0,
+        dual: false,
+        lanes: Vec::new(),
         last_line: Some("accepted (142/1) diff 32001 (12 ms)".into()),
         message: None,
     }
@@ -329,6 +342,9 @@ fn demo_state_snapshot(state: EngineState, message: Option<&str>) -> Snapshot {
         endpoint: Some("hk.aliceprotocol.org:3333".into()),
         worker_id: Some("rig-7f3a9c21".into()),
         uptime_s: 0,
+        failovers: 0,
+        dual: false,
+        lanes: Vec::new(),
         last_line: None,
         message: message.map(|m| m.to_string()),
     }
@@ -494,6 +510,85 @@ fn pose_dashboard_nvidia(app: &mut MinerApp) {
     // Idle (not mining) so both lane rows show their viability state cleanly.
     app.snapshot = None;
     app.hr_display_khs = 0.0;
+    seed_log(app);
+}
+
+/// M4: Home idle on a simulated NVIDIA box with dual-mine TURNED ON — the toggle
+/// is enabled (≥2 viable lanes) and reads active. Proves the gating flips on a
+/// supported GPU. NOT this Mac; a posed capture only.
+fn pose_home_dual_enabled_nvidia(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Home;
+    app.set_device(demo_nvidia_device()); // RVN viable → dual_viable() == true
+    install_demo_identity(app);
+    app.error = None;
+    app.snapshot = None;
+    app.hr_display_khs = 0.0;
+    app.dual_requested = true; // toggle ON (the confirm already acknowledged)
+    app.dual_confirm_open = false;
+}
+
+/// A dual-mine *running* snapshot: BOTH lanes live (CPU-XMR + GPU-RVN), with the
+/// XMR lane having failed over once to demonstrate the M4 endpoint note. The
+/// per-lane breakdown drives the two-row lane stack; top-level mirrors the
+/// (XMR) primary with a summed hashrate. Credit-only activity only.
+fn demo_dual_snapshot() -> Snapshot {
+    Snapshot {
+        state: EngineState::Running,
+        device: Some(demo_nvidia_device()),
+        lane: Some(Lane::Xmr),
+        // Top-level hashrate = XMR (8.4 kH/s) + RVN (25.4 MH/s) summed in H/s.
+        hashrate_hs: Some(8_400.0 + 25_430_000.0),
+        shares_accepted: 142 + except_rvn_accepted(),
+        shares_rejected: 1,
+        endpoint: Some("hk.aliceprotocol.org:3333".into()),
+        worker_id: Some("rig-7f3a9c21".into()),
+        uptime_s: 47 * 60 + 12,
+        failovers: 1, // the XMR lane rotated once (Layer B)
+        dual: true,
+        lanes: vec![
+            alice_miner_core::engine::LaneSnapshot {
+                lane: Lane::Xmr,
+                state: EngineState::Running,
+                hashrate_hs: Some(8_400.0),
+                shares_accepted: 142,
+                shares_rejected: 1,
+                endpoint: Some("hk.aliceprotocol.org:3333".into()),
+                failovers: 1,
+            },
+            alice_miner_core::engine::LaneSnapshot {
+                lane: Lane::GpuRvn,
+                state: EngineState::Running,
+                hashrate_hs: Some(25_430_000.0),
+                shares_accepted: except_rvn_accepted(),
+                shares_rejected: 0,
+                endpoint: Some("hk.aliceprotocol.org:8888".into()),
+                failovers: 0,
+            },
+        ],
+        last_line: Some("accepted (142/1) diff 32001 (12 ms)".into()),
+        message: None,
+    }
+}
+
+/// A fixed RVN accepted-share count for the dual demo (kept as a fn so both the
+/// per-lane row and the top-level sum use the same value).
+fn except_rvn_accepted() -> u64 {
+    58
+}
+
+/// M4: the dual-mine dashboard (NVIDIA box) — BOTH lane rows live, each with its
+/// own hashrate + shares, and the connection panel shows the "failed over" note.
+fn pose_dashboard_dual_failover(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Dashboard;
+    app.set_device(demo_nvidia_device());
+    install_demo_identity(app);
+    app.error = None;
+    app.snapshot = Some(demo_dual_snapshot());
+    // The top-level (summed) hashrate is dominated by the GPU lane — pin the
+    // display so the header/cards read a stable big number.
+    pin_mining_anim(app, (8_400.0 + 25_430_000.0) / 1000.0);
     seed_log(app);
 }
 

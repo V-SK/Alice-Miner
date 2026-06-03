@@ -143,12 +143,13 @@ pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // `resolve_miner_binary` reads a process-global env var, so these tests must
+    // `resolve_miner_binary` reads process-global env vars, so these tests must
     // not run concurrently (one setting the override would leak into another's
-    // dev-fallback path). Serialize them and always clear the var on entry.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // dev-fallback path) — and they share the lock with the engine's dual-mine
+    // test, which also sets `ALICE_MINER_*_BIN`. Serialize through the ONE
+    // crate-level lock; always clear the var on entry.
+    use crate::MINER_BIN_ENV_LOCK as ENV_LOCK;
 
     #[test]
     fn env_override_to_existing_file_is_honored() {

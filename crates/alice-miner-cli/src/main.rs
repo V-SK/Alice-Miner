@@ -67,6 +67,10 @@ struct StartArgs {
     /// Override the reward address (defaults to the active `~/.alice` identity).
     #[arg(long)]
     address: Option<String>,
+    /// Dual-mine: run BOTH lanes together (CPU-XMR + GPU-RVN), each crash-isolated,
+    /// with `cores-2` XMR headroom. Requires ≥2 viable lanes on this device.
+    #[arg(long)]
+    dual: bool,
     /// Stop automatically after this many seconds (0 = run until Ctrl-C). Used
     /// for the M1 live-connect verification.
     #[arg(long, default_value_t = 0)]
@@ -242,6 +246,22 @@ fn cmd_start(args: StartArgs) -> i32 {
         );
         return 2;
     }
+    // Dual-mine requires ≥2 viable lanes (CPU-XMR + a viable GPU-RVN). On a Mac /
+    // no-NVIDIA box only XMR is viable, so refuse with a clear reason.
+    if args.dual {
+        let viable = alice_miner_core::detect::capability::ALL_LANES
+            .iter()
+            .filter(|&&l| cap.support(l).is_runnable())
+            .count();
+        if viable < 2 {
+            eprintln!(
+                "error: dual-mine needs ≥2 viable lanes; this device has {viable} (RVN is {}). \
+                 Run a single lane instead.",
+                cap.support(Lane::GpuRvn).label(),
+            );
+            return 2;
+        }
+    }
 
     let engine = match EngineHandle::spawn() {
         Ok(e) => e,
@@ -261,12 +281,20 @@ fn cmd_start(args: StartArgs) -> i32 {
         });
     }
 
-    if let Err(e) = engine.send(EngineCommand::Start { lane, address: args.address }) {
+    if let Err(e) = engine.send(EngineCommand::Start {
+        lane,
+        address: args.address,
+        dual: args.dual,
+    }) {
         eprintln!("error: {e}");
         return 1;
     }
 
-    println!("Starting {} lane (Ctrl-C to stop)…", lane.label());
+    if args.dual {
+        println!("Starting dual-mine (CPU-XMR + GPU-RVN, Ctrl-C to stop)…");
+    } else {
+        println!("Starting {} lane (Ctrl-C to stop)…", lane.label());
+    }
 
     let start = std::time::Instant::now();
     let deadline = if args.duration_s > 0 {
@@ -335,19 +363,42 @@ fn print_snapshot(snap: &alice_miner_core::Snapshot) {
         .map(|h| format!("{h:.1} H/s"))
         .unwrap_or_else(|| "—".into());
     let endpoint = snap.endpoint.as_deref().unwrap_or("—");
+    // Surface Layer-B failover (the M4 live-connect verification reads this).
+    let failover = if snap.failovers > 0 {
+        format!(" failed-over×{}", snap.failovers)
+    } else {
+        String::new()
+    };
+    let dual = if snap.dual { " [dual]" } else { "" };
     println!(
-        "[{:?}] hashrate={} shares={}A/{}R uptime={}s endpoint={}{}",
+        "[{:?}]{dual} hashrate={} shares={}A/{}R uptime={}s endpoint={}{}{}",
         snap.state,
         hr,
         snap.shares_accepted,
         snap.shares_rejected,
         snap.uptime_s,
         endpoint,
+        failover,
         snap.last_line
             .as_deref()
             .map(|l| format!("  | {l}"))
             .unwrap_or_default(),
     );
+    // In dual mode, also print each lane's row so both lanes are visible.
+    if snap.dual {
+        for l in &snap.lanes {
+            let lhr = l.hashrate_hs.map(|h| format!("{h:.1} H/s")).unwrap_or_else(|| "—".into());
+            println!(
+                "    └ {}: [{:?}] {} {}A/{}R @ {}",
+                l.lane.label(),
+                l.state,
+                lhr,
+                l.shares_accepted,
+                l.shares_rejected,
+                l.endpoint.as_deref().unwrap_or("—"),
+            );
+        }
+    }
 }
 
 /// Human-friendly one-line GPU description for `detect` (model + VRAM, or the
