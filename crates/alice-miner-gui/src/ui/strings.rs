@@ -36,12 +36,59 @@ pub const HASHING_SUB: &str = "hashing · 待发放";
 pub const CTA_START: &str = "START";
 pub const CTA_START_SUB: &str = "press to begin · 点击开始";
 
+/// Connecting hero readout (the indeterminate sweep state).
+pub const CTA_CONNECTING: &str = "CONNECTING";
+pub const CTA_CONNECTING_SUB: &str = "reaching the relay · 连接中";
+
+/// Stopping hero readout (the brief tear-down transient).
+pub const CTA_STOPPING: &str = "STOPPING";
+pub const CTA_STOPPING_SUB: &str = "winding down · 停止中";
+
+/// Error hero readout — a calm "start again" affordance (no scary dump).
+pub const CTA_RETRY: &str = "START AGAIN";
+pub const CTA_RETRY_SUB: &str = "the lane stopped · 已停止";
+
 /// "Rewards to <addr>" prefix (the address itself is the user's OWN public one,
 /// supplied at call sites — never a collection address).
 pub const REWARDS_TO: &str = "Rewards to";
 
 /// Experimental badge ("测试中") — the mining feature is opt-in + experimental.
 pub const EXPERIMENTAL: &str = "experimental · 测试中";
+
+// ── Home status lines (one per engine state) ─────────────────────────────────
+/// Idle status line.
+pub const STATUS_IDLE: &str = "Idle — press Start to begin";
+/// Connecting status line (the PUBLIC relay only — never the upstream pool).
+pub const STATUS_CONNECTING: &str = "Connecting to the relay…";
+/// Stopping status line.
+pub const STATUS_STOPPING: &str = "Stopping the miner…";
+/// A calm, generic error status when the engine gave no specific reason.
+pub const STATUS_ERROR_GENERIC: &str = "The mining lane stopped. You can start again.";
+
+// ── Onboarding (create / back-up / confirm / import / watch-only) ────────────
+pub const OB_WELCOME_EYEBROW: &str = "Welcome · 欢迎";
+pub const OB_WELCOME_TITLE: &str = "Set up your reward identity";
+pub const OB_WELCOME_SUB: &str = "One Alice identity works in Wallet, Miner & AI.";
+
+pub const OB_BACKUP_EYEBROW: &str = "Step 2 of 3 · back up";
+pub const OB_BACKUP_TITLE: &str = "Write down your recovery phrase";
+pub const OB_BACKUP_SUB: &str = "24 words. The only way to recover this identity.";
+pub const OB_BACKUP_WARNING: &str =
+    "This is the only way to recover. Anyone with these words controls the address. Store offline — never paste it online.";
+pub const OB_BACKUP_ACK: &str = "I've written down all 24 words and stored them safely.";
+
+pub const OB_CONFIRM_EYEBROW: &str = "Step 3 of 3 · confirm";
+pub const OB_CONFIRM_TITLE: &str = "Confirm your phrase";
+/// Mismatch feedback when a tapped word is wrong (calm, not scary).
+pub const OB_CONFIRM_WRONG: &str = "That word doesn't match — tap the right one.";
+
+pub const OB_IMPORT_EYEBROW: &str = "Import";
+pub const OB_IMPORT_TITLE: &str = "Import an existing identity";
+pub const OB_IMPORT_SUB: &str = "Paste a 12/24-word phrase, or a raw seed (hex).";
+
+pub const OB_PASTE_EYEBROW: &str = "Watch-only";
+pub const OB_PASTE_TITLE: &str = "Paste an Alice address";
+pub const OB_PASTE_SUB: &str = "Track rewards for an address you own. No keys stored.";
 
 #[cfg(test)]
 mod tests {
@@ -55,14 +102,23 @@ mod tests {
     fn no_forbidden_reward_tokens_in_user_strings() {
         let src = include_str!("strings.rs");
         // Extract the body of each `pub const NAME: &str = "BODY";` declaration.
+        // Some declarations wrap the value onto the FOLLOWING line(s); when a
+        // `pub const` line carries no quote we keep scanning subsequent lines for
+        // the string literal so the scan covers EVERY user-facing constant (a
+        // multi-line value must not slip through the honesty gate).
         let mut literals = String::new();
+        let mut in_const = false; // inside a `pub const` whose literal we still seek
         for line in src.lines() {
-            let line = line.trim_start();
-            if line.starts_with("pub const") {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("pub const") {
+                in_const = true;
+            }
+            if in_const {
                 if let Some(open) = line.find('"') {
                     if let Some(close) = line[open + 1..].find('"') {
                         literals.push_str(&line[open + 1..open + 1 + close]);
                         literals.push('\n');
+                        in_const = false;
                     }
                 }
             }

@@ -54,7 +54,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let up = snap.as_ref().map(|s| fmt_uptime(s.uptime_s)).unwrap_or_else(|| "—".into());
-            let (tone, blink) = if mining { (Tone::Live, true) } else { (Tone::Off, false) };
+            let (tone, blink) = if mining { (Tone::Live, app.motion_enabled()) } else { (Tone::Off, false) };
             egui::Frame::NONE
                 .fill(egui::Color32::from_rgba_unmultiplied(tone.fg().r(), tone.fg().g(), tone.fg().b(), 22))
                 .corner_radius(255)
@@ -243,6 +243,7 @@ fn connection_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
         .unwrap_or_else(|| "hk.aliceprotocol.org:3333".into());
     let worker = snap.as_ref().and_then(|s| s.worker_id.clone());
     let connected = app.is_mining();
+    let motion = app.motion_enabled();
 
     egui::Frame::NONE
         .fill(THEME.surface)
@@ -264,7 +265,7 @@ fn connection_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                             } else {
                                 (Tone::Off, "not connected")
                             };
-                            widgets::status_dot(ui, tone.fg(), 8.0, connected);
+                            widgets::status_dot(ui, tone.fg(), 8.0, connected && motion);
                             ui.add_space(8.0);
                             ui.label(RichText::new(label).size(12.0).color(THEME.text2));
                         });
@@ -379,6 +380,35 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                 });
             });
 
+            // Appearance panel (reduced motion, language).
+            panel(ui, "Appearance", Icon::Activity, |ui| {
+                let mut rm = app.reduce_motion;
+                srow(
+                    ui,
+                    "Reduce motion",
+                    "Turns off the breathing glow, gauge sweep and number tween. Colours and states stay.",
+                    |ui| {
+                        if widgets::toggle(ui, rm).clicked() {
+                            rm = !rm;
+                        }
+                    },
+                );
+                app.reduce_motion = rm;
+                let mut zh = app.lang_zh;
+                srow(ui, "Language · 语言", "Interface language. Numbers stay mono in both.", |ui| {
+                    ui.horizontal(|ui| {
+                        if lang_seg(ui, "EN", !zh).clicked() {
+                            zh = false;
+                        }
+                        ui.add_space(2.0);
+                        if lang_seg(ui, "中文", zh).clicked() {
+                            zh = true;
+                        }
+                    });
+                });
+                app.lang_zh = zh;
+            });
+
             // Identity panel.
             panel(ui, "Identity", Icon::Eye, |ui| {
                 srow(ui, "Reward address", "Your own Alice address. Rewards accrue to it as pending.", |ui| {
@@ -405,6 +435,18 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
             );
             ui.add_space(28.0);
         });
+}
+
+/// A zinc segmented-control button (language picker). `on` = selected.
+fn lang_seg(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
+    let btn = egui::Button::new(
+        RichText::new(label).size(12.0).strong().color(if on { THEME.text } else { THEME.text3 }),
+    )
+    .fill(if on { THEME.surface3 } else { THEME.well })
+    .stroke(egui::Stroke::new(1.0, if on { THEME.line_strong } else { THEME.line }))
+    .corner_radius(8)
+    .min_size(egui::vec2(54.0, 30.0));
+    ui.add(btn)
 }
 
 fn panel(ui: &mut egui::Ui, title: &str, icon: Icon, body: impl FnOnce(&mut egui::Ui)) {

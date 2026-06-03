@@ -31,6 +31,10 @@ pub enum Onboarding {
     Choose,
     /// Created: show the 24-word mnemonic for the forced-backup step.
     Backup { mnemonic: String, acknowledged: bool },
+    /// Confirm the backup by re-picking 3 random words (PLAN §4 — the deliberate
+    /// divergence from the Wallet). Carries the mnemonic so a wrong pick can be
+    /// re-prompted without regenerating.
+    Confirm { mnemonic: String },
     /// Import an existing mnemonic or seed.
     Import,
     /// Paste an address (watch-only).
@@ -78,6 +82,20 @@ pub struct MinerApp {
     pub copied_at: Option<Instant>,
     /// Language toggle (display-only; copy is bilingual already).
     pub lang_zh: bool,
+    /// Reduced-motion setting (Settings · Appearance). When on, the breathing
+    /// glow / gauge sweep / number tween are disabled but the colour + state
+    /// semantics are KEPT, so the app stays legible + calm for motion-sensitive
+    /// users (PLAN §4, doc 06 §4/§12). egui 0.34 does not surface the OS
+    /// `prefers-reduced-motion` hint, so this is an explicit in-app toggle.
+    pub reduce_motion: bool,
+
+    // ── Onboarding · confirm-by-retyping (forced-backup divergence, PLAN §4) ──
+    /// The 3 positions (1-based word indices) the user must re-pick to confirm.
+    pub confirm_targets: Vec<usize>,
+    /// The shuffled word pool shown as tappable chips during confirm.
+    pub confirm_pool: Vec<String>,
+    /// The word the user has chosen for each target slot (`None` = empty).
+    pub confirm_filled: Vec<Option<String>>,
 
     /// Headless screenshot-mode driver. `None` on every normal run; `Some` only
     /// when `ALICE_MINER_SHOT_DIR` is set (see [`crate::shot`]). When set, the
@@ -119,8 +137,18 @@ impl MinerApp {
             last_spark_push: None,
             copied_at: None,
             lang_zh: false,
+            reduce_motion: false,
+            confirm_targets: Vec::new(),
+            confirm_pool: Vec::new(),
+            confirm_filled: Vec::new(),
             shot: crate::shot::ShotRunner::from_env(),
         })
+    }
+
+    /// Whether motion (breathing glow, gauge sweep, number tween, blinking dots)
+    /// is enabled. `false` when the user turned on reduced motion.
+    pub fn motion_enabled(&self) -> bool {
+        !self.reduce_motion
     }
 
     /// Lazily load (and cache) the Alice mark texture from the bundled PNG.
@@ -229,8 +257,14 @@ impl MinerApp {
     /// real one, adapt the gauge ceiling, and push a sparkline sample ~1×/s.
     pub fn tick_anim(&mut self, ctx: &egui::Context) {
         let target = self.hashrate_khs();
-        // Ease toward the target (the contract's fluid tween, `+= (t-x)*0.16`).
-        self.hr_display_khs += (target - self.hr_display_khs) * 0.16;
+        if self.motion_enabled() {
+            // Ease toward the target (the contract's fluid tween, `+= (t-x)*0.16`).
+            self.hr_display_khs += (target - self.hr_display_khs) * 0.16;
+        } else {
+            // Reduced motion: snap to the target (no tween) — the number is still
+            // accurate, it just doesn't animate toward the value.
+            self.hr_display_khs = target;
+        }
         if self.hr_display_khs < 0.001 {
             self.hr_display_khs = 0.0;
         }
@@ -252,12 +286,16 @@ impl MinerApp {
                 self.spark.pop_front();
             }
         }
-        // While mining (or starting/stopping) keep the frame loop live for the
-        // breathing glow + number tween; otherwise a gentle idle cadence.
-        if !matches!(self.state(), EngineState::Idle) {
-            ctx.request_repaint();
-        } else {
-            ctx.request_repaint_after(std::time::Duration::from_millis(400));
+        // While active (mining / starting / stopping) keep the frame loop live so
+        // the breathing glow + number tween animate AND engine events keep
+        // draining. Under reduced motion we still need to poll the engine for
+        // snapshots, but a calmer ~10 Hz cadence is enough (no per-frame anim).
+        match (self.state(), self.motion_enabled()) {
+            (EngineState::Idle, _) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(400));
+            }
+            (_, true) => ctx.request_repaint(),
+            (_, false) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
         }
     }
 
@@ -338,9 +376,105 @@ impl MinerApp {
         }
     }
 
+    /// Move from the backup step to the confirm step: pick 3 distinct word
+    /// positions to verify and build a shuffled chip pool (the 3 correct words
+    /// plus filler decoys from the phrase). Deterministic shuffle (no `rand`
+    /// dep) seeded off the current time — good enough for an anti-skip check.
+    pub fn begin_confirm(&mut self, mnemonic: &str) {
+        let words: Vec<String> = mnemonic.split_whitespace().map(|s| s.to_string()).collect();
+        let n = words.len().max(1);
+        // Pick 3 distinct positions via a time-seeded LCG (ascending for a calm
+        // "#3 · #9 · #11" prompt).
+        let mut seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E3779B97F4A7C15)
+            | 1;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed as usize) % bound.max(1)
+        };
+        let mut targets: Vec<usize> = Vec::new();
+        let want = 3.min(n);
+        while targets.len() < want {
+            let i = next(n);
+            if !targets.contains(&i) {
+                targets.push(i);
+            }
+        }
+        targets.sort_unstable();
+
+        // Build the chip pool: the correct words + a few decoys, then shuffle.
+        let mut pool: Vec<String> = targets.iter().map(|&i| words[i].clone()).collect();
+        let mut decoys: Vec<String> = words
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !targets.contains(i))
+            .map(|(_, w)| w.clone())
+            .collect();
+        // Take up to 5 decoys.
+        let mut chosen_decoys = Vec::new();
+        while chosen_decoys.len() < 5.min(decoys.len()) {
+            let i = next(decoys.len());
+            chosen_decoys.push(decoys.remove(i));
+        }
+        pool.extend(chosen_decoys);
+        // Fisher–Yates shuffle the pool.
+        for i in (1..pool.len()).rev() {
+            let j = next(i + 1);
+            pool.swap(i, j);
+        }
+
+        self.confirm_targets = targets.iter().map(|&i| i + 1).collect(); // 1-based for display
+        self.confirm_pool = pool;
+        self.confirm_filled = vec![None; want];
+        self.error = None;
+        self.onboarding = Some(Onboarding::Confirm {
+            mnemonic: mnemonic.to_string(),
+        });
+    }
+
+    /// True when every confirm slot holds the word at its (1-based) target index.
+    pub fn confirm_is_correct(&self, mnemonic: &str) -> bool {
+        let words: Vec<&str> = mnemonic.split_whitespace().collect();
+        if self.confirm_filled.iter().any(|f| f.is_none()) {
+            return false;
+        }
+        self.confirm_targets
+            .iter()
+            .zip(self.confirm_filled.iter())
+            .all(|(&pos, filled)| {
+                filled
+                    .as_deref()
+                    .zip(words.get(pos - 1))
+                    .map(|(f, &w)| f == w)
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Place `word` into the first empty confirm slot (chip tap).
+    pub fn confirm_place(&mut self, word: &str) {
+        if let Some(slot) = self.confirm_filled.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(word.to_string());
+        }
+    }
+
+    /// Clear a confirm slot (tap a filled slot to undo).
+    pub fn confirm_clear(&mut self, idx: usize) {
+        if let Some(slot) = self.confirm_filled.get_mut(idx) {
+            *slot = None;
+        }
+    }
+
+    /// Finish onboarding (after a correct confirm, or import/paste) → Home.
     pub fn finish_backup(&mut self) {
         self.onboarding = None;
         self.screen = Screen::Home;
+        self.confirm_targets.clear();
+        self.confirm_pool.clear();
+        self.confirm_filled.clear();
     }
 }
 
@@ -366,5 +500,73 @@ impl eframe::App for MinerApp {
         // Best-effort: stop any running lane so the child never outlives the app.
         let _ = self.engine.send(Command::Stop);
         std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PHRASE: &str =
+        "harvest copper lunar ribbon orbit tundra cipher meadow violet anchor summit frost \
+hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut zephyr";
+
+    /// `begin_confirm` must pick 3 distinct, in-range, ascending positions and a
+    /// pool that contains each correct word — and picking those words must verify.
+    #[test]
+    fn confirm_flow_accepts_correct_words() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.begin_confirm(PHRASE);
+
+        let words: Vec<&str> = PHRASE.split_whitespace().collect();
+        // 3 distinct, ascending, 1-based, in range.
+        assert_eq!(app.confirm_targets.len(), 3);
+        assert!(app.confirm_targets.windows(2).all(|w| w[0] < w[1]));
+        assert!(app.confirm_targets.iter().all(|&p| p >= 1 && p <= words.len()));
+        // The pool contains each correct word.
+        for &p in &app.confirm_targets {
+            assert!(app.confirm_pool.iter().any(|w| w == words[p - 1]));
+        }
+        // Not yet correct (all slots empty).
+        assert!(!app.confirm_is_correct(PHRASE));
+        // Place the correct word for each target in order.
+        let targets = app.confirm_targets.clone();
+        for &p in &targets {
+            app.confirm_place(words[p - 1]);
+        }
+        assert!(app.confirm_is_correct(PHRASE), "correct picks must verify");
+    }
+
+    /// A wrong pick must NOT verify; clearing a slot frees it again.
+    #[test]
+    fn confirm_flow_rejects_wrong_and_supports_clear() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.begin_confirm(PHRASE);
+        let words: Vec<&str> = PHRASE.split_whitespace().collect();
+        let targets = app.confirm_targets.clone();
+
+        // Fill all slots with a deliberately wrong word (not in the phrase).
+        for _ in &targets {
+            app.confirm_place("zzz-not-a-word");
+        }
+        assert!(!app.confirm_is_correct(PHRASE));
+        // Clear every slot, then place the correct words → verifies.
+        for i in 0..targets.len() {
+            app.confirm_clear(i);
+        }
+        assert!(app.confirm_filled.iter().all(|f| f.is_none()));
+        for &p in &targets {
+            app.confirm_place(words[p - 1]);
+        }
+        assert!(app.confirm_is_correct(PHRASE));
+    }
+
+    /// Reduced motion flips `motion_enabled`.
+    #[test]
+    fn reduce_motion_toggles_motion_enabled() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        assert!(app.motion_enabled(), "motion on by default");
+        app.reduce_motion = true;
+        assert!(!app.motion_enabled());
     }
 }

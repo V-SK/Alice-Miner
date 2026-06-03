@@ -136,6 +136,27 @@ pub fn mono(text: impl Into<String>, size: f32, color: Color32) -> RichText {
         .color(color)
 }
 
+/// A pill toggle (the contract's `.tog`): a 42×24 track with a sliding knob.
+/// Brand-filled when on, recessed well when off. Returns the click response;
+/// the caller flips its bound bool.
+pub fn toggle(ui: &mut Ui, on: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(42.0, 24.0), egui::Sense::click());
+    let p = ui.painter_at(rect);
+    let (track, knob) = if on {
+        (THEME.brand, Color32::WHITE)
+    } else {
+        (THEME.well, THEME.off)
+    };
+    p.rect_filled(rect, 255.0, track);
+    if !on {
+        p.rect_stroke(rect, 255.0, Stroke::new(1.0, THEME.line_strong), egui::epaint::StrokeKind::Inside);
+    }
+    let r = 9.0;
+    let cx = if on { rect.right() - 12.0 } else { rect.left() + 12.0 };
+    p.circle_filled(Pos2::new(cx, rect.center().y), r, knob);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// A primary brand button (filled orange, dark ink text).
 pub fn primary_button(ui: &mut Ui, label: &str, enabled: bool, full: bool) -> Response {
     let mut btn = egui::Button::new(
@@ -187,6 +208,41 @@ pub fn text_area(ui: &mut Ui, value: &mut String, hint: &str, rows: usize) -> Re
             .margin(egui::vec2(12.0, 10.0))
             .background_color(THEME.well),
     )
+}
+
+/// Lay out a row of inline widgets and CENTRE the whole row horizontally within
+/// the current `Ui`.
+///
+/// egui's `top_down(Align::Center)` only centres a child by its *allocated*
+/// width, and `ui.horizontal` allocates the FULL available width (so its content
+/// left-aligns). We therefore measure the row in a throwaway **sizing pass**
+/// (no paint), then add a left margin of `(available − content)/2` before the
+/// real `horizontal`. This is the reliable way to centre a mixed icon+text row.
+pub fn center_row(ui: &mut Ui, add: impl Fn(&mut Ui)) {
+    // ── Pass 1: measure the row's natural width (sizing pass — not painted). ──
+    let avail = ui.available_width();
+    let measured = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .sizing_pass()
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                ui.set_invisible(); // belt-and-braces: never paints
+                add(ui);
+            },
+        )
+        .response
+        .rect
+        .width();
+
+    // ── Pass 2: indent by half the slack, then lay the row out for real. ──
+    let pad = ((avail - measured) * 0.5).max(0.0);
+    ui.horizontal(|ui| {
+        if pad > 0.0 {
+            ui.add_space(pad);
+        }
+        add(ui);
+    });
 }
 
 /// Shorten a long address as `head…tail` (display only; never a collection addr).

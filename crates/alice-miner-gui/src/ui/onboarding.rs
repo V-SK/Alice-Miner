@@ -11,6 +11,7 @@
 use eframe::egui::{self, RichText};
 
 use super::icons::Icon;
+use super::strings;
 use super::theme::THEME;
 use super::widgets;
 use crate::app::{MinerApp, Onboarding};
@@ -22,14 +23,40 @@ pub fn render(ui: &mut egui::Ui, app: &mut MinerApp) {
         widgets::card(ui, 440.0, |ui| match step {
             Onboarding::Choose => choose(ui, app),
             Onboarding::Backup { mnemonic, acknowledged } => backup(ui, app, &mnemonic, acknowledged),
+            Onboarding::Confirm { mnemonic } => confirm(ui, app, &mnemonic),
             Onboarding::Import => import(ui, app),
             Onboarding::Paste => paste(ui, app),
         });
     });
 }
 
+/// The 3-dot progress rail at the top of a wizard step. `step` is 1-based; dots
+/// before it read "done", the current one is the elongated brand pill.
+fn steps(ui: &mut egui::Ui, step: usize) {
+    widgets::center_row(ui, |ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        for i in 1..=3 {
+            let (w, color) = if i == step {
+                (22.0, THEME.brand) // current — elongated pill
+            } else if i < step {
+                (7.0, THEME.brand700) // done
+            } else {
+                (7.0, THEME.line_strong) // upcoming
+            };
+            let (r, _) = ui.allocate_exact_size(egui::vec2(w, 7.0), egui::Sense::hover());
+            ui.painter().rect_filled(r, 255.0, color);
+        }
+    });
+    ui.add_space(10.0);
+}
+
+/// Centre a content block horizontally (same idiom as `home::centered`).
+fn centered(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| add(ui));
+}
+
 fn header(ui: &mut egui::Ui, eyebrow: &str, title: &str, sub: &str) {
-    ui.vertical_centered(|ui| {
+    centered(ui, |ui| {
         widgets::eyebrow(ui, eyebrow);
         ui.add_space(12.0);
         ui.label(RichText::new(title).size(19.0).strong().color(THEME.text));
@@ -42,9 +69,9 @@ fn header(ui: &mut egui::Ui, eyebrow: &str, title: &str, sub: &str) {
 fn choose(ui: &mut egui::Ui, app: &mut MinerApp) {
     header(
         ui,
-        "Welcome · 欢迎",
-        "Set up your reward identity",
-        "One Alice identity works in Wallet, Miner & AI.",
+        strings::OB_WELCOME_EYEBROW,
+        strings::OB_WELCOME_TITLE,
+        strings::OB_WELCOME_SUB,
     );
 
     // Create (primary).
@@ -85,11 +112,12 @@ fn choose(ui: &mut egui::Ui, app: &mut MinerApp) {
 }
 
 fn backup(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str, acknowledged: bool) {
+    steps(ui, 2);
     header(
         ui,
-        "Step · back up",
-        "Write down your recovery phrase",
-        "24 words. The only way to recover this identity.",
+        strings::OB_BACKUP_EYEBROW,
+        strings::OB_BACKUP_TITLE,
+        strings::OB_BACKUP_SUB,
     );
 
     // Warning banner.
@@ -99,33 +127,34 @@ fn backup(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str, acknowledged: b
         .inner_margin(egui::Margin::same(13))
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(245, 158, 11, 72)))
         .show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.horizontal_top(|ui| {
                 super::icons::show(ui, Icon::Alert, 15.0, THEME.warn);
                 ui.add_space(10.0);
                 ui.label(
-                    RichText::new(
-                        "This is the only way to recover. Anyone with these words controls the address. Store offline — never paste it online.",
-                    )
-                    .size(11.5)
-                    .color(egui::Color32::from_rgb(0xFC, 0xD9, 0xA0)),
+                    RichText::new(strings::OB_BACKUP_WARNING)
+                        .size(11.5)
+                        .color(egui::Color32::from_rgb(0xFC, 0xD9, 0xA0)),
                 );
             });
         });
 
-    // The 24 words in a 3-column grid.
+    // The 24 words in a 3-column grid (centered within the card).
     ui.add_space(14.0);
     let words: Vec<&str> = mnemonic.split_whitespace().collect();
-    egui::Grid::new("mnemonic-grid")
-        .num_columns(3)
-        .spacing(egui::vec2(7.0, 7.0))
-        .show(ui, |ui| {
-            for (i, w) in words.iter().enumerate() {
-                word_cell(ui, i + 1, w);
-                if (i + 1) % 3 == 0 {
-                    ui.end_row();
+    centered(ui, |ui| {
+        egui::Grid::new("mnemonic-grid")
+            .num_columns(3)
+            .spacing(egui::vec2(7.0, 7.0))
+            .show(ui, |ui| {
+                for (i, w) in words.iter().enumerate() {
+                    word_cell(ui, i + 1, w);
+                    if (i + 1) % 3 == 0 {
+                        ui.end_row();
+                    }
                 }
-            }
-        });
+            });
+    });
 
     ui.add_space(12.0);
     if ui
@@ -143,20 +172,135 @@ fn backup(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str, acknowledged: b
     // Acknowledgement checkbox.
     let mut ack = acknowledged;
     if ui
-        .checkbox(&mut ack, RichText::new("I've written down all 24 words and stored them safely.").size(12.0).color(THEME.text2))
+        .checkbox(&mut ack, RichText::new(strings::OB_BACKUP_ACK).size(12.0).color(THEME.text2))
         .changed()
     {
         app.onboarding = Some(Onboarding::Backup { mnemonic: mnemonic.to_string(), acknowledged: ack });
     }
 
     ui.add_space(14.0);
-    if widgets::primary_button(ui, "Continue to Home", ack, true).clicked() {
-        app.finish_backup();
+    if widgets::primary_button(ui, "Continue to confirm", ack, true).clicked() {
+        app.begin_confirm(mnemonic);
     }
 }
 
+/// Step 3 — confirm the backup by re-picking the words at 3 random positions
+/// (PLAN §4 forced-backup divergence). Empty slots + a shuffled chip pool; tap a
+/// chip to fill the next slot, tap a filled slot to clear it. All-correct + full
+/// → finish onboarding to Home.
+fn confirm(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str) {
+    steps(ui, 3);
+    header(
+        ui,
+        strings::OB_CONFIRM_EYEBROW,
+        strings::OB_CONFIRM_TITLE,
+        "",
+    );
+
+    // Prompt: "Tap the right words for positions #3, #9 and #11."
+    let positions = app
+        .confirm_targets
+        .iter()
+        .map(|p| format!("#{p}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    centered(ui, |ui| {
+        ui.label(
+            RichText::new(format!("Tap the right words for positions {positions}."))
+                .size(12.0)
+                .color(THEME.text2),
+        );
+    });
+
+    // Slots.
+    ui.add_space(12.0);
+    let targets = app.confirm_targets.clone();
+    let filled = app.confirm_filled.clone();
+    let mut clear_idx: Option<usize> = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let slot_w = (ui.available_width() - 8.0 * (targets.len().max(1) as f32 - 1.0))
+            / targets.len().max(1) as f32;
+        for (i, pos) in targets.iter().enumerate() {
+            if confirm_slot(ui, slot_w, *pos, filled.get(i).and_then(|f| f.as_deref())).clicked()
+                && filled.get(i).map(|f| f.is_some()).unwrap_or(false)
+            {
+                clear_idx = Some(i);
+            }
+        }
+    });
+    if let Some(i) = clear_idx {
+        app.confirm_clear(i);
+        app.error = None;
+    }
+
+    // Chip pool. Pre-compute a per-chip-instance "used" flag so that if the same
+    // word appears twice in the pool, only as many instances grey out as there
+    // are filled slots holding it (correct behaviour for duplicate BIP39 words).
+    ui.add_space(12.0);
+    let pool = app.confirm_pool.clone();
+    let used_count = app.confirm_filled.iter().filter(|f| f.is_some()).count();
+    let mut budget: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in app.confirm_filled.iter().flatten() {
+        *budget.entry(f.as_str()).or_insert(0) += 1;
+    }
+    let used_flags: Vec<bool> = pool
+        .iter()
+        .map(|w| {
+            let c = budget.entry(w.as_str()).or_insert(0);
+            if *c > 0 {
+                *c -= 1;
+                true
+            } else {
+                false
+            }
+        })
+        .collect();
+    let mut to_place: Option<String> = None;
+    centered(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(7.0, 7.0);
+            for (w, &is_used) in pool.iter().zip(used_flags.iter()) {
+                if word_chip(ui, w, is_used).clicked() && !is_used && used_count < targets.len() {
+                    to_place = Some(w.clone());
+                }
+            }
+        });
+    });
+    if let Some(w) = to_place {
+        app.confirm_place(&w);
+        app.error = None;
+    }
+
+    // Feedback: if all slots are full but wrong, show a calm hint.
+    let all_full = app.confirm_filled.iter().all(|f| f.is_some());
+    let correct = app.confirm_is_correct(mnemonic);
+    if all_full && !correct {
+        ui.add_space(10.0);
+        centered(ui, |ui| {
+            ui.label(RichText::new(strings::OB_CONFIRM_WRONG).size(11.5).color(THEME.warn));
+        });
+    }
+
+    // Actions: Back (to backup) + Confirm (enabled only when correct).
+    ui.add_space(16.0);
+    ui.horizontal(|ui| {
+        if widgets::ghost_button(ui, "Back", false).clicked() {
+            app.onboarding = Some(Onboarding::Backup {
+                mnemonic: mnemonic.to_string(),
+                acknowledged: true,
+            });
+            app.error = None;
+        }
+        ui.add_space(8.0);
+        if widgets::primary_button(ui, "Confirm & finish", correct, true).clicked() {
+            app.finish_backup();
+        }
+    });
+}
+
 fn import(ui: &mut egui::Ui, app: &mut MinerApp) {
-    header(ui, "Import", "Import an existing identity", "Paste a 12/24-word phrase, or a raw seed (hex).");
+    header(ui, strings::OB_IMPORT_EYEBROW, strings::OB_IMPORT_TITLE, strings::OB_IMPORT_SUB);
 
     // Toggle: mnemonic vs seed.
     ui.horizontal(|ui| {
@@ -196,7 +340,7 @@ fn import(ui: &mut egui::Ui, app: &mut MinerApp) {
 }
 
 fn paste(ui: &mut egui::Ui, app: &mut MinerApp) {
-    header(ui, "Watch-only", "Paste an Alice address", "Track rewards for an address you own. No keys stored.");
+    header(ui, strings::OB_PASTE_EYEBROW, strings::OB_PASTE_TITLE, strings::OB_PASTE_SUB);
 
     widgets::field_label(ui, "Alice address (SS58-300)");
     widgets::text_input(ui, &mut app.form_address, "a2x9…", true);
@@ -230,6 +374,101 @@ fn word_cell(ui: &mut egui::Ui, idx: usize, word: &str) {
                 ui.label(widgets::mono(word, 12.5, THEME.text));
             });
         });
+}
+
+/// A confirm slot: a fixed-height pill showing `#pos` and either the chosen word
+/// (filled, brand-tinted) or a dashed "tap word" placeholder. Returns its click
+/// response (a filled slot is clickable to clear).
+fn confirm_slot(ui: &mut egui::Ui, width: f32, pos: usize, word: Option<&str>) -> egui::Response {
+    let filled = word.is_some();
+    let (fill, stroke, kind) = if filled {
+        (
+            egui::Color32::from_rgba_unmultiplied(249, 115, 22, 20),
+            egui::Stroke::new(1.0, THEME.line_brand),
+            egui::StrokeKind::Inside,
+        )
+    } else {
+        (THEME.well, egui::Stroke::new(1.0, THEME.line_strong), egui::StrokeKind::Inside)
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 40.0), egui::Sense::click());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 9.0, fill);
+    if filled {
+        p.rect_stroke(rect, 9.0, stroke, kind);
+    } else {
+        // Dashed border for an empty slot.
+        dashed_rrect(&p, rect, 9.0, THEME.line_strong);
+        let _ = (stroke, kind);
+    }
+    // Content: "#pos  word".
+    let posg = format!("#{pos}");
+    p.text(
+        rect.left_center() + egui::vec2(10.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        posg,
+        egui::FontId::new(10.0, egui::FontFamily::Monospace),
+        THEME.text4,
+    );
+    let (label, col) = match word {
+        Some(w) => (w.to_string(), THEME.text),
+        None => ("tap word".to_string(), THEME.text4),
+    };
+    p.text(
+        rect.center() + egui::vec2(8.0, 0.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::new(12.5, if word.is_some() { egui::FontFamily::Monospace } else { egui::FontFamily::Proportional }),
+        col,
+    );
+    if filled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// A tappable word chip in the confirm pool. `used` greys + strikes it.
+fn word_chip(ui: &mut egui::Ui, word: &str, used: bool) -> egui::Response {
+    let text = if used {
+        widgets::mono(word, 12.0, THEME.text4).strikethrough()
+    } else {
+        widgets::mono(word, 12.0, THEME.text2)
+    };
+    let btn = egui::Button::new(text)
+        .fill(THEME.surface2)
+        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .corner_radius(8)
+        .min_size(egui::vec2(0.0, 30.0));
+    let resp = ui.add_enabled(!used, btn);
+    if used {
+        resp
+    } else {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+}
+
+/// Paint a dashed rounded-rect border (egui has no dashed stroke; we step short
+/// segments around the perimeter). Used for the empty confirm slot.
+fn dashed_rrect(painter: &egui::Painter, rect: egui::Rect, _radius: f32, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.0, color);
+    let dash = 5.0;
+    let gap = 4.0;
+    let seg = |a: egui::Pos2, b: egui::Pos2| {
+        let len = (b - a).length();
+        let dir = (b - a) / len.max(1e-3);
+        let mut t = 0.0;
+        while t < len {
+            let s = a + dir * t;
+            let e = a + dir * (t + dash).min(len);
+            painter.line_segment([s, e], stroke);
+            t += dash + gap;
+        }
+    };
+    let (l, r, tp, bt) = (rect.left() + 4.0, rect.right() - 4.0, rect.top(), rect.bottom());
+    seg(egui::pos2(l, tp), egui::pos2(r, tp));
+    seg(egui::pos2(l, bt), egui::pos2(r, bt));
+    seg(egui::pos2(rect.left(), tp + 4.0), egui::pos2(rect.left(), bt - 4.0));
+    seg(egui::pos2(rect.right(), tp + 4.0), egui::pos2(rect.right(), bt - 4.0));
 }
 
 fn variant_button(ui: &mut egui::Ui, icon: Icon, title: &str, badge: &str) -> egui::Response {

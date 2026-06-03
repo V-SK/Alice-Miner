@@ -47,7 +47,9 @@ fn main() -> eframe::Result<()> {
     let inner_size = if std::env::var_os("ALICE_MINER_SHOT_DIR").is_some() {
         shot::ShotRunner::window_size()
     } else {
-        [1040.0, 760.0]
+        // Tall enough that the full hero card (orb + readout + identity + footer)
+        // is visible without scrolling on first run; still resizable smaller.
+        [1040.0, 800.0]
     };
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size(inner_size)

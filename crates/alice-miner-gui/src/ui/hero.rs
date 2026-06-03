@@ -36,6 +36,20 @@ pub enum HeroMode {
     Connecting,
     /// Mining — brighter mark, breathing glow, ring fills to `p`.
     Mining,
+    /// The lane stopped / failed — a CALM muted-orange core (no scary red dump),
+    /// glow off, a thin red rim, "Start again" readout. NOT animated.
+    Error,
+    /// Brief tear-down transient as the child is killed — the mark dims, a faint
+    /// amber settling track, no breathing.
+    Stopping,
+}
+
+impl HeroMode {
+    /// Whether this mode runs a continuous animation (breathing / sweep). Idle,
+    /// Error and (under reduced motion) all modes are static.
+    fn animates(self) -> bool {
+        matches!(self, HeroMode::Connecting | HeroMode::Mining | HeroMode::Stopping)
+    }
 }
 
 /// Draw the hero. `gauge` is 0..1 (the ring fill, e.g. hashrate / a soft ceiling).
@@ -46,11 +60,14 @@ pub fn alice_core(
     diameter: f32,
     mode: HeroMode,
     gauge: f32,
+    motion: bool,
     mark_tex: &egui::TextureHandle,
 ) -> egui::Response {
     let t = THEME;
     // Reserve a square a little larger than the orb so the ring + aura have room.
-    let pad = diameter * 0.26;
+    // (The aura/glow is clipped to this rect, so it must clear the gauge ring at
+    // r_orb + ~0.065·d; 0.20·d gives the ring room + a soft aura halo.)
+    let pad = diameter * 0.20;
     let total = diameter + pad * 2.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(total), Sense::click());
     let painter = ui.painter_at(rect);
@@ -58,9 +75,16 @@ pub fn alice_core(
     let r_orb = diameter / 2.0;
 
     // Animation clock + a breathing factor (0..1) used while mining/connecting.
+    // Under reduced motion `breathe` is pinned to its lit midpoint (0.5) so the
+    // colour/state semantics survive without any pulsing, and we DON'T request
+    // continuous repaints from the hero.
     let time = ui.input(|i| i.time) as f32;
-    let breathe = 0.5 + 0.5 * (time * 1.85).sin(); // ~3.4s period like the CSS
-    let animated = !matches!(mode, HeroMode::Idle);
+    let breathe = if motion {
+        0.5 + 0.5 * (time * 1.85).sin() // ~3.4s period like the CSS
+    } else {
+        0.5
+    };
+    let animated = motion && mode.animates();
     if animated {
         ui.ctx().request_repaint();
     }
@@ -70,6 +94,10 @@ pub fn alice_core(
         HeroMode::Idle => (t.brand, 16u8),
         HeroMode::Connecting => (t.warn, 34u8),
         HeroMode::Mining => (t.brand, (40.0 + 34.0 * breathe) as u8),
+        // Error: a faint, cool ember — present but clearly "off" (calm, not red-hot).
+        HeroMode::Error => (t.brand700, 10u8),
+        // Stopping: a soft amber settling glow.
+        HeroMode::Stopping => (t.warn, 18u8),
     };
     radial_glow(&painter, center, r_orb + pad, aura_color, aura_peak);
 
@@ -85,10 +113,16 @@ pub fn alice_core(
         );
     }
 
-    // ---- 3. Conic gauge: faint full track + swept arc (mining/connecting) ----
+    // ---- 3. Conic gauge: faint full track + swept arc -----------------------
     let ring_r = r_orb + diameter * 0.045; // sits just outside the orb
     let ring_w = diameter * 0.040;
-    if animated {
+    // The groove track shows whenever the ring is meaningful (mining, connecting,
+    // stopping) — NOT idle (clean) and NOT error (we draw a calm rim instead).
+    let show_track = matches!(
+        mode,
+        HeroMode::Mining | HeroMode::Connecting | HeroMode::Stopping
+    );
+    if show_track {
         // Faint full-circle groove track.
         painter.circle_stroke(
             center,
@@ -100,22 +134,40 @@ pub fn alice_core(
             ring_r,
             Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 110)),
         );
-        match mode {
-            HeroMode::Mining => {
-                // Soft under-glow then the crisp arc, from top (−90°) sweeping
-                // clockwise p·360°. Colour ramps brand-300 → brand-600 along it.
-                draw_gauge_arc(&painter, center, ring_r, ring_w + 4.0, gauge.clamp(0.0, 1.0), 70, true);
-                draw_gauge_arc(&painter, center, ring_r, ring_w, gauge.clamp(0.0, 1.0), 255, false);
-            }
-            HeroMode::Connecting => {
-                // Indeterminate: a short bright comet that spins.
-                let head = (time * 1.1).rem_euclid(1.0);
-                draw_gauge_segment(
-                    &painter, center, ring_r, ring_w, head - 0.16, head, t.warn,
-                );
-            }
-            HeroMode::Idle => {}
+    }
+    match mode {
+        HeroMode::Mining => {
+            // Soft under-glow then the crisp arc, from top (−90°) sweeping
+            // clockwise p·360°. Colour ramps brand-300 → brand-600 along it.
+            draw_gauge_arc(&painter, center, ring_r, ring_w + 4.0, gauge.clamp(0.0, 1.0), 70, true);
+            draw_gauge_arc(&painter, center, ring_r, ring_w, gauge.clamp(0.0, 1.0), 255, false);
         }
+        HeroMode::Connecting => {
+            // Indeterminate: a short bright comet. Spins while motion is on; under
+            // reduced motion it rests as a static amber arc at the top.
+            let head = if motion { (time * 1.1).rem_euclid(1.0) } else { 0.12 };
+            draw_gauge_segment(&painter, center, ring_r, ring_w, head - 0.16, head, t.warn);
+        }
+        HeroMode::Stopping => {
+            // A dim amber arc that recedes (a calm "winding down" cue). Static
+            // under reduced motion.
+            let p = if motion {
+                0.5 - 0.5 * (time * 1.1).rem_euclid(1.0) // shrinks 0.5→0
+            } else {
+                0.25
+            };
+            draw_gauge_segment(&painter, center, ring_r, ring_w, 0.0, p.max(0.02), t.warn);
+        }
+        HeroMode::Error => {
+            // A thin, calm red rim just outside the orb — signals "stopped"
+            // without a loud fill. No track, no sweep.
+            painter.circle_stroke(
+                center,
+                ring_r,
+                Stroke::new(2.0, Color32::from_rgba_unmultiplied(239, 68, 68, 120)),
+            );
+        }
+        HeroMode::Idle => {}
     }
 
     // ---- 4. The dark glassy orb (layered radial + sheen + inner shadow) ------
@@ -129,9 +181,15 @@ pub fn alice_core(
         }
         HeroMode::Connecting => (40, t.text2),
         HeroMode::Mining => ((90.0 + 90.0 * breathe) as u8, t.brand300), // bright + breathing
+        // Error: a muted, cool ember — the mark is clearly "asleep" but still the
+        // brand (a calm "off", never an angry red glyph).
+        HeroMode::Error => (22, t.text3),
+        // Stopping: the mark fades toward the idle ember.
+        HeroMode::Stopping => (32, t.brand400),
     };
-    // Glow: concentric translucent orange behind the mark.
-    if !matches!(mode, HeroMode::Connecting) {
+    // Glow: concentric translucent orange behind the mark (skip on the
+    // glow-less modes where the mark should read as dimmed/asleep).
+    if !matches!(mode, HeroMode::Connecting | HeroMode::Error) {
         radial_glow(&painter, center, r_orb * 0.92, t.brand, glow_alpha);
     }
     // The mark itself, tinted, ~52% of the orb.

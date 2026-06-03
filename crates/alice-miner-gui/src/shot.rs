@@ -77,9 +77,20 @@ impl ShotRunner {
         Some(Self {
             dir,
             shots: vec![
+                // The M2 state matrix the milestone asks to self-verify.
                 Shot { file: "home-idle.png", pose: pose_home_idle },
+                Shot { file: "home-connecting.png", pose: pose_home_connecting },
                 Shot { file: "home-mining.png", pose: pose_home_mining },
+                Shot { file: "home-error.png", pose: pose_home_error },
+                Shot { file: "home-stopping.png", pose: pose_home_stopping },
+                Shot { file: "onboarding-create.png", pose: pose_ob_create },
+                Shot { file: "onboarding-backup.png", pose: pose_ob_backup },
+                Shot { file: "onboarding-confirm.png", pose: pose_ob_confirm },
                 Shot { file: "dashboard.png", pose: pose_dashboard_mining },
+                Shot { file: "settings.png", pose: pose_settings },
+                // Reduced-motion variants (same states, motion off) — proves the
+                // colour/state semantics survive without pulses/sweeps/tween.
+                Shot { file: "home-mining-reduced-motion.png", pose: pose_home_mining_rm },
             ],
             idx: 0,
             phase: Phase::Settling,
@@ -88,9 +99,12 @@ impl ShotRunner {
         })
     }
 
-    /// The window size to request in shot mode (matches the mockup framing).
+    /// The window size to request in shot mode. Taller than the mockup framing so
+    /// the FULL hero card (hero orb + readout + identity row + footer) and the
+    /// onboarding wizards are captured without clipping — the screenshots are a
+    /// faithful, complete render of each screen.
     pub fn window_size() -> [f32; 2] {
-        [1040.0, 720.0]
+        [1040.0, 820.0]
     }
 }
 
@@ -254,14 +268,155 @@ fn seed_log(app: &mut MinerApp) {
     }
 }
 
+/// A demo identity pointer so the "Rewards to <addr>" row + dashboard worker copy
+/// render with a realistic SS58-300 address (NOT a collection address).
+fn install_demo_identity(app: &mut MinerApp) {
+    if app.identity.is_none() {
+        app.identity = Some(alice_miner_core::identity::IdentityPointer {
+            address: "a2x9k4f7q2w8e3r5t6y1u0p9s8d7f6g5h4j3k2l1z0x9c8v7b6n5m4Q".into(),
+            pubkey: None,
+            keystore_path: None,
+            label: None,
+            created: 0,
+        });
+    }
+}
+
+/// A non-running snapshot in a specific lifecycle state (connecting / error /
+/// stopping), carrying the device + an optional calm message.
+fn demo_state_snapshot(state: EngineState, message: Option<&str>) -> Snapshot {
+    Snapshot {
+        state,
+        device: Some(demo_device()),
+        lane: Some(Lane::Xmr),
+        hashrate_hs: None,
+        shares_accepted: 0,
+        shares_rejected: 0,
+        endpoint: Some("hk.aliceprotocol.org:3333".into()),
+        worker_id: Some("rig-7f3a9c21".into()),
+        uptime_s: 0,
+        last_line: None,
+        message: message.map(|m| m.to_string()),
+    }
+}
+
 fn pose_home_idle(app: &mut MinerApp) {
     app.onboarding = None; // identity exists on disk → skip onboarding
     app.screen = Screen::Home;
     app.snapshot = None; // no snapshot ⇒ EngineState::Idle ⇒ START readout
     app.device = Some(demo_device());
+    install_demo_identity(app);
     app.error = None;
     app.hr_display_khs = 0.0;
 }
+
+fn pose_home_connecting(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Home;
+    app.device = Some(demo_device());
+    install_demo_identity(app);
+    app.error = None;
+    app.snapshot = Some(demo_state_snapshot(EngineState::Starting, None));
+    app.hr_display_khs = 0.0;
+}
+
+fn pose_home_error(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Home;
+    app.device = Some(demo_device());
+    install_demo_identity(app);
+    app.error = None;
+    // A calm, human reason — not a stack dump.
+    app.snapshot = Some(demo_state_snapshot(
+        EngineState::Error,
+        Some("Lost connection to the relay. You can start again."),
+    ));
+    app.hr_display_khs = 0.0;
+}
+
+fn pose_home_stopping(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Home;
+    app.device = Some(demo_device());
+    install_demo_identity(app);
+    app.error = None;
+    app.snapshot = Some(demo_state_snapshot(EngineState::Stopping, None));
+    // A little residual hashrate as the child winds down.
+    app.hr_display_khs = 3.1;
+    app.gauge_ceiling_khs = 9.3;
+}
+
+fn pose_ob_create(app: &mut MinerApp) {
+    app.screen = Screen::Home;
+    app.device = Some(demo_device());
+    app.identity = None;
+    app.error = None;
+    app.snapshot = None; // engine idle during onboarding → titlebar pill "Idle"
+    app.onboarding = Some(crate::app::Onboarding::Choose);
+}
+
+/// The forced-backup step: a fixed demo 24-word phrase in the grid (NOT a real
+/// key — screenshot tooling only).
+fn pose_ob_backup(app: &mut MinerApp) {
+    app.screen = Screen::Home;
+    app.device = Some(demo_device());
+    app.identity = None;
+    app.error = None;
+    app.snapshot = None;
+    app.onboarding = Some(crate::app::Onboarding::Backup {
+        mnemonic: DEMO_MNEMONIC.to_string(),
+        acknowledged: true,
+    });
+}
+
+/// The confirm-by-retyping step, posed mid-fill (one slot filled, two empty) so
+/// the slots + chip pool + the "tap word" placeholders are all visible.
+fn pose_ob_confirm(app: &mut MinerApp) {
+    app.screen = Screen::Home;
+    app.device = Some(demo_device());
+    app.identity = None;
+    app.error = None;
+    app.snapshot = None;
+    if !matches!(app.onboarding, Some(crate::app::Onboarding::Confirm { .. })) {
+        // Build the confirm state deterministically for the shot (fixed targets +
+        // a fixed pool so the capture is stable frame-to-frame).
+        let words: Vec<&str> = DEMO_MNEMONIC.split_whitespace().collect();
+        app.confirm_targets = vec![3, 9, 11];
+        app.confirm_filled = vec![Some(words[2].to_string()), None, None];
+        app.confirm_pool = vec![
+            words[2].to_string(),
+            words[8].to_string(),
+            words[10].to_string(),
+            words[0].to_string(),
+            words[5].to_string(),
+            words[15].to_string(),
+            words[20].to_string(),
+            words[18].to_string(),
+        ];
+        app.onboarding = Some(crate::app::Onboarding::Confirm {
+            mnemonic: DEMO_MNEMONIC.to_string(),
+        });
+    }
+}
+
+fn pose_settings(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Settings;
+    app.device = Some(demo_device());
+    install_demo_identity(app);
+    app.error = None;
+    app.snapshot = Some(demo_mining_snapshot());
+}
+
+fn pose_home_mining_rm(app: &mut MinerApp) {
+    pose_home_mining(app);
+    app.reduce_motion = true;
+}
+
+/// A fixed demo 24-word mnemonic for the onboarding screenshots. These are real
+/// BIP39 words but an arbitrary, NON-secret sequence used only by shot tooling.
+const DEMO_MNEMONIC: &str = "harvest copper lunar ribbon orbit tundra cipher meadow violet anchor summit frost \
+hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut zephyr";
 
 fn pose_home_mining(app: &mut MinerApp) {
     app.onboarding = None;

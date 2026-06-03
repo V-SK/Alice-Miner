@@ -95,7 +95,7 @@ fn titlebar(ui_root: &mut egui::Ui, app: &mut MinerApp) {
                     }
                     ui.add_space(8.0);
                     let (tone, label, blink) = status_for(app);
-                    widgets::status_pill(ui, tone, &label, blink);
+                    widgets::status_pill(ui, tone, &label, blink && app.motion_enabled());
                 });
             });
         });
