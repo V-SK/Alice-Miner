@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 # The Alice Miner desktop app (the product): an eframe/egui binary on the SAME
-# stack the Wallet ships (PLAN §2.1, D-stack). M0 opens a trivial empty window
-# to validate the egui stack decision and the eframe feature set; the real Home
-# / Dashboard / onboarding screens land from M2 onward.
+# stack the Wallet ships (PLAN §2.1, D-stack). M1b implements the LOCKED visual
+# contract (docs/design/mockup.html): frameless dark window + custom titlebar,
+# the left icon rail, the "Alice Core" hero (orb + conic hashrate gauge + glowing
+# Alice mark), onboarding, Home (one-click Start/Stop), and a minimal Dashboard —
+# all driven by the UI-agnostic `alice-miner-core` engine.
 
 [[bin]]
 name = "alice-miner-gui"
@@ -14,4 +16,14 @@ path = "src/main.rs"
 
 [dependencies]
 alice-miner-core = { path = "../alice-miner-core" }
+
+# Same eframe/egui feature set as the Wallet (PLAN §2.1) so the ported theme +
+# frameless-window chrome behave identically.
 eframe = { version = "0.34.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui_extras = { version = "0.34.1", features = ["svg", "image"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+# SVG → texture for the OS window icon (the Alice mark), matching the Wallet's
+# `load_icon`. The hero's in-orb mark uses the bundled PNG via egui_extras.
+resvg = "0.37"
+usvg = "0.37"
+tiny-skia = "0.11"
