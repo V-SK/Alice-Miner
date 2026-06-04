@@ -328,9 +328,11 @@ mod tests {
     /// so a stray button press in any other state can never download/swap.
     #[test]
     fn apply_is_noop_unless_available() {
-        let mut mgr = UpdateManager::default();
-        mgr.ui = UpdateUi::UpToDate {
-            current: "1.0.0".into(),
+        let mut mgr = UpdateManager {
+            ui: UpdateUi::UpToDate {
+                current: "1.0.0".into(),
+            },
+            ..Default::default()
         };
         mgr.apply();
         assert!(
@@ -342,8 +344,10 @@ mod tests {
     /// `check()` does not start a second job while one is in flight.
     #[test]
     fn check_is_noop_while_busy() {
-        let mut mgr = UpdateManager::default();
-        mgr.ui = UpdateUi::Applying;
+        let mut mgr = UpdateManager {
+            ui: UpdateUi::Applying,
+            ..Default::default()
+        };
         mgr.check();
         assert_eq!(mgr.ui, UpdateUi::Applying, "must not clobber an in-flight job");
     }

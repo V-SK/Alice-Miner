@@ -76,7 +76,7 @@ use std::time::Duration;
 pub const RELEASE_PUBKEY_B64: &str = "8P+XmZZFEsUHLmqeB62Xqr5GnwW5K9vf2sQHvRzfi5k=";
 
 /// Default location of the signed release manifest. Overridable at runtime with
-/// `ALICE_WALLET_UPDATE_URL` (must point at the directory/`latest.json`; the
+/// `ALICE_MINER_UPDATE_URL` (must point at the directory/`latest.json`; the
 /// `.sig` is fetched from the same URL with `.sig` appended).
 ///
 /// Pinned to the public **Miner** releases repo (`V-SK/alice-miner`), mirroring
@@ -88,7 +88,7 @@ pub const DEFAULT_UPDATE_URL: &str =
     "https://github.com/V-SK/alice-miner/releases/latest/download/latest.json";
 
 /// Env override for the manifest URL.
-pub const UPDATE_URL_ENV: &str = "ALICE_WALLET_UPDATE_URL";
+pub const UPDATE_URL_ENV: &str = "ALICE_MINER_UPDATE_URL";
 
 /// Manifest schema version this build understands. A manifest with a higher
 /// `schema` is treated as "newer than we can safely parse": we refuse to act on
@@ -383,7 +383,7 @@ fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(MANIFEST_READ_TIMEOUT)
-        .user_agent(concat!("alice-wallet-updater/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("alice-miner-updater/", env!("CARGO_PKG_VERSION")))
         .build()
 }
 
@@ -493,7 +493,7 @@ pub fn download_and_verify(artifact: &Artifact) -> Result<Vec<u8>> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(DOWNLOAD_READ_TIMEOUT)
-        .user_agent(concat!("alice-wallet-updater/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("alice-miner-updater/", env!("CARGO_PKG_VERSION")))
         .build();
     // Read at most size+1 so an oversized body is detected, not silently
     // truncated to a hash-matching prefix.
@@ -1825,45 +1825,88 @@ mod tests {
         assert!(!entry_name_is_safe("a\\..\\..\\x"));
     }
 
+    /// Build a single 512-byte `ustar` header block for `name` with a `size`-byte
+    /// regular-file body, computing the header checksum exactly as the format
+    /// requires. This lets a test author an archive with ANY entry name —
+    /// including a `../escape.txt` traversal — WITHOUT relying on a tar flag
+    /// (`--transform` is GNU-only; bsdtar's `-s` rename is unreliable for `..`).
+    /// The result is platform-independent and feeds the real `tar -xzf` path.
+    fn ustar_header(name: &str, size: usize) -> [u8; 512] {
+        let mut h = [0u8; 512];
+        let nb = name.as_bytes();
+        // name[0..100]
+        h[..nb.len()].copy_from_slice(nb);
+        // mode (octal, NUL-terminated) at 100..108
+        h[100..108].copy_from_slice(b"0000644\0");
+        // uid / gid at 108..116, 116..124
+        h[108..116].copy_from_slice(b"0000000\0");
+        h[116..124].copy_from_slice(b"0000000\0");
+        // size (octal) at 124..136 — 11 octal digits + NUL
+        let sz = format!("{size:011o}\0");
+        h[124..136].copy_from_slice(sz.as_bytes());
+        // mtime at 136..148
+        h[136..148].copy_from_slice(b"00000000000\0");
+        // typeflag '0' (regular file) at 156
+        h[156] = b'0';
+        // magic "ustar\0" + version "00" at 257..265
+        h[257..263].copy_from_slice(b"ustar\0");
+        h[263..265].copy_from_slice(b"00");
+        // checksum field (148..156): compute with the field filled with spaces.
+        h[148..156].copy_from_slice(b"        ");
+        let sum: u32 = h.iter().map(|&b| b as u32).sum();
+        // 6 octal digits, NUL, then space (the canonical ustar layout).
+        let chk = format!("{sum:06o}\0 ");
+        h[148..156].copy_from_slice(chk.as_bytes());
+        h
+    }
+
+    /// Author a gzip-compressed tar that contains exactly one entry named `name`
+    /// (e.g. `../escape.txt`) with `body`, by writing a raw ustar stream and
+    /// piping it through the system `gzip` (present on macOS/Linux/CI). Returns
+    /// `false` only if `gzip` is unavailable (then the caller skips, still
+    /// covered by the unit-level `entry_name_is_safe` test). No tar-flag
+    /// dependency, so the malicious `..` entry exists on every platform.
+    fn write_malicious_tar_gz(archive: &Path, name: &str, body: &[u8]) -> bool {
+        use std::io::Write;
+        // Raw tar = header(512) + body padded to 512 + two zero blocks (EOF).
+        let mut tar = Vec::new();
+        tar.extend_from_slice(&ustar_header(name, body.len()));
+        tar.extend_from_slice(body);
+        let pad = (512 - (body.len() % 512)) % 512;
+        tar.extend(std::iter::repeat_n(0u8, pad));
+        tar.extend(std::iter::repeat_n(0u8, 1024)); // two 512-byte zero blocks
+        // gzip the raw tar via the CLI (no flate2 dependency).
+        let mut child = match std::process::Command::new("gzip")
+            .arg("-c")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return false, // gzip absent → caller skips
+        };
+        child.stdin.take().unwrap().write_all(&tar).unwrap();
+        let out = child.wait_with_output().unwrap();
+        if !out.status.success() {
+            return false;
+        }
+        std::fs::write(archive, &out.stdout).unwrap();
+        true
+    }
+
     #[test]
     fn prescan_rejects_a_traversal_tar_before_extracting() {
-        // Build a tar.gz that contains a `../escape` entry and confirm the
-        // pre-scan refuses it (no extraction performed).
+        // Build a tar.gz that contains a `../escape.txt` entry (portably, with no
+        // GNU-only `--transform`) and confirm the pre-scan refuses it (no
+        // extraction performed). Coverage holds on macOS bsdtar too.
         let base = std::env::temp_dir().join(format!(
             "alice-zipslip-tar-{}-{}",
             std::process::id(),
             nanos()
         ));
-        let payload_dir = base.join("payload");
-        std::fs::create_dir_all(&payload_dir).unwrap();
-        std::fs::write(payload_dir.join("ok.txt"), b"ok").unwrap();
+        std::fs::create_dir_all(&base).unwrap();
         let archive = base.join("evil.tar.gz");
-        // `tar` with a transform that renames the entry to `../escape.txt`.
-        let status = std::process::Command::new("tar")
-            .arg("-czf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&payload_dir)
-            .arg("--transform")
-            .arg("s,^ok.txt,../escape.txt,")
-            .arg("ok.txt")
-            .status();
-        // BSD tar (macOS) lacks `--transform`; fall back to `-s` there. If neither
-        // worked, skip (we still have the unit-level entry_name_is_safe coverage).
-        let made = match status {
-            Ok(s) if s.success() => true,
-            _ => std::process::Command::new("tar")
-                .arg("-czf")
-                .arg(&archive)
-                .arg("-C")
-                .arg(&payload_dir)
-                .arg("-s")
-                .arg("|^ok.txt|../escape.txt|")
-                .arg("ok.txt")
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false),
-        };
+        let made = write_malicious_tar_gz(&archive, "../escape.txt", b"pwned");
         if made {
             let dest = base.join("unpack");
             let err = extract_archive(&archive, &dest)
@@ -1875,7 +1918,7 @@ mod tests {
             // Nothing escaped to the parent.
             assert!(!base.join("escape.txt").exists());
         } else {
-            eprintln!("skipping: this tar build supports neither --transform nor -s rename");
+            eprintln!("skipping: `gzip` not available to author the malicious fixture");
         }
         let _ = std::fs::remove_dir_all(&base);
     }

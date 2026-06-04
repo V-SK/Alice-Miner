@@ -1,0 +1,277 @@
+name: Release
+
+# Alice MINER release build matrix (PLAN §5 M7). Adapted from the Wallet's
+# .github/workflows/release.yml. This is BUILD-ONLY: it compiles + packages the
+# per-OS artifacts and uploads them. There is intentionally NO release-create
+# job — the signed `latest.json` (+ SHA256SUMS) are produced + ed25519-signed
+# OFFLINE with the project's release key (which NEVER touches CI), then the
+# GitHub release is published by hand. See scripts/release.sh.
+#
+# NOT auto-triggered for v1: the workflow runs only on workflow_dispatch (and a
+# v* tag, kept for when go-live is approved). Tests + clippy run before each
+# build; a cargo-audit job runs the supply-chain check (the deferred LOW item).
+#
+# BUNDLING POLICY (PLAN §6 D-Windows, D-GPU-miner):
+#   * macOS/Linux bundle xmrig (CPU-XMR) + kawpowminer (GPU-RVN) when supplied,
+#     each SHA-pin-verified against release-assets/miners.json (fail-closed).
+#   * WINDOWS DOES NOT BUNDLE xmrig.exe (Defender/SmartScreen PUA). It ships only
+#     AliceMiner.exe + kawpowminer.exe (when supplied) + the brand SVG; the CPU
+#     lane is an on-demand pinned-SHA download at runtime.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  # ── Supply-chain audit (deferred LOW hardening item) ───────────────────────
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Authoritative, continuously-updated advisory check over Cargo.lock.
+      # Fails the job on a known vulnerability so a release can't ship one.
+      - name: Run cargo audit
+        run: cargo audit
+
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read   # gh release download (engine binaries) needs read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: AliceMiner-linux-x86_64.tar.gz
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: AliceMiner-windows-x86_64.zip
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: AliceMiner-macos-arm64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libwayland-dev
+
+      # Cross-cutting gates (PLAN §8): the credit-only / honesty / reward-wording
+      # invariants are unit tests — run the whole workspace so they guard the build.
+      - name: Test (workspace)
+        run: cargo test --workspace --target ${{ matrix.target }}
+
+      - name: Clippy (workspace, warnings = errors)
+        run: cargo clippy --workspace --tests --target ${{ matrix.target }} -- -D warnings
+
+      - name: Build (alice-miner-gui)
+        run: cargo build --release --target ${{ matrix.target }} -p alice-miner-gui
+
+      # ----------------------------------------------------------------------
+      # Stage bundled mining engines (the "bundle the miner" half).
+      #
+      # The proven xmrig (CPU-XMR) + kawpowminer (GPU-RVN) ship as siblings of the
+      # AliceMiner binary; binaries.rs resolves + SHA-verifies them at runtime
+      # against release-assets/miners.json (baked into the binary). Each engine is
+      # supplied either committed under release-assets/<target>/ or fetched from a
+      # SAME-REPO release via the ALICE_ENGINE_REL_TAG var. The next step verifies
+      # every staged engine's SHA-256 against the pin (fail-closed) BEFORE
+      # packaging, so a wrong/tampered/placeholder engine can never ship.
+      #
+      # If an engine is absent the artifact still ships and the matching lane
+      # surfaces a clear "not installed" status — this keeps CI green before the
+      # (placeholder) kawpowminer binaries are supplied at go-live.
+      # ----------------------------------------------------------------------
+      - name: Stage bundled engines
+        id: engines
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALICE_ENGINE_REL_TAG: ${{ vars.ALICE_ENGINE_REL_TAG }}
+        run: |
+          set -euo pipefail
+          mkdir -p engine-stage
+          # 1) Committed assets take precedence (macOS arm64 ships its proven xmrig
+          #    committed under release-assets/<target>/).
+          if [ -d "release-assets/${{ matrix.target }}" ]; then
+            cp -v release-assets/${{ matrix.target }}/* engine-stage/ 2>/dev/null || true
+          fi
+          # 2) Otherwise fetch the per-OS engine(s) from a SAME-REPO release.
+          REL_TAG="${ALICE_ENGINE_REL_TAG:-engine-bin-v0.1.0}"
+          fetch() { # <asset> <out>
+            [ -f "engine-stage/$2" ] && return 0
+            echo "Fetching engine asset $1 from release $REL_TAG…"
+            gh release download "$REL_TAG" -R "$GITHUB_REPOSITORY" -p "$1" -O "engine-stage/$2" --clobber || true
+          }
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              fetch xmrig-linux-x86_64           xmrig
+              fetch kawpowminer-linux-x86_64     kawpowminer ;;
+            aarch64-apple-darwin)
+              fetch xmrig-macos-arm64            xmrig
+              fetch kawpowminer-macos-arm64      kawpowminer ;;
+            x86_64-pc-windows-msvc)
+              # WINDOWS: kawpowminer.exe ONLY — NO xmrig.exe (Defender/PUA).
+              fetch kawpowminer-windows-x86_64.exe kawpowminer.exe ;;
+          esac
+          # Defensive: ensure no xmrig.exe ever lands on the Windows runner.
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+            rm -f engine-stage/xmrig.exe engine-stage/xmrig || true
+          fi
+          ls -la engine-stage || true
+
+      # Fail-closed: every staged engine MUST match the SHA-256 pinned in
+      # release-assets/miners.json (the same pin baked into the binary). A
+      # placeholder (all-zero) or mismatched engine aborts the build so it can
+      # never be packaged. Engines that aren't staged are simply skipped.
+      - name: Verify staged engine SHA-256 == pinned
+        shell: bash
+        run: |
+          set -euo pipefail
+          triple="${{ matrix.target }}"
+          fail=0
+          # Read the (non-placeholder) pin for (filename, triple) from miners.json.
+          # Single-line python3 -c so every line stays inside the YAML block scalar.
+          read_pin() { python3 -c 'import json,sys; name,triple=sys.argv[1],sys.argv[2]; m=json.load(open("release-assets/miners.json")); e=next((x for x in m["engines"] if x.get("filename")==name and x.get("target")==triple), None); sha=((e or {}).get("sha256") or "").strip().lower(); print("" if (e is None or e.get("_placeholder") or len(sha)!=64 or set(sha)=={"0"}) else sha)' "$1" "$2"; }
+          verify() { # <staged-file> <manifest-filename>
+            local f="engine-stage/$1" name="$2"
+            [ -f "$f" ] || { echo "  (no $name staged for $triple — lane stays 'not installed')"; return 0; }
+            local pin; pin=$(read_pin "$name" "$triple")
+            if [ -z "$pin" ]; then
+              echo "::error::$name is staged for $triple but has NO real pin in miners.json (placeholder?) — refusing to package an unverifiable engine"
+              fail=1; return 0
+            fi
+            if command -v sha256sum >/dev/null 2>&1; then act=$(sha256sum "$f"|awk '{print $1}'); else act=$(shasum -a 256 "$f"|awk '{print $1}'); fi
+            echo "  $name: pinned=$pin staged=$act"
+            if [ "$pin" != "$act" ]; then echo "::error::$name SHA-256 mismatch for $triple"; fail=1; fi
+          }
+          case "$triple" in
+            x86_64-pc-windows-msvc) verify kawpowminer.exe kawpowminer.exe ;;
+            *)                      verify xmrig xmrig; verify kawpowminer kawpowminer ;;
+          esac
+          [ "$fail" = 0 ] || { echo "engine integrity check failed"; exit 1; }
+          echo "Engine integrity OK."
+
+      # ---------- Linux package ----------
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/AliceMiner
+          cp target/${{ matrix.target }}/release/alice-miner-gui dist/AliceMiner/AliceMiner
+          chmod +x dist/AliceMiner/AliceMiner
+          cp crates/alice-miner-gui/assets/brand/alice-logo.svg dist/AliceMiner/
+          # Bundled engines (optional) — sibling layout per binaries.rs.
+          for e in xmrig kawpowminer; do
+            if [ -f engine-stage/$e ]; then cp engine-stage/$e dist/AliceMiner/; chmod +x dist/AliceMiner/$e; fi
+          done
+          cat > dist/AliceMiner/AliceMiner.desktop <<EOF
+          [Desktop Entry]
+          Name=Alice Miner
+          Exec=AliceMiner
+          Icon=alice-logo
+          Type=Application
+          Categories=Utility;
+          EOF
+          cat > dist/AliceMiner/run.sh <<'EOF'
+          #!/usr/bin/env bash
+          cd "$(dirname "$0")" && ./AliceMiner
+          EOF
+          chmod +x dist/AliceMiner/run.sh
+          tar -czf ${{ matrix.artifact }} -C dist AliceMiner
+
+      # ---------- Windows package ----------
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/AliceMiner | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/alice-miner-gui.exe dist/AliceMiner/AliceMiner.exe
+          Copy-Item crates/alice-miner-gui/assets/brand/alice-logo.svg dist/AliceMiner/
+          # GPU engine only — xmrig.exe is intentionally NOT bundled on Windows.
+          if (Test-Path engine-stage/kawpowminer.exe) {
+            Copy-Item engine-stage/kawpowminer.exe dist/AliceMiner/
+          }
+          Compress-Archive -Path dist/AliceMiner -DestinationPath ${{ matrix.artifact }}
+
+      # ---------- macOS .app ----------
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: |
+          APP="dist/AliceMiner.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/${{ matrix.target }}/release/alice-miner-gui "$APP/Contents/MacOS/AliceMiner"
+          chmod +x "$APP/Contents/MacOS/AliceMiner"
+          # App icon (committed) → Resources + CFBundleIconFile.
+          if [ -f assets/macos/AliceMiner.icns ]; then
+            cp assets/macos/AliceMiner.icns "$APP/Contents/Resources/AliceMiner.icns"
+          fi
+          cp crates/alice-miner-gui/assets/brand/alice-logo.svg "$APP/Contents/Resources/"
+          # Bundled engines beside the binary in MacOS/ (binaries.rs siblings).
+          for e in xmrig kawpowminer; do
+            if [ -f engine-stage/$e ]; then cp engine-stage/$e "$APP/Contents/MacOS/"; chmod +x "$APP/Contents/MacOS/$e"; fi
+          done
+          # Read version from the GUI crate so the bundle never drifts.
+          VER=$(grep -m1 '^version' crates/alice-miner-gui/Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Alice Miner</string>
+            <key>CFBundleDisplayName</key><string>Alice Miner</string>
+            <key>CFBundleIdentifier</key><string>org.aliceprotocol.miner</string>
+            <key>CFBundleVersion</key><string>${VER}</string>
+            <key>CFBundleShortVersionString</key><string>${VER}</string>
+            <key>CFBundleExecutable</key><string>AliceMiner</string>
+            <key>CFBundleIconFile</key><string>AliceMiner</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          # Inner-first ad-hoc codesign (NOT --deep): sign nested engines first,
+          # then seal the bundle (matches scripts/adhoc_sign_macos.sh +
+          # alice-release::adhoc_codesign).
+          chmod +x scripts/adhoc_sign_macos.sh
+          scripts/adhoc_sign_macos.sh "$APP"
+          ditto -c -k --keepParent "$APP" ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  # NOTE: There is intentionally NO "release" / "Create Release" job.
+  # The release manifest (latest.json) and SHA256SUMS are signed OFFLINE with the
+  # project's ed25519 release key, which never touches CI (see scripts/release.sh
+  # and the README "Releasing" section). CI's job ends at building + uploading
+  # per-OS artifacts; a maintainer downloads them, signs locally, and publishes
+  # the GitHub release by hand. This keeps the signing key offline and removes any
+  # chance of an unsigned/auto-generated release clobbering a signed one.

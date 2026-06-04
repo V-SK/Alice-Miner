@@ -331,7 +331,7 @@ mod tests {
             // A secret that must NOT cross into the child.
             std::env::set_var("ALICE_TEST_FAKE_SECRET", "do-not-leak");
             let (tx, mut rx) = unbounded_channel();
-            let mut child = spawn_supervised(
+            let child = spawn_supervised(
                 Path::new("/bin/sh"),
                 &[
                     "-c".to_string(),
@@ -384,7 +384,7 @@ mod tests {
         let rt = rt();
         rt.block_on(async {
             let (tx, mut rx) = unbounded_channel();
-            let mut child = spawn_supervised(
+            let child = spawn_supervised(
                 Path::new("/bin/sh"),
                 &["-c".to_string(), "echo \"GOT=[${ALICE_EXPLICIT}]\"".to_string()],
                 &[("ALICE_EXPLICIT".to_string(), "passed-through".to_string())],

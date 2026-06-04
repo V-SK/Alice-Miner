@@ -1,1 +1,7 @@
 /target
+/dist
+
+# Generated macOS icon build intermediates (the committed AliceMiner.icns stays).
+assets/macos/*.iconset/
+assets/macos/AliceMiner-icon.svg
+assets/macos/AliceMiner-*.png
