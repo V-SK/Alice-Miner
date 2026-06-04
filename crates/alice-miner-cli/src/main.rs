@@ -140,9 +140,16 @@ struct IdentityArgs {
     /// Optional label for the identity.
     #[arg(long)]
     label: Option<String>,
-    /// Keystore passphrase (prompted securely if omitted for create/import).
-    #[arg(long)]
+    /// INSECURE — keystore passphrase on the command line. Visible in `ps`/the
+    /// process table and shell history; prefer the interactive prompt (omit this)
+    /// or `--password-stdin`. Kept only for non-interactive automation; using it
+    /// prints a loud warning.
+    #[arg(long, value_name = "PASS")]
     password: Option<String>,
+    /// Read the keystore passphrase from STDIN (the first line) instead of the
+    /// command line — the secure non-interactive path for scripts/pipes.
+    #[arg(long, conflicts_with = "password")]
+    password_stdin: bool,
     /// Machine-readable output (the resulting identity / active address as JSON).
     #[arg(long)]
     json: bool,
@@ -226,7 +233,15 @@ fn cmd_identity(args: IdentityArgs) -> i32 {
         return cmd_identity_show(args.json);
     }
 
-    let spec = match build_identity_spec(args.create, args.import, args.import_seed, args.paste, args.label, args.password) {
+    let spec = match build_identity_spec(
+        args.create,
+        args.import,
+        args.import_seed,
+        args.paste,
+        args.label,
+        args.password,
+        args.password_stdin,
+    ) {
         Ok(spec) => spec,
         Err(code) => return code,
     };
@@ -324,21 +339,22 @@ fn build_identity_spec(
     paste: Option<String>,
     label: Option<String>,
     password: Option<String>,
+    password_stdin: bool,
 ) -> Result<IdentitySpec, i32> {
     if create {
-        let password = resolve_password(password).map_err(|e| {
+        let password = resolve_password(password, password_stdin).map_err(|e| {
             eprintln!("error: {e}");
             EXIT_USAGE
         })?;
         Ok(IdentitySpec::Create { label, password })
     } else if let Some(mnemonic) = import {
-        let password = resolve_password(password).map_err(|e| {
+        let password = resolve_password(password, password_stdin).map_err(|e| {
             eprintln!("error: {e}");
             EXIT_USAGE
         })?;
         Ok(IdentitySpec::ImportMnemonic { mnemonic, label, password })
     } else if let Some(seed_hex) = import_seed {
-        let password = resolve_password(password).map_err(|e| {
+        let password = resolve_password(password, password_stdin).map_err(|e| {
             eprintln!("error: {e}");
             EXIT_USAGE
         })?;
@@ -575,11 +591,39 @@ fn cmd_stop(args: StopArgs) -> i32 {
 // shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Resolve a keystore passphrase: use the flag if given, else prompt securely.
-/// (Never echoes the passphrase; the engine zeroizes it after use.)
-fn resolve_password(flag: Option<String>) -> Result<String, String> {
+/// Resolve a keystore passphrase, in order of preference:
+///   1. `--password-stdin` → read the first line of STDIN (secure for scripts).
+///   2. `--password <PASS>` → use it, but print a LOUD warning that it's visible
+///      in `ps`/shell history (audit MED-5: deprecated, kept only for automation).
+///   3. neither → prompt securely (no echo) via `rpassword`.
+///
+/// Never echoes the passphrase; the engine zeroizes it after use.
+fn resolve_password(flag: Option<String>, from_stdin: bool) -> Result<String, String> {
+    if from_stdin {
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| format!("failed to read passphrase from stdin: {e}"))?;
+        // Strip exactly the trailing newline(s); a passphrase may contain spaces.
+        let pw = line.trim_end_matches(['\n', '\r']).to_string();
+        return if pw.is_empty() {
+            Err("passphrase (stdin) must not be empty".into())
+        } else {
+            Ok(pw)
+        };
+    }
     if let Some(p) = flag {
-        return Ok(p);
+        eprintln!(
+            "warning: --password is INSECURE — it is visible in the process table (ps) and \
+             your shell history. Use the interactive prompt (omit --password) or --password-stdin."
+        );
+        return if p.is_empty() {
+            Err("passphrase must not be empty".into())
+        } else {
+            Ok(p)
+        };
     }
     rpassword::prompt_password("Keystore passphrase: ")
         .map_err(|e| format!("failed to read passphrase: {e}"))
@@ -701,16 +745,66 @@ mod tests {
     #[test]
     fn build_identity_spec_requires_a_mode() {
         // Paste needs no password.
-        let spec = build_identity_spec(false, None, None, Some("addr".into()), None, None).unwrap();
+        let spec =
+            build_identity_spec(false, None, None, Some("addr".into()), None, None, false).unwrap();
         assert!(matches!(spec, IdentitySpec::Paste { .. }));
         // Create with an explicit password (no prompt in tests).
         let spec =
-            build_identity_spec(true, None, None, None, None, Some("pw".into())).unwrap();
+            build_identity_spec(true, None, None, None, None, Some("pw".into()), false).unwrap();
         assert!(matches!(spec, IdentitySpec::Create { .. }));
         // No mode → usage error.
         assert_eq!(
-            build_identity_spec(false, None, None, None, None, None).unwrap_err(),
+            build_identity_spec(false, None, None, None, None, None, false).unwrap_err(),
             EXIT_USAGE
         );
+    }
+
+    /// MED-5: `--password-stdin` parses and conflicts with `--password`, and the
+    /// plain `--password` still parses (deprecated, not removed). The runtime
+    /// stdin read is covered by the integration test (it needs a real stdin pipe).
+    #[test]
+    fn password_flags_parse_and_conflict() {
+        // --password-stdin parses on its own.
+        let cli = Cli::try_parse_from(["alice-miner", "identity", "--create", "--password-stdin"])
+            .unwrap();
+        match cli.command {
+            Command::Identity(a) => {
+                assert!(a.create && a.password_stdin && a.password.is_none());
+            }
+            _ => panic!("expected identity"),
+        }
+        // --password still parses (kept for automation, with a loud warning).
+        let cli =
+            Cli::try_parse_from(["alice-miner", "identity", "--create", "--password", "s3cret"])
+                .unwrap();
+        match cli.command {
+            Command::Identity(a) => {
+                assert_eq!(a.password.as_deref(), Some("s3cret"));
+                assert!(!a.password_stdin);
+            }
+            _ => panic!("expected identity"),
+        }
+        // The two are mutually exclusive (you can't give both).
+        assert!(Cli::try_parse_from([
+            "alice-miner",
+            "identity",
+            "--create",
+            "--password",
+            "x",
+            "--password-stdin",
+        ])
+        .is_err());
+    }
+
+    /// A non-empty `--password` flag is honored by `build_identity_spec` (the
+    /// warning is printed to stderr; we just confirm the spec carries the pw).
+    #[test]
+    fn password_flag_is_honored_for_create() {
+        let spec =
+            build_identity_spec(true, None, None, None, None, Some("hunter2".into()), false).unwrap();
+        match spec {
+            IdentitySpec::Create { password, .. } => assert_eq!(password, "hunter2"),
+            _ => panic!("expected Create"),
+        }
     }
 }

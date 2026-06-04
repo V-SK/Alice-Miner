@@ -816,9 +816,13 @@ mod tests {
         perm.set_mode(0o755);
         std::fs::set_permissions(&stub, perm).unwrap();
 
-        // Point BOTH lane resolvers at the stub.
+        // Point BOTH lane resolvers at the stub. The stub is unpinned, so this
+        // test must opt into the allow-unverified gate (the same explicit knob a
+        // user supplying their own engine would set) — proving the override path
+        // still works under the new SHA-verify policy.
         std::env::set_var("ALICE_MINER_XMR_BIN", &stub);
         std::env::set_var("ALICE_MINER_GPU_BIN", &stub);
+        std::env::set_var(crate::binaries::ALLOW_UNVERIFIED_ENV, "1");
 
         // A watch-only identity so no keystore is needed (a real SS58-300 address
         // derived through the shared keystore — mining only needs the address).
@@ -892,6 +896,7 @@ mod tests {
         engine.shutdown();
         std::env::remove_var("ALICE_MINER_XMR_BIN");
         std::env::remove_var("ALICE_MINER_GPU_BIN");
+        std::env::remove_var(crate::binaries::ALLOW_UNVERIFIED_ENV);
         let _ = std::fs::remove_file(&stub);
     }
 }

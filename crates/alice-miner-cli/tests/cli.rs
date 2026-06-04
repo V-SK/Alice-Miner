@@ -153,6 +153,40 @@ fn identity_create_round_trips_address_and_writes_pointer() {
     assert_eq!(shown["address"].as_str(), Some(address.as_str()));
 }
 
+/// MED-5: `--password-stdin` reads the passphrase from a real stdin pipe (the
+/// secure non-interactive path — nothing lands in argv/`ps`). Uses
+/// `assert_cmd::Command` (which exposes `write_stdin`).
+#[test]
+fn identity_create_reads_password_from_stdin() {
+    let env = TempEnv::new("pwstdin");
+    let mut cmd =
+        assert_cmd::Command::cargo_bin("alice-miner-cli").expect("built alice-miner-cli binary");
+    cmd.env("ALICE_WALLET_DATA_ROOT", env.wallet_root());
+    cmd.env("ALICE_IDENTITY_DIR", env.id_dir());
+    let out = cmd
+        .args(["identity", "--create", "--password-stdin", "--label", "it"])
+        .write_stdin("a stdin passphrase with spaces\n")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("Identity established:"), "stdout: {stdout}");
+    // The pointer was written, proving the keystore round-tripped via stdin pw.
+    assert!(env.id_dir().join("identity.json").is_file());
+}
+
+/// MED-5: the deprecated `--password` flag still works but prints a LOUD
+/// insecurity warning to stderr.
+#[test]
+fn identity_create_with_password_flag_warns_loudly() {
+    let env = TempEnv::new("pwwarn");
+    let mut cmd = bin();
+    env.apply(&mut cmd);
+    cmd.args(["identity", "--create", "--password", "correct horse battery staple"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("--password is INSECURE"));
+}
+
 #[test]
 fn identity_show_without_identity_errors() {
     let env = TempEnv::new("noid");

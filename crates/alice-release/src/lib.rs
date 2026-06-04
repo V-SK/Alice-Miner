@@ -79,10 +79,13 @@ pub const RELEASE_PUBKEY_B64: &str = "8P+XmZZFEsUHLmqeB62Xqr5GnwW5K9vf2sQHvRzfi5
 /// `ALICE_WALLET_UPDATE_URL` (must point at the directory/`latest.json`; the
 /// `.sig` is fetched from the same URL with `.sig` appended).
 ///
-/// NOTE for V: the repo slug below is a PLACEHOLDER — pin it to the real public
-/// releases repo before cutting a release (see docs/UPDATE-SCHEME.md).
+/// Pinned to the public **Miner** releases repo (`V-SK/alice-miner`), mirroring
+/// the Wallet's `V-SK/alice-wallet`. The Miner publishes its OWN `latest.json`
+/// here; the cross-product guard (`PRODUCT == "alice-miner"`,
+/// [`parse_verified_manifest`]) rejects a Wallet manifest even if a URL is
+/// misconfigured, so this fails closed rather than mis-updating.
 pub const DEFAULT_UPDATE_URL: &str =
-    "https://github.com/V-SK/alice-wallet/releases/latest/download/latest.json";
+    "https://github.com/V-SK/alice-miner/releases/latest/download/latest.json";
 
 /// Env override for the manifest URL.
 pub const UPDATE_URL_ENV: &str = "ALICE_WALLET_UPDATE_URL";
@@ -705,10 +708,14 @@ fn enclosing_dot_app(exe: &Path) -> Option<PathBuf> {
 
 /// Extract a verified release archive into `dest_dir` using the OS-native
 /// extractor. The bytes have ALREADY passed SHA-256 verification before this is
-/// called, so no untrusted code or path is honored from inside the archive
-/// beyond what the platform tool does. We deliberately do NOT pull a zip/tar
-/// crate into the wallet's dependency surface; the same tools that PRODUCE these
-/// archives in `scripts/release.sh` (`ditto -c -k`, `tar -czf`) extract them.
+/// called, so this only matters if the trust anchor (the ed25519 signing key) is
+/// itself compromised — but as defense-in-depth (audit H-2 / zip-slip) we both
+/// (a) **pre-scan** the archive's entry names and reject any `..` component or
+/// absolute path BEFORE extracting, and (b) after extraction **sweep** the tree
+/// and reject any path (regular or symlink) whose canonical location escapes
+/// `dest_dir`. We deliberately do NOT pull a zip/tar crate into the dependency
+/// surface; the same tools that PRODUCE these archives in `scripts/release.sh`
+/// (`ditto -c -k`, `tar -czf`) extract them.
 fn extract_archive(archive: &Path, dest_dir: &Path) -> Result<()> {
     use std::process::Command;
     std::fs::create_dir_all(dest_dir)
@@ -720,7 +727,12 @@ fn extract_archive(archive: &Path, dest_dir: &Path) -> Result<()> {
         .to_ascii_lowercase();
 
     let status = if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        // Pre-scan the tar listing for traversal/absolute entries before writing
+        // anything (tar listing is reliable + cheap).
+        prescan_tar_entries(archive)?;
         Command::new("tar")
+            // --no-same-owner: don't honor archived uid/gid (defensive).
+            .arg("--no-same-owner")
             .arg("-xzf")
             .arg(archive)
             .arg("-C")
@@ -730,6 +742,8 @@ fn extract_archive(archive: &Path, dest_dir: &Path) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             // `ditto -x -k` preserves macOS bundle metadata that `unzip` drops.
+            // (No reliable pre-listing here; the post-extraction sweep below is
+            // the guard for the zip path on macOS.)
             Command::new("ditto")
                 .arg("-x")
                 .arg("-k")
@@ -740,7 +754,9 @@ fn extract_archive(archive: &Path, dest_dir: &Path) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
             // `tar` ships in Windows 10+ and reads zip; avoids PowerShell quoting.
+            prescan_tar_entries(archive)?;
             Command::new("tar")
+                .arg("--no-same-owner")
                 .arg("-xf")
                 .arg(archive)
                 .arg("-C")
@@ -770,7 +786,148 @@ fn extract_archive(archive: &Path, dest_dir: &Path) -> Result<()> {
             archive.display()
         )));
     }
+
+    // Post-extraction sweep: reject the whole staging dir if ANY extracted path
+    // escapes it — a planted symlink (or a path the extractor placed outside via
+    // a traversal we didn't pre-catch). This is the format-agnostic backstop.
+    assert_no_escape(dest_dir)?;
     Ok(())
+}
+
+/// Reject an archive entry name that would escape the destination on extraction:
+/// an absolute path, a Windows drive/UNC absolute, or any `..` path component.
+/// Names are taken verbatim from the archive listing (untrusted).
+fn entry_name_is_safe(entry: &str) -> bool {
+    let e = entry.trim();
+    if e.is_empty() {
+        return true; // blank listing line — nothing to extract
+    }
+    // Absolute (unix `/…`, or windows `C:\…` / `\\unc`).
+    if e.starts_with('/') || e.starts_with('\\') {
+        return false;
+    }
+    let bytes = e.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return false; // drive-letter absolute
+    }
+    // Any `..` component (split on both separators).
+    !e.split(['/', '\\']).any(|c| c == "..")
+}
+
+/// List a tar(.gz) archive and reject it if ANY entry is absolute or contains a
+/// `..` component. Runs BEFORE extraction so a malicious archive writes nothing.
+fn prescan_tar_entries(archive: &Path) -> Result<()> {
+    use std::process::Command;
+    let name = archive
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut cmd = Command::new("tar");
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        cmd.arg("-tzf");
+    } else {
+        cmd.arg("-tf");
+    }
+    let out = cmd
+        .arg(archive)
+        .output()
+        .map_err(|e| UpdateError::Io(format!("list archive entries: {e}")))?;
+    if !out.status.success() {
+        return Err(UpdateError::Io(format!(
+            "could not list archive entries for {}",
+            archive.display()
+        )));
+    }
+    let listing = String::from_utf8_lossy(&out.stdout);
+    for entry in listing.lines() {
+        if !entry_name_is_safe(entry) {
+            return Err(UpdateError::Safety(format!(
+                "refusing to extract archive: unsafe entry path {entry:?} (absolute or `..` traversal)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Walk `dir` after extraction and return a [`UpdateError::Safety`] if ANY entry
+/// — regular file, directory, or symlink — resolves to a canonical path that is
+/// NOT under `dir`. Catches zip-slip via symlinks and any traversal the
+/// per-format pre-scan didn't cover. We compare canonicalized paths; a symlink
+/// whose target points outside the staging root (even a dangling one, caught via
+/// its lexical target) is rejected.
+fn assert_no_escape(dir: &Path) -> Result<()> {
+    let root = dir
+        .canonicalize()
+        .map_err(|e| UpdateError::Io(format!("canonicalize staging dir: {e}")))?;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let entries = match std::fs::read_dir(&cur) {
+            Ok(e) => e,
+            Err(e) => return Err(UpdateError::Io(format!("readdir during escape sweep: {e}"))),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|e| UpdateError::Io(format!("stat during escape sweep: {e}")))?;
+            if meta.file_type().is_symlink() {
+                // Resolve the link target relative to its parent dir and check it
+                // stays under the staging root. A symlink pointing outside (e.g.
+                // -> /etc or -> ../../foo) is rejected outright.
+                let target = std::fs::read_link(&path)
+                    .map_err(|e| UpdateError::Io(format!("read symlink: {e}")))?;
+                let resolved = if target.is_absolute() {
+                    target.clone()
+                } else {
+                    path.parent().unwrap_or(&root).join(&target)
+                };
+                let resolved_canon = resolved
+                    .canonicalize()
+                    .unwrap_or_else(|_| lexical_normalize(&resolved));
+                if !resolved_canon.starts_with(&root) {
+                    return Err(UpdateError::Safety(format!(
+                        "refusing extracted archive: symlink {} -> {} escapes the staging dir",
+                        path.display(),
+                        target.display()
+                    )));
+                }
+                // Do NOT descend through symlinks.
+                continue;
+            }
+            // Regular file or dir: its canonical path must stay under the root.
+            let canon = path
+                .canonicalize()
+                .map_err(|e| UpdateError::Io(format!("canonicalize extracted path: {e}")))?;
+            if !canon.starts_with(&root) {
+                return Err(UpdateError::Safety(format!(
+                    "refusing extracted archive: {} resolves outside the staging dir",
+                    path.display()
+                )));
+            }
+            if meta.file_type().is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Lexically normalize a path (resolve `.`/`..` components without touching the
+/// filesystem) — used as a fallback when a symlink target can't be canonicalized
+/// (e.g. it's dangling), so an escaping dangling symlink is still caught.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Find the freshly-extracted install unit inside `staging` that should replace
@@ -1647,6 +1804,144 @@ mod tests {
         assert_eq!(d3, LaunchDecision::Normal);
         assert!(!has_pending_health_check(&app));
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── Zip-slip / extraction safety (audit H-2) ─────────────────────────────
+
+    #[test]
+    fn entry_name_safety_rejects_traversal_and_absolute() {
+        // Safe relative names.
+        assert!(entry_name_is_safe("app/bin/alice-miner"));
+        assert!(entry_name_is_safe("./AliceMiner.app/Contents/MacOS/x"));
+        assert!(entry_name_is_safe("")); // blank listing line
+        // Absolute (unix / windows drive / UNC) → rejected.
+        assert!(!entry_name_is_safe("/etc/passwd"));
+        assert!(!entry_name_is_safe("C:\\Windows\\System32\\evil.dll"));
+        assert!(!entry_name_is_safe("\\\\server\\share\\x"));
+        // Any `..` component → rejected (both separators).
+        assert!(!entry_name_is_safe("../../etc/cron.d/evil"));
+        assert!(!entry_name_is_safe("a/b/../../../../tmp/x"));
+        assert!(!entry_name_is_safe("a\\..\\..\\x"));
+    }
+
+    #[test]
+    fn prescan_rejects_a_traversal_tar_before_extracting() {
+        // Build a tar.gz that contains a `../escape` entry and confirm the
+        // pre-scan refuses it (no extraction performed).
+        let base = std::env::temp_dir().join(format!(
+            "alice-zipslip-tar-{}-{}",
+            std::process::id(),
+            nanos()
+        ));
+        let payload_dir = base.join("payload");
+        std::fs::create_dir_all(&payload_dir).unwrap();
+        std::fs::write(payload_dir.join("ok.txt"), b"ok").unwrap();
+        let archive = base.join("evil.tar.gz");
+        // `tar` with a transform that renames the entry to `../escape.txt`.
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&payload_dir)
+            .arg("--transform")
+            .arg("s,^ok.txt,../escape.txt,")
+            .arg("ok.txt")
+            .status();
+        // BSD tar (macOS) lacks `--transform`; fall back to `-s` there. If neither
+        // worked, skip (we still have the unit-level entry_name_is_safe coverage).
+        let made = match status {
+            Ok(s) if s.success() => true,
+            _ => std::process::Command::new("tar")
+                .arg("-czf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&payload_dir)
+                .arg("-s")
+                .arg("|^ok.txt|../escape.txt|")
+                .arg("ok.txt")
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false),
+        };
+        if made {
+            let dest = base.join("unpack");
+            let err = extract_archive(&archive, &dest)
+                .expect_err("a `..` tar entry must be refused");
+            assert!(
+                matches!(err, UpdateError::Safety(_)),
+                "expected a Safety refusal, got {err:?}"
+            );
+            // Nothing escaped to the parent.
+            assert!(!base.join("escape.txt").exists());
+        } else {
+            eprintln!("skipping: this tar build supports neither --transform nor -s rename");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escape_sweep_rejects_a_symlink_pointing_outside() {
+        // A staging dir containing a symlink to /etc must be rejected by the
+        // post-extraction sweep (the zip-slip-via-symlink case).
+        let base = std::env::temp_dir().join(format!(
+            "alice-zipslip-link-{}-{}",
+            std::process::id(),
+            nanos()
+        ));
+        let staging = base.join("unpacked");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("real.txt"), b"ok").unwrap();
+        std::os::unix::fs::symlink("/etc", staging.join("escape")).unwrap();
+        let err = assert_no_escape(&staging).expect_err("symlink to /etc must be rejected");
+        assert!(matches!(err, UpdateError::Safety(_)), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escape_sweep_allows_an_internal_symlink() {
+        // A symlink that stays INSIDE the staging tree is fine (e.g. a bundle's
+        // internal `Current -> A` framework link).
+        let base = std::env::temp_dir().join(format!(
+            "alice-zipslip-ok-{}-{}",
+            std::process::id(),
+            nanos()
+        ));
+        let staging = base.join("unpacked");
+        std::fs::create_dir_all(staging.join("A")).unwrap();
+        std::fs::write(staging.join("A/lib"), b"x").unwrap();
+        std::os::unix::fs::symlink("A", staging.join("Current")).unwrap();
+        assert_no_escape(&staging).expect("an internal symlink must be allowed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn extract_archive_round_trips_a_clean_tar() {
+        // A normal, well-formed tar.gz extracts and passes the escape sweep.
+        let base = std::env::temp_dir().join(format!(
+            "alice-extract-ok-{}-{}",
+            std::process::id(),
+            nanos()
+        ));
+        let src = base.join("src");
+        std::fs::create_dir_all(src.join("bin")).unwrap();
+        std::fs::write(src.join("bin/app"), b"#!/bin/sh\necho hi\n").unwrap();
+        let archive = base.join("clean.tar.gz");
+        let ok = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&src)
+            .arg("bin")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "tar must produce the test archive");
+        let dest = base.join("out");
+        extract_archive(&archive, &dest).expect("clean archive extracts");
+        assert!(dest.join("bin/app").is_file(), "extracted the file");
         let _ = std::fs::remove_dir_all(&base);
     }
 

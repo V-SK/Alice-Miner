@@ -13,6 +13,7 @@ use super::theme::THEME;
 use super::widgets::{self, Tone};
 use super::{lane_accent, lane_chip_label};
 use crate::app::MinerApp;
+use crate::update::UpdateUi;
 use alice_miner_core::{CreditState, Lane, LaneSupport, Reconciliation};
 
 /// One boxed stat-card painter, so the grid can lay the four cards out in either
@@ -719,6 +720,12 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                 });
             });
 
+            // Software-update panel — the USER-INITIATED signed self-updater
+            // (ed25519 manifest + SHA-256 artifact + atomic swap with rollback;
+            // the keystore is never touched). v1 never silent-applies: a check
+            // only surfaces a state, and the user presses "Update now" to apply.
+            render_update_panel(ui, app);
+
             // Appearance panel (reduced motion, language).
             panel(ui, "Appearance", Icon::Activity, |ui| {
                 let mut rm = app.reduce_motion;
@@ -804,6 +811,170 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
             );
             ui.add_space(28.0);
         });
+}
+
+/// The Settings → Software update panel. Renders the current updater state and
+/// the "Check for updates" affordance; on a verified newer manifest it offers
+/// "Update now". All work is user-initiated and runs on a background thread (see
+/// [`crate::update`]); this only reads/sets `app.updater`.
+fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
+    // The release channel link (PUBLIC apex; never an internal/core host). Shown
+    // as the fallback for platforms without an in-app artifact.
+    const RELEASES_PAGE: &str = "https://github.com/V-SK/alice-miner/releases/latest";
+
+    panel(ui, "Software update", Icon::Globe, |ui| {
+        // A one-time "updated to vX" confirmation, if the health gate committed a
+        // freshly-applied build at startup. Cleared after it's shown once.
+        if let Some(v) = app.update_committed_note.clone() {
+            srow(
+                ui,
+                "Updated",
+                "This build was just installed and verified.",
+                |ui| {
+                    ui.label(widgets::mono(format!("now on v{v}"), 12.5, THEME.live));
+                },
+            );
+            app.update_committed_note = None;
+        }
+
+        let current = env!("CARGO_PKG_VERSION");
+        let busy = app.updater.ui.is_busy();
+
+        // The check row: current version + a "Check for updates" button. The
+        // button disables (shows "Checking…") while a job is in flight.
+        let mut do_check = false;
+        srow(
+            ui,
+            "Check for updates",
+            "Updates are signed (ed25519) and integrity-checked (SHA-256). Your keystore is never touched.",
+            |ui| {
+                let label = if busy { "Checking…" } else { "Check for updates" };
+                let btn = egui::Button::new(
+                    RichText::new(label)
+                        .size(12.5)
+                        .strong()
+                        .color(if busy { THEME.text4 } else { THEME.ink_on_brand }),
+                )
+                .fill(if busy { THEME.well } else { THEME.brand })
+                .stroke(egui::Stroke::new(1.0, if busy { THEME.line_strong } else { THEME.brand }))
+                .corner_radius(9)
+                .min_size(egui::vec2(0.0, 32.0));
+                if ui.add_enabled(!busy, btn).clicked() {
+                    do_check = true;
+                }
+            },
+        );
+        if do_check {
+            app.updater.check();
+        }
+
+        // The result/status row depends on the current updater state.
+        match app.updater.ui.clone() {
+            UpdateUi::Idle => {
+                srow(ui, "Status", "No check run yet this session.", |ui| {
+                    ui.label(widgets::mono(format!("v{current}"), 12.5, THEME.text3));
+                });
+            }
+            UpdateUi::Checking | UpdateUi::Applying => {
+                let what = if matches!(app.updater.ui, UpdateUi::Applying) {
+                    "Downloading and verifying the update…"
+                } else {
+                    "Contacting the release channel…"
+                };
+                srow(ui, "Status", what, |ui| {
+                    ui.label(RichText::new("working…").size(12.0).color(THEME.text3));
+                });
+            }
+            UpdateUi::UpToDate { current } => {
+                srow(ui, "Status", "You're on the latest build.", |ui| {
+                    ui.horizontal(|ui| {
+                        widgets::status_dot(ui, THEME.live, 8.0, false);
+                        ui.add_space(6.0);
+                        ui.label(widgets::mono(format!("v{current} · up to date"), 12.5, THEME.text2));
+                    });
+                });
+            }
+            UpdateUi::Available { version, notes, .. } => {
+                let hint = if notes.trim().is_empty() {
+                    format!("Version {version} is available.")
+                } else {
+                    format!("Version {version} is available — {notes}")
+                };
+                let mut do_apply = false;
+                srow(ui, "Update available", &hint, |ui| {
+                    let btn = egui::Button::new(
+                        RichText::new("Update now")
+                            .size(12.5)
+                            .strong()
+                            .color(THEME.ink_on_brand),
+                    )
+                    .fill(THEME.brand)
+                    .stroke(egui::Stroke::new(1.0, THEME.brand))
+                    .corner_radius(9)
+                    .min_size(egui::vec2(0.0, 32.0));
+                    if ui.add(btn).clicked() {
+                        do_apply = true;
+                    }
+                });
+                if do_apply {
+                    app.updater.apply();
+                }
+            }
+            UpdateUi::AvailableNoArtifact { version, .. } => {
+                srow(
+                    ui,
+                    "Update available",
+                    &format!("Version {version} is available, but there's no in-app build for this platform — download it from the releases page."),
+                    |ui| {
+                        let btn = egui::Button::new(
+                            RichText::new("Open releases").size(12.5).strong().color(THEME.text),
+                        )
+                        .fill(THEME.well)
+                        .stroke(egui::Stroke::new(1.0, THEME.line_strong))
+                        .corner_radius(9)
+                        .min_size(egui::vec2(0.0, 32.0));
+                        if ui.add(btn).on_hover_text(RELEASES_PAGE).clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(RELEASES_PAGE));
+                        }
+                    },
+                );
+            }
+            UpdateUi::Unsupported { min_supported, .. } => {
+                srow(
+                    ui,
+                    "Update required",
+                    &format!("This build is older than the minimum supported (v{min_supported}). Please update to keep mining."),
+                    |ui| {
+                        let btn = egui::Button::new(
+                            RichText::new("Open releases").size(12.5).strong().color(THEME.ink_on_brand),
+                        )
+                        .fill(THEME.warn)
+                        .stroke(egui::Stroke::new(1.0, THEME.warn))
+                        .corner_radius(9)
+                        .min_size(egui::vec2(0.0, 32.0));
+                        if ui.add(btn).on_hover_text(RELEASES_PAGE).clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(RELEASES_PAGE));
+                        }
+                    },
+                );
+            }
+            UpdateUi::Applied { version } => {
+                srow(
+                    ui,
+                    "Update installed",
+                    &format!("Version {version} is installed and verified. Restart Alice Miner to run it."),
+                    |ui| {
+                        ui.label(widgets::mono("restart to apply", 12.5, THEME.live));
+                    },
+                );
+            }
+            UpdateUi::Failed { message } => {
+                srow(ui, "Update check failed", &message, |ui| {
+                    ui.label(RichText::new("could not update").size(12.0).color(THEME.err));
+                });
+            }
+        }
+    });
 }
 
 /// A zinc segmented-control button (language picker). `on` = selected.

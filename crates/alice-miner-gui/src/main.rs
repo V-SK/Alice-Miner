@@ -15,6 +15,7 @@
 mod app;
 mod shot;
 mod ui;
+mod update;
 
 use eframe::egui::IconData;
 

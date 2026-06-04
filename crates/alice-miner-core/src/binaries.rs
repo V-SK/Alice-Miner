@@ -1,4 +1,4 @@
-//! `core/binaries` — resolve the bundled miner engine on disk.
+//! `core/binaries` — resolve AND integrity-verify the bundled miner engine.
 //!
 //! Generalizes `alice-wallet/gui/src/node.rs::resolve_miner_binary` over a
 //! [`MinerKind`] (`CpuXmr` = xmrig; `GpuRvn` = kawpowminer, M3). Resolution order
@@ -12,13 +12,55 @@
 //!      `CARGO_MANIFEST_DIR`, so `cargo run`/`cargo test` works in a checkout
 //!      without packaging.
 //!
-//! Returns `Ok(path)` only when the file actually exists; otherwise a clear,
-//! kind-specific "not installed" error (the GPU lane uses this to stay
-//! gracefully unavailable — see [`resolve_miner_binary`]). **Never panics.**
+//! Returns `Ok(path)` only when the file exists **and its SHA-256 matches the
+//! pin baked into the binary from `release-assets/miners.json`** (audit MED-2/3:
+//! never exec an unverified engine). The pinned-binary manifest is embedded at
+//! compile time via [`MINERS_MANIFEST`], so the integrity check needs no file on
+//! disk at runtime. A bundled (sibling/dev) binary whose hash doesn't match, or
+//! for which no real pin exists yet (the kawpowminer placeholder), is **refused**
+//! with a clear error — no exec. The `ALICE_MINER_<KIND>_BIN` override is the one
+//! escape hatch and it requires an explicit `ALICE_MINER_ALLOW_UNVERIFIED_BIN=1`
+//! opt-in (and logs a loud warning) — it never silently runs an unpinned binary.
+//!
+//! Otherwise a clear, kind-specific "not installed" / "integrity" error (the GPU
+//! lane uses this to stay gracefully unavailable). **Never panics.**
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+/// The pinned-engine manifest, embedded at compile time so the SHA-256 pins
+/// travel inside the binary (no `release-assets/miners.json` needed at runtime).
+/// This is the SAME file the offline packaging step reads; baking it in is what
+/// turns the "SHA-pinned engine" promise from a packaging-time note into a
+/// runtime guarantee (audit B-1).
+const MINERS_MANIFEST: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../release-assets/miners.json"));
+
+/// The env var that, set to `1`/`true`, permits the `ALICE_MINER_<KIND>_BIN`
+/// override to run a binary whose SHA-256 is NOT pinned (or doesn't match). This
+/// is an explicit, loud opt-in for advanced users supplying their own engine
+/// (e.g. T-Rex); without it, an override to an unverified binary is refused.
+pub const ALLOW_UNVERIFIED_ENV: &str = "ALICE_MINER_ALLOW_UNVERIFIED_BIN";
+
+/// A single entry in `release-assets/miners.json`.
+#[derive(Debug, Clone, Deserialize)]
+struct MinerPin {
+    kind: String,
+    target: String,
+    filename: String,
+    sha256: String,
+    #[serde(default)]
+    #[serde(rename = "_placeholder")]
+    placeholder: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MinersManifest {
+    engines: Vec<MinerPin>,
+}
 
 /// The bundled engine kinds. [`MinerKind::CpuXmr`] = xmrig (the proven CPU lane);
 /// [`MinerKind::GpuRvn`] = kawpowminer (the M3 GPU lane). The kawpowminer binary
@@ -45,6 +87,74 @@ impl MinerKind {
             MinerKind::CpuXmr => "ALICE_MINER_XMR_BIN",
             MinerKind::GpuRvn => "ALICE_MINER_GPU_BIN",
         }
+    }
+
+    /// The `kind` string this engine carries in `release-assets/miners.json`.
+    fn manifest_kind(self) -> &'static str {
+        match self {
+            MinerKind::CpuXmr => "cpu-xmr",
+            MinerKind::GpuRvn => "gpu-rvn",
+        }
+    }
+}
+
+/// A non-placeholder SHA-256 pin for `kind` on the current target triple, parsed
+/// from the embedded [`MINERS_MANIFEST`]. `None` when no entry matches OR the
+/// entry is an all-zero placeholder (e.g. kawpowminer until M7) — i.e. "there is
+/// no real pin to verify against", which the resolver treats as not-installable
+/// for a bundled binary (it must not exec something it can't verify).
+fn pinned_sha256_for(kind: MinerKind) -> Option<String> {
+    let triple = current_target_triple();
+    let manifest: MinersManifest = serde_json::from_str(MINERS_MANIFEST).ok()?;
+    manifest.engines.into_iter().find_map(|e| {
+        let matches = e.kind == kind.manifest_kind()
+            && e.target == triple
+            && e.filename == kind.binary_name();
+        if !matches {
+            return None;
+        }
+        let sha = e.sha256.trim().to_ascii_lowercase();
+        // Reject the all-zero placeholder: it is NOT a usable pin.
+        if e.placeholder || sha.chars().all(|c| c == '0') || sha.len() != 64 {
+            None
+        } else {
+            Some(sha)
+        }
+    })
+}
+
+/// Compute the lowercase-hex SHA-256 of a file on disk (streamed via the audited
+/// `alice_release::sha256_hex`). Returns an `Err` string on a read failure.
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("cannot read {} for integrity check: {e}", path.display()))?;
+    Ok(alice_release::sha256_hex(&bytes))
+}
+
+/// Verify the resolved bundled binary at `path` against the pinned SHA-256 for
+/// `kind`. Refuses (clear `Err`, no exec) when there is no real pin to check
+/// against, or when the on-disk hash does not match the pin.
+fn verify_pinned(kind: MinerKind, path: &Path) -> Result<(), String> {
+    let Some(pin) = pinned_sha256_for(kind) else {
+        return Err(format!(
+            "refusing to run the {} engine at {}: no pinned SHA-256 is available for this \
+             platform yet (the bundled binary cannot be integrity-verified). The lane stays \
+             unavailable until a pinned build ships.",
+            kind.binary_name(),
+            path.display()
+        ));
+    };
+    let got = file_sha256(path)?;
+    if got.eq_ignore_ascii_case(&pin) {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to run the {} engine at {}: SHA-256 integrity check FAILED \
+             (got {got}, pinned {pin}). The on-disk binary does not match the signed \
+             release; it may have been tampered with or replaced.",
+            kind.binary_name(),
+            path.display()
+        ))
     }
 }
 
@@ -78,24 +188,50 @@ pub fn current_target_triple() -> &'static str {
     }
 }
 
-/// Resolve the bundled engine binary for `kind`. See the module docs for the
-/// resolution order. Returns `Ok(path)` only when the file exists.
+/// Resolve AND integrity-verify the bundled engine binary for `kind`. See the
+/// module docs for the resolution order + the trust model. Returns `Ok(path)`
+/// only when the file exists AND (for a bundled binary) its SHA-256 matches the
+/// pin baked in from `release-assets/miners.json`; the env override is the one
+/// path that may skip verification, and only behind the explicit
+/// `ALICE_MINER_ALLOW_UNVERIFIED_BIN=1` opt-in (with a loud warning).
 pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
-    // 1) explicit override.
+    // 1) explicit override. This is an advanced/test escape hatch (e.g. T-Rex),
+    //    so we verify it against the pin IF one exists, and otherwise refuse —
+    //    UNLESS the user has explicitly opted out of verification, in which case
+    //    we run it but log a loud warning. Never silently exec an unpinned path.
     if let Some(over) = std::env::var_os(kind.env_override()) {
         let p = PathBuf::from(over);
-        return if p.is_file() {
-            Ok(p)
-        } else {
-            Err(format!(
+        if !p.is_file() {
+            return Err(format!(
                 "{} does not point to a file: {}",
                 kind.env_override(),
                 p.display()
-            ))
-        };
+            ));
+        }
+        if allow_unverified() {
+            eprintln!(
+                "[alice-miner] WARNING: running an UNVERIFIED miner binary from {} ({}={}). \
+                 Its SHA-256 is not checked against the signed release. Only do this with a \
+                 binary you trust.",
+                p.display(),
+                ALLOW_UNVERIFIED_ENV,
+                std::env::var(ALLOW_UNVERIFIED_ENV).unwrap_or_default(),
+            );
+            return Ok(p);
+        }
+        // No opt-out: the override must match a real pin, or we refuse.
+        verify_pinned(kind, &p).map_err(|e| {
+            format!(
+                "{e}\n(the {} override binary must match the pinned SHA-256; to run an \
+                 unpinned binary you trust, set {}=1.)",
+                kind.env_override(),
+                ALLOW_UNVERIFIED_ENV
+            )
+        })?;
+        return Ok(p);
     }
 
-    // 2) sibling of this executable (the packaged layout).
+    // 2) sibling of this executable (the packaged layout). Verified before exec.
     let exe =
         std::env::current_exe().map_err(|e| format!("cannot locate miner executable: {e}"))?;
     let dir = exe
@@ -103,11 +239,12 @@ pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
         .ok_or_else(|| "miner executable has no parent directory".to_string())?;
     let candidate = dir.join(kind.binary_name());
     if candidate.is_file() {
+        verify_pinned(kind, &candidate)?;
         return Ok(candidate);
     }
 
     // 3) dev fallback: the committed asset in the source tree (debug only), so
-    //    `cargo run`/`cargo test` works before packaging.
+    //    `cargo run`/`cargo test` works before packaging. Verified before exec.
     #[cfg(debug_assertions)]
     {
         let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -117,6 +254,7 @@ pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
             .join(current_target_triple())
             .join(kind.binary_name());
         if dev.is_file() {
+            verify_pinned(kind, &dev)?;
             return Ok(dev);
         }
     }
@@ -140,6 +278,17 @@ pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
     })
 }
 
+/// `true` when `ALICE_MINER_ALLOW_UNVERIFIED_BIN` is set to an affirmative value
+/// (`1` / `true` / `yes`, case-insensitive). Off (safe) by default.
+fn allow_unverified() -> bool {
+    std::env::var(ALLOW_UNVERIFIED_ENV)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,43 +300,115 @@ mod tests {
     // crate-level lock; always clear the var on entry.
     use crate::MINER_BIN_ENV_LOCK as ENV_LOCK;
 
+    /// Clear both the kind override AND the allow-unverified gate, so a test
+    /// starts from a clean, verifying-by-default environment.
+    fn clear_env(kind: MinerKind) {
+        std::env::remove_var(kind.env_override());
+        std::env::remove_var(ALLOW_UNVERIFIED_ENV);
+    }
+
     #[test]
-    fn env_override_to_existing_file_is_honored() {
+    fn env_override_to_existing_file_is_honored_with_allow_gate() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Point the override at a file we know exists (this test binary's own
-        // path is not stable, so use a temp file).
+        clear_env(MinerKind::CpuXmr);
+        // An arbitrary stub binary won't match the pin, so the override now
+        // requires the explicit allow-unverified opt-in to be honored.
         let tmp = std::env::temp_dir().join(format!("alice-miner-binstub-{}", std::process::id()));
         std::fs::write(&tmp, b"#!/bin/sh\n").unwrap();
         std::env::set_var(MinerKind::CpuXmr.env_override(), &tmp);
-        let resolved = resolve_miner_binary(MinerKind::CpuXmr).expect("override resolves");
+        std::env::set_var(ALLOW_UNVERIFIED_ENV, "1");
+        let resolved = resolve_miner_binary(MinerKind::CpuXmr).expect("override resolves under opt-in");
         assert_eq!(resolved, tmp);
-        std::env::remove_var(MinerKind::CpuXmr.env_override());
+        clear_env(MinerKind::CpuXmr);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn env_override_to_unpinned_file_is_refused_without_allow_gate() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env(MinerKind::CpuXmr);
+        // Same arbitrary stub, but WITHOUT the opt-in: it doesn't match the pin,
+        // so resolution must REFUSE (no exec of an unverified binary).
+        let tmp =
+            std::env::temp_dir().join(format!("alice-miner-binstub-noallow-{}", std::process::id()));
+        std::fs::write(&tmp, b"#!/bin/sh\n").unwrap();
+        std::env::set_var(MinerKind::CpuXmr.env_override(), &tmp);
+        let err = resolve_miner_binary(MinerKind::CpuXmr)
+            .expect_err("unpinned override without opt-in must be refused");
+        assert!(
+            err.contains("integrity check FAILED") || err.contains("no pinned SHA-256"),
+            "expected an integrity refusal, got: {err}"
+        );
+        assert!(err.contains(ALLOW_UNVERIFIED_ENV), "the error must name the opt-out knob");
+        clear_env(MinerKind::CpuXmr);
         let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn env_override_to_missing_file_errors() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env(MinerKind::CpuXmr);
         std::env::set_var(
             MinerKind::CpuXmr.env_override(),
             "/no/such/alice/miner/binary",
         );
         let err = resolve_miner_binary(MinerKind::CpuXmr).expect_err("missing override errors");
         assert!(err.contains("does not point to a file"));
-        std::env::remove_var(MinerKind::CpuXmr.env_override());
+        clear_env(MinerKind::CpuXmr);
     }
 
     #[cfg(all(debug_assertions, target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn dev_fallback_finds_committed_macos_xmrig() {
+    fn dev_fallback_finds_and_verifies_committed_macos_xmrig() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // With no override and (normally) no sibling under cargo test, the dev
-        // fallback should find the committed macOS arm64 xmrig asset.
-        std::env::remove_var(MinerKind::CpuXmr.env_override());
-        let resolved = resolve_miner_binary(MinerKind::CpuXmr).expect("dev fallback resolves");
+        clear_env(MinerKind::CpuXmr);
+        // With no override and no sibling under cargo test, the dev fallback finds
+        // the committed macOS arm64 xmrig — and (the MED-2 fix) its SHA-256 MUST
+        // match the pin in release-assets/miners.json, or this would error.
+        let resolved = resolve_miner_binary(MinerKind::CpuXmr).expect("dev fallback resolves + verifies");
         assert!(resolved.is_file());
         assert_eq!(resolved.file_name().unwrap(), "xmrig");
         assert!(resolved.to_string_lossy().contains("aarch64-apple-darwin"));
+        // The pin is real (non-placeholder) and matches the on-disk bytes.
+        let pin = pinned_sha256_for(MinerKind::CpuXmr).expect("xmrig has a real pin");
+        assert_eq!(file_sha256(&resolved).unwrap(), pin);
+    }
+
+    /// A bundled (dev-fallback) binary whose bytes have been corrupted must be
+    /// REFUSED — the resolver verifies the SHA-256 before returning the path.
+    #[cfg(all(debug_assertions, target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn dev_fallback_refuses_on_sha_mismatch() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env(MinerKind::CpuXmr);
+        // We can't corrupt the committed asset, but we CAN prove the gate via the
+        // verify helper directly on a wrong-bytes file (the same call the resolver
+        // makes on the dev path).
+        let tmp = std::env::temp_dir().join(format!("alice-miner-corrupt-{}", std::process::id()));
+        std::fs::write(&tmp, b"NOT-the-real-xmrig").unwrap();
+        let err = verify_pinned(MinerKind::CpuXmr, &tmp)
+            .expect_err("a wrong-bytes binary must fail the pin check");
+        assert!(err.contains("integrity check FAILED"), "got: {err}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The embedded miners.json parses, the real xmrig pin is present + non-zero,
+    /// and the kawpowminer entries are (correctly) treated as no-pin placeholders.
+    #[test]
+    fn embedded_manifest_pins_xmrig_and_placeholders_kawpow() {
+        // The CPU-XMR pin exists ONLY on the platform whose triple is in the
+        // manifest (aarch64-apple-darwin); on other triples there's no entry.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let pin = pinned_sha256_for(MinerKind::CpuXmr).expect("xmrig pinned on this triple");
+            assert_eq!(pin.len(), 64);
+            assert!(!pin.chars().all(|c| c == '0'), "pin must not be all-zero");
+        }
+        // kawpowminer is a placeholder everywhere (no real binary yet) → no pin.
+        assert!(
+            pinned_sha256_for(MinerKind::GpuRvn).is_none(),
+            "the kawpowminer placeholder must NOT be treated as a usable pin"
+        );
     }
 
     #[test]
@@ -204,7 +425,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // No override, and no bundled kawpowminer on this dev machine (none is
         // committed) → a clear "GPU miner not installed" error, NOT a panic.
-        std::env::remove_var(MinerKind::GpuRvn.env_override());
+        clear_env(MinerKind::GpuRvn);
         let err = resolve_miner_binary(MinerKind::GpuRvn).expect_err("no GPU binary on this box");
         assert!(
             err.contains("GPU miner not installed"),
@@ -216,16 +437,30 @@ mod tests {
     }
 
     #[test]
-    fn gpu_env_override_to_existing_file_is_honored() {
+    fn gpu_env_override_to_existing_file_is_honored_under_opt_in() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // The override path (e.g. a user-supplied kawpowminer / T-Rex) resolves.
+        clear_env(MinerKind::GpuRvn);
+        // A user-supplied kawpowminer / T-Rex has no bundled pin, so the override
+        // is honored only with the explicit allow-unverified opt-in (loud warn).
         let tmp =
             std::env::temp_dir().join(format!("alice-miner-gpustub-{}", std::process::id()));
         std::fs::write(&tmp, b"#!/bin/sh\n").unwrap();
         std::env::set_var(MinerKind::GpuRvn.env_override(), &tmp);
-        let resolved = resolve_miner_binary(MinerKind::GpuRvn).expect("override resolves");
+        std::env::set_var(ALLOW_UNVERIFIED_ENV, "1");
+        let resolved = resolve_miner_binary(MinerKind::GpuRvn).expect("override resolves under opt-in");
         assert_eq!(resolved, tmp);
-        std::env::remove_var(MinerKind::GpuRvn.env_override());
+        clear_env(MinerKind::GpuRvn);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn allow_unverified_accepts_only_affirmative_values() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (val, want) in [("1", true), ("true", true), ("YES", true), ("0", false), ("", false), ("no", false)] {
+            std::env::set_var(ALLOW_UNVERIFIED_ENV, val);
+            assert_eq!(allow_unverified(), want, "value {val:?}");
+        }
+        std::env::remove_var(ALLOW_UNVERIFIED_ENV);
+        assert!(!allow_unverified(), "unset → off (safe default)");
     }
 }

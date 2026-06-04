@@ -128,6 +128,10 @@ impl ShotRunner {
                 // Settings → Identity: the active address with a keystore-backed
                 // tag + the "Change reward address" action (the new section).
                 Shot { file: "settings-identity-change.png", pose: pose_settings_identity },
+                // Settings → Software update: the "Check for updates" affordance
+                // with a posed "Update available → Update now" result (the H-1
+                // updater wiring, made visible). No network in shot mode.
+                Shot { file: "settings-software-update.png", pose: pose_settings_update },
                 // The change modal launcher (over Settings): current address +
                 // the three change paths (create / import / paste).
                 Shot { file: "change-addr-choose.png", pose: pose_change_addr_choose },
@@ -745,6 +749,49 @@ fn pose_settings_identity(app: &mut MinerApp) {
     install_demo_identity_keystore(app);
     app.error = None;
     app.snapshot = None; // idle → the change action is enabled
+}
+
+/// Settings → Software update: the "Check for updates" affordance with a posed
+/// "Update available" result (a verified newer manifest → "Update now" offered).
+/// This is the H-1 wiring made visible. The pose drives the SAME `UpdateUi` the
+/// real `check_for_update` produces — no network is touched in shot mode.
+fn pose_settings_update(app: &mut MinerApp) {
+    use alice_miner_core::alice_release as release;
+    app.onboarding = None;
+    app.change_addr = None;
+    app.screen = Screen::Settings;
+    reset_lane_to_device_default(app);
+    app.set_device(demo_device());
+    install_demo_identity_keystore(app);
+    app.error = None;
+    app.snapshot = None;
+    app.update_committed_note = None;
+    // Pose a verified "Update available" state with an artifact for THIS platform
+    // so the "Update now" button renders. (Built directly, exactly as
+    // `outcome_to_ui(UpdateAvailable{..})` would yield.)
+    let artifact = release::Artifact {
+        platform: release::current_platform().to_string(),
+        url: "https://github.com/V-SK/alice-miner/releases/latest/download/alice-miner.tar.gz"
+            .to_string(),
+        sha256: "00".repeat(32),
+        size: 1,
+    };
+    let manifest = release::Manifest {
+        schema: 1,
+        product: release::PRODUCT.to_string(),
+        version: "1.1.0".to_string(),
+        min_supported: "1.0.0".to_string(),
+        released: "2026-06-03T00:00:00Z".to_string(),
+        notes: "stability + speed.".to_string(),
+        artifacts: vec![artifact.clone()],
+    };
+    app.updater.ui = crate::update::UpdateUi::Available {
+        current: release::current_version().to_string(),
+        version: "1.1.0".to_string(),
+        notes: "stability + speed.".to_string(),
+        manifest: Box::new(manifest),
+        artifact,
+    };
 }
 
 /// The change-address modal launcher over Settings: the current address card +

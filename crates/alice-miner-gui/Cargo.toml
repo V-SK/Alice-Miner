@@ -27,3 +27,12 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 resvg = "0.37"
 usvg = "0.37"
 tiny-skia = "0.11"
+# Wipe the GUI password buffers on clear (audit U-2). Already in the tree via
+# alice-crypto / alice-miner-core, so no new transitive crates.
+zeroize = "1.8.2"
+
+[dev-dependencies]
+# Used only by the updater unit tests to forge a wrong-product manifest and
+# assert the cross-product guard rejects it. Already in the tree transitively
+# (via `alice-miner-core` / `alice-release`), so this adds no new crates.
+serde_json = "1.0"

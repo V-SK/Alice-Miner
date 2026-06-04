@@ -135,8 +135,10 @@ dependencies = [
  "egui_extras",
  "image",
  "resvg 0.37.0",
+ "serde_json",
  "tiny-skia",
  "usvg 0.37.0",
+ "zeroize",
 ]
 
 [[package]]

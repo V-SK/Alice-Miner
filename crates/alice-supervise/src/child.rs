@@ -17,6 +17,41 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc::UnboundedSender;
 
+/// The minimal, non-secret environment variables the spawned miner child is
+/// allowed to inherit (audit S-1). Everything else is cleared. These let the
+/// engine find shared libraries + a scratch/cache dir on each OS; none carries a
+/// secret. The list is intentionally small and OS-conditional.
+#[cfg(unix)]
+const ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    // GPU/driver discovery for the (Linux) RVN lane; harmless/absent elsewhere.
+    "LD_LIBRARY_PATH",
+    "DISPLAY",
+    "XAUTHORITY",
+    "CUDA_VISIBLE_DEVICES",
+    "NVIDIA_VISIBLE_DEVICES",
+];
+#[cfg(windows)]
+const ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "SystemRoot",
+    "SystemDrive",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+];
+#[cfg(not(any(unix, windows)))]
+const ENV_ALLOWLIST: &[&str] = &["PATH"];
+
 /// A line captured from a child's stdout/stderr (raw — caller sanitises).
 #[derive(Debug, Clone)]
 pub struct LogLine {
@@ -124,10 +159,19 @@ pub fn spawn_supervised(
         .stderr(Stdio::piped())
         .kill_on_drop(true); // never leak the child if the handle is dropped
 
-    // Defensive: start from a clean-ish env we extend, so the child can't
-    // inherit anything secret the wallet may hold. We deliberately do NOT
-    // clear the whole env (the child needs PATH/HOME), but we add only the
-    // explicit, non-secret entries the caller passes.
+    // Audit S-1: scrub the child's environment. We `env_clear()` first, then
+    // re-add ONLY a minimal, non-secret allowlist (the few vars a miner actually
+    // needs to find libs / a scratch dir), plus the explicit entries the caller
+    // passes. This guarantees the miner child inherits NONE of this process's
+    // environment — so a future change that ever placed a secret in our env can't
+    // leak it to the engine. Today nothing secret is ever in our env, so this is
+    // pure hardening (no behaviour change for the proven argv-only launch).
+    cmd.env_clear();
+    for key in ENV_ALLOWLIST {
+        if let Some(val) = std::env::var_os(key) {
+            cmd.env(key, val);
+        }
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -272,6 +316,95 @@ mod tests {
             let _ = code;
             // PID file cleaned up.
             assert_eq!(read_pid_file(&pid_file), None);
+        });
+    }
+
+    /// Audit S-1: the spawned child must NOT inherit this process's environment.
+    /// We set a fake "secret" in the parent env, spawn a child that echoes it,
+    /// and confirm the child sees it EMPTY (env was cleared) while an allowlisted
+    /// var (PATH) is still present.
+    #[cfg(unix)]
+    #[test]
+    fn child_env_is_scrubbed_to_allowlist() {
+        let rt = rt();
+        rt.block_on(async {
+            // A secret that must NOT cross into the child.
+            std::env::set_var("ALICE_TEST_FAKE_SECRET", "do-not-leak");
+            let (tx, mut rx) = unbounded_channel();
+            let mut child = spawn_supervised(
+                Path::new("/bin/sh"),
+                &[
+                    "-c".to_string(),
+                    // Print the secret (should be empty) and whether PATH is set.
+                    "echo \"SECRET=[${ALICE_TEST_FAKE_SECRET}]\"; \
+                     if [ -n \"$PATH\" ]; then echo PATH_PRESENT; else echo PATH_MISSING; fi"
+                        .to_string(),
+                ],
+                &[],
+                None,
+                tx,
+            )
+            .expect("spawn");
+
+            let mut saw_secret_empty = false;
+            let mut saw_path_present = false;
+            // Drain the few lines the child prints.
+            for _ in 0..4 {
+                match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+                    Ok(Some(line)) => {
+                        if line.text.contains("SECRET=[]") {
+                            saw_secret_empty = true;
+                        }
+                        if line.text.contains("PATH_PRESENT") {
+                            saw_path_present = true;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            let _ = child.stop(Duration::from_secs(2)).await;
+            std::env::remove_var("ALICE_TEST_FAKE_SECRET");
+
+            assert!(
+                saw_secret_empty,
+                "child must NOT inherit the parent's ALICE_TEST_FAKE_SECRET (env_clear)"
+            );
+            assert!(
+                saw_path_present,
+                "PATH (allowlisted) must still be available to the child"
+            );
+        });
+    }
+
+    /// An explicit env entry passed by the caller IS applied to the child (the
+    /// allowlist scrub doesn't drop caller-supplied vars).
+    #[cfg(unix)]
+    #[test]
+    fn caller_supplied_env_reaches_child() {
+        let rt = rt();
+        rt.block_on(async {
+            let (tx, mut rx) = unbounded_channel();
+            let mut child = spawn_supervised(
+                Path::new("/bin/sh"),
+                &["-c".to_string(), "echo \"GOT=[${ALICE_EXPLICIT}]\"".to_string()],
+                &[("ALICE_EXPLICIT".to_string(), "passed-through".to_string())],
+                None,
+                tx,
+            )
+            .expect("spawn");
+            let mut ok = false;
+            for _ in 0..3 {
+                match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+                    Ok(Some(line)) if line.text.contains("GOT=[passed-through]") => {
+                        ok = true;
+                        break;
+                    }
+                    Ok(Some(_)) => continue,
+                    _ => break,
+                }
+            }
+            let _ = child.stop(Duration::from_secs(2)).await;
+            assert!(ok, "caller-supplied env var must reach the child");
         });
     }
 

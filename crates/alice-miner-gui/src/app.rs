@@ -170,6 +170,14 @@ pub struct MinerApp {
     /// when `ALICE_MINER_SHOT_DIR` is set (see [`crate::shot`]). When set, the
     /// `ui()` loop is driven by the shot state machine instead of the engine.
     pub shot: Option<crate::shot::ShotRunner>,
+
+    /// The signed self-updater (ed25519 + SHA-256, last-known-good rollback).
+    /// User-initiated only (Settings → "Check for updates"); v1 never
+    /// silent-applies. See [`crate::update`].
+    pub updater: crate::update::UpdateManager,
+    /// A one-time "updated to vX" note set when the health gate confirmed a
+    /// freshly-applied build at startup. Shown once in Settings, then cleared.
+    pub update_committed_note: Option<String>,
 }
 
 impl MinerApp {
@@ -178,6 +186,15 @@ impl MinerApp {
         // Kick off device detection immediately (PLAN: Detect on launch).
         engine.send(Command::Detect)?;
         let identity = identity::load_pointer();
+        // Resolve the first-launch update health gate ONCE, early — commit a
+        // freshly-applied build (drop last-known-good) or roll back a crash-loop.
+        // Skipped in screenshot mode so captures stay byte-for-byte unchanged.
+        let shot = crate::shot::ShotRunner::from_env();
+        let update_committed_note = if shot.is_none() {
+            crate::update::UpdateManager::register_launch_at_startup()
+        } else {
+            None
+        };
         // No identity on disk → start in onboarding.
         let onboarding = if identity.is_none() {
             Some(Onboarding::Choose)
@@ -223,7 +240,9 @@ impl MinerApp {
             // (no network, honest panel). See `alice_miner_core::dashboard`.
             credit_client: PoolStatsClient::not_exposed(),
             credit_state: CreditState::NotExposed,
-            shot: crate::shot::ShotRunner::from_env(),
+            shot,
+            updater: crate::update::UpdateManager::default(),
+            update_committed_note,
         })
     }
 
@@ -424,11 +443,23 @@ impl MinerApp {
                 self.screen = Screen::Home;
             }
         }
-        // Clear sensitive form fields after use.
-        self.form_password.clear();
-        self.form_password2.clear();
-        self.form_mnemonic.clear();
-        self.form_seed.clear();
+        // Wipe sensitive form fields after use — ZEROIZE the backing buffers (not
+        // a bare `.clear()`, which leaves the bytes in memory). Audit U-2.
+        self.wipe_secret_forms();
+    }
+
+    /// Zeroize-and-clear the sensitive identity-entry buffers (password ×2,
+    /// mnemonic, seed). `String::zeroize()` overwrites the bytes before emptying,
+    /// so the passphrase/seed don't linger on the heap after the op completes.
+    /// (The downstream engine ALSO zeroizes the password it receives; this closes
+    /// the small window on the UI side.) The pasted address is PUBLIC, so it is
+    /// only `.clear()`-ed, not zeroized.
+    fn wipe_secret_forms(&mut self) {
+        use zeroize::Zeroize;
+        self.form_password.zeroize();
+        self.form_password2.zeroize();
+        self.form_mnemonic.zeroize();
+        self.form_seed.zeroize();
     }
 
     fn on_snapshot(&mut self, s: Snapshot) {
@@ -822,12 +853,10 @@ impl MinerApp {
 
     /// Clear every shared identity-entry form field (password, mnemonic, seed,
     /// pasted address). Called when opening/closing the change modal so secrets +
-    /// addresses never bleed between the onboarding and change flows.
+    /// addresses never bleed between the onboarding and change flows. The secret
+    /// fields are ZEROIZED (audit U-2); the public address is just cleared.
     fn reset_identity_forms(&mut self) {
-        self.form_password.clear();
-        self.form_password2.clear();
-        self.form_mnemonic.clear();
-        self.form_seed.clear();
+        self.wipe_secret_forms();
         self.form_address.clear();
         self.form_use_seed = false;
     }
@@ -837,6 +866,15 @@ impl MinerApp {
     /// tears the modal down (the new address is already live via `self.identity`).
     pub fn finish_change_addr(&mut self) {
         self.close_change_addr();
+    }
+}
+
+impl Drop for MinerApp {
+    /// Zeroize any passphrase/seed still sitting in the form buffers when the app
+    /// is torn down (e.g. the user quits mid-onboarding) — so a secret never
+    /// lingers in freed heap memory after exit. Audit U-2.
+    fn drop(&mut self) {
+        self.wipe_secret_forms();
     }
 }
 
@@ -859,6 +897,10 @@ impl eframe::App for MinerApp {
             return;
         }
         self.drain_events();
+        // Drain any completed background updater results (check / apply) into the
+        // UI state. Cheap + non-blocking; the actual network/FS work runs on a
+        // worker thread (see `crate::update`). Kept off the screenshot path.
+        self.updater.poll();
         // Source B: refresh the server-confirmed credit state from the poller
         // (v1: a pure no-op yielding `NotExposed`; the fast-follow drives a real
         // poll here). Kept off the screenshot path so posed states survive.
