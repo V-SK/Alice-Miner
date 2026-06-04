@@ -15,6 +15,19 @@ path = "src/main.rs"
 [dependencies]
 alice-miner-core = { path = "../alice-miner-core" }
 clap = { version = "4.5", features = ["derive"] }
-# Ctrl-C → graceful Stop. No egui/eframe anywhere in this tree (PLAN §2.2/C2).
-ctrlc = "3.4"
+# Ctrl-C → graceful Stop. The `termination` feature ALSO traps SIGTERM/SIGHUP so a
+# `stop` subcommand (which SIGTERMs the recorded `start` pid) drives the SAME
+# graceful Command::Stop path as Ctrl-C. No egui/eframe anywhere in this tree
+# (PLAN §2.2/C2; verified by `cargo tree` + a no-egui unit test).
+ctrlc = { version = "3.4", features = ["termination"] }
 rpassword = "7.3"
+# `--json` machine-readable output (detect/start). serde_json is already in the
+# engine's tree (a core dep), so this pulls in NO new transitive crates.
+serde_json = "1.0"
+
+[dev-dependencies]
+# Drive the built CLI binary end-to-end in integration tests (subcommand parsing,
+# --help, the no-egui surface, identity round-trip). `CARGO_BIN_EXE_*` is provided
+# by cargo to the test harness.
+assert_cmd = "2.0"
+predicates = "3.1"

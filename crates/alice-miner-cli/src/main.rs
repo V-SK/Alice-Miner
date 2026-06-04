@@ -1,14 +1,36 @@
 //! Alice Miner — headless CLI binary (clap).
 //!
-//! Drives the same `alice-miner-core` engine as the GUI, with NO egui/eframe in
-//! its dependency tree (PLAN §2.2 / C2; verify via `cargo tree`). M1a wires the
-//! real subcommands `detect | identity | start`; full parity (`status | stop` as
-//! peers, `--dual`, `--lane gpu|auto`) is M6.
+//! A clean, complete **headless front-end** with full parity to the GUI, driving
+//! the SAME `alice-miner-core` engine over the `Command`/`Event` channel pair, so
+//! the two front-ends cannot drift (PLAN §2.2 / §5 M6). It adds **zero new mining
+//! logic** — every subcommand is a thin presentation layer over the engine.
 //!
-//! This is the M1 test harness: `start --lane xmr` drives the engine end-to-end
-//! to `hk.aliceprotocol.org:3333` with ADDRESS-ONLY login, streams live
-//! [`Snapshot`]s to stdout, and on Ctrl-C issues `Stop` (SIGTERM→SIGKILL on the
-//! owned child) before exiting.
+//! Subcommands (M6):
+//!
+//! - `detect` — print the [`CapabilityProfile`]: device model string, CPU/GPU,
+//!   and the lane-viability matrix (runnable lanes + the recommended one).
+//!   `--json` for machine-readable output.
+//! - `identity` — `--create` / `--import <MNEMONIC>` / `--import-seed <HEX>` /
+//!   `--paste <ADDRESS>` (watch-only) / `--show` (print the active address;
+//!   never a secret).
+//! - `start` — `--lane xmr|gpu|auto` (auto = recommended), `--dual` (gated:
+//!   refuses honestly with the viability reason when <2 viable lanes),
+//!   `--address <A>` (else the `~/.alice` identity). Streams a clean headless
+//!   dashboard each interval; `--json` emits one [`Snapshot`] JSON line per tick.
+//! - `stop` — graceful `Command::Stop` (SIGTERM→SIGKILL) of a running `start`
+//!   (recorded via a pid file), clean exit, no orphan.
+//!
+//! ── Hard invariants (the brief, PLAN §3) ────────────────────────────────────
+//!
+//! - **NO egui/eframe** in this binary (verified by `cargo tree -p
+//!   alice-miner-cli`, `otool -L`, AND a `no_egui_in_dep_tree` unit test).
+//! - **Credit-only honesty** — the dashboard shows rewards only as
+//!   "pending · 待发放"; it NEVER prints `$`/fiat/`paid`/`earned`, and never the
+//!   collection address / upstream pool / core IP (those never reach the client
+//!   — the engine bakes only the PUBLIC relay). A strings honesty test scans
+//!   this file's user-facing copy.
+//! - Exit codes: `0` ok, non-zero on error (`1` engine/runtime fault, `2`
+//!   usage/argument error).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,10 +39,33 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use alice_miner_core::engine::{Command as EngineCommand, Event, IdentitySpec};
-use alice_miner_core::{EngineHandle, Lane};
+use alice_miner_core::{EngineHandle, EngineState, Lane, Snapshot};
+
+mod dashboard;
+mod pidfile;
+
+// ── Exit codes ──────────────────────────────────────────────────────────────
+/// Success.
+const EXIT_OK: i32 = 0;
+/// Runtime / engine fault (spawn failed, relay unreachable, …).
+const EXIT_RUNTIME: i32 = 1;
+/// Usage / argument error (bad lane, no identity flag, dual refused, …).
+const EXIT_USAGE: i32 = 2;
 
 #[derive(Parser)]
-#[command(name = "alice-miner-cli", about = "Alice Miner — headless client (credit-only)")]
+#[command(
+    name = "alice-miner",
+    bin_name = "alice-miner",
+    version,
+    about = "Alice Miner — headless client (credit-only).",
+    long_about = "Alice Miner — the headless front-end for the Alice one-click miner.\n\
+        \n\
+        Detects your device, manages your Alice reward identity, and mines ALICE\n\
+        credit to your OWN address against the public relay. Drives the same engine\n\
+        as the desktop app. Rewards accrue as pending (待发放); payout, settlement,\n\
+        and on-chain transfer stay gated (phase-J).",
+    propagate_version = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -28,214 +73,300 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Probe the device and print its profile.
-    Detect,
-    /// Create, import, or paste the Alice reward identity.
+    /// Probe this device and print its capability profile + lane matrix.
+    #[command(long_about = "Probe this device (CPU / GPU / Apple Silicon) and print its\n\
+        capability profile: the model string, core count, memory, and the\n\
+        lane-viability matrix — which lanes are runnable here and which one is\n\
+        recommended. Use --json for machine-readable output.")]
+    Detect(DetectArgs),
+
+    /// Create, import, paste, or show the Alice reward identity.
+    #[command(long_about = "Manage the Alice reward identity stored at ~/.alice/identity.json.\n\
+        \n\
+        --create            generate a fresh 24-word identity (prints the mnemonic — BACK IT UP)\n\
+        --import <MNEMONIC> import from a 24-word recovery phrase\n\
+        --import-seed <HEX> import from a raw 32-byte seed (hex, optional 0x)\n\
+        --paste <ADDRESS>   watch-only: track an address you own (no keystore)\n\
+        --show              print the active address (never any secret)")]
     Identity(IdentityArgs),
-    /// Start mining to the user's own Alice address and stream live stats.
+
+    /// Start mining to your Alice address and stream a live dashboard.
+    #[command(long_about = "Start mining to your OWN Alice address and stream a clean headless\n\
+        dashboard (state, hashrate, accepted/rejected shares, endpoint, failovers,\n\
+        uptime). The reward address defaults to the active ~/.alice identity.\n\
+        \n\
+        --lane xmr   CPU RandomX/XMR lane\n\
+        --lane gpu   NVIDIA KawPoW/RVN lane\n\
+        --lane auto  the recommended lane for this device\n\
+        --dual       run BOTH lanes (needs >=2 viable lanes; refuses honestly otherwise)\n\
+        --json       emit one Snapshot JSON line per tick (for scripting)\n\
+        \n\
+        Ctrl-C (or `alice-miner stop`) stops gracefully. Rewards accrue as pending\n\
+        (待发放); the collection address and upstream pool are never shown.")]
     Start(StartArgs),
+
+    /// Gracefully stop a running `start` (SIGTERM→SIGKILL, no orphan).
+    #[command(long_about = "Gracefully stop a miner started by `alice-miner start` in another\n\
+        terminal. Reads the pid recorded at start, sends SIGTERM (which the running\n\
+        process handles exactly like Ctrl-C: Command::Stop → SIGTERM→SIGKILL on the\n\
+        owned child), and escalates to SIGKILL if it doesn't exit. Leaves no orphan.")]
+    Stop(StopArgs),
+}
+
+#[derive(clap::Args)]
+struct DetectArgs {
+    /// Emit the full capability profile as a single JSON object (machine-readable).
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(clap::Args)]
 struct IdentityArgs {
     /// Create a fresh 24-word identity (prints the mnemonic — BACK IT UP).
-    #[arg(long, conflicts_with_all = ["import", "paste"])]
+    #[arg(long, conflicts_with_all = ["import", "import_seed", "paste", "show"])]
     create: bool,
     /// Import from a 24-word mnemonic (quote it).
-    #[arg(long, value_name = "MNEMONIC", conflicts_with_all = ["create", "paste"])]
+    #[arg(long, value_name = "MNEMONIC", conflicts_with_all = ["create", "import_seed", "paste", "show"])]
     import: Option<String>,
     /// Import from a raw 32-byte seed hex (0x…).
-    #[arg(long, value_name = "SEED_HEX", conflicts_with_all = ["create", "import", "paste"])]
+    #[arg(long, value_name = "SEED_HEX", conflicts_with_all = ["create", "import", "paste", "show"])]
     import_seed: Option<String>,
     /// Paste an address only (watch-only — no keystore).
-    #[arg(long, value_name = "ADDRESS", conflicts_with_all = ["create", "import"])]
+    #[arg(long, value_name = "ADDRESS", conflicts_with_all = ["create", "import", "import_seed", "show"])]
     paste: Option<String>,
+    /// Print the active reward address from ~/.alice/identity.json (no secret).
+    #[arg(long, conflicts_with_all = ["create", "import", "import_seed", "paste"])]
+    show: bool,
     /// Optional label for the identity.
     #[arg(long)]
     label: Option<String>,
     /// Keystore passphrase (prompted securely if omitted for create/import).
     #[arg(long)]
     password: Option<String>,
+    /// Machine-readable output (the resulting identity / active address as JSON).
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(clap::Args)]
 struct StartArgs {
     /// Which lane to mine: `xmr` (CPU/RandomX), `gpu`/`rvn` (NVIDIA/KawPoW), or
     /// `auto` (the recommended lane for this device).
-    #[arg(long, default_value = "xmr")]
+    #[arg(long, default_value = "auto", value_name = "LANE")]
     lane: String,
-    /// Override the reward address (defaults to the active `~/.alice` identity).
-    #[arg(long)]
+    /// Override the reward address (defaults to the active ~/.alice identity).
+    #[arg(long, value_name = "ADDRESS")]
     address: Option<String>,
     /// Dual-mine: run BOTH lanes together (CPU-XMR + GPU-RVN), each crash-isolated,
-    /// with `cores-2` XMR headroom. Requires ≥2 viable lanes on this device.
+    /// with `cores-2` XMR headroom. Requires >=2 viable lanes on this device.
     #[arg(long)]
     dual: bool,
-    /// Stop automatically after this many seconds (0 = run until Ctrl-C). Used
-    /// for the M1 live-connect verification.
-    #[arg(long, default_value_t = 0)]
+    /// Emit one Snapshot JSON line per tick (for scripting) instead of the
+    /// human dashboard.
+    #[arg(long)]
+    json: bool,
+    /// Stop automatically after this many seconds (0 = run until Ctrl-C / stop).
+    /// Used for the live-connect verification.
+    #[arg(long, default_value_t = 0, value_name = "SECONDS")]
     duration_s: u64,
+}
+
+#[derive(clap::Args)]
+struct StopArgs {
+    /// Seconds to wait for a graceful exit before escalating to SIGKILL.
+    #[arg(long, default_value_t = 8, value_name = "SECONDS")]
+    timeout_s: u64,
 }
 
 fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
-        Command::Detect => cmd_detect(),
+        Command::Detect(args) => cmd_detect(args),
         Command::Identity(args) => cmd_identity(args),
         Command::Start(args) => cmd_start(args),
+        Command::Stop(args) => cmd_stop(args),
     };
     std::process::exit(code);
 }
 
-fn cmd_detect() -> i32 {
-    let engine = match EngineHandle::spawn() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return 1;
-        }
-    };
-    if let Err(e) = engine.send(EngineCommand::Detect) {
-        eprintln!("error: {e}");
-        return 1;
-    }
-    match engine.recv_timeout(Duration::from_secs(10)) {
-        Ok(Event::Device(p)) => {
-            println!("Device:  {}", p.display);
-            println!("  os:            {}", p.os.label());
-            println!("  arch:          {}", p.arch);
-            println!("  apple_silicon: {}", p.apple_silicon);
-            println!("  logical_cores: {}", p.logical_cores);
-            if !p.cpu_model.is_empty() {
-                println!("  cpu_model:     {}", p.cpu_model);
+// ─────────────────────────────────────────────────────────────────────────────
+// detect
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmd_detect(args: DetectArgs) -> i32 {
+    // Detect synchronously (the probe is fail-safe + cheap); no engine thread
+    // needed for a one-shot read. Build the full CapabilityProfile so we print
+    // the same matrix the GUI/engine compute.
+    let cap = alice_miner_core::CapabilityProfile::detect();
+
+    if args.json {
+        match serde_json::to_string_pretty(&cap) {
+            Ok(s) => {
+                println!("{s}");
+                EXIT_OK
             }
-            println!("  gpu:           {}", fmt_gpu(&p.gpu));
-            println!("  memory_gb:     {}", p.memory_gb);
-            if !p.warnings.is_empty() {
-                println!("  warnings:      {}", p.warnings.join(", "));
+            Err(e) => {
+                eprintln!("error: failed to serialize profile: {e}");
+                EXIT_RUNTIME
             }
-            // The lane-viability matrix (which lanes this device can run).
-            let cap = alice_miner_core::CapabilityProfile::from_profile(p.clone());
-            println!("Lanes:");
-            for lane in alice_miner_core::detect::capability::ALL_LANES {
-                let support = cap.support(lane);
-                let marker = if lane == cap.recommended_lane() { " (recommended)" } else { "" };
-                println!(
-                    "  {:<10} {}{}",
-                    lane.label(),
-                    support.label(),
-                    marker
-                );
-            }
-            engine.shutdown();
-            0
         }
-        Ok(other) => {
-            eprintln!("unexpected event: {other:?}");
-            1
-        }
-        Err(_) => {
-            eprintln!("error: timed out waiting for device profile");
-            1
-        }
+    } else {
+        print!("{}", dashboard::render_detect(&cap));
+        EXIT_OK
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// identity
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn cmd_identity(args: IdentityArgs) -> i32 {
-    let spec = if args.create {
-        let password = match resolve_password(args.password, true) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return 2;
-            }
-        };
-        IdentitySpec::Create { label: args.label, password }
-    } else if let Some(mnemonic) = args.import {
-        let password = match resolve_password(args.password, true) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return 2;
-            }
-        };
-        IdentitySpec::ImportMnemonic { mnemonic, label: args.label, password }
-    } else if let Some(seed_hex) = args.import_seed {
-        let password = match resolve_password(args.password, true) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return 2;
-            }
-        };
-        IdentitySpec::ImportSeedHex { seed_hex, label: args.label, password }
-    } else if let Some(address) = args.paste {
-        IdentitySpec::Paste { address, label: args.label }
-    } else {
-        eprintln!("error: choose one of --create | --import <MNEMONIC> | --import-seed <HEX> | --paste <ADDR>");
-        return 2;
+    // `--show` is a pure read of the public pointer — no engine, no secret.
+    if args.show {
+        return cmd_identity_show(args.json);
+    }
+
+    let spec = match build_identity_spec(args.create, args.import, args.import_seed, args.paste, args.label, args.password) {
+        Ok(spec) => spec,
+        Err(code) => return code,
     };
 
     let engine = match EngineHandle::spawn() {
         Ok(e) => e,
         Err(e) => {
             eprintln!("error: {e}");
-            return 1;
+            return EXIT_RUNTIME;
         }
     };
     if let Err(e) = engine.send(EngineCommand::Identity(spec)) {
         eprintln!("error: {e}");
-        return 1;
+        return EXIT_RUNTIME;
     }
     match engine.recv_timeout(Duration::from_secs(30)) {
         Ok(Event::Identity { identity, mnemonic }) => {
-            println!("Identity established:");
-            println!("  address:    {}", identity.address);
-            println!("  watch_only: {}", identity.watch_only);
-            if let Some(ks) = identity.keystore_path.as_ref() {
-                println!("  keystore:   {}", ks.display());
-            }
-            println!("  pointer:    {}", alice_miner_core::identity::identity_path().display());
-            if let Some(phrase) = mnemonic {
-                println!();
-                println!("  ── BACK UP THIS RECOVERY PHRASE (24 words) ──");
-                println!("  {phrase}");
-                println!("  ─────────────────────────────────────────────");
+            if args.json {
+                // JSON form: the public identity (never the mnemonic — it stays
+                // human-only so it can't be slurped into a log/file by mistake).
+                let pointer_path = alice_miner_core::identity::identity_path();
+                let obj = serde_json::json!({
+                    "address": identity.address,
+                    "pubkey": identity.pubkey,
+                    "watch_only": identity.watch_only,
+                    "keystore_path": identity.keystore_path.as_ref().map(|p| p.display().to_string()),
+                    "pointer": pointer_path.display().to_string(),
+                });
+                println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
+                // The mnemonic, when present, still goes to STDERR with the
+                // back-up warning so machine consumers of stdout never capture it.
+                if let Some(phrase) = mnemonic {
+                    eprintln!();
+                    eprintln!("  ── BACK UP THIS RECOVERY PHRASE (24 words) ──");
+                    eprintln!("  {phrase}");
+                    eprintln!("  ─────────────────────────────────────────────");
+                }
+            } else {
+                print!("{}", dashboard::render_identity(&identity, mnemonic.as_deref()));
             }
             engine.shutdown();
-            0
+            EXIT_OK
         }
         Ok(Event::Error(e)) => {
             eprintln!("error: {e}");
-            1
+            EXIT_RUNTIME
         }
         Ok(other) => {
             eprintln!("unexpected event: {other:?}");
-            1
+            EXIT_RUNTIME
         }
         Err(_) => {
             eprintln!("error: timed out establishing identity");
-            1
+            EXIT_RUNTIME
         }
     }
 }
 
+/// `identity --show`: print the active address from the pointer. NEVER a secret.
+fn cmd_identity_show(json: bool) -> i32 {
+    match alice_miner_core::identity::load_pointer() {
+        Some(p) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&p).unwrap_or_default());
+            } else {
+                print!("{}", dashboard::render_identity_show(&p));
+            }
+            EXIT_OK
+        }
+        None => {
+            let path = alice_miner_core::identity::identity_path();
+            if json {
+                println!("{}", serde_json::json!({ "address": null, "pointer": path.display().to_string() }));
+            } else {
+                eprintln!(
+                    "No identity yet. Create or import one first:\n  \
+                     alice-miner identity --create\n  \
+                     alice-miner identity --import \"<24 words>\"\n  \
+                     alice-miner identity --paste <address>   (watch-only)\n\
+                     (expected pointer: {})",
+                    path.display()
+                );
+            }
+            EXIT_RUNTIME
+        }
+    }
+}
+
+/// Map the identity flags to an [`IdentitySpec`], resolving the passphrase where
+/// a keystore is written. Returns the exit code to use on a usage error.
+fn build_identity_spec(
+    create: bool,
+    import: Option<String>,
+    import_seed: Option<String>,
+    paste: Option<String>,
+    label: Option<String>,
+    password: Option<String>,
+) -> Result<IdentitySpec, i32> {
+    if create {
+        let password = resolve_password(password).map_err(|e| {
+            eprintln!("error: {e}");
+            EXIT_USAGE
+        })?;
+        Ok(IdentitySpec::Create { label, password })
+    } else if let Some(mnemonic) = import {
+        let password = resolve_password(password).map_err(|e| {
+            eprintln!("error: {e}");
+            EXIT_USAGE
+        })?;
+        Ok(IdentitySpec::ImportMnemonic { mnemonic, label, password })
+    } else if let Some(seed_hex) = import_seed {
+        let password = resolve_password(password).map_err(|e| {
+            eprintln!("error: {e}");
+            EXIT_USAGE
+        })?;
+        Ok(IdentitySpec::ImportSeedHex { seed_hex, label, password })
+    } else if let Some(address) = paste {
+        Ok(IdentitySpec::Paste { address, label })
+    } else {
+        eprintln!(
+            "error: choose one of:\n  \
+             --create | --import <MNEMONIC> | --import-seed <HEX> | --paste <ADDR> | --show"
+        );
+        Err(EXIT_USAGE)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// start
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn cmd_start(args: StartArgs) -> i32 {
-    let lane = match args.lane.to_ascii_lowercase().as_str() {
-        "xmr" | "cpu" => Lane::Xmr,
-        "gpu" | "rvn" => Lane::GpuRvn,
-        "auto" => {
-            // Pick the recommended lane for this device (RVN on NVIDIA, else XMR).
-            alice_miner_core::CapabilityProfile::detect().recommended_lane()
-        }
-        other => {
-            eprintln!("error: unknown lane `{other}` (use xmr | gpu | auto)");
-            return 2;
-        }
-    };
-    // If the chosen lane isn't runnable on this device, say so up front (the
-    // engine would also error, but a clear pre-flight message is friendlier).
+    // Resolve the lane (auto = recommended for this device), then pre-flight the
+    // viability gates so we refuse HONESTLY before spawning a child.
     let cap = alice_miner_core::CapabilityProfile::detect();
+    let lane = match resolve_lane(&args.lane, &cap) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+
     if !cap.support(lane).is_runnable() {
         eprintln!(
             "error: the {} lane is {} on this device ({}). Recommended lane: {}.",
@@ -244,22 +375,25 @@ fn cmd_start(args: StartArgs) -> i32 {
             cap.viability.reason(lane).unwrap_or("not viable"),
             cap.recommended_lane().label(),
         );
-        return 2;
+        return EXIT_USAGE;
     }
-    // Dual-mine requires ≥2 viable lanes (CPU-XMR + a viable GPU-RVN). On a Mac /
-    // no-NVIDIA box only XMR is viable, so refuse with a clear reason.
+
+    // Dual-mine requires >=2 viable lanes. On a Mac / no-NVIDIA box only XMR is
+    // viable, so refuse with the honest per-lane reason.
     if args.dual {
-        let viable = alice_miner_core::detect::capability::ALL_LANES
-            .iter()
-            .filter(|&&l| cap.support(l).is_runnable())
-            .count();
-        if viable < 2 {
+        let runnable = cap.viability.runnable_lanes();
+        if runnable.len() < 2 {
+            let rvn = Lane::GpuRvn;
             eprintln!(
-                "error: dual-mine needs ≥2 viable lanes; this device has {viable} (RVN is {}). \
-                 Run a single lane instead.",
-                cap.support(Lane::GpuRvn).label(),
+                "error: dual-mine needs 2 viable lanes; this device has {} ({} is {}: {}). \
+                 Run a single lane instead, e.g. `alice-miner start --lane {}`.",
+                runnable.len(),
+                rvn.label(),
+                cap.support(rvn).label(),
+                cap.viability.reason(rvn).unwrap_or("not viable"),
+                cap.recommended_lane().id(),
             );
-            return 2;
+            return EXIT_USAGE;
         }
     }
 
@@ -267,12 +401,13 @@ fn cmd_start(args: StartArgs) -> i32 {
         Ok(e) => e,
         Err(e) => {
             eprintln!("error: {e}");
-            return 1;
+            return EXIT_RUNTIME;
         }
     };
 
-    // Ctrl-C → graceful Stop. We set a flag the main loop watches; the engine's
-    // Stop command does the SIGTERM→SIGKILL on the owned child.
+    // Ctrl-C / SIGTERM (from `alice-miner stop`) → graceful Stop. We set a flag
+    // the main loop watches; the engine's Stop does the SIGTERM→SIGKILL on the
+    // owned child. The `termination` feature traps SIGTERM/SIGHUP too.
     let stop_flag = Arc::new(AtomicBool::new(false));
     {
         let f = stop_flag.clone();
@@ -281,52 +416,52 @@ fn cmd_start(args: StartArgs) -> i32 {
         });
     }
 
+    // Record our pid so `alice-miner stop` (another process) can find us. Removed
+    // on the way out so a stale pid never lingers. Best-effort: a write failure
+    // (e.g. read-only home) does not block mining — only `stop` would be unable
+    // to find us, and Ctrl-C still works.
+    let pid_guard = pidfile::PidGuard::acquire();
+
     if let Err(e) = engine.send(EngineCommand::Start {
         lane,
-        address: args.address,
+        address: args.address.clone(),
         dual: args.dual,
     }) {
         eprintln!("error: {e}");
-        return 1;
+        return EXIT_RUNTIME;
     }
 
-    if args.dual {
-        println!("Starting dual-mine (CPU-XMR + GPU-RVN, Ctrl-C to stop)…");
-    } else {
-        println!("Starting {} lane (Ctrl-C to stop)…", lane.label());
+    if !args.json {
+        print!("{}", dashboard::render_start_banner(lane, args.dual));
     }
 
     let start = std::time::Instant::now();
-    let deadline = if args.duration_s > 0 {
-        Some(Duration::from_secs(args.duration_s))
-    } else {
-        None
-    };
+    let deadline = (args.duration_s > 0).then(|| Duration::from_secs(args.duration_s));
 
-    let mut exit_code = 0;
+    let mut exit_code = EXIT_OK;
     let mut requested_stop = false;
     let mut saw_running = false;
 
     loop {
-        // Drain any pending events (snapshots / errors).
         match engine.recv_timeout(Duration::from_millis(500)) {
             Ok(Event::Snapshot(snap)) => {
-                print_snapshot(&snap);
-                if matches!(snap.state, alice_miner_core::EngineState::Running) {
+                emit_snapshot(&snap, args.json);
+                if matches!(snap.state, EngineState::Running) {
                     saw_running = true;
                 }
                 if requested_stop
-                    && matches!(
-                        snap.state,
-                        alice_miner_core::EngineState::Idle | alice_miner_core::EngineState::Error
-                    )
+                    && matches!(snap.state, EngineState::Idle | EngineState::Error)
                 {
                     break;
                 }
             }
             Ok(Event::Error(e)) => {
-                eprintln!("engine error: {e}");
-                exit_code = 1;
+                if args.json {
+                    println!("{}", serde_json::json!({ "error": e }));
+                } else {
+                    eprintln!("engine error: {e}");
+                }
+                exit_code = EXIT_RUNTIME;
                 break;
             }
             Ok(_other) => {}
@@ -337,96 +472,114 @@ fn cmd_start(args: StartArgs) -> i32 {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        // Ctrl-C or duration elapsed → request Stop once.
+        // Ctrl-C / SIGTERM or duration elapsed → request Stop once.
         let timed_out = deadline.map(|d| start.elapsed() >= d).unwrap_or(false);
         if !requested_stop && (stop_flag.load(Ordering::SeqCst) || timed_out) {
-            println!("Stopping…");
+            if !args.json {
+                print!("{}", dashboard::render_stopping_banner());
+            }
             let _ = engine.send(EngineCommand::Stop);
             requested_stop = true;
         }
     }
 
-    // Best-effort: ensure the child is torn down on the way out.
+    // Best-effort: ensure the child is torn down on the way out (kill_on_drop is
+    // the backstop). Then drop the pid file.
     engine.shutdown();
+    drop(pid_guard);
 
-    if exit_code == 0 && !saw_running {
+    if exit_code == EXIT_OK && !saw_running {
         // We never reached Running — surface that as a soft failure for the
-        // harness (the relay may have been unreachable).
-        eprintln!("note: the lane never reached the Running state");
+        // harness (e.g. the relay was unreachable from this context).
+        if !args.json {
+            eprintln!(
+                "note: the lane never reached the Running state \
+                 (the relay may be unreachable from here)."
+            );
+        }
     }
     exit_code
 }
 
-fn print_snapshot(snap: &alice_miner_core::Snapshot) {
-    let hr = snap
-        .hashrate_hs
-        .map(|h| format!("{h:.1} H/s"))
-        .unwrap_or_else(|| "—".into());
-    let endpoint = snap.endpoint.as_deref().unwrap_or("—");
-    // Surface Layer-B failover (the M4 live-connect verification reads this).
-    let failover = if snap.failovers > 0 {
-        format!(" failed-over×{}", snap.failovers)
+/// Emit one snapshot, either as a JSON line (`--json`) or rendered into the
+/// human dashboard block.
+fn emit_snapshot(snap: &Snapshot, json: bool) {
+    if json {
+        // One compact JSON object per tick — credit-only by construction (the
+        // Snapshot type has no payout field; a core test asserts the JSON shape).
+        match serde_json::to_string(snap) {
+            Ok(line) => println!("{line}"),
+            Err(e) => eprintln!("error: failed to serialize snapshot: {e}"),
+        }
     } else {
-        String::new()
-    };
-    let dual = if snap.dual { " [dual]" } else { "" };
-    println!(
-        "[{:?}]{dual} hashrate={} shares={}A/{}R uptime={}s endpoint={}{}{}",
-        snap.state,
-        hr,
-        snap.shares_accepted,
-        snap.shares_rejected,
-        snap.uptime_s,
-        endpoint,
-        failover,
-        snap.last_line
-            .as_deref()
-            .map(|l| format!("  | {l}"))
-            .unwrap_or_default(),
-    );
-    // In dual mode, also print each lane's row so both lanes are visible.
-    if snap.dual {
-        for l in &snap.lanes {
-            let lhr = l.hashrate_hs.map(|h| format!("{h:.1} H/s")).unwrap_or_else(|| "—".into());
-            println!(
-                "    └ {}: [{:?}] {} {}A/{}R @ {}",
-                l.lane.label(),
-                l.state,
-                lhr,
-                l.shares_accepted,
-                l.shares_rejected,
-                l.endpoint.as_deref().unwrap_or("—"),
-            );
+        print!("{}", dashboard::render_snapshot(snap));
+    }
+}
+
+/// Resolve the `--lane` string to a [`Lane`]. `auto` → the device's recommended
+/// lane. Returns the usage exit code on an unknown lane.
+fn resolve_lane(s: &str, cap: &alice_miner_core::CapabilityProfile) -> Result<Lane, i32> {
+    match s.to_ascii_lowercase().as_str() {
+        "xmr" | "cpu" => Ok(Lane::Xmr),
+        "gpu" | "rvn" => Ok(Lane::GpuRvn),
+        "auto" => Ok(cap.recommended_lane()),
+        other => {
+            eprintln!("error: unknown lane `{other}` (use: xmr | gpu | auto)");
+            Err(EXIT_USAGE)
         }
     }
 }
 
-/// Human-friendly one-line GPU description for `detect` (model + VRAM, or the
-/// vendor when no model was probed; `none` when CPU-only).
-fn fmt_gpu(gpu: &alice_miner_core::GpuInfo) -> String {
-    use alice_miner_core::GpuVendor;
-    match gpu.vendor {
-        GpuVendor::None => "none (CPU-only)".to_string(),
-        GpuVendor::Nvidia => {
-            if gpu.vram_gb > 0 {
-                format!("{} · {} GB VRAM", gpu.model, gpu.vram_gb)
-            } else {
-                gpu.model.clone()
+// ─────────────────────────────────────────────────────────────────────────────
+// stop
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmd_stop(args: StopArgs) -> i32 {
+    match pidfile::read_pid() {
+        None => {
+            eprintln!(
+                "No running miner found (no pid file at {}).",
+                pidfile::pid_path().display()
+            );
+            // Not an error per se, but non-zero so scripts can branch.
+            EXIT_RUNTIME
+        }
+        Some(pid) if !pidfile::is_alive(pid) => {
+            eprintln!("No running miner (stale pid {pid}); cleaning up.");
+            pidfile::remove();
+            EXIT_RUNTIME
+        }
+        Some(pid) => {
+            println!("Stopping miner (pid {pid})…");
+            match pidfile::stop_pid(pid, Duration::from_secs(args.timeout_s)) {
+                pidfile::StopOutcome::Graceful => {
+                    println!("Miner stopped cleanly.");
+                    pidfile::remove();
+                    EXIT_OK
+                }
+                pidfile::StopOutcome::Killed => {
+                    println!("Miner did not exit in time; sent SIGKILL. No orphan left.");
+                    pidfile::remove();
+                    EXIT_OK
+                }
+                pidfile::StopOutcome::Error(e) => {
+                    eprintln!("error: {e}");
+                    EXIT_RUNTIME
+                }
             }
         }
-        GpuVendor::Amd => format!("{} (lane coming soon)", gpu.model),
-        GpuVendor::Apple => format!("{} (unified memory)", gpu.model),
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// shared helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Resolve a keystore passphrase: use the flag if given, else prompt securely.
 /// (Never echoes the passphrase; the engine zeroizes it after use.)
-fn resolve_password(flag: Option<String>, required: bool) -> Result<String, String> {
+fn resolve_password(flag: Option<String>) -> Result<String, String> {
     if let Some(p) = flag {
         return Ok(p);
-    }
-    if !required {
-        return Ok(String::new());
     }
     rpassword::prompt_password("Keystore passphrase: ")
         .map_err(|e| format!("failed to read passphrase: {e}"))
@@ -437,4 +590,127 @@ fn resolve_password(flag: Option<String>, required: bool) -> Result<String, Stri
                 Ok(p)
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    /// Clap wiring is sane: every subcommand + flag parses to the expected shape.
+    /// (`try_parse_from` does NOT exit the process, so this is a pure check.)
+    #[test]
+    fn cli_parses_all_subcommands() {
+        // detect (+ --json)
+        let cli = Cli::try_parse_from(["alice-miner", "detect"]).unwrap();
+        assert!(matches!(cli.command, Command::Detect(DetectArgs { json: false })));
+        let cli = Cli::try_parse_from(["alice-miner", "detect", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Detect(DetectArgs { json: true })));
+
+        // identity variants
+        let cli = Cli::try_parse_from(["alice-miner", "identity", "--create"]).unwrap();
+        match cli.command {
+            Command::Identity(a) => {
+                assert!(a.create && a.import.is_none() && !a.show);
+            }
+            _ => panic!("expected identity"),
+        }
+        let cli =
+            Cli::try_parse_from(["alice-miner", "identity", "--import", "a b c"]).unwrap();
+        match cli.command {
+            Command::Identity(a) => assert_eq!(a.import.as_deref(), Some("a b c")),
+            _ => panic!("expected identity"),
+        }
+        let cli =
+            Cli::try_parse_from(["alice-miner", "identity", "--import-seed", "0xdead"]).unwrap();
+        match cli.command {
+            Command::Identity(a) => assert_eq!(a.import_seed.as_deref(), Some("0xdead")),
+            _ => panic!("expected identity"),
+        }
+        let cli = Cli::try_parse_from(["alice-miner", "identity", "--paste", "addr"]).unwrap();
+        match cli.command {
+            Command::Identity(a) => assert_eq!(a.paste.as_deref(), Some("addr")),
+            _ => panic!("expected identity"),
+        }
+        let cli = Cli::try_parse_from(["alice-miner", "identity", "--show"]).unwrap();
+        match cli.command {
+            Command::Identity(a) => assert!(a.show),
+            _ => panic!("expected identity"),
+        }
+
+        // start defaults: lane=auto, no dual, no json.
+        let cli = Cli::try_parse_from(["alice-miner", "start"]).unwrap();
+        match cli.command {
+            Command::Start(a) => {
+                assert_eq!(a.lane, "auto");
+                assert!(!a.dual && !a.json);
+                assert_eq!(a.duration_s, 0);
+            }
+            _ => panic!("expected start"),
+        }
+        let cli = Cli::try_parse_from([
+            "alice-miner", "start", "--lane", "xmr", "--dual", "--json", "--duration-s", "30",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Start(a) => {
+                assert_eq!(a.lane, "xmr");
+                assert!(a.dual && a.json);
+                assert_eq!(a.duration_s, 30);
+            }
+            _ => panic!("expected start"),
+        }
+
+        // stop (+ default timeout)
+        let cli = Cli::try_parse_from(["alice-miner", "stop"]).unwrap();
+        match cli.command {
+            Command::Stop(a) => assert_eq!(a.timeout_s, 8),
+            _ => panic!("expected stop"),
+        }
+    }
+
+    /// Mutually-exclusive identity flags are rejected by clap (e.g. --create with
+    /// --paste), so the user can't ask for two contradictory things.
+    #[test]
+    fn conflicting_identity_flags_are_rejected() {
+        assert!(Cli::try_parse_from(["alice-miner", "identity", "--create", "--paste", "x"]).is_err());
+        assert!(Cli::try_parse_from(["alice-miner", "identity", "--show", "--create"]).is_err());
+        assert!(Cli::try_parse_from(["alice-miner", "identity", "--import", "x", "--import-seed", "y"]).is_err());
+    }
+
+    /// Unknown subcommands / bad lanes are usage errors (clap rejects unknown
+    /// subcommands; the lane string is validated at runtime in `resolve_lane`).
+    #[test]
+    fn unknown_subcommand_is_rejected() {
+        assert!(Cli::try_parse_from(["alice-miner", "mine-everything"]).is_err());
+    }
+
+    #[test]
+    fn resolve_lane_maps_aliases_and_auto() {
+        let cap = alice_miner_core::CapabilityProfile::detect();
+        assert_eq!(resolve_lane("xmr", &cap).unwrap(), Lane::Xmr);
+        assert_eq!(resolve_lane("cpu", &cap).unwrap(), Lane::Xmr);
+        assert_eq!(resolve_lane("gpu", &cap).unwrap(), Lane::GpuRvn);
+        assert_eq!(resolve_lane("rvn", &cap).unwrap(), Lane::GpuRvn);
+        assert_eq!(resolve_lane("AUTO", &cap).unwrap(), cap.recommended_lane());
+        assert!(resolve_lane("prl", &cap).is_err());
+    }
+
+    /// build_identity_spec maps each flag and errors when none is given.
+    #[test]
+    fn build_identity_spec_requires_a_mode() {
+        // Paste needs no password.
+        let spec = build_identity_spec(false, None, None, Some("addr".into()), None, None).unwrap();
+        assert!(matches!(spec, IdentitySpec::Paste { .. }));
+        // Create with an explicit password (no prompt in tests).
+        let spec =
+            build_identity_spec(true, None, None, None, None, Some("pw".into())).unwrap();
+        assert!(matches!(spec, IdentitySpec::Create { .. }));
+        // No mode → usage error.
+        assert_eq!(
+            build_identity_spec(false, None, None, None, None, None).unwrap_err(),
+            EXIT_USAGE
+        );
+    }
 }
