@@ -206,6 +206,47 @@ pub fn load_pointer() -> Option<IdentityPointer> {
     serde_json::from_str(&contents).ok()
 }
 
+/// Read-only view of the keystore the next create/import would write to (and
+/// back up). Used by the "change reward address" UI so it can (a) say whether a
+/// signing keystore exists today, and (b) show the exact `.bak-…` path the old
+/// keystore would be moved to BEFORE the user confirms an overwrite — without
+/// duplicating any of the backup logic (that still runs inside
+/// [`create`]/[`import_*`] via `alice_crypto::backup_existing_wallet`). NO secret
+/// is touched: this only reads the path + a file-exists flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeystoreStatus {
+    /// Absolute path to the active keystore (`…/AliceWallet/wallet.json`).
+    pub path: PathBuf,
+    /// Whether a keystore file exists there right now (i.e. an overwrite would
+    /// have something to back up first).
+    pub exists: bool,
+}
+
+impl KeystoreStatus {
+    /// The `…/wallet.json.bak-<unix>` path the existing keystore WOULD be moved
+    /// to on the next overwrite (mirrors `alice_crypto::backup_existing_wallet`'s
+    /// naming). `None` when no keystore exists (nothing to back up). The `<unix>`
+    /// is a *preview* of "now"; the real backup stamps its own (very close) time.
+    pub fn projected_backup_path(&self) -> Option<PathBuf> {
+        if !self.exists {
+            return None;
+        }
+        let name = self
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("wallet.json");
+        Some(self.path.with_file_name(format!("{name}.bak-{}", now_unix())))
+    }
+}
+
+/// The active keystore's path + whether it currently exists. Pure read; no unlock.
+pub fn keystore_status() -> KeystoreStatus {
+    let path = alice_crypto::default_wallet_path();
+    let exists = path.is_file();
+    KeystoreStatus { path, exists }
+}
+
 /// Write the pointer atomically with `0o600` perms (write to a temp file in the
 /// same dir, fsync, rename into place). Mirrors the Wallet keystore write.
 fn write_pointer(pointer: &IdentityPointer) -> Result<(), String> {
@@ -405,6 +446,129 @@ mod tests {
             // A non-Alice address is rejected.
             assert!(paste("not-an-address", None).is_err());
             assert!(paste("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", None).is_err());
+        });
+    }
+
+    /// CHANGE → paste (watch-only) must REPOINT `identity.json` to the new address
+    /// while PRESERVING the existing keystore byte-for-byte (paste never touches
+    /// the key — the security-critical guarantee for the change flow).
+    #[test]
+    fn change_to_paste_preserves_existing_keystore() {
+        with_temp_env(|| {
+            // Establish a keystore-backed identity first (the "current" reward id).
+            let (orig, _m) = create(Some("orig".into()), "correct horse battery staple")
+                .expect("create original");
+            let ks = alice_crypto::default_wallet_path();
+            let before = std::fs::read(&ks).expect("keystore exists");
+            assert!(!orig.watch_only);
+
+            // Now CHANGE to a different pasted (watch-only) address.
+            let other = alice_crypto::create_wallet_payload(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+                "pw-123456",
+            )
+            .unwrap()
+            .address;
+            assert_ne!(other, orig.address, "must be a different address");
+            let pasted = paste(&other, Some("watch".into())).expect("paste change");
+
+            // The pointer now names the PASTED address + has no keystore_path.
+            let ptr = load_pointer().expect("pointer");
+            assert_eq!(ptr.address, other);
+            assert!(ptr.keystore_path.is_none());
+            assert!(pasted.watch_only);
+
+            // The original keystore is UNTOUCHED (same path, identical bytes).
+            assert!(ks.is_file(), "keystore preserved");
+            let after = std::fs::read(&ks).expect("keystore still readable");
+            assert_eq!(before, after, "paste must NOT modify the keystore");
+            // And it still decrypts to the ORIGINAL address (the key is intact).
+            let payload: alice_crypto::WalletPayload =
+                serde_json::from_slice(&after).unwrap();
+            let unlocked =
+                alice_crypto::unlock_wallet(&payload, "correct horse battery staple").unwrap();
+            assert_eq!(unlocked.secrets.address, orig.address);
+        });
+    }
+
+    /// CHANGE → create must BACK UP the existing keystore (move it to a `.bak-…`
+    /// sibling) before writing the new one — never silently destroy a key. The new
+    /// keystore decrypts to the NEW address; the backup decrypts to the OLD one.
+    #[test]
+    fn change_to_create_backs_up_old_keystore() {
+        with_temp_env(|| {
+            let (orig, _m) = create(Some("orig".into()), "correct horse battery staple")
+                .expect("create original");
+            let ks = alice_crypto::default_wallet_path();
+            // The status helper reports the keystore as present (drives the UI's
+            // "this overwrites + backs up" warning + the projected `.bak-…` path).
+            let status = keystore_status();
+            assert_eq!(status.path, ks);
+            assert!(status.exists);
+            assert!(status.projected_backup_path().is_some());
+
+            // CHANGE to a freshly created identity (a new key).
+            let (next, _m2) = create(Some("next".into()), "another good passphrase here")
+                .expect("create change");
+            assert_ne!(next.address, orig.address, "new identity = new address");
+
+            // A `.bak-…` of the old keystore now exists alongside the new one.
+            let dir = ks.parent().unwrap();
+            let baks: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.contains("wallet.json.bak-"))
+                .collect();
+            assert!(!baks.is_empty(), "old keystore backed up (.bak-…)");
+
+            // The LIVE keystore decrypts to the NEW address; the backup to the OLD.
+            let live: alice_crypto::WalletPayload =
+                serde_json::from_slice(&std::fs::read(&ks).unwrap()).unwrap();
+            assert_eq!(
+                alice_crypto::unlock_wallet(&live, "another good passphrase here")
+                    .unwrap()
+                    .secrets
+                    .address,
+                next.address
+            );
+            let bak_path = dir.join(&baks[0]);
+            let bak: alice_crypto::WalletPayload =
+                serde_json::from_slice(&std::fs::read(&bak_path).unwrap()).unwrap();
+            assert_eq!(
+                alice_crypto::unlock_wallet(&bak, "correct horse battery staple")
+                    .unwrap()
+                    .secrets
+                    .address,
+                orig.address,
+                "the backup must still hold the OLD key"
+            );
+
+            // The pointer now names the NEW address + keystore.
+            assert_eq!(load_pointer().unwrap().address, next.address);
+        });
+    }
+
+    /// `keystore_status` reports a missing keystore as not-present, and then a
+    /// watch-only paste never creates one (so a subsequent create has nothing to
+    /// back up — `projected_backup_path` stays `None`).
+    #[test]
+    fn keystore_status_reflects_absence_and_paste_creates_none() {
+        with_temp_env(|| {
+            // Fresh env: no keystore yet.
+            let s0 = keystore_status();
+            assert!(!s0.exists);
+            assert!(s0.projected_backup_path().is_none());
+
+            // A watch-only paste must NOT create a keystore.
+            let addr = alice_crypto::create_wallet_payload(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+                "pw-123456",
+            )
+            .unwrap()
+            .address;
+            paste(&addr, None).expect("paste");
+            assert!(!keystore_status().exists, "paste leaves no keystore");
         });
     }
 }

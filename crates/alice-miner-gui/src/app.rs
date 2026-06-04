@@ -27,6 +27,36 @@ pub enum Screen {
     Settings,
 }
 
+/// The post-onboarding "change reward address" overlay. Reachable from Settings
+/// (Identity section) and the Home "Rewards to <addr>" edit affordance once an
+/// identity already exists. It offers the SAME three paths onboarding uses
+/// (create / import / paste) and drives the exact same `alice-miner-core`
+/// identity functions — but as a modal over Home/Settings (NOT the full-screen
+/// onboarding takeover), and only when NOT mining. Create/Import gain an explicit
+/// overwrite-confirm step first (the existing keystore is backed up before being
+/// replaced); Paste is watch-only and never touches the keystore.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ChangeAddr {
+    /// The launcher: pick create / import / paste, with the current address shown.
+    Choose,
+    /// Create-new OVERWRITE gate: warn that this REPLACES + backs up the current
+    /// keystore before we generate. Carries the `.bak-…` path we'll move the old
+    /// keystore to (when one exists) so the warning can name it. "Continue"
+    /// advances to [`ChangeAddr::CreateForm`].
+    ConfirmCreate { backup_hint: Option<String> },
+    /// The create password form (shown after the overwrite warning is accepted).
+    CreateForm,
+    /// After a create commits: the 24-word phrase for the forced-backup step.
+    Backup { mnemonic: String, acknowledged: bool },
+    /// Confirm the new phrase by re-picking 3 words (reuses the onboarding logic).
+    Confirm { mnemonic: String },
+    /// Import a different mnemonic / seed. The overwrite warning is recapped inline
+    /// (Import also replaces + backs up the keystore).
+    Import { backup_hint: Option<String> },
+    /// Paste a different address (watch-only). Preserves the existing keystore.
+    Paste,
+}
+
 /// Onboarding sub-flow (only reachable when there is no `~/.alice/identity.json`).
 #[derive(Clone, PartialEq, Eq)]
 pub enum Onboarding {
@@ -75,6 +105,11 @@ pub struct MinerApp {
     pub screen: Screen,
     /// `Some` while onboarding (no identity yet, or user chose to add one).
     pub onboarding: Option<Onboarding>,
+    /// `Some` while the post-onboarding "change reward address" modal is open
+    /// (reachable from Settings + the Home edit affordance once an identity
+    /// exists). Mutually exclusive with `onboarding` in practice (onboarding only
+    /// runs when there is no identity; the change flow only when there IS one).
+    pub change_addr: Option<ChangeAddr>,
 
     /// The Alice mark texture — a WHITE / alpha mask (rasterised once from the
     /// bundled SVG), tinted to the brand colour at each draw site. See
@@ -163,6 +198,7 @@ impl MinerApp {
             identity,
             screen: Screen::Home,
             onboarding,
+            change_addr: None,
             mark_tex: None,
             form_password: String::new(),
             form_password2: String::new(),
@@ -345,7 +381,10 @@ impl MinerApp {
     }
 
     fn on_identity(&mut self, identity: Identity, mnemonic: Option<String>) {
-        // Refresh the on-disk pointer view (the core wrote it).
+        // Refresh the on-disk pointer view (the core wrote it). This single line
+        // is what makes the engine/dashboards/Home immediately reflect the NEW
+        // reward address — every reward-address read goes through `self.identity`
+        // / `reward_address()`.
         self.identity = identity::load_pointer().or(Some(IdentityPointer {
             address: identity.address.clone(),
             pubkey: identity.pubkey.clone(),
@@ -356,17 +395,31 @@ impl MinerApp {
             label: None,
             created: 0,
         }));
-        match mnemonic {
-            // A freshly created identity → force the backup step (show the
-            // mnemonic once, require an explicit acknowledgement).
-            Some(m) => {
+        // Route the completion differently depending on whether this was the
+        // first-run onboarding or the post-onboarding CHANGE flow.
+        let changing = self.change_addr.is_some();
+        match (changing, mnemonic) {
+            // CHANGE → create: force the backup step inside the MODAL (stay over
+            // the current screen), don't fall back into onboarding.
+            (true, Some(m)) => {
+                self.change_addr = Some(ChangeAddr::Backup {
+                    mnemonic: m,
+                    acknowledged: false,
+                });
+            }
+            // CHANGE → import / paste: done — close the modal, stay where we are.
+            (true, None) => {
+                self.change_addr = None;
+            }
+            // ONBOARDING → create: the forced-backup onboarding step.
+            (false, Some(m)) => {
                 self.onboarding = Some(Onboarding::Backup {
                     mnemonic: m,
                     acknowledged: false,
                 });
             }
-            // Import / paste → onboarding done, go Home.
-            None => {
+            // ONBOARDING → import / paste: onboarding done, go Home.
+            (false, None) => {
                 self.onboarding = None;
                 self.screen = Screen::Home;
             }
@@ -540,8 +593,25 @@ impl MinerApp {
         }
     }
 
+    /// Refuse an identity change while a lane is running (security/safety: never
+    /// re-key the reward target out from under a live miner). Returns `true` when
+    /// the change is BLOCKED (and sets the error). Always `false` during
+    /// onboarding (no identity ⇒ nothing is mining), so it's a no-op there.
+    fn change_blocked_by_mining(&mut self) -> bool {
+        if self.is_mining() {
+            self.error =
+                Some("Stop mining before changing the reward address.".into());
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn submit_create(&mut self) {
         self.error = None;
+        if self.change_blocked_by_mining() {
+            return;
+        }
         if self.form_password.len() < 8 {
             self.error = Some("Password must be at least 8 characters.".into());
             return;
@@ -561,6 +631,9 @@ impl MinerApp {
 
     pub fn submit_import(&mut self) {
         self.error = None;
+        if self.change_blocked_by_mining() {
+            return;
+        }
         if self.form_password.len() < 8 {
             self.error = Some("Password must be at least 8 characters.".into());
             return;
@@ -585,6 +658,9 @@ impl MinerApp {
 
     pub fn submit_paste(&mut self) {
         self.error = None;
+        if self.change_blocked_by_mining() {
+            return;
+        }
         let spec = IdentitySpec::Paste {
             address: self.form_address.trim().to_string(),
             label: None,
@@ -649,9 +725,17 @@ impl MinerApp {
         self.confirm_pool = pool;
         self.confirm_filled = vec![None; want];
         self.error = None;
-        self.onboarding = Some(Onboarding::Confirm {
-            mnemonic: mnemonic.to_string(),
-        });
+        // Advance whichever flow is active (the post-onboarding change modal, or
+        // first-run onboarding) into its confirm step — same retype check for both.
+        if self.change_addr.is_some() {
+            self.change_addr = Some(ChangeAddr::Confirm {
+                mnemonic: mnemonic.to_string(),
+            });
+        } else {
+            self.onboarding = Some(Onboarding::Confirm {
+                mnemonic: mnemonic.to_string(),
+            });
+        }
     }
 
     /// True when every confirm slot holds the word at its (1-based) target index.
@@ -693,6 +777,66 @@ impl MinerApp {
         self.confirm_targets.clear();
         self.confirm_pool.clear();
         self.confirm_filled.clear();
+    }
+
+    // ── Change reward address (post-onboarding) ───────────────────────────────
+
+    /// Open the "change reward address" modal at its launcher. No-op (and clears
+    /// any half-typed forms) — guarded by the caller on `!is_mining()`. We reset
+    /// the shared identity form fields so a stale paste/password can't leak in.
+    pub fn open_change_addr(&mut self) {
+        self.error = None;
+        self.reset_identity_forms();
+        self.change_addr = Some(ChangeAddr::Choose);
+    }
+
+    /// Whether the active reward identity is WATCH-ONLY (a pasted address with no
+    /// signing keystore). Used to label the Settings Identity section honestly.
+    pub fn reward_is_watch_only(&self) -> bool {
+        match &self.identity {
+            Some(p) => p.keystore_path.is_none(),
+            None => false,
+        }
+    }
+
+    /// The `…/wallet.json.bak-<unix>` path the current keystore WOULD be moved to
+    /// on the next create/import overwrite (`None` when no keystore exists). This
+    /// is the exact destination `alice_crypto::backup_existing_wallet` will use,
+    /// surfaced so the overwrite warning can name it BEFORE the user confirms.
+    pub fn keystore_backup_hint(&self) -> Option<String> {
+        identity::keystore_status()
+            .projected_backup_path()
+            .map(|p| p.to_string_lossy().to_string())
+    }
+
+    /// Close the change-address modal without applying anything (Cancel / done),
+    /// wiping the transient form + confirm scratch state.
+    pub fn close_change_addr(&mut self) {
+        self.change_addr = None;
+        self.reset_identity_forms();
+        self.confirm_targets.clear();
+        self.confirm_pool.clear();
+        self.confirm_filled.clear();
+        self.error = None;
+    }
+
+    /// Clear every shared identity-entry form field (password, mnemonic, seed,
+    /// pasted address). Called when opening/closing the change modal so secrets +
+    /// addresses never bleed between the onboarding and change flows.
+    fn reset_identity_forms(&mut self) {
+        self.form_password.clear();
+        self.form_password2.clear();
+        self.form_mnemonic.clear();
+        self.form_seed.clear();
+        self.form_address.clear();
+        self.form_use_seed = false;
+    }
+
+    /// Finish a change-address CREATE after a correct phrase confirm → close the
+    /// modal. The pointer + keystore were already updated by the engine; this just
+    /// tears the modal down (the new address is already live via `self.identity`).
+    pub fn finish_change_addr(&mut self) {
+        self.close_change_addr();
     }
 }
 
@@ -870,5 +1014,128 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             warnings: vec![],
         });
         assert!(app.dual_viable(), "NVIDIA box → dual enabled (two viable lanes)");
+    }
+
+    // ── Change reward address (post-onboarding) ───────────────────────────────
+
+    /// A minimal Running snapshot so `is_mining()` is true (drives the change
+    /// guard + the disabled affordances).
+    fn running_snapshot() -> Snapshot {
+        Snapshot {
+            state: EngineState::Running,
+            device: None,
+            lane: Some(Lane::Xmr),
+            hashrate_hs: Some(8400.0),
+            shares_accepted: 10,
+            shares_rejected: 0,
+            endpoint: Some("hk.aliceprotocol.org:3333".into()),
+            worker_id: Some("rig-1".into()),
+            uptime_s: 5,
+            failovers: 0,
+            dual: false,
+            lanes: Vec::new(),
+            last_line: None,
+            message: None,
+        }
+    }
+
+    /// `open_change_addr` opens the modal at its launcher and wipes any stale
+    /// identity-form scratch (so a half-typed paste/password can't leak in).
+    #[test]
+    fn open_change_addr_opens_launcher_and_clears_forms() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.form_address = "leftover".into();
+        app.form_password = "leftover-pw".into();
+        app.open_change_addr();
+        assert!(matches!(app.change_addr, Some(ChangeAddr::Choose)));
+        assert!(app.form_address.is_empty(), "paste field cleared");
+        assert!(app.form_password.is_empty(), "password field cleared");
+    }
+
+    /// The MINING GUARD: while a lane is running, none of the three change submits
+    /// fire an identity change — each sets the honest "stop mining first" error
+    /// instead. (Onboarding is unaffected: with no identity nothing is mining, so
+    /// the guard is a no-op there.)
+    #[test]
+    fn change_refused_while_mining() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.snapshot = Some(running_snapshot());
+        assert!(app.is_mining());
+
+        // A valid-looking create attempt is blocked BEFORE the password checks.
+        app.form_password = "a-good-password".into();
+        app.form_password2 = "a-good-password".into();
+        app.submit_create();
+        assert_eq!(
+            app.error.as_deref(),
+            Some("Stop mining before changing the reward address.")
+        );
+
+        // Import is blocked too.
+        app.error = None;
+        app.form_mnemonic = "abandon abandon abandon".into();
+        app.submit_import();
+        assert_eq!(
+            app.error.as_deref(),
+            Some("Stop mining before changing the reward address.")
+        );
+
+        // Paste is blocked too.
+        app.error = None;
+        app.form_address = "a2x9whatever".into();
+        app.submit_paste();
+        assert_eq!(
+            app.error.as_deref(),
+            Some("Stop mining before changing the reward address.")
+        );
+    }
+
+    /// When NOT mining the guard does not trip: a too-short create password then
+    /// fails on its OWN validation (proving the guard isn't masking later checks).
+    #[test]
+    fn change_allowed_when_idle_then_hits_own_validation() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.snapshot = None; // idle
+        assert!(!app.is_mining());
+        app.form_password = "short".into(); // < 8 chars
+        app.form_password2 = "short".into();
+        app.submit_create();
+        assert_eq!(
+            app.error.as_deref(),
+            Some("Password must be at least 8 characters."),
+            "idle → guard passes, the real validation runs"
+        );
+    }
+
+    /// `reward_is_watch_only` reflects the pointer's keystore presence (so the
+    /// Settings/modal tag is honest), and `close_change_addr` tears the modal +
+    /// scratch down.
+    #[test]
+    fn watch_only_flag_and_close_modal() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        // Watch-only pointer (no keystore_path) → watch-only true.
+        app.identity = Some(IdentityPointer {
+            address: "a2x9k4f7q2w8e3r5t6y1u0p9s8d7f6g5h4j3k2l1z0x9c8v7b6n5m4Q".into(),
+            pubkey: None,
+            keystore_path: None,
+            label: None,
+            created: 0,
+        });
+        assert!(app.reward_is_watch_only());
+        // Keystore-backed pointer → watch-only false.
+        app.identity = Some(IdentityPointer {
+            address: "a2x9k4f7q2w8e3r5t6y1u0p9s8d7f6g5h4j3k2l1z0x9c8v7b6n5m4Q".into(),
+            pubkey: Some("0x00".into()),
+            keystore_path: Some("/tmp/wallet.json".into()),
+            label: None,
+            created: 0,
+        });
+        assert!(!app.reward_is_watch_only());
+
+        app.change_addr = Some(ChangeAddr::Paste);
+        app.form_address = "scratch".into();
+        app.close_change_addr();
+        assert!(app.change_addr.is_none());
+        assert!(app.form_address.is_empty());
     }
 }

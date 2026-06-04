@@ -90,6 +90,49 @@ pub const OB_PASTE_EYEBROW: &str = "Watch-only";
 pub const OB_PASTE_TITLE: &str = "Paste an Alice address";
 pub const OB_PASTE_SUB: &str = "Track rewards for an address you own. No keys stored.";
 
+// ── Change reward address (post-onboarding) ──────────────────────────────────
+/// The Settings Identity section + the Home edit affordance open this flow.
+pub const CHANGE_ADDR_EYEBROW: &str = "Identity · 身份";
+pub const CHANGE_ADDR_TITLE: &str = "Change reward address";
+pub const CHANGE_ADDR_SUB: &str =
+    "Point mining at a different Alice address. Choose how below.";
+/// The label of the current-address row at the top of the change launcher.
+pub const CHANGE_ADDR_CURRENT: &str = "Currently mining to";
+/// The Settings Identity-section action button + its hint.
+pub const CHANGE_ADDR_ACTION: &str = "Change reward address";
+/// Tag shown next to the address: it is backed by a signing keystore on disk.
+pub const IDENTITY_KEYSTORE_BACKED: &str = "keystore-backed · 有私钥";
+/// Tag shown next to the address: watch-only (a pasted address, no signing key).
+pub const IDENTITY_WATCH_ONLY: &str = "watch-only · 仅观察";
+
+/// The three change paths (mirrors onboarding's choose).
+pub const CHANGE_ADDR_CREATE_TITLE: &str = "Create a new identity";
+pub const CHANGE_ADDR_CREATE_SUB: &str = "Generate a fresh 24-word recovery phrase.";
+pub const CHANGE_ADDR_IMPORT_TITLE: &str = "Import a different identity";
+pub const CHANGE_ADDR_IMPORT_SUB: &str = "Restore from a 12/24-word phrase or a raw seed (hex).";
+pub const CHANGE_ADDR_PASTE_TITLE: &str = "Paste a different address";
+pub const CHANGE_ADDR_PASTE_SUB: &str = "Watch-only — track an address you may not hold the key for.";
+
+/// The overwrite warning shown before Create / Import commits. `{path}` is the
+/// `.bak-…` destination (filled at the call site); when no keystore exists yet
+/// the [`CHANGE_ADDR_OVERWRITE_NOPRIOR`] variant is shown instead.
+pub const CHANGE_ADDR_OVERWRITE_TITLE: &str = "This replaces your current reward identity";
+pub const CHANGE_ADDR_OVERWRITE_BODY: &str =
+    "Your existing keystore is backed up first — it is never destroyed. Keep your old recovery phrase too.";
+/// Shown when there is no prior keystore to back up (first key was watch-only).
+pub const CHANGE_ADDR_OVERWRITE_NOPRIOR: &str =
+    "No signing keystore exists yet, so nothing is overwritten — this creates one.";
+/// The "backed up to" line prefix (the path follows, mono).
+pub const CHANGE_ADDR_BACKUP_TO: &str = "Old keystore backed up to";
+
+/// The watch-only paste caution (mining will credit an address you may not hold).
+pub const CHANGE_ADDR_PASTE_CAUTION: &str =
+    "Mining will accrue pending to this address. If you don't hold its key, you can't recover it.";
+
+/// Shown (disabled state) when the user opens the flow while mining is live.
+pub const CHANGE_ADDR_MINING_BLOCK: &str =
+    "Stop mining first — the reward address can't change while a lane is running.";
+
 // ── M5 dashboard depth: Source A (activity) / Source B (server-confirmed) ─────
 /// Source-A section eyebrow + caption — this is LOCAL ACTIVITY, explicitly NOT
 /// earnings (the brief's hard separation).

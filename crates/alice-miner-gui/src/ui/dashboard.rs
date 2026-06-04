@@ -6,6 +6,7 @@
 
 use eframe::egui::{self, RichText};
 
+use super::change_addr;
 use super::icons::Icon;
 use super::strings;
 use super::theme::THEME;
@@ -747,20 +748,50 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                 app.lang_zh = zh;
             });
 
-            // Identity panel.
+            // Identity panel — the active reward address (with a copy affordance +
+            // a keystore-backed / watch-only tag) and a "Change reward address"
+            // action that opens the post-onboarding change flow. The action is
+            // disabled while mining (the reward target can't be re-keyed under a
+            // running lane); the hint says why.
+            let mining = app.is_mining();
             panel(ui, "Identity", Icon::Eye, |ui| {
                 srow(ui, "Reward address", "Your own Alice address. Rewards accrue to it as pending.", |ui| {
                     if let Some(addr) = app.reward_address() {
-                        let copy = egui::Button::new(widgets::mono(widgets::shorten(&addr), 12.5, THEME.text))
-                            .fill(THEME.well)
-                            .stroke(egui::Stroke::new(1.0, THEME.line_strong))
-                            .corner_radius(9);
-                        if ui.add(copy).on_hover_text("Click to copy").clicked() {
-                            ui.ctx().copy_text(addr.clone());
-                            app.copied_at = Some(std::time::Instant::now());
-                        }
+                        let watch_only = app.reward_is_watch_only();
+                        ui.horizontal(|ui| {
+                            change_addr::identity_tag(ui, watch_only);
+                            ui.add_space(8.0);
+                            let copy = egui::Button::new(widgets::mono(widgets::shorten(&addr), 12.5, THEME.text))
+                                .fill(THEME.well)
+                                .stroke(egui::Stroke::new(1.0, THEME.line_strong))
+                                .corner_radius(9);
+                            if ui.add(copy).on_hover_text("Click to copy").clicked() {
+                                ui.ctx().copy_text(addr.clone());
+                                app.copied_at = Some(std::time::Instant::now());
+                            }
+                        });
                     } else {
                         ui.label(RichText::new("none").size(12.5).color(THEME.text4));
+                    }
+                });
+                let hint = if mining {
+                    strings::CHANGE_ADDR_MINING_BLOCK
+                } else {
+                    "Create new, import a phrase/seed, or paste a different address. Your old keystore is backed up first."
+                };
+                srow(ui, "Change reward address", hint, |ui| {
+                    let btn = egui::Button::new(
+                        RichText::new(strings::CHANGE_ADDR_ACTION)
+                            .size(12.5)
+                            .strong()
+                            .color(if mining { THEME.text4 } else { THEME.ink_on_brand }),
+                    )
+                    .fill(if mining { THEME.well } else { THEME.brand })
+                    .stroke(egui::Stroke::new(1.0, if mining { THEME.line_strong } else { THEME.brand }))
+                    .corner_radius(9)
+                    .min_size(egui::vec2(0.0, 32.0));
+                    if ui.add_enabled(!mining, btn).clicked() {
+                        app.open_change_addr();
                     }
                 });
             });

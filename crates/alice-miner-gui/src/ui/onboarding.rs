@@ -136,6 +136,14 @@ fn choose(ui: &mut egui::Ui, app: &mut MinerApp) {
     error(ui, app);
 }
 
+/// What changed in the shared backup-step body this frame.
+pub(crate) struct BackupOutcome {
+    /// The (possibly toggled) acknowledgement checkbox state.
+    pub acknowledged: bool,
+    /// `true` when "Continue to confirm" was pressed (only fires while acked).
+    pub continue_clicked: bool,
+}
+
 fn backup(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str, acknowledged: bool) {
     steps(ui, 2);
     header(
@@ -144,7 +152,29 @@ fn backup(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str, acknowledged: b
         strings::OB_BACKUP_TITLE,
         strings::OB_BACKUP_SUB,
     );
+    let out = backup_body(ui, app, mnemonic, acknowledged);
+    if out.acknowledged != acknowledged {
+        app.onboarding = Some(Onboarding::Backup {
+            mnemonic: mnemonic.to_string(),
+            acknowledged: out.acknowledged,
+        });
+    }
+    if out.continue_clicked {
+        app.begin_confirm(mnemonic);
+    }
+}
 
+/// The shared forced-backup body: the warning banner + the 24-word grid + a
+/// "Copy all" + the "I wrote it down" acknowledgement + "Continue to confirm".
+/// Reused by onboarding AND the change-reward-address create flow so the
+/// show-the-phrase step is identical in both. Returns the new ack state + whether
+/// continue was pressed (the caller persists the ack into its own flow enum).
+pub(crate) fn backup_body(
+    ui: &mut egui::Ui,
+    app: &mut MinerApp,
+    mnemonic: &str,
+    acknowledged: bool,
+) -> BackupOutcome {
     // Warning banner.
     egui::Frame::NONE
         .fill(egui::Color32::from_rgba_unmultiplied(245, 158, 11, 26))
@@ -200,17 +230,25 @@ fn backup(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str, acknowledged: b
     ui.add_space(12.0);
     // Acknowledgement checkbox.
     let mut ack = acknowledged;
-    if ui
-        .checkbox(&mut ack, RichText::new(strings::OB_BACKUP_ACK).size(12.0).color(THEME.text2))
-        .changed()
-    {
-        app.onboarding = Some(Onboarding::Backup { mnemonic: mnemonic.to_string(), acknowledged: ack });
-    }
+    ui.checkbox(&mut ack, RichText::new(strings::OB_BACKUP_ACK).size(12.0).color(THEME.text2));
 
     ui.add_space(12.0);
-    if widgets::primary_button(ui, "Continue to confirm", ack, true).clicked() {
-        app.begin_confirm(mnemonic);
+    let continue_clicked = widgets::primary_button(ui, "Continue to confirm", ack, true).clicked();
+    BackupOutcome {
+        acknowledged: ack,
+        continue_clicked,
     }
+}
+
+/// What the user pressed in the shared confirm-body actions row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfirmAction {
+    /// Nothing this frame.
+    None,
+    /// "Back" — return to the backup (show-phrase) step.
+    Back,
+    /// "Confirm & finish" — the retype was correct (only emitted when correct).
+    Finish,
 }
 
 /// Step 3 — confirm the backup by re-picking the words at 3 random positions
@@ -225,7 +263,25 @@ fn confirm(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str) {
         strings::OB_CONFIRM_TITLE,
         "",
     );
+    match confirm_body(ui, app, mnemonic) {
+        ConfirmAction::Back => {
+            app.onboarding = Some(Onboarding::Backup {
+                mnemonic: mnemonic.to_string(),
+                acknowledged: true,
+            });
+            app.error = None;
+        }
+        ConfirmAction::Finish => app.finish_backup(),
+        ConfirmAction::None => {}
+    }
+}
 
+/// The shared confirm-by-retyping interactive body (prompt + slots + chip pool +
+/// feedback + the Back/Confirm actions). Reused by BOTH the onboarding confirm
+/// step and the post-onboarding "change reward address" create flow so the
+/// anti-skip backup check is written once. Returns which action was pressed; the
+/// caller decides what "Back"/"Finish" mean for its flow.
+pub(crate) fn confirm_body(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str) -> ConfirmAction {
     // Prompt: "Tap the right words for positions #3, #9 and #11."
     let positions = app
         .confirm_targets
@@ -313,19 +369,17 @@ fn confirm(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str) {
 
     // Actions: Back (to backup) + Confirm (enabled only when correct).
     ui.add_space(16.0);
+    let mut action = ConfirmAction::None;
     ui.horizontal(|ui| {
         if widgets::ghost_button(ui, "Back", false).clicked() {
-            app.onboarding = Some(Onboarding::Backup {
-                mnemonic: mnemonic.to_string(),
-                acknowledged: true,
-            });
-            app.error = None;
+            action = ConfirmAction::Back;
         }
         ui.add_space(8.0);
         if widgets::primary_button(ui, "Confirm & finish", correct, true).clicked() {
-            app.finish_backup();
+            action = ConfirmAction::Finish;
         }
     });
+    action
 }
 
 fn import(ui: &mut egui::Ui, app: &mut MinerApp) {
@@ -501,7 +555,10 @@ fn dashed_rrect(painter: &egui::Painter, rect: egui::Rect, _radius: f32, color: 
     seg(egui::pos2(rect.right(), tp + 4.0), egui::pos2(rect.right(), bt - 4.0));
 }
 
-fn variant_button(ui: &mut egui::Ui, icon: Icon, title: &str, badge: &str) -> egui::Response {
+/// A full-width ghost "variant" row: a boxed leading icon, a bold title, a small
+/// badge chip + a trailing arrow. Used by the onboarding chooser AND the
+/// change-reward-address chooser. Public to the crate so both reuse one widget.
+pub(crate) fn variant_button(ui: &mut egui::Ui, icon: Icon, title: &str, badge: &str) -> egui::Response {
     let resp = egui::Frame::NONE
         .fill(THEME.surface2)
         .corner_radius(12)

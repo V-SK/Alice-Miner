@@ -155,9 +155,14 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     ui.add_space(10.0);
     if let Some(addr) = app.reward_address() {
         // `center_row` runs its builder twice (a measure pass + the real pass),
-        // so the click flag uses interior mutability (the sizing pass never
-        // registers a real click, so this fires at most once).
+        // so the click flags use interior mutability (the sizing pass never
+        // registers a real click, so these fire at most once). A small pencil
+        // "change" affordance opens the post-onboarding change-reward-address
+        // flow; it is INERT while mining (the address can't change under a live
+        // lane) and shows a "stop first" hover then.
         let do_copy = std::cell::Cell::new(false);
+        let do_change = std::cell::Cell::new(false);
+        let can_change = !app.is_mining();
         centered(ui, |ui| {
             ui.label(RichText::new(strings::REWARDS_TO).size(12.5).color(THEME.text2));
             ui.add_space(6.0);
@@ -166,14 +171,33 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
             if super::icons::show(ui, Icon::Copy, 13.0, THEME.text4)
                 .interact(egui::Sense::click())
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Copy address")
                 .clicked()
             {
                 do_copy.set(true);
+            }
+            ui.add_space(6.0);
+            // Change (pencil) affordance — brand-tinted when actionable, muted
+            // while mining.
+            let edit_color = if can_change { THEME.text_brand } else { THEME.text4 };
+            let edit = super::icons::show(ui, Icon::Edit, 13.0, edit_color)
+                .interact(egui::Sense::click());
+            let edit = if can_change {
+                edit.on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Change reward address")
+            } else {
+                edit.on_hover_text(strings::CHANGE_ADDR_MINING_BLOCK)
+            };
+            if edit.clicked() && can_change {
+                do_change.set(true);
             }
         });
         if do_copy.get() {
             ui.ctx().copy_text(addr.clone());
             app.copied_at = Some(std::time::Instant::now());
+        }
+        if do_change.get() {
+            app.open_change_addr();
         }
     }
 

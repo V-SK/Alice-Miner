@@ -2,6 +2,7 @@
 //! shared widgets, and the screens (onboarding / home / dashboard), plus the
 //! window chrome (titlebar + left icon rail) in [`shell`].
 
+pub mod change_addr;
 pub mod chrome;
 pub mod dashboard;
 pub mod hero;

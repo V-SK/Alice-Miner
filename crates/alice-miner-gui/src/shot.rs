@@ -124,6 +124,24 @@ impl ShotRunner {
                 // The Source-B fast-follow path rendered honestly: a CONFIRMED
                 // credit state shows ONLY "pending" (never the number) + "in sync".
                 Shot { file: "dashboard-m5-credit-confirmed.png", pose: pose_dashboard_m5_confirmed },
+                // ── Change reward address (post-onboarding) ─────────────────
+                // Settings → Identity: the active address with a keystore-backed
+                // tag + the "Change reward address" action (the new section).
+                Shot { file: "settings-identity-change.png", pose: pose_settings_identity },
+                // The change modal launcher (over Settings): current address +
+                // the three change paths (create / import / paste).
+                Shot { file: "change-addr-choose.png", pose: pose_change_addr_choose },
+                // The create OVERWRITE-confirm gate: the "this replaces your
+                // identity; old keystore backed up to <path>" warning.
+                Shot { file: "change-addr-overwrite-confirm.png", pose: pose_change_addr_confirm_create },
+                // The import step: the overwrite recap + mnemonic/seed toggle +
+                // the password field (Import also replaces + backs up the keystore).
+                Shot { file: "change-addr-import.png", pose: pose_change_addr_import },
+                // The watch-only paste step: the caution + the address field.
+                Shot { file: "change-addr-paste.png", pose: pose_change_addr_paste },
+                // The Home "Rewards to <addr>" line with the pencil change
+                // affordance (idle → actionable).
+                Shot { file: "home-idle-change-affordance.png", pose: pose_home_idle },
             ],
             idx: 0,
             phase: Phase::Settling,
@@ -357,6 +375,20 @@ fn install_demo_identity(app: &mut MinerApp) {
     }
 }
 
+/// Like [`install_demo_identity`] but KEYSTORE-BACKED (a `keystore_path` is set)
+/// so the Settings Identity section + the change-modal launcher render the
+/// "keystore-backed" tag rather than "watch-only". Forces the pointer (overwrites
+/// any watch-only one) so the tag is deterministic across re-poses.
+fn install_demo_identity_keystore(app: &mut MinerApp) {
+    app.identity = Some(alice_miner_core::identity::IdentityPointer {
+        address: "a2x9k4f7q2w8e3r5t6y1u0p9s8d7f6g5h4j3k2l1z0x9c8v7b6n5m4Q".into(),
+        pubkey: Some("0x8f3a…c21b".into()),
+        keystore_path: Some("/Users/demo/Library/Application Support/AliceWallet/wallet.json".into()),
+        label: None,
+        created: 0,
+    });
+}
+
 /// A non-running snapshot in a specific lifecycle state (connecting / error /
 /// stopping), carrying the device + an optional calm message.
 fn demo_state_snapshot(state: EngineState, message: Option<&str>) -> Snapshot {
@@ -380,8 +412,10 @@ fn demo_state_snapshot(state: EngineState, message: Option<&str>) -> Snapshot {
 
 fn pose_home_idle(app: &mut MinerApp) {
     app.onboarding = None; // identity exists on disk → skip onboarding
+    app.change_addr = None; // no modal here (clear any leaked from a prior shot)
     app.screen = Screen::Home;
     app.snapshot = None; // no snapshot ⇒ EngineState::Idle ⇒ START readout
+    reset_lane_to_device_default(app);
     app.set_device(demo_device());
     install_demo_identity(app);
     app.error = None;
@@ -687,6 +721,90 @@ fn pose_dashboard_m5_confirmed(app: &mut MinerApp) {
     app.credit_state = alice_miner_core::CreditState::Confirmed {
         score: alice_miner_core::CreditScore::new(12.56),
     };
+}
+
+// ── Change reward address poses (post-onboarding) ────────────────────────────
+
+/// Reset the lane selection to the device default so a prior NVIDIA pose doesn't
+/// leave RVN "selected" on an Apple demo device (purely a shot-harness hygiene
+/// fix; the product recomputes this from the live device).
+fn reset_lane_to_device_default(app: &mut MinerApp) {
+    app.lane_user_picked = false;
+    app.selected_lane = alice_miner_core::Lane::Xmr;
+}
+
+/// Settings → Identity with the new reward-address section: a keystore-backed
+/// address (copy + tag) + the "Change reward address" action. Idle (not mining)
+/// so the action is enabled.
+fn pose_settings_identity(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.change_addr = None;
+    app.screen = Screen::Settings;
+    reset_lane_to_device_default(app);
+    app.set_device(demo_device());
+    install_demo_identity_keystore(app);
+    app.error = None;
+    app.snapshot = None; // idle → the change action is enabled
+}
+
+/// The change-address modal launcher over Settings: the current address card +
+/// the three change paths (create / import / paste).
+fn pose_change_addr_choose(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Settings;
+    app.set_device(demo_device());
+    install_demo_identity_keystore(app);
+    app.error = None;
+    app.snapshot = None;
+    app.change_addr = Some(crate::app::ChangeAddr::Choose);
+}
+
+/// The create OVERWRITE-confirm gate: the "this replaces your reward identity;
+/// old keystore backed up to <path>" warning + the backup destination box. We
+/// pass an explicit `backup_hint` so the shot is deterministic (independent of
+/// whether a real keystore exists on the capture box).
+fn pose_change_addr_confirm_create(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Settings;
+    app.set_device(demo_device());
+    install_demo_identity_keystore(app);
+    app.error = None;
+    app.snapshot = None;
+    app.change_addr = Some(crate::app::ChangeAddr::ConfirmCreate {
+        backup_hint: Some(
+            "/Users/demo/Library/Application Support/AliceWallet/wallet.json.bak-1717000000"
+                .into(),
+        ),
+    });
+}
+
+/// The import step: the overwrite recap + the mnemonic/seed toggle + password
+/// field. Import also REPLACES + backs up the keystore (the recap says so).
+fn pose_change_addr_import(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Settings;
+    app.set_device(demo_device());
+    install_demo_identity_keystore(app);
+    app.error = None;
+    app.snapshot = None;
+    app.change_addr = Some(crate::app::ChangeAddr::Import {
+        backup_hint: Some(
+            "/Users/demo/Library/Application Support/AliceWallet/wallet.json.bak-1717000000"
+                .into(),
+        ),
+    });
+}
+
+/// The watch-only paste step: the "mining will accrue pending to this address;
+/// your existing keystore is untouched" caution + the address field.
+fn pose_change_addr_paste(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Settings;
+    app.set_device(demo_device());
+    install_demo_identity_keystore(app);
+    app.error = None;
+    app.snapshot = None;
+    app.change_addr = Some(crate::app::ChangeAddr::Paste);
 }
 
 // ── PNG writer ────────────────────────────────────────────────────────────────

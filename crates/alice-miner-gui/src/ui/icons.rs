@@ -45,6 +45,8 @@ pub enum Icon {
     Plus,
     /// Import card (mnemonic / seed).
     Import,
+    /// Pencil (edit / change — e.g. change the reward address).
+    Edit,
 }
 
 /// Draw `icon` centered in `rect`, stroked in `color`. `width` is the stroke
@@ -159,6 +161,15 @@ pub fn draw(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32, wid
             poly(vec![p(4.0, 7.0), p(4.0, 5.0), p(6.0, 3.0)]);
             poly(vec![p(6.0, 3.0), p(18.0, 3.0), p(20.0, 5.0), p(20.0, 7.0)]);
             line(p(3.0, 11.0), p(21.0, 11.0));
+        }
+        Icon::Edit => {
+            // A monoline pencil: the nib triangle + the body shaft + a baseline.
+            // Body shaft (two parallel edges) from the nib up to the eraser end.
+            poly(vec![p(6.0, 18.0), p(15.5, 8.5), p(18.0, 11.0), p(8.5, 20.5)]);
+            // The nib tip at the lower-left.
+            poly(vec![p(6.0, 18.0), p(5.0, 21.0), p(8.5, 20.5)]);
+            // The eraser-end cap (the small slanted top edge).
+            poly(vec![p(15.5, 8.5), p(17.0, 7.0), p(19.5, 9.5), p(18.0, 11.0)]);
         }
     }
 }

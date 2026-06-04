@@ -40,6 +40,24 @@ pub fn render(ui_root: &mut egui::Ui, app: &mut MinerApp) {
                     Screen::Dashboard => super::dashboard::render(ui, app),
                     Screen::Settings => super::dashboard::render_settings(ui, app),
                 }
+                // The "change reward address" modal overlays the current screen
+                // (dim scrim + centred card) once an identity exists. Drawn in a
+                // foreground Area covering the content panel so it sits above the
+                // screen content + intercepts interaction behind the card. The
+                // Area is given the panel rect as BOTH its position and its
+                // layout size so the centred card lands correctly.
+                if app.change_addr.is_some() {
+                    let panel = ui.max_rect();
+                    egui::Area::new(egui::Id::new("change-addr-modal"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(panel.min)
+                        .default_size(panel.size())
+                        .show(ui.ctx(), |ui| {
+                            ui.set_min_size(panel.size());
+                            ui.set_max_size(panel.size());
+                            super::change_addr::render(ui, app);
+                        });
+                }
             }
         });
 }
