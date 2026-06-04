@@ -213,13 +213,16 @@ pub fn text_area(ui: &mut Ui, value: &mut String, hint: &str, rows: usize) -> Re
 /// Lay out a row of inline widgets and CENTRE the whole row horizontally within
 /// the current `Ui`.
 ///
-/// egui's `top_down(Align::Center)` only centres a child by its *allocated*
-/// width, and `ui.horizontal` allocates the FULL available width (so its content
-/// left-aligns). We therefore measure the row in a throwaway **sizing pass**
-/// (no paint), then add a left margin of `(available − content)/2` before the
-/// real `horizontal`. This is the reliable way to centre a mixed icon+text row.
+/// egui's `top_down(Align::Center)` only centres a child by its *allocated* width,
+/// and `ui.horizontal` left-aligns its content, so we measure the row's natural
+/// width in a throwaway **sizing pass** and indent by half the slack before the
+/// real `horizontal`. The sizing-pass scope advances the parent cursor by the
+/// measured height, so we immediately pull it back up by the same amount
+/// (`add_space(-measured_h)`) — WITHOUT that correction every centred row consumed
+/// its height TWICE vertically and inflated tall cards (the Home hero) far past
+/// the viewport. `add` runs twice (measure + real), so it is `Fn`.
 pub fn center_row(ui: &mut Ui, add: impl Fn(&mut Ui)) {
-    // ── Pass 1: measure the row's natural width (sizing pass — not painted). ──
+    // ── Pass 1: measure the row's natural size (sizing pass — not painted). ──
     let avail = ui.available_width();
     let measured = ui
         .scope_builder(
@@ -232,11 +235,14 @@ pub fn center_row(ui: &mut Ui, add: impl Fn(&mut Ui)) {
             },
         )
         .response
-        .rect
-        .width();
+        .rect;
+    // Reclaim the vertical space the sizing-pass scope just advanced past, so the
+    // real row below occupies the slot ONCE (negative advance moves the top-down
+    // cursor back up; the real row re-expands the min_rect to the same place).
+    ui.add_space(-measured.height());
 
     // ── Pass 2: indent by half the slack, then lay the row out for real. ──
-    let pad = ((avail - measured) * 0.5).max(0.0);
+    let pad = ((avail - measured.width()) * 0.5).max(0.0);
     ui.horizontal(|ui| {
         if pad > 0.0 {
             ui.add_space(pad);
@@ -272,6 +278,41 @@ pub fn card<R>(ui: &mut Ui, max_width: f32, inner: impl FnOnce(&mut Ui) -> R) ->
         })
         .show(ui, |ui| {
             ui.set_max_width(max_width);
+            inner(ui)
+        });
+    // Faint top inner highlight along the card's top edge.
+    let top = r.response.rect;
+    ui.painter().hline(
+        (top.left() + 20.0)..=(top.right() - 20.0),
+        top.top() + 1.0,
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 16)),
+    );
+    r.inner
+}
+
+/// Like [`card`] but with a FIXED inner `width` and a STABLE minimum inner height
+/// (`min_h`). Used by onboarding so the card frame + its centred position are the
+/// SAME across every wizard step (the fix for the card drifting between steps):
+/// the body never shrinks below `min_h`, so shorter steps don't pull the card up.
+/// Content taller than `min_h` still grows (the outer ScrollArea catches it).
+pub fn card_min_h<R>(ui: &mut Ui, width: f32, min_h: f32, inner: impl FnOnce(&mut Ui) -> R) -> R {
+    let t = THEME;
+    let r = egui::Frame::NONE
+        .fill(t.surface)
+        .corner_radius(CornerRadius::same(20))
+        .inner_margin(egui::Margin::same(26))
+        .stroke(Stroke::new(1.0, t.line))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 12],
+            blur: 36,
+            spread: 0,
+            color: Color32::from_rgba_premultiplied(0, 0, 0, 120),
+        })
+        .show(ui, |ui| {
+            // Pin BOTH dimensions: exact content width (so the frame can't widen)
+            // and a min height (so it can't shrink below the tallest step).
+            ui.set_width(width);
+            ui.set_min_height(min_h);
             inner(ui)
         });
     // Faint top inner highlight along the card's top edge.

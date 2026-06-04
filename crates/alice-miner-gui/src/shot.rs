@@ -132,12 +132,24 @@ impl ShotRunner {
         })
     }
 
-    /// The window size to request in shot mode — the SAME as the real default
-    /// (see `main.rs`), so the captures show exactly what the owner sees on first
-    /// run. The scroll areas in each screen body guarantee nothing clips at this
-    /// size (or at the smaller `min_inner_size`).
+    /// The window size to request in shot mode. Reads `ALICE_MINER_SHOT_W` /
+    /// `ALICE_MINER_SHOT_H` (physical px) so the verification harness can capture
+    /// the SAME screen set at several window sizes (e.g. 960×680, 1120×800,
+    /// 1600×1040) and confirm the UI scales + stays filled at each. Defaults to
+    /// the real first-run size (1120×800). The scroll areas in each screen body
+    /// guarantee nothing clips at the smaller sizes.
     pub fn window_size() -> [f32; 2] {
-        [1120.0, 800.0]
+        let read = |key: &str, default: f32| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| *v >= 320.0 && *v <= 6000.0)
+                .unwrap_or(default)
+        };
+        [
+            read("ALICE_MINER_SHOT_W", 1120.0),
+            read("ALICE_MINER_SHOT_H", 800.0),
+        ]
     }
 }
 

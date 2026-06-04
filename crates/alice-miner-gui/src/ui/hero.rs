@@ -21,10 +21,13 @@
 //!     biased toward a lit top-centre — so the highlight reads off-axis WITHOUT
 //!     moving the silhouette. Plus a top inner sheen arc + a bottom inner shadow
 //!     arc + a layered soft drop-shadow, all on the same `center`.
-//!   * **Alice mark glowing inside** → the bundled `alice-logo.png` painted as a
-//!     texture tinted orange (#FB923C idle ember → #FDBA74 mining), CENTERED in
-//!     the orb, with a smooth Mesh glow behind it that brightens/breathes while
-//!     mining.
+//!   * **Alice mark glowing inside** → the Alice mark rendered as a WHITE / alpha
+//!     **mask** texture (see [`super::theme::alice_mark_mask`]) then tinted with
+//!     the brand colour per state (#FB923C idle ember → #FDBA74 mining; a muted
+//!     brand700 for error/stopping), CENTERED in the orb, with a smooth Mesh glow
+//!     behind it that brightens/breathes while mining. The mask (not the
+//!     already-orange artwork) is what keeps the mark true brand-orange — tinting
+//!     the orange source would multiply orange×orange and crush it to RED.
 //!
 //! The whole hero is one clickable region (Start when idle, Stop when running).
 
@@ -201,17 +204,21 @@ pub fn alice_core(
     paint_orb(&painter, center, r, &resp);
 
     // ---- 5. The Alice mark glowing inside (centered) -------------------------
+    // The mark is ALWAYS brand-orange (white-mask × brand tint = the tint). Each
+    // state picks a point on the brand ramp — bright while mining, a dim ember at
+    // idle, and a MUTED-BUT-STILL-ORANGE brand700 while connecting / error /
+    // stopping — so the mark is never grey and never the orange×orange = RED bug.
     let (glow_alpha, tint) = match mode {
         HeroMode::Idle => {
             let hover = if resp.hovered() { 1.3 } else { 1.0 };
             ((46.0 * hover) as u8, t.brand400) // dim ember
         }
-        HeroMode::Connecting => (40, t.text2),
+        HeroMode::Connecting => (40, t.brand400),
         HeroMode::Mining => ((90.0 + 90.0 * breathe) as u8, t.brand300), // bright + breathing
-        // Error: a muted, cool ember — the mark is clearly "asleep" but still the
-        // brand (a calm "off", never an angry red glyph).
-        HeroMode::Error => (22, t.text3),
-        // Stopping: the mark fades toward the idle ember.
+        // Error: a muted brand ember — the mark is clearly "asleep" but still the
+        // brand (a calm "off", never an angry red glyph, never grey).
+        HeroMode::Error => (22, t.brand700),
+        // Stopping: the mark fades toward the idle ember (still orange).
         HeroMode::Stopping => (32, t.brand400),
     };
     // Glow: a smooth Mesh radial behind the mark (skip on the glow-less modes

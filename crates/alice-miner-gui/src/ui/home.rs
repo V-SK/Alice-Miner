@@ -16,21 +16,48 @@ use super::{lane_accent, lane_chip_label};
 use crate::app::MinerApp;
 use alice_miner_core::{EngineState, Lane, LaneSupport};
 
+/// The Home hero card's fixed inner width (mockup `.card-hero` max-width 392px).
+const HERO_CARD_W: f32 = 392.0;
+
 pub fn render(ui: &mut egui::Ui, app: &mut MinerApp) {
-    // Vertically + horizontally centre the hero card with a modest top inset; the
-    // surrounding ScrollArea is the safety net so NOTHING (incl. the error status
-    // line + footer) is ever cut at the default OR the min window size.
+    // The hero card is vertically centred when there's slack and top-anchored
+    // (scrolls) when the window is short — so it never floats with a void beneath
+    // it on a tall window, and nothing (incl. the error status line + footer) is
+    // ever clipped on a short one. We balance with a TOP inset = half the leftover
+    // height vs a per-state height estimate (errs a little high so the card never
+    // pushes off the bottom; the inset is clamped to a small floor regardless).
+    let avail_h = ui.available_height();
+    let est_h = estimate_hero_height(app);
+    let top = (((avail_h - est_h) * 0.5).floor()).clamp(8.0, 130.0);
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(10.0);
-                widgets::card(ui, 392.0, |ui| {
+                ui.add_space(top);
+                widgets::card(ui, HERO_CARD_W, |ui| {
                     hero_card_body(ui, app);
                 });
-                ui.add_space(16.0);
+                ui.add_space(20.0);
             });
         });
+}
+
+/// A per-state height estimate (points) for the Home card — used only to balance
+/// the centring inset. Tuned to the tightened `hero_card_body` rhythm; it errs a
+/// touch high so the inset never pushes the card past the bottom. Off-by-a-little
+/// is fine (the inset is clamped + the ScrollArea is the safety net).
+fn estimate_hero_height(app: &MinerApp) -> f32 {
+    use alice_miner_core::EngineState;
+    // Tuned to the MEASURED card heights (≈510–540pt at zoom 1.0) so the centring
+    // inset balances air above + below. A touch high so the card never overflows
+    // the bottom; the ScrollArea is the final safety net regardless.
+    match app.state() {
+        EngineState::Idle => 576.0,
+        EngineState::Error => 568.0,
+        // Mid-run cards add the Stop button (+ dashboard link, except stopping).
+        EngineState::Running | EngineState::Starting => 582.0,
+        EngineState::Stopping => 538.0,
+    }
 }
 
 fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
@@ -48,7 +75,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
         EngineState::Idle => "Device auto-detected",
     };
     centered(ui, |ui| widgets::eyebrow(ui, eyebrow));
-    ui.add_space(12.0);
+    ui.add_space(11.0);
 
     // Device line: chip + model string (model only, e.g. "Apple M2 Max · 12 cores").
     let model = app
@@ -70,22 +97,35 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
         ui.label(RichText::new(model.clone()).size(15.5).strong().color(THEME.text));
     });
 
-    ui.add_space(10.0);
-    // Lane row: the selected lane chip + (when the device supports it) a
-    // selectable/"coming soon" chip for the other lane. Reflects viability:
-    // on a non-NVIDIA box the RVN chip reads "coming soon" and is inert; XMR
-    // stays the default. Only shown while NOT mid-run (so it can't change lanes
-    // under a running child).
-    lane_selector(ui, app);
-
-    // Dual-mine toggle: run BOTH lanes (CPU-XMR + GPU-RVN) together. Gated on
-    // viability (≥2 runnable lanes) — DISABLED on this Mac ("needs a supported
-    // GPU"). Default OFF. Shown only when not mid-run.
-    ui.add_space(9.0);
-    dual_mine_row(ui, app);
+    // Lane selector + dual-mine toggle are SETUP affordances — shown only while
+    // idle/error (when the user can actually choose a lane). While mid-run the
+    // lane is locked + already surfaced (titlebar pill + status line), so hiding
+    // these rows keeps the running/connecting card compact enough to fit without
+    // clipping the Stop button + footer. A dual-mine RUN still shows its "active"
+    // indicator inside `dual_mine_row`.
+    let mid_run = matches!(
+        state,
+        EngineState::Running | EngineState::Starting | EngineState::Stopping
+    );
+    if !mid_run {
+        ui.add_space(9.0);
+        // Lane row: the selected lane chip + (when the device supports it) a
+        // selectable/"coming soon" chip for the other lane. Reflects viability:
+        // on a non-NVIDIA box the RVN chip reads "coming soon" and is inert; XMR
+        // stays the default.
+        lane_selector(ui, app);
+        // Dual-mine toggle: run BOTH lanes (CPU-XMR + GPU-RVN) together. Gated on
+        // viability (≥2 runnable lanes) — DISABLED on this Mac. Default OFF.
+        ui.add_space(8.0);
+        dual_mine_row(ui, app);
+    } else if app.snapshot.as_ref().map(|s| s.dual).unwrap_or(false) {
+        // Dual-mine running → keep just the compact "active" indicator.
+        ui.add_space(9.0);
+        dual_mine_row(ui, app);
+    }
 
     // ── The Alice Core hero ───────────────────────────────────────────────────
-    ui.add_space(14.0);
+    ui.add_space(12.0);
     let mode = match state {
         EngineState::Running => HeroMode::Mining,
         EngineState::Starting => HeroMode::Connecting,
@@ -97,7 +137,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     let motion = app.motion_enabled();
     let tex = app.mark_tex.clone().expect("mark texture loaded by chrome");
     let resp = ui
-        .vertical_centered(|ui| hero::alice_core(ui, 134.0, mode, gauge, motion, &tex))
+        .vertical_centered(|ui| hero::alice_core(ui, 118.0, mode, gauge, motion, &tex))
         .inner;
     if resp.clicked() {
         match state {
@@ -108,11 +148,11 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     }
 
     // ── Readout BELOW the orb ─────────────────────────────────────────────────
-    ui.add_space(12.0);
+    ui.add_space(10.0);
     readout(ui, app, mode);
 
     // ── Rewards-to line ───────────────────────────────────────────────────────
-    ui.add_space(11.0);
+    ui.add_space(10.0);
     if let Some(addr) = app.reward_address() {
         // `center_row` runs its builder twice (a measure pass + the real pass),
         // so the click flag uses interior mutability (the sizing pass never
@@ -138,7 +178,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     }
 
     // ── Status line ───────────────────────────────────────────────────────────
-    ui.add_space(11.0);
+    ui.add_space(10.0);
     status_line(ui, app);
 
     // ── Stop button + dashboard link while mining/connecting/stopping ─────────
@@ -146,7 +186,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
         state,
         EngineState::Running | EngineState::Starting | EngineState::Stopping
     ) {
-        ui.add_space(15.0);
+        ui.add_space(13.0);
         let stopping = matches!(state, EngineState::Stopping);
         let do_stop = std::cell::Cell::new(false);
         centered(ui, |ui| {
@@ -165,7 +205,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
             app.stop_mining();
         }
         if !stopping {
-            ui.add_space(11.0);
+            ui.add_space(10.0);
             let go_dash = std::cell::Cell::new(false);
             centered(ui, |ui| {
                 if ui
@@ -191,7 +231,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     ui.add_space(12.0);
     let r = ui.available_rect_before_wrap();
     ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0, THEME.line));
-    ui.add_space(11.0);
+    ui.add_space(10.0);
     footer(ui);
 }
 
@@ -202,7 +242,7 @@ fn readout(ui: &mut egui::Ui, app: &MinerApp, mode: HeroMode) {
             // The live hashrate number (mono) + unit, then the hashing sub-line.
             let txt = format!("{:.2}", app.hr_display_khs);
             centered(ui, |ui| {
-                ui.label(widgets::mono(txt.clone(), 33.0, THEME.text).strong());
+                ui.label(widgets::mono(txt.clone(), 31.0, THEME.text).strong());
                 ui.add_space(5.0);
                 ui.label(RichText::new("kH/s").size(13.0).strong().color(THEME.text3));
             });

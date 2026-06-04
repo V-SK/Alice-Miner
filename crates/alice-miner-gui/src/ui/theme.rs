@@ -8,7 +8,7 @@
 //! NO emoji is ever rendered; glyphs are monoline strokes drawn with epaint
 //! (see [`crate::ui::icons`]).
 
-use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, Stroke};
+use eframe::egui::{self, Color32, ColorImage, FontData, FontDefinitions, FontFamily, Stroke};
 use std::sync::Arc;
 
 /// The Alice Miner palette. Field names follow the mockup `:root` tokens so the
@@ -104,6 +104,54 @@ pub const THEME: Theme = Theme {
     lane_gpu: Color32::from_rgb(0x3B, 0x82, 0xF6),
     lane_mac: Color32::from_rgb(0x22, 0xD3, 0xEE),
 };
+
+/// Rasterise the bundled Alice-mark **SVG** into a WHITE / alpha **mask**
+/// [`ColorImage`] at `px` square — every covered pixel is pure white, with the
+/// glyph's coverage carried entirely in the alpha channel.
+///
+/// This is the fix for the "Alice mark renders RED" defect: the source artwork
+/// (`alice-logo.svg` / `.png`) is *already brand-orange*, so painting it with an
+/// orange `tint` multiplies orange×orange and crushes the green channel → the
+/// mark reads RED. A white mask multiplied by a brand tint yields the EXACT tint
+/// (white·#FB923C = #FB923C), so the caller can colour the mark per state with no
+/// surprises. We render the SVG (vector ⇒ crisp at any size) then force RGB→white
+/// while preserving alpha; the source fill colour is irrelevant to the result.
+pub fn alice_mark_mask(px: u32) -> ColorImage {
+    use usvg::TreeParsing;
+    let svg = include_bytes!("../../assets/brand/alice-logo.svg");
+    let opt = usvg::Options::default();
+    // Fall back to a fully-transparent image only if the bundled asset ever fails
+    // to parse/allocate — the mark just won't show rather than panicking the app.
+    let pixmap = match (
+        usvg::Tree::from_data(svg, &opt),
+        tiny_skia::Pixmap::new(px, px),
+    ) {
+        (Ok(tree), Some(mut pixmap)) => {
+            let size = tree.size;
+            let scale = (px as f32 / size.width()).min(px as f32 / size.height());
+            // Centre the glyph in the square (the artwork is itself centred, but
+            // guard against a non-square intrinsic size).
+            let tx = (px as f32 - size.width() * scale) * 0.5;
+            let ty = (px as f32 - size.height() * scale) * 0.5;
+            let transform = tiny_skia::Transform::from_translate(tx, ty).pre_scale(scale, scale);
+            resvg::Tree::from_usvg(&tree).render(transform, &mut pixmap.as_mut());
+            pixmap
+        }
+        _ => {
+            let n = (px * px) as usize;
+            return ColorImage::new([px as usize, px as usize], vec![Color32::TRANSPARENT; n]);
+        }
+    };
+    // egui wants UN-premultiplied straight RGBA: white (255,255,255) at the
+    // glyph's coverage alpha. We read the rendered pixmap's alpha channel and
+    // discard its (orange) RGB entirely — so the result is a pure white mask.
+    let pixels: Vec<Color32> = pixmap
+        .data()
+        .chunks_exact(4)
+        .map(|px4| Color32::from_rgba_unmultiplied(255, 255, 255, px4[3]))
+        .collect();
+    ColorImage::new([px as usize, px as usize], pixels)
+}
 
 /// Register the bundled fonts. JetBrains Mono leads the Monospace family (every
 /// numeral is rendered mono per the contract); Inter leads Proportional; the

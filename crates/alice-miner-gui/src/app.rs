@@ -76,7 +76,9 @@ pub struct MinerApp {
     /// `Some` while onboarding (no identity yet, or user chose to add one).
     pub onboarding: Option<Onboarding>,
 
-    /// The Alice mark texture (loaded once from the bundled PNG).
+    /// The Alice mark texture — a WHITE / alpha mask (rasterised once from the
+    /// bundled SVG), tinted to the brand colour at each draw site. See
+    /// [`MinerApp::mark_texture`].
     pub mark_tex: Option<TextureHandle>,
 
     // ── Onboarding form state ────────────────────────────────────────────────
@@ -236,17 +238,57 @@ impl MinerApp {
         !self.reduce_motion
     }
 
-    /// Lazily load (and cache) the Alice mark texture from the bundled PNG.
+    /// Make the UI **scale proportionally with the window** so content always
+    /// fills a consistent fraction of the frame — never a tiny card floating in a
+    /// black void on a big monitor, and never cramped on a small one.
+    ///
+    /// egui composes `pixels_per_point = zoom_factor × native_pixels_per_point`,
+    /// so we drive the **zoom factor** (and let egui fold in the OS DPI itself).
+    /// The window's true size in native-DPI points is `inner_width_points ×
+    /// current_zoom` (independent of the zoom we're about to set), so the target
+    /// zoom is a one-step fixed point:
+    ///
+    /// ```text
+    /// zoom = clamp(window_logical_width / REFERENCE_W, MIN, MAX)
+    /// ```
+    ///
+    /// with `REFERENCE_W = 1120` (the design/default width → zoom 1.0). Clamped to
+    /// [0.9, 1.5] so text stays legible at the 960 floor and doesn't get cartoonish
+    /// at 1600+. Applied every frame; egui only rebuilds layout when it changes.
+    pub fn apply_window_scaling(&self, ctx: &egui::Context) {
+        /// The design reference width (points). At this window width the UI renders
+        /// at its natural 1.0 zoom; wider scales up, narrower scales down.
+        const REFERENCE_W: f32 = 1120.0;
+        const MIN_ZOOM: f32 = 0.9;
+        const MAX_ZOOM: f32 = 1.5;
+
+        // `content_rect` is the content area in points at the CURRENT ppp; the
+        // window's true width in native-DPI points is therefore width × zoom
+        // (zoom-independent). Robust headless too (no `inner_rect` needed).
+        let content_w_pts = ctx.input(|i| i.content_rect().width());
+        let cur_zoom = ctx.zoom_factor();
+        let logical_w = content_w_pts * cur_zoom;
+        if logical_w <= 1.0 {
+            return; // not yet known (first frame); keep current zoom
+        }
+        let target = (logical_w / REFERENCE_W).clamp(MIN_ZOOM, MAX_ZOOM);
+        // Only nudge when it actually moved (avoid churn / repaint storms).
+        if (target - cur_zoom).abs() > 0.005 {
+            ctx.set_zoom_factor(target);
+        }
+    }
+
+    /// Lazily load (and cache) the Alice mark texture as a **WHITE / alpha mask**
+    /// (the brand-orange source artwork rasterised then whitened — see
+    /// [`ui::theme::alice_mark_mask`]). Every call site tints it with the exact
+    /// brand colour for its state, so the mark is always brand-orange (white·tint
+    /// = tint) and never the orange×orange = RED bug. Rendered at a generous 256px
+    /// so it stays crisp at any UI scale / high-DPI.
     pub fn mark_texture(&mut self, ctx: &egui::Context) -> TextureHandle {
         if let Some(t) = &self.mark_tex {
             return t.clone();
         }
-        let bytes = include_bytes!("../assets/brand/alice-logo.png");
-        let img = image::load_from_memory(bytes)
-            .expect("bundled alice-logo.png decodes")
-            .to_rgba8();
-        let (w, h) = img.dimensions();
-        let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img);
+        let color = ui::theme::alice_mark_mask(256);
         let tex = ctx.load_texture("alice-mark", color, egui::TextureOptions::LINEAR);
         self.mark_tex = Some(tex.clone());
         tex
@@ -657,6 +699,9 @@ impl MinerApp {
 impl eframe::App for MinerApp {
     fn ui(&mut self, ui_root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui_root.ctx().clone();
+        // Scale the whole UI proportionally to the window FIRST (drives egui's
+        // zoom factor), so every screen fills a consistent fraction at any size.
+        self.apply_window_scaling(&ctx);
         ui::theme::apply_style(&ctx);
         if self.shot.is_some() {
             // Screenshot mode: the shot state machine poses the app + captures;

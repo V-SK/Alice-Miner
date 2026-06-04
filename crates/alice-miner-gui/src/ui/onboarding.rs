@@ -16,25 +16,39 @@ use super::theme::THEME;
 use super::widgets;
 use crate::app::{MinerApp, Onboarding};
 
+/// The onboarding card's fixed inner width (points) — the same across every step.
+const OB_CARD_W: f32 = 440.0;
+/// A STABLE minimum content height for the card body (points). Anchoring the card
+/// to one size across steps is the fix for the "card drifts/jumps between steps"
+/// defect: create / confirm / import / paste have different natural heights, so
+/// without a fixed frame the centred card visibly shifts. We pin the body to the
+/// height of the TALLEST non-scrolling step (create ≈ 620pt inner) so create fills
+/// it exactly and the shorter steps (confirm / paste) pad up to the SAME size —
+/// the card frame + its top never move. (The 24-word backup step is taller still;
+/// it grows downward from the same anchored top + scrolls, so the top is stable.)
+const OB_CARD_MIN_H: f32 = 620.0;
+/// A constant top anchor (points) on a tall window. The card sits at the SAME y
+/// for every step. On a short window the ScrollArea takes over (nothing clips).
+const OB_TOP_ANCHOR: f32 = 22.0;
+
 pub fn render(ui: &mut egui::Ui, app: &mut MinerApp) {
     let step = app.onboarding.clone().unwrap_or(Onboarding::Choose);
-    // Wrap in a vertical ScrollArea so the taller wizard steps (backup / confirm)
-    // are never clipped at the min window size — they scroll instead.
+    // Wrap in a vertical ScrollArea so the taller wizard steps are never clipped at
+    // the min window size — they scroll instead. The card is anchored to a STABLE
+    // top inset + a fixed min height so stepping through never moves it ("漂移").
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                // Only enough top inset to centre on a tall window; on a short one
-                // it collapses to a small margin and the ScrollArea takes over.
-                ui.add_space((ui.available_height() * 0.5 - 250.0).max(18.0));
-                widgets::card(ui, 440.0, |ui| match step {
+                ui.add_space(OB_TOP_ANCHOR);
+                widgets::card_min_h(ui, OB_CARD_W, OB_CARD_MIN_H, |ui| match step {
                     Onboarding::Choose => choose(ui, app),
                     Onboarding::Backup { mnemonic, acknowledged } => backup(ui, app, &mnemonic, acknowledged),
                     Onboarding::Confirm { mnemonic } => confirm(ui, app, &mnemonic),
                     Onboarding::Import => import(ui, app),
                     Onboarding::Paste => paste(ui, app),
                 });
-                ui.add_space(24.0);
+                ui.add_space(28.0);
             });
         });
 }
@@ -67,12 +81,14 @@ fn centered(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 fn header(ui: &mut egui::Ui, eyebrow: &str, title: &str, sub: &str) {
     centered(ui, |ui| {
         widgets::eyebrow(ui, eyebrow);
-        ui.add_space(12.0);
+        ui.add_space(10.0);
         ui.label(RichText::new(title).size(19.0).strong().color(THEME.text));
-        ui.add_space(6.0);
-        ui.label(RichText::new(sub).size(12.5).color(THEME.text3));
+        if !sub.is_empty() {
+            ui.add_space(6.0);
+            ui.label(RichText::new(sub).size(12.5).color(THEME.text3));
+        }
     });
-    ui.add_space(18.0);
+    ui.add_space(16.0);
 }
 
 fn choose(ui: &mut egui::Ui, app: &mut MinerApp) {
@@ -133,7 +149,7 @@ fn backup(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str, acknowledged: b
     egui::Frame::NONE
         .fill(egui::Color32::from_rgba_unmultiplied(245, 158, 11, 26))
         .corner_radius(10)
-        .inner_margin(egui::Margin::same(13))
+        .inner_margin(egui::Margin::symmetric(12, 10))
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(245, 158, 11, 72)))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -148,24 +164,28 @@ fn backup(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str, acknowledged: b
             });
         });
 
-    // The 24 words in a 3-column grid (centered within the card).
-    ui.add_space(14.0);
-    let words: Vec<&str> = mnemonic.split_whitespace().collect();
-    centered(ui, |ui| {
-        egui::Grid::new("mnemonic-grid")
-            .num_columns(3)
-            .spacing(egui::vec2(7.0, 7.0))
-            .show(ui, |ui| {
-                for (i, w) in words.iter().enumerate() {
-                    word_cell(ui, i + 1, w);
-                    if (i + 1) % 3 == 0 {
-                        ui.end_row();
-                    }
-                }
-            });
-    });
-
+    // The 24 words in a 3-column grid. Each column is an equal third of the card
+    // width so the grid fills it edge-to-edge (no fragile re-centring of a Grid,
+    // which `center_row` would otherwise lay out twice). The cells are compact so
+    // all 8 rows + the controls below fit the card without scrolling.
     ui.add_space(12.0);
+    let words: Vec<&str> = mnemonic.split_whitespace().collect();
+    let grid_w = ui.available_width();
+    let col_gap = 7.0;
+    let col_w = ((grid_w - col_gap * 2.0) / 3.0).floor();
+    egui::Grid::new("mnemonic-grid")
+        .num_columns(3)
+        .spacing(egui::vec2(col_gap, 6.0))
+        .show(ui, |ui| {
+            for (i, w) in words.iter().enumerate() {
+                word_cell(ui, col_w, i + 1, w);
+                if (i + 1) % 3 == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+
+    ui.add_space(11.0);
     if ui
         .add(egui::Button::new(RichText::new("Copy all").size(11.5).color(THEME.text3))
             .fill(egui::Color32::TRANSPARENT)
@@ -177,7 +197,7 @@ fn backup(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str, acknowledged: b
         app.copied_at = Some(std::time::Instant::now());
     }
 
-    ui.add_space(14.0);
+    ui.add_space(12.0);
     // Acknowledgement checkbox.
     let mut ack = acknowledged;
     if ui
@@ -187,7 +207,7 @@ fn backup(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str, acknowledged: b
         app.onboarding = Some(Onboarding::Backup { mnemonic: mnemonic.to_string(), acknowledged: ack });
     }
 
-    ui.add_space(14.0);
+    ui.add_space(12.0);
     if widgets::primary_button(ui, "Continue to confirm", ack, true).clicked() {
         app.begin_confirm(mnemonic);
     }
@@ -369,15 +389,16 @@ fn paste(ui: &mut egui::Ui, app: &mut MinerApp) {
 
 // ── small helpers ─────────────────────────────────────────────────────────────
 
-fn word_cell(ui: &mut egui::Ui, idx: usize, word: &str) {
+fn word_cell(ui: &mut egui::Ui, width: f32, idx: usize, word: &str) {
     egui::Frame::NONE
         .fill(THEME.well)
-        .corner_radius(9)
-        .inner_margin(egui::Margin::symmetric(10, 9))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(10, 7))
         .stroke(egui::Stroke::new(1.0, THEME.line))
         .show(ui, |ui| {
+            // Fixed column width so the three columns are uniform + fill the card.
+            ui.set_width((width - 20.0).max(0.0));
             ui.horizontal(|ui| {
-                ui.set_min_width(96.0);
                 ui.label(widgets::mono(format!("{idx:>2}"), 10.0, THEME.text4));
                 ui.add_space(7.0);
                 ui.label(widgets::mono(word, 12.5, THEME.text));
