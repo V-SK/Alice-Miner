@@ -11,5 +11,7 @@
 //! override).
 
 pub mod parse_kawpow;
+pub mod parse_srbminer;
 
 pub use parse_kawpow::{parse_kawpow, KawpowSample};
+pub use parse_srbminer::parse_srbminer;

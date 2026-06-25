@@ -37,6 +37,7 @@ use alice_supervise::{sanitize_log_line, ProcState, RestartPolicy};
 use crate::endpoint::{Endpoint, EndpointPlan};
 use crate::lane::Lane;
 use crate::stats::parse_kawpow;
+use crate::stats::parse_srbminer;
 
 /// Grace period for a graceful miner stop before SIGKILL (verbatim from Wallet).
 const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -664,6 +665,24 @@ fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
                     g.accepted = a;
                     g.rejected = r;
                     note_accepted_progress(g, a);
+                }
+            }
+        }
+        Lane::GpuPrl => {
+            // SRBMiner (pearlhash) writes share/hashrate lines to its --log-file
+            // (the supervisor tails it). Accepted/rejected can arrive on SEPARATE
+            // lines, so update each independently (unlike the kawpow both-or-none).
+            if let Some(sample) = parse_srbminer(&line) {
+                if let Some(hr) = sample.hashrate_hs {
+                    g.hashrate_hs = Some(hr);
+                    note_hashrate_progress(g, hr);
+                }
+                if let Some(a) = sample.accepted {
+                    g.accepted = a;
+                    note_accepted_progress(g, a);
+                }
+                if let Some(r) = sample.rejected {
+                    g.rejected = r;
                 }
             }
         }

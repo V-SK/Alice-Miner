@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::lane::{gpu_rvn, xmr, Lane};
+use crate::lane::{gpu_prl, gpu_rvn, xmr, Lane};
 
 /// Env var an OPERATOR sets to override the default [`EndpointPlan`] (e.g. to
 /// point at the Finland core directly, or to add TLS fallbacks). A JSON array of
@@ -155,11 +155,23 @@ impl EndpointPlan {
     /// 8888 RVN) and NEVER the core IP / collection address / upstream pool
     /// (asserted by [`tests::default_plan_is_relay_only_no_core_ip`]).
     pub fn default_for_lane(lane: Lane) -> Self {
-        let (host, port) = match lane {
-            Lane::Xmr => (xmr::ALICE_POOL_HOST, xmr::ALICE_POOL_PORT),
-            Lane::GpuRvn => (gpu_rvn::ALICE_POOL_HOST, gpu_rvn::ALICE_POOL_PORT),
-        };
-        Self::single(Endpoint::plaintext(host, port))
+        match lane {
+            Lane::Xmr => {
+                Self::single(Endpoint::plaintext(xmr::ALICE_POOL_HOST, xmr::ALICE_POOL_PORT))
+            }
+            Lane::GpuRvn => Self::single(Endpoint::plaintext(
+                gpu_rvn::ALICE_POOL_HOST,
+                gpu_rvn::ALICE_POOL_PORT,
+            )),
+            // GPU-PRL ships the THREE region relays (:3340) so Layer-A failover +
+            // RTT selection have the full set; relay-only, no core IP / collection.
+            Lane::GpuPrl => Self::new(gpu_prl::region_default_endpoints()).unwrap_or_else(|_| {
+                Self::single(Endpoint::plaintext(
+                    gpu_prl::REGION_HOSTS[0].1,
+                    gpu_prl::GPU_RELAY_PORT,
+                ))
+            }),
+        }
     }
 
     /// Resolve a plan for `lane` from an optional operator override JSON string

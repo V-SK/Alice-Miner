@@ -537,10 +537,11 @@ fn emit_snapshot(snap: &Snapshot, json: bool) {
 fn resolve_lane(s: &str, cap: &alice_miner_core::CapabilityProfile) -> Result<Lane, i32> {
     match s.to_ascii_lowercase().as_str() {
         "xmr" | "cpu" => Ok(Lane::Xmr),
+        "prl" => Ok(Lane::GpuPrl),
         "gpu" | "rvn" => Ok(Lane::GpuRvn),
         "auto" => Ok(cap.recommended_lane()),
         other => {
-            eprintln!("error: unknown lane `{other}` (use: xmr | gpu | auto)");
+            eprintln!("error: unknown lane `{other}` (use: xmr | prl | gpu | auto)");
             Err(EXIT_USAGE)
         }
     }
@@ -738,7 +739,7 @@ mod tests {
         assert_eq!(resolve_lane("gpu", &cap).unwrap(), Lane::GpuRvn);
         assert_eq!(resolve_lane("rvn", &cap).unwrap(), Lane::GpuRvn);
         assert_eq!(resolve_lane("AUTO", &cap).unwrap(), cap.recommended_lane());
-        assert!(resolve_lane("prl", &cap).is_err());
+        assert_eq!(resolve_lane("prl", &cap).unwrap(), Lane::GpuPrl);
     }
 
     /// build_identity_spec maps each flag and errors when none is given.

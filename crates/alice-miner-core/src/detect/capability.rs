@@ -125,9 +125,10 @@ impl LaneViability {
     }
 }
 
-/// The full universe of client lanes (the two real ones). Declared here so every
-/// derivation covers exactly this set — PRL/LTC/AI are intentionally absent.
-pub const ALL_LANES: [Lane; 2] = [Lane::Xmr, Lane::GpuRvn];
+/// The full universe of client lanes. Declared here so every derivation covers
+/// exactly this set: CPU-XMR, the GPU-PRL **mainline** (SRBMiner pearlhash), and
+/// the earlier GPU-RVN path. LTC/AI are intentionally absent.
+pub const ALL_LANES: [Lane; 3] = [Lane::Xmr, Lane::GpuPrl, Lane::GpuRvn];
 
 /// Derive the lane-viability matrix from a detected [`DeviceProfile`].
 ///
@@ -169,6 +170,20 @@ pub fn derive_lane_viability(profile: &DeviceProfile) -> LaneViability {
     };
     support.insert(Lane::GpuRvn, rvn_support);
     reasons.insert(Lane::GpuRvn, rvn_reason.to_string());
+
+    // ── PRL (SRBMiner pearlhash): NVIDIA + AMD viable (SRBMiner supports both);
+    //    Apple/none unavailable (SRBMiner ships no macOS build). ────────────────
+    let (prl_support, prl_reason) = match profile.gpu.vendor {
+        GpuVendor::Nvidia => (LaneSupport::Viable, "nvidia_present"),
+        GpuVendor::Amd => (LaneSupport::Viable, "amd_srbminer_supported"),
+        GpuVendor::Apple => (
+            LaneSupport::Unavailable,
+            "prl_requires_nvidia_or_amd_apple_excluded",
+        ),
+        GpuVendor::None => (LaneSupport::Unavailable, "prl_requires_gpu_cpu_only"),
+    };
+    support.insert(Lane::GpuPrl, prl_support);
+    reasons.insert(Lane::GpuPrl, prl_reason.to_string());
 
     // ── recommended: best runnable lane (RVN if viable, else XMR) ───────────
     let recommended = if support
@@ -214,6 +229,7 @@ pub fn parse_lane_override(value: Option<&str>) -> Option<Vec<Lane>> {
         let lane = match key.as_str() {
             "" => continue,
             "xmr" | "cpu" => Lane::Xmr,
+            "prl" => Lane::GpuPrl,
             "gpu" | "rvn" => Lane::GpuRvn,
             _ => continue, // unknown token → ignore (fail-open)
         };
@@ -404,16 +420,26 @@ mod tests {
         assert_eq!(v.support(Lane::Xmr), LaneSupport::Viable);
         assert!(!v.is_runnable(Lane::GpuRvn));
         assert_eq!(v.support(Lane::GpuRvn), LaneSupport::Unavailable);
+        // PRL (SRBMiner) is also unavailable on Apple (no macOS SRBMiner build).
+        assert_eq!(v.support(Lane::GpuPrl), LaneSupport::Unavailable);
+        assert!(!v.is_runnable(Lane::GpuPrl));
         assert_eq!(v.recommended, Lane::Xmr);
         assert_eq!(v.reason(Lane::GpuRvn), Some("rvn_requires_nvidia_apple_excluded"));
 
-        // Simulated NVIDIA: RVN viable AND recommended; XMR still viable.
+        // Simulated NVIDIA: RVN + PRL viable; XMR still viable.
         let v = derive_lane_viability(&nvidia());
         assert_eq!(v.support(Lane::Xmr), LaneSupport::Viable);
         assert_eq!(v.support(Lane::GpuRvn), LaneSupport::Viable);
+        assert_eq!(v.support(Lane::GpuPrl), LaneSupport::Viable);
         assert!(v.is_runnable(Lane::GpuRvn));
+        assert!(v.is_runnable(Lane::GpuPrl));
+        // recommended is still RVN at T2 (PRL becomes the mainline default once PoP
+        // earning is wired); runnable set = recommended-first, then ALL_LANES order.
         assert_eq!(v.recommended, Lane::GpuRvn);
-        assert_eq!(v.runnable_lanes(), vec![Lane::GpuRvn, Lane::Xmr]);
+        assert_eq!(
+            v.runnable_lanes(),
+            vec![Lane::GpuRvn, Lane::Xmr, Lane::GpuPrl]
+        );
     }
 
     /// AMD → RVN "coming soon" (NOT runnable), XMR viable, recommended XMR.
@@ -448,9 +474,15 @@ mod tests {
             parse_lane_override(Some("gpu, xmr")),
             Some(vec![Lane::GpuRvn, Lane::Xmr])
         );
-        // Unknown tokens are ignored (fail-open).
-        assert_eq!(parse_lane_override(Some("prl,xmr")), Some(vec![Lane::Xmr]));
-        assert_eq!(parse_lane_override(Some("prl")), None);
+        // `prl` is now the GPU-PRL mainline lane.
+        assert_eq!(
+            parse_lane_override(Some("prl,xmr")),
+            Some(vec![Lane::GpuPrl, Lane::Xmr])
+        );
+        assert_eq!(parse_lane_override(Some("prl")), Some(vec![Lane::GpuPrl]));
+        // Genuinely-unknown tokens are still ignored (fail-open).
+        assert_eq!(parse_lane_override(Some("ltc,xmr")), Some(vec![Lane::Xmr]));
+        assert_eq!(parse_lane_override(Some("ltc")), None);
         assert_eq!(parse_lane_override(Some("")), None);
         assert_eq!(parse_lane_override(None), None);
     }

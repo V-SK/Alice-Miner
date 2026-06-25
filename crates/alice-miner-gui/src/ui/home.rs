@@ -600,6 +600,7 @@ fn lane_chip(
 fn lane_short(lane: Lane) -> &'static str {
     match lane {
         Lane::Xmr => "XMR",
+        Lane::GpuPrl => "PRL",
         Lane::GpuRvn => "RVN",
     }
 }
@@ -609,6 +610,8 @@ fn unavailable_tail(lane: Lane) -> &'static str {
     match lane {
         // RVN unavailable means no NVIDIA (Apple/CPU-only) → XMR is the lane.
         Lane::GpuRvn => "needs NVIDIA",
+        // PRL (SRBMiner) needs an NVIDIA/AMD GPU; no macOS build.
+        Lane::GpuPrl => "needs NVIDIA/AMD GPU",
         Lane::Xmr => "not supported",
     }
 }

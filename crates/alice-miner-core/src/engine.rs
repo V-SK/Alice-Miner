@@ -27,7 +27,7 @@ use crate::detect::DeviceProfile;
 use crate::endpoint::{Endpoint, EndpointPlan};
 use crate::identity::{self, Identity};
 use crate::lane::Lane;
-use crate::lane::{gpu_rvn, xmr};
+use crate::lane::{gpu_prl, gpu_rvn, xmr};
 use crate::supervise::LaneSupervisor;
 
 /// How a [`Command::Identity`] establishes the reward identity.
@@ -559,6 +559,27 @@ fn start_one_lane(
                     eps,
                 )?
             };
+            Ok((p.program, p.args))
+        }),
+        Lane::GpuPrl => Arc::new(move |eps: &[Endpoint]| {
+            let program =
+                crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::GpuPrl)?;
+            let Some(active) = eps.first() else {
+                return Err("gpu-prl launch plan needs at least one endpoint".into());
+            };
+            let region = format!("{}:{}", active.host, active.port);
+            // T2 skeleton: no-PoP SMOKE — placeholder password + a per-lane log
+            // file. T4 replaces this with the region-bound PoP token (fetch →
+            // sign → assemble) and the supervisor-owned log path; under the live
+            // relay's REQUIRE_POP=1 the placeholder is rejected (no earning).
+            let log_path = std::env::temp_dir().join("alice-gpu-prl.log");
+            let p = gpu_prl::build_srbminer_pearl_launch_plan(
+                program,
+                &addr_for_rebuild,
+                &region,
+                "x",
+                &log_path,
+            )?;
             Ok((p.program, p.args))
         }),
     };

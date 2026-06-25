@@ -26,6 +26,24 @@
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "_placeholder": true,
       "source": "PLACEHOLDER — KawPowMiner (GPL-3.0) Windows x86_64 build, pinned + signed at packaging (M7). Windows is GPU-first (no bundled xmrig)."
+    },
+    {
+      "kind": "gpu-prl",
+      "engine": "srbminer-multi",
+      "target": "x86_64-unknown-linux-gnu",
+      "filename": "SRBMiner-MULTI",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "_placeholder": true,
+      "source": "PLACEHOLDER — SRBMiner-MULTI (freeware, closed-source) Linux x86_64, the GPU-PRL pearlhash mainline. Real SHA pinned at packaging (T6) by downloading the SRBMiner-Multi 3.3.9 Linux asset + verifying (local shasum + vendor digest), same procedure as the xmrig entries. Until then the resolver fails gracefully (GPU-PRL lane unavailable); ALICE_MINER_PRL_BIN is the override escape hatch."
+    },
+    {
+      "kind": "gpu-prl",
+      "engine": "srbminer-multi",
+      "target": "x86_64-pc-windows-msvc",
+      "filename": "SRBMiner-MULTI.exe",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "_placeholder": true,
+      "source": "PLACEHOLDER — SRBMiner-MULTI (freeware) Windows x86_64, GPU-PRL pearlhash mainline. Real SHA pinned at packaging (T6). macOS intentionally absent: SRBMiner ships no macOS build, so the GPU-PRL lane is Unavailable on Apple (capability matrix asserts this)."
     }
   ]
 }

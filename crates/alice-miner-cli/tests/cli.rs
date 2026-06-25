@@ -238,8 +238,9 @@ fn gpu_lane_refuses_without_nvidia() {
 
 #[test]
 fn unknown_lane_is_usage_error() {
+    // `prl` is now a real lane (GPU-PRL mainline); use a genuinely unknown token.
     bin()
-        .args(["start", "--lane", "prl"])
+        .args(["start", "--lane", "ltc"])
         .assert()
         .failure()
         .code(2)

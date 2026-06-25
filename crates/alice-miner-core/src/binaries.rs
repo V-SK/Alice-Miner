@@ -70,6 +70,8 @@ struct MinersManifest {
 pub enum MinerKind {
     CpuXmr,
     GpuRvn,
+    /// SRBMiner-MULTI on the `pearlhash` algorithm — the GPU-PRL mainline lane.
+    GpuPrl,
 }
 
 impl MinerKind {
@@ -78,6 +80,7 @@ impl MinerKind {
         match self {
             MinerKind::CpuXmr => XMRIG_BINARY_NAME,
             MinerKind::GpuRvn => KAWPOW_BINARY_NAME,
+            MinerKind::GpuPrl => SRBMINER_BINARY_NAME,
         }
     }
 
@@ -86,6 +89,7 @@ impl MinerKind {
         match self {
             MinerKind::CpuXmr => "ALICE_MINER_XMR_BIN",
             MinerKind::GpuRvn => "ALICE_MINER_GPU_BIN",
+            MinerKind::GpuPrl => "ALICE_MINER_PRL_BIN",
         }
     }
 
@@ -94,6 +98,7 @@ impl MinerKind {
         match self {
             MinerKind::CpuXmr => "cpu-xmr",
             MinerKind::GpuRvn => "gpu-rvn",
+            MinerKind::GpuPrl => "gpu-prl",
         }
     }
 }
@@ -167,6 +172,11 @@ pub const XMRIG_BINARY_NAME: &str = "xmrig";
 pub const KAWPOW_BINARY_NAME: &str = "kawpowminer.exe";
 #[cfg(not(target_os = "windows"))]
 pub const KAWPOW_BINARY_NAME: &str = "kawpowminer";
+
+#[cfg(target_os = "windows")]
+pub const SRBMINER_BINARY_NAME: &str = "SRBMiner-MULTI.exe";
+#[cfg(not(target_os = "windows"))]
+pub const SRBMINER_BINARY_NAME: &str = "SRBMiner-MULTI";
 
 /// The committed release-asset target-triple directory for the current build,
 /// used by the dev fallback (matches the `release-assets/<triple>/` layout the
@@ -272,6 +282,13 @@ pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
             "GPU miner not installed: the KawPowMiner engine `{}` was not found \
              (set {} to a kawpowminer/T-Rex binary, or install the bundled engine). \
              The RVN lane stays unavailable.",
+            kind.binary_name(),
+            kind.env_override(),
+        ),
+        MinerKind::GpuPrl => format!(
+            "GPU miner not installed: the SRBMiner-MULTI engine `{}` was not found \
+             (set {} to an SRBMiner-MULTI binary, or install the bundled engine). \
+             The GPU-PRL lane stays unavailable.",
             kind.binary_name(),
             kind.env_override(),
         ),
