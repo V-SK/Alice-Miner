@@ -714,6 +714,12 @@ fn start_one_lane(
     // or budget-exhaustion Error), so it shares the lane's lifecycle.
     if lane == Lane::GpuPrl {
         if let Some(secrets) = secrets {
+            // T5: best-effort 15%-PRL payout enroll — bind the user's OWN prl1p…
+            // payout address to their Alice address, ONCE, after PoP is up. Skips
+            // cleanly (no error, no fake signature) when no payout address is set
+            // or the identity is watch-only. Spawned before the refresh task takes
+            // ownership of `secrets`.
+            spawn_prl_enroll_task(sup.clone(), address.clone(), secrets.clone());
             spawn_pop_refresh_task(sup.clone(), address.clone(), secrets);
         }
     }
@@ -798,6 +804,58 @@ fn spawn_pop_refresh_task(
                 }
             }
         }
+    });
+}
+
+/// Map a relay host (`us.aliceprotocol.org`) to its short region tag (`us`) for the
+/// enroll `region` field; falls back to the host itself if it isn't a known relay.
+fn region_tag_for_host(host: &str) -> String {
+    gpu_prl::REGION_HOSTS
+        .iter()
+        .find(|(_, h)| *h == host)
+        .map(|(tag, _)| (*tag).to_string())
+        .unwrap_or_else(|| host.to_string())
+}
+
+/// Spawn the T5 one-shot 15%-PRL **payout enroll** task (GPU-PRL only). MUST be
+/// called inside a tokio runtime context. Best-effort: it binds the user's OWN
+/// `prl1p…` payout address to their Alice address ONCE after the lane is up, then
+/// exits. It NEVER fails the lane — a watch-only identity, an unset payout address,
+/// or a transient server error is logged-as-outcome and dropped (the binding can be
+/// retried on the next lane start). `secrets` is a dedicated clone owned by this
+/// task and zeroizes when the task ends. The enroll endpoint is CENTRAL (one payout
+/// authority), so the binding does not need to re-run per region failover.
+fn spawn_prl_enroll_task(
+    sup: LaneSupervisor,
+    address: String,
+    secrets: alice_crypto::WalletSecrets,
+) {
+    tokio::spawn(async move {
+        // The lane may have been stopped before we even got scheduled; if so, skip.
+        if !sup.is_active() {
+            return;
+        }
+        let device_id = match crate::lane::xmr::derive_worker_id(&address) {
+            Ok(d) => d,
+            Err(_) => return, // invalid address → nothing to enroll
+        };
+        // The region tag of the lane's CURRENT (cursor) endpoint, for the binding's
+        // `region` field. Enroll itself is central; the tag is informational.
+        let host = sup
+            .current_endpoint()
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let region = region_tag_for_host(&host);
+        // The HTTPS POSTs are blocking (ureq); run them off the async worker so they
+        // can't stall the runtime. The outcome is best-effort — we don't surface it
+        // as a lane Error (the lane keeps mining regardless of the payout binding).
+        let _outcome = tokio::task::spawn_blocking(move || {
+            crate::prl_payout::run_enroll_best_effort(&address, &device_id, &region, &secrets)
+        })
+        .await;
+        // `_outcome` is intentionally dropped: enroll is fail-open w.r.t. the lane.
     });
 }
 

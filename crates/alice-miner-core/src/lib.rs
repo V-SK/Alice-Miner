@@ -38,6 +38,7 @@ pub mod engine;
 pub mod identity;
 pub mod lane;
 pub mod pop;
+pub mod prl_payout;
 pub mod stats;
 pub mod supervise;
 
@@ -68,3 +69,4 @@ pub use endpoint::{Endpoint, EndpointPlan, Transport};
 pub use engine::{Command, EngineHandle, EngineState, Event, IdentitySpec, Snapshot};
 pub use identity::{Identity, IdentityPointer};
 pub use lane::Lane;
+pub use prl_payout::{EnrollOutcome, PrlPayoutDisplay};
