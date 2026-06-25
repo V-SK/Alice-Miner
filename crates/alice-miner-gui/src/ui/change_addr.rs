@@ -249,7 +249,7 @@ fn backup(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str, acknowledged: b
     let out = onboarding::backup_body(ui, app, mnemonic, acknowledged);
     if out.acknowledged != acknowledged {
         app.change_addr = Some(ChangeAddr::Backup {
-            mnemonic: mnemonic.to_string(),
+            mnemonic: mnemonic.to_string().into(),
             acknowledged: out.acknowledged,
         });
     }
@@ -265,7 +265,7 @@ fn confirm(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str) {
     match onboarding::confirm_body(ui, app, mnemonic) {
         ConfirmAction::Back => {
             app.change_addr = Some(ChangeAddr::Backup {
-                mnemonic: mnemonic.to_string(),
+                mnemonic: mnemonic.to_string().into(),
                 acknowledged: true,
             });
             app.error = None;

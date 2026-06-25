@@ -104,6 +104,17 @@ pub fn build_srbminer_pearl_launch_plan(
     if !MINING_EXECUTION_ALLOWED {
         return Err("mining execution is not enabled in this build".into());
     }
+    // Defense-in-depth: the pop token rides the `--password` value verbatim. Reject
+    // any whitespace / ASCII control char so a malformed token can never inject an
+    // extra argv token (the assembler in `pop.rs` already guards this; enforce it at
+    // the builder boundary too, regardless of caller). `:`/`=`/base64 stay allowed —
+    // they are part of the legit `pop=<id>:<sig>` shape.
+    if pop_token
+        .bytes()
+        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err("pop token contains whitespace/control characters".into());
+    }
     let reward = reward_identity.trim();
     let worker = derive_worker_id(reward)?; // fail-closed Alice-address validation
     let wallet = format!("{reward}.{worker}");

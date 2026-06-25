@@ -383,6 +383,10 @@ fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(MANIFEST_READ_TIMEOUT)
+        // Defense-in-depth: refuse plain-HTTP (incl. an http:// redirect target).
+        // The update chain is already ed25519-verified, but the transport should
+        // never silently downgrade off TLS.
+        .https_only(true)
         .user_agent(concat!("alice-miner-updater/", env!("CARGO_PKG_VERSION")))
         .build()
 }
@@ -493,6 +497,7 @@ pub fn download_and_verify(artifact: &Artifact) -> Result<Vec<u8>> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(DOWNLOAD_READ_TIMEOUT)
+        .https_only(true) // see agent(): TLS-only download path
         .user_agent(concat!("alice-miner-updater/", env!("CARGO_PKG_VERSION")))
         .build();
     // Read at most size+1 so an oversized body is detected, not silently

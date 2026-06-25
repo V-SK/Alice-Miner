@@ -155,7 +155,7 @@ fn backup(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str, acknowledged: b
     let out = backup_body(ui, app, mnemonic, acknowledged);
     if out.acknowledged != acknowledged {
         app.onboarding = Some(Onboarding::Backup {
-            mnemonic: mnemonic.to_string(),
+            mnemonic: mnemonic.to_string().into(),
             acknowledged: out.acknowledged,
         });
     }
@@ -266,7 +266,7 @@ fn confirm(ui: &mut egui::Ui, app: &mut MinerApp, mnemonic: &str) {
     match confirm_body(ui, app, mnemonic) {
         ConfirmAction::Back => {
             app.onboarding = Some(Onboarding::Backup {
-                mnemonic: mnemonic.to_string(),
+                mnemonic: mnemonic.to_string().into(),
                 acknowledged: true,
             });
             app.error = None;

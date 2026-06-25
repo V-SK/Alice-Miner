@@ -35,7 +35,10 @@ pub enum Screen {
 /// onboarding takeover), and only when NOT mining. Create/Import gain an explicit
 /// overwrite-confirm step first (the existing keystore is backed up before being
 /// replaced); Paste is watch-only and never touches the keystore.
-#[derive(Clone, PartialEq, Eq)]
+// No PartialEq/Eq: the mnemonic field is a `Zeroizing<String>` (zeroizes every
+// dropped copy, incl. the egui per-frame clones) which doesn't impl PartialEq,
+// and the enum is only ever `matches!`-ed, never compared with `==`.
+#[derive(Clone)]
 pub enum ChangeAddr {
     /// The launcher: pick create / import / paste, with the current address shown.
     Choose,
@@ -47,9 +50,9 @@ pub enum ChangeAddr {
     /// The create password form (shown after the overwrite warning is accepted).
     CreateForm,
     /// After a create commits: the 24-word phrase for the forced-backup step.
-    Backup { mnemonic: String, acknowledged: bool },
+    Backup { mnemonic: zeroize::Zeroizing<String>, acknowledged: bool },
     /// Confirm the new phrase by re-picking 3 words (reuses the onboarding logic).
-    Confirm { mnemonic: String },
+    Confirm { mnemonic: zeroize::Zeroizing<String> },
     /// Import a different mnemonic / seed. The overwrite warning is recapped inline
     /// (Import also replaces + backs up the keystore).
     Import { backup_hint: Option<String> },
@@ -77,16 +80,17 @@ pub struct PrlUnlock {
 }
 
 /// Onboarding sub-flow (only reachable when there is no `~/.alice/identity.json`).
-#[derive(Clone, PartialEq, Eq)]
+// No PartialEq/Eq — see ChangeAddr above (mnemonic is `Zeroizing<String>`).
+#[derive(Clone)]
 pub enum Onboarding {
     /// Pick: create new / import / paste address.
     Choose,
     /// Created: show the 24-word mnemonic for the forced-backup step.
-    Backup { mnemonic: String, acknowledged: bool },
+    Backup { mnemonic: zeroize::Zeroizing<String>, acknowledged: bool },
     /// Confirm the backup by re-picking 3 random words (PLAN §4 — the deliberate
     /// divergence from the Wallet). Carries the mnemonic so a wrong pick can be
     /// re-prompted without regenerating.
-    Confirm { mnemonic: String },
+    Confirm { mnemonic: zeroize::Zeroizing<String> },
     /// Import an existing mnemonic or seed.
     Import,
     /// Paste an address (watch-only).
@@ -536,7 +540,7 @@ impl MinerApp {
             // the current screen), don't fall back into onboarding.
             (true, Some(m)) => {
                 self.change_addr = Some(ChangeAddr::Backup {
-                    mnemonic: m,
+                    mnemonic: m.into(),
                     acknowledged: false,
                 });
             }
@@ -547,7 +551,7 @@ impl MinerApp {
             // ONBOARDING → create: the forced-backup onboarding step.
             (false, Some(m)) => {
                 self.onboarding = Some(Onboarding::Backup {
-                    mnemonic: m,
+                    mnemonic: m.into(),
                     acknowledged: false,
                 });
             }
@@ -967,11 +971,11 @@ impl MinerApp {
         // first-run onboarding) into its confirm step — same retype check for both.
         if self.change_addr.is_some() {
             self.change_addr = Some(ChangeAddr::Confirm {
-                mnemonic: mnemonic.to_string(),
+                mnemonic: mnemonic.to_string().into(),
             });
         } else {
             self.onboarding = Some(Onboarding::Confirm {
-                mnemonic: mnemonic.to_string(),
+                mnemonic: mnemonic.to_string().into(),
             });
         }
     }

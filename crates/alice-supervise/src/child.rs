@@ -98,9 +98,9 @@ impl OwnedChild {
         self.request_term_unix();
         #[cfg(not(unix))]
         {
-            // On Windows tokio's `kill` maps to TerminateProcess; we have no
-            // graceful CTRL_BREAK here without a console group, so go straight
-            // to kill after the grace window below.
+            // On Windows there is no process group / graceful CTRL_BREAK without a
+            // console group, so the graceful phase is just the grace window; the
+            // force path below terminates the whole process TREE.
         }
 
         // Bounded wait for graceful exit.
@@ -108,7 +108,14 @@ impl OwnedChild {
         let code = match waited {
             Ok(Ok(status)) => Some(status.code().unwrap_or(-1)),
             _ => {
-                // Force kill, then reap.
+                // Force-kill the whole process TREE (not just the recorded PID), so
+                // a miner that spawned helper processes can't leave them orphaned
+                // (consuming the GPU) after Stop.
+                #[cfg(unix)]
+                self.force_kill_group_unix();
+                #[cfg(windows)]
+                self.force_kill_tree_windows();
+                #[cfg(not(any(unix, windows)))]
                 let _ = self.child.start_kill();
                 let _ = self.child.wait().await;
                 self.child.try_wait().ok().flatten().and_then(|s| s.code())
@@ -120,12 +127,35 @@ impl OwnedChild {
 
     #[cfg(unix)]
     fn request_term_unix(&self) {
-        // SIGTERM to the recorded PID (the one we spawned).
-        // Safety: PID is the child we own; signal 15 = SIGTERM.
+        // SIGTERM to the child's PROCESS GROUP (negative pid). The child is its own
+        // group leader (pgid==pid, set via setpgid(0,0) at spawn), so this reaches
+        // the miner AND any helper it spawned — signaling only the PID would orphan
+        // grandchildren. Safety: the group is exclusively our spawned subtree.
         let pid = self.pid as i32;
         unsafe {
-            libc_kill(pid, 15);
+            libc_kill(-pid, 15);
         }
+    }
+
+    /// SIGKILL the child's whole process group (force path).
+    #[cfg(unix)]
+    fn force_kill_group_unix(&self) {
+        let pid = self.pid as i32;
+        unsafe {
+            libc_kill(-pid, 9);
+        }
+    }
+
+    /// Terminate the child + its entire process tree on Windows (no process groups
+    /// there; `taskkill /T` walks and kills descendants, so helper miners can't be
+    /// orphaned). A blunt but reliable teardown that needs no Win32 FFI.
+    #[cfg(windows)]
+    fn force_kill_tree_windows(&self) {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &self.pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 
     fn cleanup_pid_file(&mut self) {

@@ -575,7 +575,7 @@ fn pose_ob_backup(app: &mut MinerApp) {
     app.error = None;
     app.snapshot = None;
     app.onboarding = Some(crate::app::Onboarding::Backup {
-        mnemonic: DEMO_MNEMONIC.to_string(),
+        mnemonic: DEMO_MNEMONIC.to_string().into(),
         acknowledged: true,
     });
 }
@@ -605,7 +605,7 @@ fn pose_ob_confirm(app: &mut MinerApp) {
             words[18].to_string(),
         ];
         app.onboarding = Some(crate::app::Onboarding::Confirm {
-            mnemonic: DEMO_MNEMONIC.to_string(),
+            mnemonic: DEMO_MNEMONIC.to_string().into(),
         });
     }
 }
