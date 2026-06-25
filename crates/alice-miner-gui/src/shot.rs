@@ -155,6 +155,12 @@ impl ShotRunner {
                 // The Home "Rewards to <addr>" line with the pencil change
                 // affordance (idle → actionable).
                 Shot { file: "home-idle-change-affordance.png", pose: pose_home_idle },
+                // ── A5c: the simple multi-GPU selector ──────────────────────
+                // A simulated 3×NVIDIA box with the GPU-PRL lane selected → the
+                // per-card checkbox list renders (index · name · VRAM), defaulting
+                // to all-checked, with the middle card UNCHECKED to show the
+                // opt-in subset shape. NOT this Mac; a posed capture only.
+                Shot { file: "home-idle-multigpu-select.png", pose: pose_home_multigpu_select },
             ],
             idx: 0,
             phase: Phase::Settling,
@@ -351,6 +357,48 @@ fn demo_nvidia_device() -> DeviceProfile {
         },
         memory_gb: 64,
         display: "AMD Ryzen 9 5950X · 16 cores".into(),
+        warnings: vec![],
+    }
+}
+
+/// A simulated **3×NVIDIA** box for the A5c multi-GPU picker shot: three
+/// enumerated cards (`gpus`) so the per-card checkbox list renders. NOT this Mac;
+/// a posed capture only.
+fn demo_multigpu_device() -> DeviceProfile {
+    use alice_miner_core::detect::GpuDevice;
+    DeviceProfile {
+        os: OsFamily::Linux,
+        arch: "x86_64".into(),
+        apple_silicon: false,
+        logical_cores: 32,
+        cpu_model: "AMD Ryzen Threadripper 3970X".into(),
+        gpu: GpuInfo {
+            vendor: GpuVendor::Nvidia,
+            model: "NVIDIA GeForce RTX 3090".into(),
+            vram_gb: 24,
+            gpus: vec![
+                GpuDevice {
+                    index: 0,
+                    name: "NVIDIA GeForce RTX 3090".into(),
+                    vram_gb: 24,
+                    uuid: "GPU-aaaa1111".into(),
+                },
+                GpuDevice {
+                    index: 1,
+                    name: "NVIDIA GeForce RTX 3090".into(),
+                    vram_gb: 24,
+                    uuid: "GPU-bbbb2222".into(),
+                },
+                GpuDevice {
+                    index: 2,
+                    name: "NVIDIA GeForce RTX 3080".into(),
+                    vram_gb: 10,
+                    uuid: "GPU-cccc3333".into(),
+                },
+            ],
+        },
+        memory_gb: 128,
+        display: "AMD Ryzen Threadripper 3970X · 32 cores".into(),
         warnings: vec![],
     }
 }
@@ -608,6 +656,27 @@ fn pose_home_idle_nvidia(app: &mut MinerApp) {
     app.screen = Screen::Home;
     app.set_device(demo_nvidia_device()); // recomputes viability → PRL recommended
     install_demo_identity(app);
+    app.error = None;
+    app.snapshot = None;
+    app.hr_display_khs = 0.0;
+}
+
+/// A5c: Home idle on a simulated 3×NVIDIA box with the GPU-PRL lane selected →
+/// the simple per-card checkbox list renders. The middle card (index 1) is
+/// UNCHECKED so the capture shows BOTH the checked + unchecked row treatments and
+/// the "2 of 3 selected" count (the opt-in subset that resolves to
+/// `GpuSelection::Ids(0,2)`). NOT this Mac; a posed capture only.
+fn pose_home_multigpu_select(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.change_addr = None;
+    app.prl_unlock = None; // clear any modal leaked from the prl-unlock shot
+    app.screen = Screen::Home;
+    app.set_device(demo_multigpu_device()); // 3 enumerated cards → picker shows
+    install_demo_identity_keystore(app); // PRL needs a keystore-backed identity
+    app.select_lane(Lane::GpuPrl); // a GPU lane → the picker is applicable
+    // Uncheck the middle card to show the subset shape (must be after set_device,
+    // which resets the selection to all-checked).
+    app.gpu_selected = vec![true, false, true];
     app.error = None;
     app.snapshot = None;
     app.hr_display_khs = 0.0;

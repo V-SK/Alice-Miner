@@ -136,6 +136,17 @@ pub struct MinerApp {
     /// for every non-PRL start (XMR/RVN never raise this).
     pub prl_unlock: Option<PrlUnlock>,
 
+    /// The simple per-GPU **selection** checkbox state (A5c). One `bool` per
+    /// enumerated card (parallel to `device.gpu.gpus`, by position) — `true` =
+    /// checked = include that card. Kept in sync with the detected GPU list by
+    /// [`MinerApp::sync_gpu_selection`]; reset to "all checked" whenever the GPU
+    /// list changes (a fresh `Detect` / device swap), so the default is always
+    /// **All cards** and the start argv stays byte-identical to pre-A5c unless the
+    /// user actively unchecks a card. Only rendered when ≥2 GPUs are enumerated AND
+    /// a GPU lane is selected (single-GPU / no-list machines never see the control
+    /// and always run All). It NEVER carries an address/secret — pure indices.
+    pub gpu_selected: Vec<bool>,
+
     /// The Alice mark texture — a WHITE / alpha mask (rasterised once from the
     /// bundled SVG), tinted to the brand colour at each draw site. See
     /// [`MinerApp::mark_texture`].
@@ -242,6 +253,7 @@ impl MinerApp {
             onboarding,
             change_addr: None,
             prl_unlock: None,
+            gpu_selected: Vec::new(),
             mark_tex: None,
             form_password: String::new(),
             form_password2: String::new(),
@@ -398,6 +410,82 @@ impl MinerApp {
         }
         self.viability = Some(cap.viability);
         self.device = Some(p);
+        // Re-sync the per-GPU selection to the (possibly new) enumerated card list.
+        self.sync_gpu_selection();
+    }
+
+    /// The enumerated GPU devices for the detected machine (one entry per physical
+    /// card). Empty when no device is known yet, or when per-GPU enumeration is
+    /// unavailable (non-NVIDIA / single-summary / probe failure — see
+    /// [`alice_miner_core::detect::GpuInfo::gpus`]). The multi-GPU picker keys off
+    /// this list.
+    pub fn gpu_devices(&self) -> &[alice_miner_core::detect::GpuDevice] {
+        self.device.as_ref().map(|d| d.gpu.gpus.as_slice()).unwrap_or(&[])
+    }
+
+    /// Re-shape [`MinerApp::gpu_selected`] to match the current enumerated GPU
+    /// list. When the list's LENGTH changed (a fresh device / first detect / a
+    /// hot-plug), we reset to **all cards checked** — the honest default that keeps
+    /// the start argv byte-identical to "use every card". When the length is the
+    /// same we leave the user's existing checks untouched (a re-detect of the same
+    /// machine must not silently clobber a deliberate selection). Idempotent.
+    pub fn sync_gpu_selection(&mut self) {
+        let n = self.gpu_devices().len();
+        if self.gpu_selected.len() != n {
+            self.gpu_selected = vec![true; n];
+        }
+    }
+
+    /// Whether the simple multi-GPU picker should be SHOWN: only when ≥2 cards are
+    /// enumerated AND a GPU lane is selected. A single GPU / no enumeration / a
+    /// CPU-XMR selection keeps the picker hidden and the behaviour at All (the UI
+    /// is unchanged for those cases — the no-regression contract).
+    pub fn show_gpu_selector(&self) -> bool {
+        self.gpu_devices().len() >= 2
+            && matches!(self.selected_lane, Lane::GpuPrl | Lane::GpuRvn)
+    }
+
+    /// Toggle the checkbox for the card at position `idx` (a no-op when out of
+    /// range). Never lets the user uncheck the LAST remaining card — at least one
+    /// card must stay selected (an empty set would be a meaningless "mine on no
+    /// GPU"; the user picks XMR to not GPU-mine), so unchecking the final checked
+    /// box is ignored.
+    pub fn toggle_gpu(&mut self, idx: usize) {
+        let checked_count = self.gpu_selected.iter().filter(|&&b| b).count();
+        if let Some(slot) = self.gpu_selected.get_mut(idx) {
+            if *slot && checked_count <= 1 {
+                // Refuse to clear the last remaining card.
+                return;
+            }
+            *slot = !*slot;
+        }
+    }
+
+    /// The [`GpuSelection`] the current checkbox state resolves to — the value a
+    /// Start of a GPU lane should carry. Returns [`GpuSelection::All`] (the
+    /// unchanged, every-card default) when the picker isn't applicable (no GPU
+    /// lane, <2 cards, or every card checked); only an actual partial selection
+    /// yields [`GpuSelection::Ids`] (the opt-in argv). The ids are the enumerated
+    /// cards' real device indices (NOT positions), in enumeration order.
+    pub fn resolved_gpu_selection(&self) -> GpuSelection {
+        // Not a multi-GPU GPU-lane situation → All (argv unchanged).
+        if !self.show_gpu_selector() {
+            return GpuSelection::All;
+        }
+        let devices = self.gpu_devices();
+        let ids: Vec<u32> = devices
+            .iter()
+            .zip(self.gpu_selected.iter())
+            .filter(|(_, &checked)| checked)
+            .map(|(dev, _)| dev.index)
+            .collect();
+        // All checked (or, defensively, none enumerable) → All so the argv is
+        // byte-for-byte the every-card default; a real subset → Ids (opt-in).
+        if ids.is_empty() || ids.len() == devices.len() {
+            GpuSelection::All
+        } else {
+            GpuSelection::Ids(ids)
+        }
     }
 
     /// The support level of a lane on the detected device (defaults to `Viable`
@@ -664,9 +752,11 @@ impl MinerApp {
                 address: None,
                 dual,
                 unlock_password: None,
-                // A5b: the GUI has no per-card picker yet → All (every card,
-                // unchanged behavior). CLI `--gpus` is the opt-in entry point.
-                gpus: GpuSelection::All,
+                // A5c: the simple per-GPU picker resolves to All (every card,
+                // unchanged behavior) unless the user unchecked some cards on a
+                // ≥2-GPU box with a GPU lane — then Ids(selected indices). CPU-XMR
+                // and single-GPU machines always resolve to All.
+                gpus: self.resolved_gpu_selection(),
             })
         {
             self.error = Some(e);
@@ -685,13 +775,16 @@ impl MinerApp {
         };
         self.error = None;
         let PrlUnlock { lane, dual, .. } = unlock;
+        // A5c: PRL is a GPU lane, so honour the multi-GPU picker here too (resolves
+        // to All unless the user picked a subset on a ≥2-GPU box).
+        let gpus = self.resolved_gpu_selection();
         // Send a CLONE; the original buffer is zeroized below regardless of outcome.
         let send_result = self.engine.send(Command::Start {
             lane,
             address: None,
             dual,
             unlock_password: Some(unlock.password.clone()),
-            gpus: GpuSelection::All,
+            gpus,
         });
         // Zeroize the GUI-held password the instant Start is dispatched.
         unlock.password.zeroize();
@@ -1428,5 +1521,132 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         });
         app.confirm_prl_start();
         assert!(app.prl_unlock.is_none(), "modal consumed on confirm");
+    }
+
+    // ── A5c: the simple multi-GPU selector ────────────────────────────────────
+
+    /// A simulated NVIDIA box with `n` enumerated cards (so the picker is
+    /// applicable). Indices are deliberately NON-contiguous offsets to prove the
+    /// resolved `Ids` carry the cards' real device indices, not their positions.
+    fn multigpu_device(n: u32) -> alice_miner_core::detect::DeviceProfile {
+        use alice_miner_core::detect::{DeviceProfile, GpuDevice, GpuInfo, GpuVendor, OsFamily};
+        let gpus: Vec<GpuDevice> = (0..n)
+            .map(|i| GpuDevice {
+                index: i,
+                name: format!("NVIDIA Test {i}"),
+                vram_gb: 24,
+                uuid: format!("GPU-{i}"),
+            })
+            .collect();
+        DeviceProfile {
+            os: OsFamily::Linux,
+            arch: "x86_64".into(),
+            apple_silicon: false,
+            logical_cores: 16,
+            cpu_model: "AMD Ryzen 9 5950X".into(),
+            gpu: GpuInfo {
+                vendor: GpuVendor::Nvidia,
+                model: "NVIDIA Test".into(),
+                vram_gb: 24,
+                gpus,
+            },
+            memory_gb: 64,
+            display: "AMD Ryzen 9 5950X · 16 cores".into(),
+            warnings: vec![],
+        }
+    }
+
+    /// `set_device` sizes the selection to the enumerated cards (all checked), and
+    /// the picker is shown only on a ≥2-GPU box with a GPU lane selected.
+    #[test]
+    fn gpu_selection_defaults_all_and_visibility() {
+        let mut app = MinerApp::new().expect("engine spawns");
+
+        // Single-GPU NVIDIA (the summary GPU but no enumeration) → picker hidden.
+        app.set_device(nvidia_device()); // gpus: [] (no enumeration)
+        app.select_lane(Lane::GpuRvn);
+        assert!(!app.show_gpu_selector(), "no enumerated list → no picker");
+        assert_eq!(app.resolved_gpu_selection(), GpuSelection::All);
+
+        // 3-GPU box → selection sized to 3, all checked.
+        app.set_device(multigpu_device(3));
+        assert_eq!(app.gpu_selected, vec![true, true, true]);
+
+        // With a CPU lane the picker stays hidden even on a 3-GPU box.
+        app.select_lane(Lane::Xmr);
+        assert!(!app.show_gpu_selector(), "CPU-XMR → no GPU picker");
+        assert_eq!(app.resolved_gpu_selection(), GpuSelection::All);
+
+        // With a GPU lane the picker shows; all-checked still resolves to All
+        // (byte-identical every-card argv — the no-regression contract).
+        app.select_lane(Lane::GpuRvn);
+        assert!(app.show_gpu_selector(), "≥2 GPUs + GPU lane → picker shows");
+        assert_eq!(
+            app.resolved_gpu_selection(),
+            GpuSelection::All,
+            "all cards checked ⇒ All (argv unchanged)"
+        );
+    }
+
+    /// Unchecking a card resolves Start to `Ids(<checked device indices>)`, in
+    /// enumeration order, using the cards' real indices.
+    #[test]
+    fn gpu_selection_subset_resolves_to_ids() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(multigpu_device(3));
+        app.select_lane(Lane::GpuPrl);
+
+        // Uncheck the middle card (position 1, device index 1).
+        app.toggle_gpu(1);
+        assert_eq!(app.gpu_selected, vec![true, false, true]);
+        assert_eq!(
+            app.resolved_gpu_selection(),
+            GpuSelection::Ids(vec![0, 2]),
+            "checked positions → their device indices, in order"
+        );
+
+        // Re-check it → back to All.
+        app.toggle_gpu(1);
+        assert_eq!(app.resolved_gpu_selection(), GpuSelection::All);
+    }
+
+    /// The picker never lets the user clear the LAST checked card (an empty set is
+    /// meaningless — pick XMR to not GPU-mine).
+    #[test]
+    fn gpu_selection_keeps_at_least_one_card() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(multigpu_device(2));
+        app.select_lane(Lane::GpuRvn);
+
+        app.toggle_gpu(0); // now only card 1 checked
+        assert_eq!(app.gpu_selected, vec![false, true]);
+        // Clearing the last remaining card is refused.
+        app.toggle_gpu(1);
+        assert_eq!(app.gpu_selected, vec![false, true], "last card stays checked");
+        // It resolves to the single remaining card (index 1).
+        assert_eq!(app.resolved_gpu_selection(), GpuSelection::Ids(vec![1]));
+    }
+
+    /// Re-detecting the SAME-sized GPU list must NOT clobber a deliberate user
+    /// selection (only a length change resets to all-checked).
+    #[test]
+    fn gpu_selection_survives_redetect_same_size() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(multigpu_device(3));
+        app.select_lane(Lane::GpuRvn);
+        app.toggle_gpu(2); // user unchecks card 2
+        assert_eq!(app.gpu_selected, vec![true, true, false]);
+
+        // A re-detect of the same 3-GPU machine keeps the selection.
+        app.set_device(multigpu_device(3));
+        assert_eq!(
+            app.gpu_selected,
+            vec![true, true, false],
+            "same-size re-detect preserves the user's checks"
+        );
+
+        // A device with a DIFFERENT card count resets to all-checked.
+        app.set_device(multigpu_device(2));
+        assert_eq!(app.gpu_selected, vec![true, true], "count change → reset to All");
     }
 }

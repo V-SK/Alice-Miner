@@ -114,6 +114,14 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
         // on a non-NVIDIA/AMD box the PRL chip reads "needs NVIDIA/AMD GPU" and
         // is inert; XMR stays the default.
         lane_selector(ui, app);
+        // Multi-GPU picker (A5c): a simple per-card checkbox list, shown ONLY on a
+        // ≥2-GPU box while a GPU lane is selected. Default = all cards checked (=
+        // All, argv unchanged). Hidden on this Mac (single unified GPU) and for the
+        // CPU-XMR lane — the no-regression contract.
+        if app.show_gpu_selector() {
+            ui.add_space(8.0);
+            gpu_selector(ui, app);
+        }
         // Dual-mine toggle: run BOTH lanes (CPU-XMR + GPU-PRL) together. Gated on
         // viability (≥2 runnable lanes) — DISABLED on this Mac. Default OFF.
         ui.add_space(8.0);
@@ -511,6 +519,128 @@ fn dual_mine_row(ui: &mut egui::Ui, app: &mut MinerApp) {
             app.dual_requested = false;
             app.dual_confirm_open = false;
         }
+    }
+}
+
+/// The **simple multi-GPU picker** (A5c): one checkbox row per enumerated card
+/// (index · name · VRAM), defaulting to all-checked (= All, the every-card argv).
+/// Shown only on a ≥2-GPU box with a GPU lane selected; the caller gates on
+/// [`MinerApp::show_gpu_selector`]. Unchecking a card resolves Start to
+/// `GpuSelection::Ids(checked indices)` (opt-in); the last checked card can't be
+/// cleared (an empty set is meaningless — pick XMR to not GPU-mine). Credit-only:
+/// the control only toggles device indices — no address/secret rides along.
+fn gpu_selector(ui: &mut egui::Ui, app: &mut MinerApp) {
+    let accent = lane_accent(app.active_lane());
+    // Snapshot the rows we need (index/name/vram + checked) so we don't hold an
+    // immutable borrow of `app` across the toggle mutation.
+    let rows: Vec<(usize, u32, String, u32, bool)> = app
+        .gpu_devices()
+        .iter()
+        .enumerate()
+        .map(|(pos, d)| {
+            let checked = app.gpu_selected.get(pos).copied().unwrap_or(true);
+            (pos, d.index, d.name.clone(), d.vram_gb, checked)
+        })
+        .collect();
+    let checked_count = rows.iter().filter(|(_, _, _, _, c)| *c).count();
+    let toggle = std::cell::Cell::new(None);
+
+    egui::Frame::NONE
+        .fill(THEME.surface2)
+        .corner_radius(12)
+        .inner_margin(egui::Margin::symmetric(13, 10))
+        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .show(ui, |ui| {
+            ui.set_width(HERO_CARD_W - 64.0);
+            // Header: label + the "N of M cards" count.
+            centered(ui, |ui| {
+                ui.label(RichText::new("GPUs to mine").size(12.0).strong().color(THEME.text2));
+                ui.add_space(7.0);
+                ui.label(
+                    RichText::new(format!("{} of {} selected", checked_count, rows.len()))
+                        .size(11.0)
+                        .color(THEME.text4),
+                );
+            });
+            ui.add_space(8.0);
+            for (pos, index, name, vram, checked) in &rows {
+                // A single card row: checkbox square + "GPU N · <name> · <vram> GB".
+                // The last checked card is non-interactive (can't clear it).
+                let is_last_checked = *checked && checked_count <= 1;
+                let label = if *vram > 0 {
+                    format!("GPU {index} · {name} · {vram} GB")
+                } else {
+                    format!("GPU {index} · {name}")
+                };
+                let resp = gpu_row(ui, *checked, &label, accent, is_last_checked);
+                if resp.clicked() && !is_last_checked {
+                    toggle.set(Some(*pos));
+                }
+            }
+        });
+
+    if let Some(pos) = toggle.get() {
+        app.toggle_gpu(pos);
+    }
+}
+
+/// One GPU checkbox row: a square checkbox (filled+check when on) + the card
+/// label. Clickable unless it's the last checked card (then inert/dimmed).
+fn gpu_row(
+    ui: &mut egui::Ui,
+    checked: bool,
+    label: &str,
+    accent: egui::Color32,
+    last_checked: bool,
+) -> egui::Response {
+    let frame = egui::Frame::NONE
+        .inner_margin(egui::Margin::symmetric(2, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 9.0;
+                // The checkbox square.
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                let p = ui.painter_at(rect);
+                if checked {
+                    p.rect_filled(rect, 4.0, accent);
+                    // A simple check mark.
+                    let c = rect.center();
+                    let s = rect.width();
+                    p.line_segment(
+                        [
+                            egui::pos2(c.x - s * 0.24, c.y + s * 0.02),
+                            egui::pos2(c.x - s * 0.05, c.y + s * 0.20),
+                        ],
+                        egui::Stroke::new(1.8, THEME.ink_on_brand),
+                    );
+                    p.line_segment(
+                        [
+                            egui::pos2(c.x - s * 0.05, c.y + s * 0.20),
+                            egui::pos2(c.x + s * 0.26, c.y - s * 0.20),
+                        ],
+                        egui::Stroke::new(1.8, THEME.ink_on_brand),
+                    );
+                } else {
+                    p.rect_stroke(
+                        rect,
+                        4.0,
+                        egui::Stroke::new(1.0, THEME.line_strong),
+                        egui::epaint::StrokeKind::Inside,
+                    );
+                }
+                let text_color = if checked { THEME.text } else { THEME.text3 };
+                ui.label(RichText::new(label).size(11.5).color(text_color));
+            });
+        });
+
+    let resp = frame.response;
+    if last_checked {
+        resp.interact(egui::Sense::hover())
+            .on_hover_text("At least one GPU must stay selected")
+    } else {
+        resp.interact(egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 }
 

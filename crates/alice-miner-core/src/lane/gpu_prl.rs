@@ -86,6 +86,7 @@ pub fn region_default_endpoints() -> Vec<Endpoint> {
 /// * `log_path` — the supervisor-owned log file. SRBMiner emits share/hashrate
 ///   lines ONLY to `--log-file`, so it is **mandatory** (without it the dashboard
 ///   reads 0 and health checks false-error).
+///
 /// `gpus` selects which physical card(s) to run on (A5b):
 /// * [`GpuSelection::All`] (the default) appends **no** device flag — SRBMiner
 ///   uses every detected card, so the argv is **byte-for-byte identical** to the
