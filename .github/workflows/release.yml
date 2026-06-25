@@ -149,6 +149,28 @@ jobs:
           fi
           ls -la engine-stage || true
 
+      # ----------------------------------------------------------------------
+      # Stage the GPU-PRL pearlhash engine (SRBMiner-MULTI, the GPU mainline).
+      #
+      # Unlike xmrig/kawpowminer (single pre-built asset), SRBMiner ships as a
+      # vendor archive. scripts/stage_gpu_prl.sh reads archive_url +
+      # archive_sha256 + binary_path_in_archive + sha256 from miners.json, then
+      # fetches the archive, verifies its SHA-256, extracts the one binary,
+      # verifies the binary SHA-256, and stages it as engine-stage/SRBMiner-MULTI
+      # (.exe on Windows). ANY mismatch FAILS the build (fail-closed, not silent).
+      # We do NOT commit the ~18-24MB binary into git (fetch-at-packaging, same as
+      # kawpowminer). macOS is a clean no-op (SRBMiner has no Apple build → the
+      # GPU-PRL lane reports Unavailable there).
+      # ----------------------------------------------------------------------
+      - name: Stage gpu-prl engine (SRBMiner-MULTI)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/stage_gpu_prl.sh
+          scripts/stage_gpu_prl.sh "${{ matrix.target }}" engine-stage
+          ls -la engine-stage || true
+
       # Fail-closed: every staged engine MUST match the SHA-256 pinned in
       # release-assets/miners.json (the same pin baked into the binary). A
       # placeholder (all-zero) or mismatched engine aborts the build so it can
@@ -174,8 +196,13 @@ jobs:
             echo "  $name: pinned=$pin staged=$act"
             if [ "$pin" != "$act" ]; then echo "::error::$name SHA-256 mismatch for $triple"; fail=1; fi
           }
+          # SRBMiner-MULTI (GPU-PRL) is staged by scripts/stage_gpu_prl.sh, which
+          # already SHA-verifies it; re-verify here so the canonical fail-closed
+          # gate covers every engine the package step will copy. macOS has no
+          # SRBMiner build, so it is only checked on Linux/Windows.
           case "$triple" in
-            x86_64-pc-windows-msvc) verify kawpowminer.exe kawpowminer.exe ;;
+            x86_64-pc-windows-msvc) verify kawpowminer.exe kawpowminer.exe; verify SRBMiner-MULTI.exe SRBMiner-MULTI.exe ;;
+            x86_64-unknown-linux-gnu) verify xmrig xmrig; verify kawpowminer kawpowminer; verify SRBMiner-MULTI SRBMiner-MULTI ;;
             *)                      verify xmrig xmrig; verify kawpowminer kawpowminer ;;
           esac
           [ "$fail" = 0 ] || { echo "engine integrity check failed"; exit 1; }
@@ -193,7 +220,8 @@ jobs:
           chmod +x dist/AliceMiner/alice-miner-cli
           cp crates/alice-miner-gui/assets/brand/alice-logo.svg dist/AliceMiner/
           # Bundled engines (optional) — sibling layout per binaries.rs.
-          for e in xmrig kawpowminer; do
+          # SRBMiner-MULTI = the GPU-PRL pearlhash mainline (Linux/Windows only).
+          for e in xmrig kawpowminer SRBMiner-MULTI; do
             if [ -f engine-stage/$e ]; then cp engine-stage/$e dist/AliceMiner/; chmod +x dist/AliceMiner/$e; fi
           done
           cat > dist/AliceMiner/AliceMiner.desktop <<EOF
@@ -221,9 +249,13 @@ jobs:
           # Headless CLI alongside the GUI (the performance path for rigs).
           Copy-Item target/${{ matrix.target }}/release/alice-miner-cli.exe dist/AliceMiner/alice-miner-cli.exe
           Copy-Item crates/alice-miner-gui/assets/brand/alice-logo.svg dist/AliceMiner/
-          # GPU engine only — xmrig.exe is intentionally NOT bundled on Windows.
+          # GPU engines only — xmrig.exe is intentionally NOT bundled on Windows.
           if (Test-Path engine-stage/kawpowminer.exe) {
             Copy-Item engine-stage/kawpowminer.exe dist/AliceMiner/
+          }
+          # SRBMiner-MULTI.exe = the GPU-PRL pearlhash mainline (fetched + verified).
+          if (Test-Path engine-stage/SRBMiner-MULTI.exe) {
+            Copy-Item engine-stage/SRBMiner-MULTI.exe dist/AliceMiner/
           }
           Compress-Archive -Path dist/AliceMiner -DestinationPath ${{ matrix.artifact }}
 

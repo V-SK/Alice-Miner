@@ -263,6 +263,10 @@ PLIST
       kb="$(stage_engine kawpowminer "${triple}" "${d}" 0)"
       [[ -n "${kb}" ]] && echo "  + bundled kawpowminer (SHA-pinned $(sha256_of "${kb}" | cut -c1-12)…)" \
                        || echo "  ~ no kawpowminer for ${triple} — GPU lane stays unavailable"
+      # GPU-PRL pearlhash mainline (SRBMiner-MULTI): fetched from archive_url and
+      # SHA-pin-verified (archive, then extracted binary) by stage_gpu_prl.sh.
+      # Fail-closed — any mismatch exits non-zero. NOT committed into git (~18MB).
+      "${ROOT_DIR}/scripts/stage_gpu_prl.sh" "${triple}" "${d}"
       cat > "${d}/AliceMiner.desktop" <<EOF
 [Desktop Entry]
 Name=Alice Miner
@@ -288,6 +292,9 @@ EOF
       kb="$(stage_engine kawpowminer "${triple}" "${d}" 1)"
       [[ -n "${kb}" ]] && echo "  + bundled kawpowminer.exe (SHA-pinned $(sha256_of "${kb}" | cut -c1-12)…)" \
                        || echo "  ~ no kawpowminer.exe for ${triple} — GPU lane stays unavailable"
+      # GPU-PRL pearlhash mainline (SRBMiner-MULTI.exe): fetched + SHA-pin-verified
+      # by stage_gpu_prl.sh (fail-closed). NOT committed into git.
+      "${ROOT_DIR}/scripts/stage_gpu_prl.sh" "${triple}" "${d}"
       echo "  · windows: xmrig.exe intentionally NOT bundled (on-demand download)"
       # zip via `ditto` on a macOS host, else `zip`.
       if command -v ditto >/dev/null 2>&1; then

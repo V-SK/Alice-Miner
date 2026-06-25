@@ -428,6 +428,54 @@ mod tests {
         );
     }
 
+    /// The gpu-prl (SRBMiner-MULTI) entries are the only engines staged by a
+    /// FETCH-at-packaging path (scripts/stage_gpu_prl.sh): archive_url ->
+    /// archive_sha256 -> binary_path_in_archive -> sha256. Guard that BOTH the
+    /// Linux and Windows entries carry a real (non-placeholder) 64-hex binary
+    /// `sha256` plus a complete, well-formed fetch spec, so the packaging step
+    /// can never silently ship an unverifiable PRL engine. macOS is asserted
+    /// ABSENT (SRBMiner has no Apple build → GPU-PRL Unavailable).
+    #[test]
+    fn gpu_prl_manifest_entries_have_real_pin_and_fetch_spec() {
+        let v: serde_json::Value = serde_json::from_str(MINERS_MANIFEST).unwrap();
+        let engines = v["engines"].as_array().expect("engines array");
+        let is_hex64 = |s: &str| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit());
+
+        let prl: Vec<&serde_json::Value> = engines
+            .iter()
+            .filter(|e| e["kind"].as_str() == Some("gpu-prl"))
+            .collect();
+        assert_eq!(prl.len(), 2, "expected exactly 2 gpu-prl entries (linux + windows)");
+
+        let mut targets = std::collections::BTreeSet::new();
+        for e in &prl {
+            let target = e["target"].as_str().expect("gpu-prl target");
+            targets.insert(target.to_string());
+            assert!(
+                target != "aarch64-apple-darwin",
+                "SRBMiner has no macOS build — gpu-prl must not list an Apple target"
+            );
+            // Not a placeholder, and a real 64-hex binary pin (the runtime gate).
+            assert_ne!(e.get("_placeholder").and_then(|p| p.as_bool()), Some(true));
+            let sha = e["sha256"].as_str().unwrap_or("");
+            assert!(is_hex64(sha) && !sha.chars().all(|c| c == '0'),
+                "gpu-prl {target}: sha256 must be a real 64-hex pin, got {sha:?}");
+            // A complete, well-formed fetch spec for stage_gpu_prl.sh.
+            let arc_sha = e["archive_sha256"].as_str().unwrap_or("");
+            assert!(is_hex64(arc_sha) && !arc_sha.chars().all(|c| c == '0'),
+                "gpu-prl {target}: archive_sha256 must be real 64-hex, got {arc_sha:?}");
+            assert!(e["archive_url"].as_str().unwrap_or("").starts_with("https://"),
+                "gpu-prl {target}: archive_url must be an https URL");
+            assert!(!e["binary_path_in_archive"].as_str().unwrap_or("").is_empty(),
+                "gpu-prl {target}: binary_path_in_archive must be set");
+            let fname = e["filename"].as_str().unwrap_or("");
+            assert!(fname == "SRBMiner-MULTI" || fname == "SRBMiner-MULTI.exe",
+                "gpu-prl {target}: unexpected filename {fname:?}");
+        }
+        assert!(targets.contains("x86_64-unknown-linux-gnu"));
+        assert!(targets.contains("x86_64-pc-windows-msvc"));
+    }
+
     #[test]
     fn gpu_kind_has_distinct_binary_name_and_override() {
         // kawpowminer (not xmrig) + its own env override.
