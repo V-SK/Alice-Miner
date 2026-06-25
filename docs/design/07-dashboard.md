@@ -289,7 +289,7 @@ alice-miner/src/dashboard/pool_stats.rs
 ```
 
 Server JSON contract (verified against
-`alice-acp/src/alice_acp/shadow_server/http_app.py`):
+`(server-internal credit module)`):
 
 - **`GET /shadow/window`** (persisting) / **`/shadow/window/preview`** (read-only,
   preferred for a polling client so it doesn't spam the audit log) —
@@ -333,11 +333,11 @@ miner **never** sends a passport/device id. **The open-enrollment Alice address 
 not a key in the public `/shadow/*` responses.** This is the §6 fork.
 
 The provider that *does* attribute by address is server-internal
-(`alice-acp/src/alice_acp/shadow_server/pool_evidence_providers.py` — "server-read
+(`(server-internal credit module)` — "server-read
 per-worker shares, never client claims", keyed by `(pool_id, address,
 worker_name, epoch_label)`), but it is **not exposed as a public read-only HTTP
-endpoint today.** The tw-pool integration (memory) polls upstream
-`api.tw-pool.com/api/worker_stats` *server-side*; the client has no equivalent.
+endpoint today.** The upstream-pool integration polls upstream
+`an upstream pool worker-stats API` *server-side*; the client has no equivalent.
 
 **Therefore Source B, as specified against the *current* public API, can only
 prove "credit accounting is live and payout is off" — it cannot yet return a
@@ -357,7 +357,7 @@ experience. See §6 for the three ways V can close this.
 | **B (server)** | **30 s** default, **60 s** when backgrounded; jittered ±10% | a dedicated tokio task (`pool_stats_poller`) calls `fetch_credit`, writes the result into a shared `Arc<Mutex<CreditView>>` the model reads. Never on the UI thread. Single-flight (no overlapping requests); exponential backoff to 5 min on repeated failure. |
 
 The provider cache upstream is ~one snapshot reused for a poll window
-(`pool_evidence_providers.py:102`), so polling faster than ~30 s buys nothing.
+(`(server-internal credit module)`), so polling faster than ~30 s buys nothing.
 
 ### 5.2 Reconciliation (A vs B) — show drift, never fake agreement
 
@@ -417,7 +417,7 @@ client beyond the `PoolStatsClient` URL/parse):
   returning the same credit-only envelope (`paid_acu:"0"`). This is the cleanest
   match to the survey's "public read-only stats API by the user's address" and
   makes `CreditState::Confirmed` reachable for the Miner. (The internal
-  per-address attribution already exists in `pool_evidence_providers.py`; this is
+  per-address attribution already exists in `(server-internal credit module)`; this is
   an exposure, not new accounting.)
 - **Option 2 — Reuse `/shadow/balance` by mapping address→synthetic
   passport/device.** If open-enrollment miners are mirrored into the roster under

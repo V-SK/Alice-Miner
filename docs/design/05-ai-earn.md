@@ -25,9 +25,9 @@ This lands as a **later milestone** with a **minimal integration surface**: one 
 | Job execution (admit → backend → usage) | `DemandDrivenInferenceWorker.execute_job_envelope` | `…/inference_worker.py` |
 | Mining-state field (the mutual-exclusion primitive) | `Q38InferenceAvailabilityHeartbeat.current_mining_state` (`idle`/`mining`/`preemptible`/`paused`) | `…/inference_availability.py:13-25,86` |
 | Yield-to-mining / throttle signal | `mining_throttle_signal` on the scheduler admission | `…/inference_scheduler.py:79,142,176` |
-| GPU-fair credit (peg to mining rate) | `Route1PegResolver` + `InferenceCompletionRequest.{model_tier,gpu_class,runtime}` | `alice-acp/.../shadow_server/route1_peg.py:317,399`; `.../types.py:256-258` |
-| Credit ACU policy (fallback) | `calculate_verified_inference_acu` | `alice-acp/.../shadow_server/inference_acu.py:84` |
-| Lane + session constants | `MAIN_POOL_AI`, `SESSION_KIND_INFERENCE` | `alice-acp/.../shadow_server/types.py:37,46` |
+| GPU-fair credit (peg to mining rate) | `Route1PegResolver` + `InferenceCompletionRequest.{model_tier,gpu_class,runtime}` | `(server-internal credit module),399`; `.../types.py:256-258` |
+| Credit ACU policy (fallback) | `calculate_verified_inference_acu` | `(server-internal credit module)` |
+| Lane + session constants | `MAIN_POOL_AI`, `SESSION_KIND_INFERENCE` | `(server-internal credit module),46` |
 | Credit-only client guardrails | `_strip_forbidden_queue_fields` (drops `live_reward`/`payout` keys), `_validate_no_raw_prompt_response`, `config.validate()` rejecting `live_reward_enabled`/`payout_executor_enabled`/`direct_pool_mode_enabled` | `…/inference_worker_client.py:28-38,71-93,366-387` |
 | Reference end-to-end credit loop | `ColocatedInferenceWorker` (Phase A, reward OFF, `paid_acu="0"`) | `alice-acp/.../api_chat_gateway/colocated_inference_worker.py` |
 | Process supervision (spawn/SIGTERM→SIGKILL/log pump) | the Miner's miner-supervisor (mirrors `MinerSupervisor`) | `alice-wallet/gui/src/supervise/miner_supervisor.rs` |

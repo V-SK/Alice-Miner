@@ -176,7 +176,7 @@ ever, to start or run mining.
 | Device detection (fail-safe, dep-light) | `Alice-Protocol/miner/mining_internal/hardware_probe.py` | **port to Rust** `core/detect/`, keep shape/override semantics |
 | KawPoW argv + log regexes | `…/mining_internal/trex_runner.py` + `trex_logs.py` | port → `core/lane/gpu_rvn.rs` + `stats/parse_kawpow.rs` |
 | Inference worker (credit-only) | `…/mining_internal/inference_worker_client.py` `run_once()` | drive from a supervised sidecar (AI lane, later) |
-| Public credit read API | `alice-acp/.../shadow_server/http_app.py:1683-1815` (`/shadow/window(/preview)`, `/shadow/balance`, `paid_acu="0"` envelope) | poll for Source-B credit; assert `paid_acu=="0"` |
+| Public credit read API | `(server-internal credit module)` (`/shadow/window(/preview)`, `/shadow/balance`, `paid_acu="0"` envelope) | poll for Source-B credit; assert `paid_acu=="0"` |
 | Download page pattern | `alice-website/wallet.html` (+ `mine.html`, `vercel.json`) | clone → `miner.html`; wire `mine.html` buttons; add `/miner` rewrite |
 
 ---
