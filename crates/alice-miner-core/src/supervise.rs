@@ -29,9 +29,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
-use alice_supervise::child::{spawn_supervised, LogLine, OwnedChild};
+use alice_supervise::child::{spawn_supervised, LogLine, LogStream, OwnedChild};
 use alice_supervise::{sanitize_log_line, ProcState, RestartPolicy};
 
 use crate::endpoint::{Endpoint, EndpointPlan};
@@ -227,6 +227,15 @@ impl LaneSupervisor {
         self.lane
     }
 
+    /// Surface a transient PoP-status note in the lane snapshot (e.g. an OOB
+    /// re-verify failure) so the GUI/CLI shows it instead of the lane silently
+    /// dropping out of the relay allowlist. `None` clears it. Only touches
+    /// `message`; the watchdog's failover/error messages still take over on a
+    /// real failure.
+    pub fn note_message(&self, msg: Option<String>) {
+        self.inner.lock().expect("mutex").message = msg;
+    }
+
     /// The endpoint the lane is currently targeting (`host:port`).
     pub fn current_endpoint(&self) -> String {
         self.inner
@@ -361,6 +370,11 @@ impl LaneSupervisor {
         };
 
         let (log_tx, mut log_rx) = unbounded_channel::<LogLine>();
+        // GPU-PRL only: SRBMiner writes shares/hashrate ONLY to its --log-file
+        // (never stdout), so clone a sender for a file-tail task that feeds those
+        // lines into the SAME channel the parser drains (the tail task is spawned
+        // after the child is up, below).
+        let log_tx_tail = (self.lane == Lane::GpuPrl).then(|| log_tx.clone());
         // No extra env, no PID file — the miner is fully ephemeral.
         let owned = match spawn_supervised(&program, &args, &[], None, log_tx) {
             Ok(c) => c,
@@ -377,6 +391,20 @@ impl LaneSupervisor {
             let mut g = self.inner.lock().expect("mutex");
             g.pid = Some(pid);
             g.state = ProcState::Running;
+        }
+
+        // GPU-PRL log-file tail (blocker fix): SRBMiner emits shares/hashrate ONLY
+        // to its `--log-file`, so without tailing it the stdout-only log pump sees
+        // ~0 shares and the Layer-B no-progress watchdog wrongly tears down a
+        // HEALTHY lane. Feed the file's new lines into the SAME LogLine channel the
+        // parser drains. Generation-gated so a stale tail can't clobber a newer run.
+        if let Some(tail_tx) = log_tx_tail {
+            if let Some(log_file) = extract_log_file_arg(&args) {
+                let tail_inner = self.inner.clone();
+                tokio::spawn(async move {
+                    tail_log_file_into(log_file, tail_tx, tail_inner, gen).await;
+                });
+            }
         }
 
         // Log pump → parse hashrate / shares into the snapshot (per-lane parser).
@@ -707,6 +735,87 @@ fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
     g.last_line = line;
 }
 
+/// Extract the value following `--log-file` in a child argv (the GPU-PRL SRBMiner
+/// log path the supervisor must tail). `None` if the flag/value is absent.
+fn extract_log_file_arg(args: &[String]) -> Option<std::path::PathBuf> {
+    args.iter()
+        .position(|a| a == "--log-file")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from)
+}
+
+/// Tail a child's `--log-file`, feeding each COMPLETE new line into `tx` (the same
+/// [`LogLine`] channel the per-lane parser drains). SRBMiner writes shares only
+/// here, never stdout, so this is the data source that keeps the GPU-PRL lane's
+/// stats + no-progress watchdog honest.
+///
+/// * **generation-gated**: returns as soon as `inner.generation` advances (a newer
+///   child took over) — a stale tail can never clobber a newer run.
+/// * polls ~1s; tolerates the file not existing yet (SRBMiner creates it on start)
+///   and truncation/rotation (offset reset).
+/// * only advances past the LAST newline, so a partially-written trailing line is
+///   re-read whole next tick (never splits a share/hashrate line). Offset is tracked
+///   in RAW bytes (not the lossy-decoded string) so multi-byte/invalid bytes can't
+///   desync it. Bounded per-poll read so a runaway file can't stall the task.
+async fn tail_log_file_into(
+    path: std::path::PathBuf,
+    tx: UnboundedSender<LogLine>,
+    inner: Arc<Mutex<Inner>>,
+    gen: u64,
+) {
+    use std::io::{Read, Seek, SeekFrom};
+    const POLL: Duration = Duration::from_millis(1000);
+    const MAX_READ: usize = 256 * 1024;
+    let mut offset: u64 = 0;
+    loop {
+        tokio::time::sleep(POLL).await;
+        if inner.lock().expect("mutex").generation != gen {
+            return; // a newer run superseded this child
+        }
+        let mut f = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue, // not created yet
+        };
+        let len = match f.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => continue,
+        };
+        if len < offset {
+            offset = 0; // truncated / rotated → restart from the top
+        }
+        if len <= offset {
+            continue; // nothing new
+        }
+        if f.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        let want = ((len - offset) as usize).min(MAX_READ);
+        let mut buf = vec![0u8; want];
+        let n = match f.read(&mut buf) {
+            Ok(0) => continue,
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        // Consume only up to the last complete line (raw-byte index).
+        let consume = match buf[..n].iter().rposition(|&b| b == b'\n') {
+            Some(i) => i + 1,
+            None => continue, // no complete line yet — re-read next tick
+        };
+        offset += consume as u64;
+        for line in String::from_utf8_lossy(&buf[..consume]).lines() {
+            if tx
+                .send(LogLine {
+                    stream: LogStream::Stdout,
+                    text: line.to_string(),
+                })
+                .is_err()
+            {
+                return; // receiver gone — channel closed
+            }
+        }
+    }
+}
+
 /// A higher-than-best hashrate counts as progress (re-arms the watchdog). A
 /// steady or falling rate does NOT (so a lane that connects but never lands a
 /// share, with a flat hashrate, will still eventually trip the watchdog).
@@ -789,6 +898,74 @@ mod tests {
     /// single-endpoint relay plan). The args are fixed.
     fn fixed_rebuild(program: std::path::PathBuf, args: Vec<String>) -> RebuildFn {
         Arc::new(move |_eps: &[Endpoint]| Ok((program.clone(), args.clone())))
+    }
+
+    #[test]
+    fn extract_log_file_arg_finds_value_else_none() {
+        let args = vec![
+            "--algorithm".to_string(),
+            "pearlhash".to_string(),
+            "--log-file".to_string(),
+            "/tmp/alice-prl.log".to_string(),
+            "--disable-cpu".to_string(),
+        ];
+        assert_eq!(
+            extract_log_file_arg(&args),
+            Some(std::path::PathBuf::from("/tmp/alice-prl.log"))
+        );
+        // flag with no following value, or absent → None.
+        assert_eq!(extract_log_file_arg(&["--log-file".to_string()]), None);
+        assert_eq!(
+            extract_log_file_arg(&["--foo".to_string(), "bar".to_string()]),
+            None
+        );
+    }
+
+    /// Blocker-1 fix: the GPU-PRL log-file tail must feed the file's lines into the
+    /// LogLine channel (so the parser sees SRBMiner's shares), and must STOP as soon
+    /// as the run generation advances (a stale tail can't clobber a newer child).
+    #[test]
+    fn tail_log_file_feeds_lines_then_stops_on_generation_bump() {
+        let sup = LaneSupervisor::new(Lane::GpuPrl);
+        let inner = sup.inner.clone();
+        let gen = inner.lock().expect("mutex").generation;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("alice-tail-test-{}-{}.log", std::process::id(), nanos));
+        std::fs::write(&path, "GPU0: pearlhash 31.21 Mh/s\nAccepted: 5 / Rejected: 0\n")
+            .expect("seed log");
+
+        rt().block_on(async {
+            let (tx, mut rx) = unbounded_channel::<LogLine>();
+            let h = tokio::spawn(tail_log_file_into(path.clone(), tx, inner.clone(), gen));
+
+            // First poll fires after ~1s; give margin.
+            tokio::time::sleep(Duration::from_millis(1400)).await;
+            let mut got = Vec::new();
+            while let Ok(l) = rx.try_recv() {
+                got.push(l.text);
+            }
+            assert!(
+                got.iter().any(|t| t.contains("Mh/s")),
+                "hashrate line must be tailed: {got:?}"
+            );
+            assert!(
+                got.iter().any(|t| t.contains("Accepted")),
+                "shares line must be tailed: {got:?}"
+            );
+
+            // Bump the generation → the tail must exit on its next poll; lines
+            // appended afterward must NOT arrive.
+            inner.lock().expect("mutex").generation += 1;
+            tokio::time::sleep(Duration::from_millis(1400)).await;
+            assert!(
+                h.is_finished(),
+                "tail task must stop once the run generation advances"
+            );
+        });
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

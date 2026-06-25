@@ -795,12 +795,39 @@ fn spawn_pop_refresh_task(
                 Ok(d) => d,
                 Err(_) => return, // address became invalid — nothing to refresh
             };
-            match crate::pop::establish_pop(&host, &address, &device_id, &secrets, None) {
-                Ok(_) => {
+            // Run the blocking HTTPS handshake OFF the async worker (ureq is sync,
+            // ~10s/call) so it can NEVER starve the tokio runtime — same as the
+            // enroll task. A failure is SURFACED (stderr + a lane note the GUI/CLI
+            // shows) instead of silently swallowed, then retried next tick; the
+            // relay is the authority, a transient verify hiccup must not kill the
+            // lane.
+            let (h, a, d, s) = (
+                host.clone(),
+                address.clone(),
+                device_id.clone(),
+                secrets.clone(),
+            );
+            let res = tokio::task::spawn_blocking(move || {
+                crate::pop::establish_pop(&h, &a, &d, &s, None)
+            })
+            .await;
+            match res {
+                Ok(Ok(_)) => {
                     verified_at = std::time::Instant::now();
+                    sup.note_message(None); // recovered — clear any prior warning
                 }
-                Err(_) => {
+                Ok(Err(e)) => {
+                    eprintln!(
+                        "[pop-refresh] OOB re-verify failed for {host}: {e} — retrying; \
+                         crediting may pause if the allowlist TTL lapses"
+                    );
+                    sup.note_message(Some(
+                        "PoP re-verify failing — crediting may pause; retrying".into(),
+                    ));
                     // Leave `verified_at` as-is so we retry on the next tick.
+                }
+                Err(join_err) => {
+                    eprintln!("[pop-refresh] re-verify task panicked: {join_err}");
                 }
             }
         }
