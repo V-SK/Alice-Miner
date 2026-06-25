@@ -23,4 +23,5 @@ dirs = "5.0.1"
 blake2 = "0.10.6"
 bs58 = "0.5.1"
 hex = "0.4.3"
+base64 = "0.22.1"
 zeroize = { version = "1.8.2", features = ["derive"] }

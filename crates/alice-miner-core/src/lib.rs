@@ -37,6 +37,7 @@ pub mod endpoint;
 pub mod engine;
 pub mod identity;
 pub mod lane;
+pub mod pop;
 pub mod stats;
 pub mod supervise;
 

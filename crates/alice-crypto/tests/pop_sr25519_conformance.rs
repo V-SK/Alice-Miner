@@ -100,3 +100,29 @@ fn tampered_message_and_foreign_key_fail() {
     let msg = pop_signature_message(SS58_300_ADDRESS, Some(DEVICE_ID), CHALLENGE_NONCE);
     assert!(!verify(&py_sig, &msg, &PublicKey(foreign)), "foreign pubkey must NOT verify");
 }
+
+// ── ENROLL (15% payout binding) — same fixture, distinct domain ──────────────
+const ENROLL_DOMAIN: &str = "alice-acp:m4-enroll:bind-payout:v1";
+const ENROLL_PAYOUT: &str = "prl1ptestpayout000000000000000000000000000000000000";
+const ENROLL_NONCE: &str = "enroll-nonce-cafe-0002";
+const PY_ENROLL_SIG_HEX: &str = "5485e9f27b36811dd971a81b0486a485a5fd8696e59644f8f26d6250c061f341524244c649533c115aab3f107d49559a443d7e625c1afac82c3fbf824f5e2286";
+
+/// Enroll binding bytes — 4 `key=value` lines, device_id verbatim, no trailing newline.
+fn enroll_signature_message(alice: &str, payout: &str, device_id: &str, nonce: &str) -> Vec<u8> {
+    format!("{ENROLL_DOMAIN}\nalice_address={alice}\nprl_payout_address={payout}\ndevice_id={device_id}\nnonce={nonce}")
+        .into_bytes()
+}
+
+#[test]
+fn python_enroll_signature_verifies_in_rust() {
+    let pubkey = PublicKey(arr32(PUBKEY_HEX));
+    let msg = enroll_signature_message(SS58_300_ADDRESS, ENROLL_PAYOUT, DEVICE_ID, ENROLL_NONCE);
+    let py_sig = Signature(arr64(PY_ENROLL_SIG_HEX));
+    assert!(
+        verify(&py_sig, &msg, &pubkey),
+        "Python enroll signature MUST verify in Rust — proves byte-compatible payout binding"
+    );
+    // A login PoP signature must NOT verify as an enroll binding (domain separation).
+    let login_sig = Signature(arr64(PY_SIG_HEX));
+    assert!(!verify(&login_sig, &msg, &pubkey), "login sig must NOT satisfy enroll binding");
+}
