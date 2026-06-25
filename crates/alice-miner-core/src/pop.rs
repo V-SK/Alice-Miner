@@ -22,7 +22,11 @@
 //! This module is the headless PoP core (no UI, no lane wiring) so it ports cleanly
 //! into the future shared `alice-mining-core` crate.
 
+use std::io::Read as _;
+use std::time::Duration;
+
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 
 use alice_crypto::WalletSecrets;
 
@@ -101,6 +105,300 @@ pub fn assemble_pop_password(challenge_id: &str, signature_b64: &str) -> Result<
     Ok(format!("pop={challenge_id}:{signature_b64}"))
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// HTTPS control plane
+//
+// Four POST endpoints carry the PoP handshake over HTTPS:
+//   * region (per-relay): `m4/challenge` (mint a nonce) + `m4/verify` (best-effort
+//     OOB confirm of a login token).
+//   * central (`api.aliceprotocol.org`): `m4/enroll/nonce` + `m4/enroll` (bind the
+//     15%-payout `prl1p…` address to the Alice address).
+//
+// HARD RULES (mirror the server's transport guard):
+//   * every URL MUST be `https://` — a plaintext url fails closed (a PoP token /
+//     payout binding must never cross the wire in the clear).
+//   * a small read cap + ~10 s timeout bound a hostile/oversized response.
+// All bodies are typed structs serialized with serde_json (compact by default), so
+// the on-wire JSON shape is asserted in unit tests with NO network.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Central control-plane host for enroll (payout-binding). Region relays mint
+/// login challenges; enroll is always central so the payout map has one authority.
+const CENTRAL_HOST: &str = "https://api.aliceprotocol.org";
+
+/// Connect + read timeout for every control-plane call (~10 s, per task).
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on any control-plane response body. Challenge/enroll payloads are a
+/// few hundred bytes; 64 KiB is generous yet caps a hostile/runaway response.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+
+/// Env override for the region login-challenge URL (test/ops). When set it REPLACES
+/// the derived `https://<host>/m4/challenge`; still required to be `https://`.
+const ENV_CHALLENGE_URL: &str = "ALICE_GPU_RELAY_POP_CHALLENGE_URL";
+/// Env override for the central enroll-nonce URL.
+const ENV_ENROLL_NONCE_URL: &str = "ALICE_GPU_RELAY_ENROLL_NONCE_URL";
+/// Env override for the central enroll URL.
+const ENV_ENROLL_URL: &str = "ALICE_GPU_RELAY_ENROLL_URL";
+
+/// A server-minted login challenge: an opaque id (echoed back in the `pop=` token)
+/// and the nonce whose bytes get signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopChallenge {
+    pub challenge_id: String,
+    pub challenge_nonce: String,
+}
+
+// ── request bodies (typed → compact JSON, field order fixed here) ──────────────
+
+#[derive(Serialize)]
+struct ChallengeRequest<'a> {
+    alice_address: &'a str,
+    device_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct VerifyRequest<'a> {
+    alice_address: &'a str,
+    device_id: &'a str,
+    pop: &'a str,
+}
+
+#[derive(Serialize)]
+struct EnrollNonceRequest<'a> {
+    alice_address: &'a str,
+    device_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct EnrollRequest<'a> {
+    alice_address: &'a str,
+    device_id: &'a str,
+    prl_payout_address: &'a str,
+    region: &'a str,
+    nonce: &'a str,
+    signature_b64: &'a str,
+}
+
+// ── response shapes ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ChallengeResponse {
+    challenge_id: String,
+    /// Canonical field.
+    #[serde(default)]
+    challenge_nonce: Option<String>,
+    /// Legacy field name kept for back-compat with older relays.
+    #[serde(default)]
+    nonce: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VerifyResponse {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    verified: bool,
+}
+
+#[derive(Deserialize)]
+struct EnrollNonceResponse {
+    nonce: String,
+}
+
+/// Reject any non-`https://` URL — fail closed so a PoP token / payout binding can
+/// never be sent in the clear.
+fn require_https(url: &str) -> Result<(), String> {
+    if url.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(format!("refusing non-https control-plane url: {url}"))
+    }
+}
+
+/// `true` iff `host` is safe to splice into a URL path: no whitespace, no `/`, and
+/// no ASCII control chars (which could smuggle a second path segment or header).
+fn is_safe_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host.contains('/')
+        && !host.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(HTTP_TIMEOUT)
+        .timeout_read(HTTP_TIMEOUT)
+        .user_agent(concat!("alice-miner-pop/", env!("CARGO_PKG_VERSION")))
+        .build()
+}
+
+/// POST a typed body as compact JSON, read the (capped) response, and parse it into
+/// `R`. Caller has already validated the URL is https.
+fn post_json<B: Serialize, R: serde::de::DeserializeOwned>(
+    url: &str,
+    body: &B,
+) -> Result<R, String> {
+    // Serialize to a compact JSON string ourselves and send with an explicit
+    // content-type. ureq's `send_json` needs the `json` feature, which the
+    // workspace's default-features=false (tls+gzip only) build intentionally omits.
+    let payload = serde_json::to_string(body).map_err(|e| format!("serialize: {e}"))?;
+    let resp = agent()
+        .post(url)
+        .set("Content-Type", "application/json")
+        .send_string(&payload)
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(MAX_RESPONSE_BYTES)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read {url}: {e}"))?;
+    serde_json::from_slice(&buf).map_err(|e| format!("parse {url}: {e}"))
+}
+
+/// Build the region login-challenge URL `https://<host>/m4/challenge`.
+///
+/// If [`ENV_CHALLENGE_URL`] is set it REPLACES the derivation (still https-checked).
+/// `region_host` is rejected if it contains a `/`, whitespace, or control chars.
+pub fn region_challenge_url(region_host: &str) -> Result<String, String> {
+    if let Ok(over) = std::env::var(ENV_CHALLENGE_URL) {
+        if !over.is_empty() {
+            require_https(&over)?;
+            return Ok(over);
+        }
+    }
+    if !is_safe_host(region_host) {
+        return Err(format!("unsafe region host: {region_host:?}"));
+    }
+    let url = format!("https://{region_host}/m4/challenge");
+    require_https(&url)?;
+    Ok(url)
+}
+
+/// Derive the OOB verify URL from a challenge URL by swapping the trailing
+/// `/m4/challenge` for `/m4/verify`. Fails closed if the suffix is absent (so a
+/// caller can never POST a verify to an unrelated path) or the result isn't https.
+pub fn verify_url(challenge_url: &str) -> Result<String, String> {
+    require_https(challenge_url)?;
+    let stem = challenge_url
+        .strip_suffix("/m4/challenge")
+        .ok_or_else(|| format!("challenge url missing /m4/challenge suffix: {challenge_url}"))?;
+    let url = format!("{stem}/m4/verify");
+    require_https(&url)?;
+    Ok(url)
+}
+
+/// POST to the region `m4/challenge` endpoint and return the minted challenge.
+/// Reads `challenge_nonce`, falling back to the legacy `nonce` field.
+pub fn fetch_challenge(
+    challenge_url: &str,
+    alice_address: &str,
+    device_id: &str,
+) -> Result<PopChallenge, String> {
+    require_https(challenge_url)?;
+    let body = ChallengeRequest {
+        alice_address,
+        device_id,
+    };
+    let resp: ChallengeResponse = post_json(challenge_url, &body)?;
+    let challenge_nonce = resp
+        .challenge_nonce
+        .or(resp.nonce)
+        .ok_or_else(|| "challenge response missing challenge_nonce/nonce".to_string())?;
+    if resp.challenge_id.is_empty() || challenge_nonce.is_empty() {
+        return Err("challenge response had empty challenge_id/nonce".into());
+    }
+    Ok(PopChallenge {
+        challenge_id: resp.challenge_id,
+        challenge_nonce,
+    })
+}
+
+/// Best-effort out-of-band confirmation that a login `pop_token` was accepted.
+/// **Never panics, never errors** — any transport/parse failure is a `false` so the
+/// caller can log-and-continue (the authoritative gate is the relay itself).
+pub fn oob_verify(
+    verify_url: &str,
+    alice_address: &str,
+    device_id: &str,
+    pop_token: &str,
+) -> bool {
+    if require_https(verify_url).is_err() {
+        return false;
+    }
+    let body = VerifyRequest {
+        alice_address,
+        device_id,
+        pop: pop_token,
+    };
+    match post_json::<_, VerifyResponse>(verify_url, &body) {
+        Ok(r) => r.ok || r.verified,
+        Err(_) => false,
+    }
+}
+
+/// Fetch an enroll nonce from the CENTRAL host (or [`ENV_ENROLL_NONCE_URL`]).
+pub fn fetch_enroll_nonce(alice_address: &str, device_id: &str) -> Result<String, String> {
+    let url = enroll_nonce_url()?;
+    let body = EnrollNonceRequest {
+        alice_address,
+        device_id,
+    };
+    let resp: EnrollNonceResponse = post_json(&url, &body)?;
+    if resp.nonce.is_empty() {
+        return Err("enroll-nonce response had empty nonce".into());
+    }
+    Ok(resp.nonce)
+}
+
+/// Submit the M4 enroll (payout-binding) to the CENTRAL host (or [`ENV_ENROLL_URL`]).
+/// All six fields are carried; a non-2xx response surfaces as an error.
+#[allow(clippy::too_many_arguments)]
+pub fn enroll(
+    alice_address: &str,
+    device_id: &str,
+    prl_payout_address: &str,
+    region: &str,
+    nonce: &str,
+    signature_b64: &str,
+) -> Result<(), String> {
+    let url = enroll_url()?;
+    let body = EnrollRequest {
+        alice_address,
+        device_id,
+        prl_payout_address,
+        region,
+        nonce,
+        signature_b64,
+    };
+    // We don't need the body, but a malformed/oversized one still gets capped+read.
+    let _resp: serde_json::Value = post_json(&url, &body)?;
+    Ok(())
+}
+
+/// Central enroll-nonce URL (env override or default), https-checked.
+fn enroll_nonce_url() -> Result<String, String> {
+    central_url(ENV_ENROLL_NONCE_URL, "/acp/m4/enroll/nonce")
+}
+
+/// Central enroll URL (env override or default), https-checked.
+fn enroll_url() -> Result<String, String> {
+    central_url(ENV_ENROLL_URL, "/acp/m4/enroll")
+}
+
+/// Resolve a central URL: the env override (if set & non-empty) else
+/// `CENTRAL_HOST + path`. Always https-checked.
+fn central_url(env_key: &str, path: &str) -> Result<String, String> {
+    if let Ok(over) = std::env::var(env_key) {
+        if !over.is_empty() {
+            require_https(&over)?;
+            return Ok(over);
+        }
+    }
+    let url = format!("{CENTRAL_HOST}{path}");
+    require_https(&url)?;
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +469,237 @@ mod tests {
         // A display-only secrets value has no key → sign must fail closed.
         let watch = WalletSecrets::display_only(ADDR);
         assert!(sign_message_b64(&watch, b"msg").is_err());
+    }
+
+    // ── HTTPS control plane (NO network — pure URL/JSON logic only) ────────────
+
+    // Process env is global; cargo runs tests on parallel threads. Serialize every
+    // test that reads OR writes a control-plane env key through this one lock so two
+    // tests can never observe each other's mid-flight override on a shared key.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with `key` unset, restoring any prior value afterward. The control-
+    /// plane URL builders read process env, so isolate them from the ambient env.
+    fn without_env(key: &str, f: impl FnOnce()) {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var(key).ok();
+        std::env::remove_var(key);
+        f();
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// Like [`without_env`] but unsets several keys at once (single lock, no
+    /// re-entrancy — the guard is a plain non-reentrant Mutex).
+    fn without_env_many(keys: &[&str], f: impl FnOnce()) {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let saved: Vec<(String, Option<String>)> = keys
+            .iter()
+            .map(|k| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        f();
+        for (k, prev) in saved {
+            match prev {
+                Some(v) => std::env::set_var(&k, v),
+                None => std::env::remove_var(&k),
+            }
+        }
+    }
+
+    /// Run `f` with `key` set to `val`, restoring any prior value afterward — under
+    /// the same lock as [`without_env`].
+    fn with_env(key: &str, val: &str, f: impl FnOnce()) {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, val);
+        f();
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn region_challenge_url_built_from_host() {
+        without_env(ENV_CHALLENGE_URL, || {
+            let url = region_challenge_url("relay.us.aliceprotocol.org").unwrap();
+            assert_eq!(url, "https://relay.us.aliceprotocol.org/m4/challenge");
+        });
+    }
+
+    #[test]
+    fn verify_url_derived_from_challenge() {
+        let v = verify_url("https://relay.us.aliceprotocol.org/m4/challenge").unwrap();
+        assert_eq!(v, "https://relay.us.aliceprotocol.org/m4/verify");
+        // Only the trailing /m4/challenge is rewritten; an unrelated path fails closed.
+        assert!(verify_url("https://relay/other").is_err());
+        // Non-https challenge url is refused before any derivation.
+        assert!(verify_url("http://relay/m4/challenge").is_err());
+    }
+
+    #[test]
+    fn non_https_fails_closed() {
+        // Env override that is non-https must be rejected (derivation itself is
+        // always https, so the env path is where a plaintext url can sneak in).
+        with_env(ENV_CHALLENGE_URL, "http://evil/m4/challenge", || {
+            assert!(region_challenge_url("ignored.host").is_err());
+        });
+        // fetch_challenge / oob_verify guard the url too (no network is reached).
+        assert!(fetch_challenge("http://relay/m4/challenge", ADDR, DEV).is_err());
+        assert!(!oob_verify("http://relay/m4/verify", ADDR, DEV, "pop=x:y"));
+    }
+
+    #[test]
+    fn region_host_unsafe_chars_fail_closed() {
+        without_env(ENV_CHALLENGE_URL, || {
+            assert!(region_challenge_url("bad host").is_err()); // whitespace
+            assert!(region_challenge_url("evil/extra/path").is_err()); // slash
+            assert!(region_challenge_url("ctl\u{0007}host").is_err()); // control char
+            assert!(region_challenge_url("ho\nst").is_err()); // newline
+            assert!(region_challenge_url("").is_err()); // empty
+        });
+    }
+
+    #[test]
+    fn env_override_replaces_derivation() {
+        with_env(ENV_CHALLENGE_URL, "https://override.example/m4/challenge", || {
+            // host arg is ignored when the override is present.
+            let url = region_challenge_url("ignored").unwrap();
+            assert_eq!(url, "https://override.example/m4/challenge");
+        });
+    }
+
+    #[test]
+    fn central_vs_region_host_selection() {
+        // Default (no overrides) → both enroll URLs resolve to the central host.
+        without_env_many(&[ENV_ENROLL_NONCE_URL, ENV_ENROLL_URL], || {
+            assert_eq!(
+                enroll_nonce_url().unwrap(),
+                "https://api.aliceprotocol.org/acp/m4/enroll/nonce"
+            );
+            assert_eq!(
+                enroll_url().unwrap(),
+                "https://api.aliceprotocol.org/acp/m4/enroll"
+            );
+        });
+        // Region challenge points at the relay host, NOT the central host.
+        without_env(ENV_CHALLENGE_URL, || {
+            assert!(region_challenge_url("relay.hk")
+                .unwrap()
+                .starts_with("https://relay.hk/"));
+        });
+        // Central enroll env overrides are honored and https-checked.
+        with_env(ENV_ENROLL_URL, "https://staging.example/enroll", || {
+            assert_eq!(enroll_url().unwrap(), "https://staging.example/enroll");
+        });
+        with_env(ENV_ENROLL_URL, "http://insecure/enroll", || {
+            assert!(enroll_url().is_err());
+        });
+    }
+
+    #[test]
+    fn challenge_request_body_is_compact_ordered_json() {
+        let body = ChallengeRequest {
+            alice_address: ADDR,
+            device_id: DEV,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert_eq!(
+            json,
+            format!("{{\"alice_address\":\"{ADDR}\",\"device_id\":\"{DEV}\"}}")
+        );
+        assert!(!json.contains(' '), "compact: no spaces");
+    }
+
+    #[test]
+    fn verify_request_body_uses_pop_field() {
+        let body = VerifyRequest {
+            alice_address: ADDR,
+            device_id: DEV,
+            pop: "pop=ch1:c2ln",
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                "{{\"alice_address\":\"{ADDR}\",\"device_id\":\"{DEV}\",\"pop\":\"pop=ch1:c2ln\"}}"
+            )
+        );
+    }
+
+    #[test]
+    fn enroll_request_body_has_all_six_fields() {
+        let body = EnrollRequest {
+            alice_address: ADDR,
+            device_id: DEV,
+            prl_payout_address: "prl1ppayout",
+            region: "us",
+            nonce: "n-1",
+            signature_b64: "c2lnYg==",
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                "{{\"alice_address\":\"{ADDR}\",\"device_id\":\"{DEV}\",\"prl_payout_address\":\"prl1ppayout\",\"region\":\"us\",\"nonce\":\"n-1\",\"signature_b64\":\"c2lnYg==\"}}"
+            )
+        );
+    }
+
+    #[test]
+    fn enroll_nonce_request_body_shape() {
+        let body = EnrollNonceRequest {
+            alice_address: ADDR,
+            device_id: DEV,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert_eq!(
+            json,
+            format!("{{\"alice_address\":\"{ADDR}\",\"device_id\":\"{DEV}\"}}")
+        );
+    }
+
+    #[test]
+    fn challenge_response_parses_canonical_field() {
+        let raw = r#"{"challenge_id":"ch-abc","challenge_nonce":"nonce-001"}"#;
+        let resp: ChallengeResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.challenge_id, "ch-abc");
+        assert_eq!(resp.challenge_nonce.as_deref(), Some("nonce-001"));
+        assert_eq!(resp.nonce, None);
+    }
+
+    #[test]
+    fn challenge_response_legacy_nonce_field_compat() {
+        // Older relay returns `nonce` instead of `challenge_nonce`.
+        let raw = r#"{"challenge_id":"ch-legacy","nonce":"legacy-nonce-77"}"#;
+        let resp: ChallengeResponse = serde_json::from_str(raw).unwrap();
+        // The fold logic prefers challenge_nonce, falls back to nonce.
+        let chosen = resp.challenge_nonce.or(resp.nonce).unwrap();
+        assert_eq!(chosen, "legacy-nonce-77");
+    }
+
+    #[test]
+    fn verify_response_accepts_ok_or_verified() {
+        let ok: VerifyResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(ok.ok || ok.verified);
+        let verified: VerifyResponse = serde_json::from_str(r#"{"verified":true}"#).unwrap();
+        assert!(verified.ok || verified.verified);
+        let neither: VerifyResponse = serde_json::from_str(r#"{"ok":false}"#).unwrap();
+        assert!(!(neither.ok || neither.verified));
+        // Missing fields default to false (serde default) → not verified.
+        let empty: VerifyResponse = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(!(empty.ok || empty.verified));
+    }
+
+    #[test]
+    fn enroll_nonce_response_parses() {
+        let resp: EnrollNonceResponse =
+            serde_json::from_str(r#"{"nonce":"enroll-nonce-xyz"}"#).unwrap();
+        assert_eq!(resp.nonce, "enroll-nonce-xyz");
     }
 }

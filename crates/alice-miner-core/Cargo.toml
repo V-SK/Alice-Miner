@@ -25,3 +25,7 @@ bs58 = "0.5.1"
 hex = "0.4.3"
 base64 = "0.22.1"
 zeroize = { version = "1.8.2", features = ["derive"] }
+# HTTPS control-plane client for the GPU-PRL PoP handshake (M4 challenge/verify/
+# enroll). Pinned to the SAME ureq config as `alice-release` so the TLS/gzip
+# feature set and transitive deps stay byte-identical across the workspace.
+ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }

@@ -116,6 +116,7 @@ dependencies = [
  "alice-crypto",
  "alice-release",
  "alice-supervise",
+ "base64 0.22.1",
  "blake2",
  "bs58",
  "dirs",
@@ -123,6 +124,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "ureq",
  "zeroize",
 ]
 
