@@ -248,7 +248,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
         snap.as_ref().and_then(|s| s.lanes.iter().find(|l| l.lane == lane))
     };
     let xmr_ls = per_lane(Lane::Xmr);
-    let rvn_ls = per_lane(Lane::GpuRvn);
+    let prl_ls = per_lane(Lane::GpuPrl);
     // XMR row: live when dual (and it has a lane snapshot) OR single-XMR mining.
     let xmr_active = if dual {
         xmr_ls.map(|l| matches!(l.state, alice_miner_core::EngineState::Running | alice_miner_core::EngineState::Starting)).unwrap_or(false)
@@ -265,28 +265,28 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
         xmr_sh,
         xmr_active,
     );
-    // RVN row: live when dual (with a lane snapshot) OR single-RVN mining. The
-    // role reflects the device's lane viability honestly: "available" on an
-    // NVIDIA box, "coming soon" on AMD, "needs NVIDIA" on Apple/CPU-only.
-    let rvn_active = if dual {
-        rvn_ls.map(|l| matches!(l.state, alice_miner_core::EngineState::Running | alice_miner_core::EngineState::Starting)).unwrap_or(false)
+    // PRL row (the GPU mainline): live when dual (with a lane snapshot) OR
+    // single-PRL mining. The role reflects the device's lane viability honestly:
+    // "ready" on an NVIDIA/AMD box, "needs NVIDIA/AMD GPU" on Apple/CPU-only.
+    let prl_active = if dual {
+        prl_ls.map(|l| matches!(l.state, alice_miner_core::EngineState::Running | alice_miner_core::EngineState::Starting)).unwrap_or(false)
     } else {
-        mining && app.active_lane() == Lane::GpuRvn
+        mining && app.active_lane() == Lane::GpuPrl
     };
-    let rvn_role = match app.lane_support(Lane::GpuRvn) {
-        LaneSupport::Viable => "· GPU · NVIDIA · ready",
-        LaneSupport::ComingSoon => "· GPU · AMD · coming soon",
-        LaneSupport::Unavailable => "· GPU · needs NVIDIA",
+    let prl_role = match app.lane_support(Lane::GpuPrl) {
+        LaneSupport::Viable => "· GPU · NVIDIA/AMD · ready",
+        LaneSupport::ComingSoon => "· GPU · coming soon",
+        LaneSupport::Unavailable => "· GPU · needs NVIDIA/AMD GPU",
     };
-    let (rvn_hr, rvn_sh) = lane_live_figures(app, dual, rvn_ls, rvn_active, (a, r));
+    let (prl_hr, prl_sh) = lane_live_figures(app, dual, prl_ls, prl_active, (a, r));
     lane_row(
         ui,
         THEME.lane_gpu,
-        "RVN · KawPoW",
-        rvn_role,
-        rvn_hr,
-        rvn_sh,
-        rvn_active,
+        "PRL · pearlhash",
+        prl_role,
+        prl_hr,
+        prl_sh,
+        prl_active,
     );
 
     // ── 15% PRL 返还 (A2c) — GPU-PRL mainline only. Rendered ONLY when the engine
@@ -786,7 +786,7 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                     let n = app.device.as_ref().map(|d| d.logical_cores).unwrap_or(0);
                     ui.label(widgets::mono(format!("{n} threads"), 13.0, THEME.text));
                 });
-                srow(ui, "Lane", "Auto picks the best lane for your device. XMR uses the CPU (RandomX); RVN uses an NVIDIA GPU (KawPoW).", |ui| {
+                srow(ui, "Lane", "Auto picks the best lane for your device. XMR uses the CPU (RandomX); PRL uses an NVIDIA/AMD GPU (pearlhash).", |ui| {
                     let lane = app.active_lane();
                     widgets::chip(ui, Some(lane_accent(lane)), lane_chip_label(lane));
                 });

@@ -340,7 +340,7 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
     // The active identity address (the ONLY thing the mining path needs).
     let mut active_address: Option<String> = None;
     // The active run: the engine owns N `LaneSupervisor`s (M4) — one in
-    // single-lane mode, two in dual-mine (CPU-XMR + GPU-RVN), each crash-isolated
+    // single-lane mode, two in dual-mine (CPU-XMR + GPU-PRL), each crash-isolated
     // in its own process group. Empty when idle.
     let mut run = RunSet::default();
     let mut active_worker_id: Option<String> = None;
@@ -396,7 +396,14 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
                 // password surfaces a clear error and the lane never starts (no
                 // earning without PoP). The secrets/password drop at the end of
                 // the start (the lane + refresh task own their own clone).
-                let prl_in_play = lane == Lane::GpuPrl || (dual && matches!(lane, Lane::GpuPrl));
+                // PRL needs the signing key. It is in play for a single PRL start,
+                // and for dual-mine whose GPU partner is the PRL mainline (anything
+                // but an explicit RVN selection — see `start_run`'s `gpu_lane`).
+                let prl_in_play = if dual {
+                    lane != Lane::GpuRvn
+                } else {
+                    lane == Lane::GpuPrl
+                };
                 let secrets = if prl_in_play {
                     match resolve_prl_secrets(unlock_password.as_deref()) {
                         Ok(s) => Some(s),
@@ -464,7 +471,7 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
 
 /// The set of lane supervisors the engine drives concurrently (PLAN §2.2: "the
 /// engine owns N of them"). One in single-lane mode; two in dual-mine (CPU-XMR +
-/// GPU-RVN), each crash-isolated in its own process group.
+/// GPU-PRL), each crash-isolated in its own process group.
 #[derive(Default)]
 struct RunSet {
     /// The running supervisors, primary first (the primary drives the top-level
@@ -606,13 +613,14 @@ fn start_run(
     let _guard = rt.enter();
 
     if dual {
-        // Both lanes together. XMR gets `cores-2` headroom; RVN runs full. The
-        // current dual pairing is CPU-XMR + GPU-RVN (neither needs PoP secrets);
-        // a GPU-PRL dual pairing would thread `secrets` into the PRL start here.
+        // Both lanes together. XMR gets `cores-2` headroom; the GPU lane runs full.
+        // The GPU partner is the PRL **mainline** (PoP-gated → `secrets` are threaded
+        // into its start) unless RVN was explicitly selected (legacy, address-only).
+        let gpu_lane = if lane == Lane::GpuRvn { Lane::GpuRvn } else { Lane::GpuPrl };
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let xmr_threads = dual_xmr_threads(cores);
         let (xmr_sup, _) = start_one_lane(Lane::Xmr, address, Some(xmr_threads), None)?;
-        let (rvn_sup, _) = match start_one_lane(Lane::GpuRvn, address, None, None) {
+        let (gpu_sup, prl_enroll) = match start_one_lane(gpu_lane, address, None, secrets) {
             Ok(s) => s,
             Err(e) => {
                 // The XMR lane already started; tear it back down so we don't leave
@@ -623,9 +631,9 @@ fn start_run(
         };
         Ok((
             RunSet {
-                supervisors: vec![xmr_sup, rvn_sup],
+                supervisors: vec![xmr_sup, gpu_sup],
                 dual: true,
-                prl_enroll: None,
+                prl_enroll,
             },
             worker_id,
         ))
@@ -1311,10 +1319,14 @@ mod tests {
         .unwrap()
         .address;
 
+        // Exercise the **legacy RVN dual** (CPU-XMR + GPU-RVN): explicitly selecting
+        // RVN keeps the GPU partner address-only, so no keystore/PoP secrets are
+        // needed (the default PRL dual signs a PoP — covered by the single-PRL +
+        // `prl_in_play` tests). `start_run` maps `lane == GpuRvn` → an RVN partner.
         let engine = EngineHandle::spawn().expect("spawn");
         engine
             .send(Command::Start {
-                lane: Lane::Xmr,
+                lane: Lane::GpuRvn,
                 address: Some(address),
                 dual: true,
                 unlock_password: None,

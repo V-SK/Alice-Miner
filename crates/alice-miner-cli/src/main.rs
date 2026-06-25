@@ -96,7 +96,8 @@ enum Command {
         uptime). The reward address defaults to the active ~/.alice identity.\n\
         \n\
         --lane xmr   CPU RandomX/XMR lane\n\
-        --lane gpu   NVIDIA KawPoW/RVN lane\n\
+        --lane gpu   NVIDIA/AMD pearlhash/PRL lane (the GPU mainline)\n\
+        --lane rvn   NVIDIA KawPoW/RVN lane (legacy)\n\
         --lane auto  the recommended lane for this device\n\
         --dual       run BOTH lanes (needs >=2 viable lanes; refuses honestly otherwise)\n\
         --json       emit one Snapshot JSON line per tick (for scripting)\n\
@@ -157,14 +158,14 @@ struct IdentityArgs {
 
 #[derive(clap::Args)]
 struct StartArgs {
-    /// Which lane to mine: `xmr` (CPU/RandomX), `gpu`/`rvn` (NVIDIA/KawPoW), or
-    /// `auto` (the recommended lane for this device).
+    /// Which lane to mine: `xmr` (CPU/RandomX), `gpu`/`prl` (NVIDIA/AMD pearlhash —
+    /// the GPU mainline), `rvn` (legacy KawPoW), or `auto` (the recommended lane).
     #[arg(long, default_value = "auto", value_name = "LANE")]
     lane: String,
     /// Override the reward address (defaults to the active ~/.alice identity).
     #[arg(long, value_name = "ADDRESS")]
     address: Option<String>,
-    /// Dual-mine: run BOTH lanes together (CPU-XMR + GPU-RVN), each crash-isolated,
+    /// Dual-mine: run BOTH lanes together (CPU-XMR + GPU-PRL), each crash-isolated,
     /// with `cores-2` XMR headroom. Requires >=2 viable lanes on this device.
     #[arg(long)]
     dual: bool,
@@ -409,14 +410,14 @@ fn cmd_start(args: StartArgs) -> i32 {
     if args.dual {
         let runnable = cap.viability.runnable_lanes();
         if runnable.len() < 2 {
-            let rvn = Lane::GpuRvn;
+            let gpu = Lane::GpuPrl; // dual's GPU partner is the PRL mainline
             eprintln!(
                 "error: dual-mine needs 2 viable lanes; this device has {} ({} is {}: {}). \
                  Run a single lane instead, e.g. `alice-miner start --lane {}`.",
                 runnable.len(),
-                rvn.label(),
-                cap.support(rvn).label(),
-                cap.viability.reason(rvn).unwrap_or("not viable"),
+                gpu.label(),
+                cap.support(gpu).label(),
+                cap.viability.reason(gpu).unwrap_or("not viable"),
                 cap.recommended_lane().id(),
             );
             return EXIT_USAGE;
@@ -449,8 +450,11 @@ fn cmd_start(args: StartArgs) -> i32 {
     let pid_guard = pidfile::PidGuard::acquire();
 
     // GPU-PRL needs the wallet password to unlock the signing key for PoP. Resolve
-    // it (stdin / flag / interactive prompt) only for that lane; XMR/RVN pass None.
-    let unlock_password = if lane == Lane::GpuPrl {
+    // it (stdin / flag / interactive prompt) when PRL is in play: a single PRL start,
+    // or a dual-mine whose GPU partner is the PRL mainline (anything but an explicit
+    // RVN selection). Mirrors `engine.rs` `prl_in_play`. XMR / RVN pass None.
+    let prl_in_play = if args.dual { lane != Lane::GpuRvn } else { lane == Lane::GpuPrl };
+    let unlock_password = if prl_in_play {
         match resolve_password(args.password.clone(), args.password_stdin) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -562,11 +566,13 @@ fn emit_snapshot(snap: &Snapshot, json: bool) {
 fn resolve_lane(s: &str, cap: &alice_miner_core::CapabilityProfile) -> Result<Lane, i32> {
     match s.to_ascii_lowercase().as_str() {
         "xmr" | "cpu" => Ok(Lane::Xmr),
-        "prl" => Ok(Lane::GpuPrl),
-        "gpu" | "rvn" => Ok(Lane::GpuRvn),
+        // `gpu` means the GPU **mainline** = PRL (pearlhash). `rvn` selects the
+        // legacy KawPoW lane explicitly.
+        "gpu" | "prl" => Ok(Lane::GpuPrl),
+        "rvn" => Ok(Lane::GpuRvn),
         "auto" => Ok(cap.recommended_lane()),
         other => {
-            eprintln!("error: unknown lane `{other}` (use: xmr | prl | gpu | auto)");
+            eprintln!("error: unknown lane `{other}` (use: xmr | gpu | prl | rvn | auto)");
             Err(EXIT_USAGE)
         }
     }
@@ -761,10 +767,11 @@ mod tests {
         let cap = alice_miner_core::CapabilityProfile::detect();
         assert_eq!(resolve_lane("xmr", &cap).unwrap(), Lane::Xmr);
         assert_eq!(resolve_lane("cpu", &cap).unwrap(), Lane::Xmr);
-        assert_eq!(resolve_lane("gpu", &cap).unwrap(), Lane::GpuRvn);
+        // `gpu` now means the GPU mainline (PRL); `rvn` selects the legacy lane.
+        assert_eq!(resolve_lane("gpu", &cap).unwrap(), Lane::GpuPrl);
+        assert_eq!(resolve_lane("prl", &cap).unwrap(), Lane::GpuPrl);
         assert_eq!(resolve_lane("rvn", &cap).unwrap(), Lane::GpuRvn);
         assert_eq!(resolve_lane("AUTO", &cap).unwrap(), cap.recommended_lane());
-        assert_eq!(resolve_lane("prl", &cap).unwrap(), Lane::GpuPrl);
     }
 
     /// build_identity_spec maps each flag and errors when none is given.

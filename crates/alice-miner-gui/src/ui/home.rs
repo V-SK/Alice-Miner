@@ -111,10 +111,10 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
         ui.add_space(9.0);
         // Lane row: the selected lane chip + (when the device supports it) a
         // selectable/"coming soon" chip for the other lane. Reflects viability:
-        // on a non-NVIDIA box the RVN chip reads "coming soon" and is inert; XMR
-        // stays the default.
+        // on a non-NVIDIA/AMD box the PRL chip reads "needs NVIDIA/AMD GPU" and
+        // is inert; XMR stays the default.
         lane_selector(ui, app);
-        // Dual-mine toggle: run BOTH lanes (CPU-XMR + GPU-RVN) together. Gated on
+        // Dual-mine toggle: run BOTH lanes (CPU-XMR + GPU-PRL) together. Gated on
         // viability (≥2 runnable lanes) — DISABLED on this Mac. Default OFF.
         ui.add_space(8.0);
         dual_mine_row(ui, app);
@@ -353,9 +353,10 @@ fn status_line(ui: &mut egui::Ui, app: &MinerApp) {
 
 /// The lane row beneath the device line: the SELECTED lane as a filled chip,
 /// plus the *other* lane as either a selectable chip (when runnable on this
-/// device) or a muted "coming soon" / "Apple → XMR" chip (when not). On this
-/// non-NVIDIA Mac the RVN chip reads "RVN · coming soon" and is inert, while XMR
-/// stays selected — the honest M3 viability behaviour.
+/// device) or a muted "coming soon" / "Apple → XMR" chip (when not). The GPU
+/// chip is **PRL** — the GPU mainline (V: "GPU 主线 = PRL,展示不隐藏"). On a
+/// non-NVIDIA/AMD Mac the PRL chip reads "PRL · needs NVIDIA/AMD GPU" and is
+/// inert, while XMR stays selected — the honest viability behaviour.
 fn lane_selector(ui: &mut egui::Ui, app: &mut MinerApp) {
     let selected = app.active_lane();
     // While a run is in flight, the lane is locked (can't switch under a child).
@@ -363,8 +364,8 @@ fn lane_selector(ui: &mut egui::Ui, app: &mut MinerApp) {
         app.state(),
         EngineState::Running | EngineState::Starting | EngineState::Stopping
     );
-    // Deterministic order: XMR then RVN.
-    let lanes = [Lane::Xmr, Lane::GpuRvn];
+    // Deterministic order: XMR then PRL (the GPU mainline).
+    let lanes = [Lane::Xmr, Lane::GpuPrl];
     let pick = std::cell::Cell::new(None);
     centered(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 7.0;
@@ -383,7 +384,7 @@ fn lane_selector(ui: &mut egui::Ui, app: &mut MinerApp) {
 }
 
 /// The dual-mine toggle row beneath the lane selector. Runs BOTH lanes together
-/// (CPU-XMR + GPU-RVN), each crash-isolated, `cores-2` XMR headroom. The toggle
+/// (CPU-XMR + GPU-PRL), each crash-isolated, `cores-2` XMR headroom. The toggle
 /// is **gated on viability**: enabled only when ≥2 lanes are runnable. On this
 /// Mac (Apple Silicon, no NVIDIA) only XMR is viable, so it renders DISABLED with
 /// an honest "needs a supported GPU" hint — the user can't even flip it. When it

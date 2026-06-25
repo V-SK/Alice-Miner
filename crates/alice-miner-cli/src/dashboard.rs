@@ -127,7 +127,12 @@ pub fn render_identity_show(p: &alice_miner_core::IdentityPointer) -> String {
 /// The one-line banner printed when a run starts.
 pub fn render_start_banner(lane: Lane, dual: bool) -> String {
     if dual {
-        "Starting dual-mine (CPU·XMR + GPU·RVN) — Ctrl-C or `alice-miner stop` to stop.\n".to_string()
+        // Dual's GPU partner is the PRL mainline unless RVN was explicitly selected
+        // (mirrors `engine.rs` `start_run`'s `gpu_lane`).
+        let gpu = if lane == Lane::GpuRvn { "RVN" } else { "PRL" };
+        format!(
+            "Starting dual-mine (CPU·XMR + GPU·{gpu}) — Ctrl-C or `alice-miner stop` to stop.\n"
+        )
     } else {
         format!(
             "Starting {} lane — Ctrl-C or `alice-miner stop` to stop.\n",

@@ -95,11 +95,11 @@ impl ShotRunner {
                 // colour/state semantics survive without pulses/sweeps/tween.
                 Shot { file: "home-mining-reduced-motion.png", pose: pose_home_mining_rm },
                 // ── M3: lane viability on Home ──────────────────────────────
-                // This Mac (Apple Silicon): RVN shows "coming soon", XMR default.
+                // This Mac (Apple Silicon): PRL shows "needs NVIDIA/AMD GPU", XMR default.
                 Shot { file: "home-idle-lanes-apple.png", pose: pose_home_idle },
-                // A simulated NVIDIA box: RVN becomes selectable + recommended.
+                // A simulated NVIDIA box: PRL becomes selectable + recommended.
                 Shot { file: "home-idle-lanes-nvidia.png", pose: pose_home_idle_nvidia },
-                // The same NVIDIA box's dashboard (RVN row reads "ready").
+                // The same NVIDIA box's dashboard (PRL row reads "ready").
                 Shot { file: "dashboard-nvidia.png", pose: pose_dashboard_nvidia },
                 // ── M4: dual-mine + failover ────────────────────────────────
                 // This Mac (Apple Silicon): the dual-mine toggle renders DISABLED
@@ -117,13 +117,14 @@ impl ShotRunner {
                 // (honest: accounting live, payout off, explorer deep-link) + the
                 // reconciliation badge ("activity flowing").
                 Shot { file: "dashboard-m5-mining.png", pose: pose_dashboard_m5_mining },
-                // The M3 follow-up FIX, visualised: dashboard IDLE on an NVIDIA box
-                // with RVN selected → RVN row reads "ready" + the Connection
-                // endpoint reflects the lane. Reconciliation badge reads "idle".
-                Shot { file: "dashboard-m5-idle-rvn-endpoint.png", pose: pose_dashboard_m5_idle_rvn },
-                // The DEFINITIVE :8888 proof (short page): Settings → Network on an
-                // NVIDIA box, RVN selected → Endpoint reads :8888, not :3333.
-                Shot { file: "settings-m5-rvn-endpoint.png", pose: pose_settings_rvn_endpoint },
+                // The lane-aware endpoint, visualised: dashboard IDLE on an NVIDIA
+                // box with PRL (the GPU mainline) selected → PRL row reads "ready" +
+                // the Connection endpoint reflects the lane. Badge reads "idle".
+                Shot { file: "dashboard-m5-idle-prl-endpoint.png", pose: pose_dashboard_m5_idle_prl },
+                // The DEFINITIVE :3340 proof (short page): Settings → Network on an
+                // NVIDIA box, PRL selected → Endpoint reads the region relay :3340,
+                // not :3333.
+                Shot { file: "settings-m5-prl-endpoint.png", pose: pose_settings_prl_endpoint },
                 // The Source-B fast-follow path rendered honestly: a CONFIRMED
                 // credit state shows ONLY "pending" (never the number) + "in sync".
                 Shot { file: "dashboard-m5-credit-confirmed.png", pose: pose_dashboard_m5_confirmed },
@@ -279,7 +280,7 @@ pub fn drive(app: &mut MinerApp, ctx: &egui::Context) {
 // the hero/cards read exactly as designed. Re-applied every shot frame.
 
 /// A demo device line so the model row reads like a real machine (this Mac:
-/// Apple Silicon, unified-memory GPU → RVN is "coming soon", XMR is the lane).
+/// Apple Silicon, unified-memory GPU → PRL needs an NVIDIA/AMD GPU, XMR is the lane).
 /// A2a: pose the GPU-PRL unlock-password modal — a keystore-backed identity asked
 /// to start the PoP-gated PRL lane, so the app prompts for the wallet password.
 /// (The modal draws whenever `prl_unlock` is `Some`, independent of `screen`.)
@@ -315,7 +316,7 @@ fn demo_device() -> DeviceProfile {
     }
 }
 
-/// A simulated NVIDIA box (for the M3 lane-select shot): RVN becomes selectable
+/// A simulated NVIDIA box (for the M3 lane-select shot): PRL becomes selectable
 /// and recommended. NOT this Mac — purely a posed capture to prove the UI flips.
 fn demo_nvidia_device() -> DeviceProfile {
     DeviceProfile {
@@ -580,20 +581,20 @@ fn pose_dashboard_mining(app: &mut MinerApp) {
     seed_log(app);
 }
 
-/// M3: Home idle on a SIMULATED NVIDIA box — RVN becomes selectable + the
+/// M3: Home idle on a SIMULATED NVIDIA box — PRL becomes selectable + the
 /// recommended/default lane (proves the viability matrix flips the UI). NOT this
 /// Mac; a posed capture only.
 fn pose_home_idle_nvidia(app: &mut MinerApp) {
     app.onboarding = None;
     app.screen = Screen::Home;
-    app.set_device(demo_nvidia_device()); // recomputes viability → RVN recommended
+    app.set_device(demo_nvidia_device()); // recomputes viability → PRL recommended
     install_demo_identity(app);
     app.error = None;
     app.snapshot = None;
     app.hr_display_khs = 0.0;
 }
 
-/// M3: the NVIDIA box's dashboard — the RVN lane row reads "ready" (viable).
+/// M3: the NVIDIA box's dashboard — the PRL lane row reads "ready" (viable).
 fn pose_dashboard_nvidia(app: &mut MinerApp) {
     app.onboarding = None;
     app.screen = Screen::Dashboard;
@@ -612,7 +613,7 @@ fn pose_dashboard_nvidia(app: &mut MinerApp) {
 fn pose_home_dual_enabled_nvidia(app: &mut MinerApp) {
     app.onboarding = None;
     app.screen = Screen::Home;
-    app.set_device(demo_nvidia_device()); // RVN viable → dual_viable() == true
+    app.set_device(demo_nvidia_device()); // PRL viable → dual_viable() == true
     install_demo_identity(app);
     app.error = None;
     app.snapshot = None;
@@ -621,7 +622,7 @@ fn pose_home_dual_enabled_nvidia(app: &mut MinerApp) {
     app.dual_confirm_open = false;
 }
 
-/// A dual-mine *running* snapshot: BOTH lanes live (CPU-XMR + GPU-RVN), with the
+/// A dual-mine *running* snapshot: BOTH lanes live (CPU-XMR + GPU-PRL), with the
 /// XMR lane having failed over once to demonstrate the M4 endpoint note. The
 /// per-lane breakdown drives the two-row lane stack; top-level mirrors the
 /// (XMR) primary with a summed hashrate. Credit-only activity only.
@@ -630,9 +631,9 @@ fn demo_dual_snapshot() -> Snapshot {
         state: EngineState::Running,
         device: Some(demo_nvidia_device()),
         lane: Some(Lane::Xmr),
-        // Top-level hashrate = XMR (8.4 kH/s) + RVN (25.4 MH/s) summed in H/s.
-        hashrate_hs: Some(8_400.0 + 25_430_000.0),
-        shares_accepted: 142 + except_rvn_accepted(),
+        // Top-level hashrate = XMR (8.4 kH/s) + PRL (31.2 MH/s) summed in H/s.
+        hashrate_hs: Some(8_400.0 + 31_210_000.0),
+        shares_accepted: 142 + demo_prl_accepted(),
         shares_rejected: 1,
         endpoint: Some("hk.aliceprotocol.org:3333".into()),
         worker_id: Some("rig-7f3a9c21".into()),
@@ -650,12 +651,12 @@ fn demo_dual_snapshot() -> Snapshot {
                 failovers: 1,
             },
             alice_miner_core::engine::LaneSnapshot {
-                lane: Lane::GpuRvn,
+                lane: Lane::GpuPrl,
                 state: EngineState::Running,
-                hashrate_hs: Some(25_430_000.0),
-                shares_accepted: except_rvn_accepted(),
+                hashrate_hs: Some(31_210_000.0),
+                shares_accepted: demo_prl_accepted(),
                 shares_rejected: 0,
-                endpoint: Some("hk.aliceprotocol.org:8888".into()),
+                endpoint: Some("fi.aliceprotocol.org:3340".into()),
                 failovers: 0,
             },
         ],
@@ -665,9 +666,9 @@ fn demo_dual_snapshot() -> Snapshot {
     }
 }
 
-/// A fixed RVN accepted-share count for the dual demo (kept as a fn so both the
+/// A fixed PRL accepted-share count for the dual demo (kept as a fn so both the
 /// per-lane row and the top-level sum use the same value).
-fn except_rvn_accepted() -> u64 {
+fn demo_prl_accepted() -> u64 {
     58
 }
 
@@ -682,7 +683,7 @@ fn pose_dashboard_dual_failover(app: &mut MinerApp) {
     app.snapshot = Some(demo_dual_snapshot());
     // The top-level (summed) hashrate is dominated by the GPU lane — pin the
     // display so the header/cards read a stable big number.
-    pin_mining_anim(app, (8_400.0 + 25_430_000.0) / 1000.0);
+    pin_mining_anim(app, (8_400.0 + 31_210_000.0) / 1000.0);
     seed_log(app);
 }
 
@@ -704,35 +705,35 @@ fn pose_dashboard_m5_mining(app: &mut MinerApp) {
     app.credit_state = alice_miner_core::CreditState::NotExposed;
 }
 
-/// M5 (the M3 follow-up FIX visualised): dashboard IDLE on a simulated NVIDIA box
-/// with the RVN lane SELECTED — the Connection endpoint must read :8888, NOT the
-/// old hardcoded :3333. Not mining, so the lane rows + endpoint show the idle
-/// (selected-lane) state.
-fn pose_dashboard_m5_idle_rvn(app: &mut MinerApp) {
+/// M5 (the lane-aware endpoint visualised): dashboard IDLE on a simulated NVIDIA
+/// box with the **PRL mainline** SELECTED — the Connection endpoint must read the
+/// region relay `:3340`, NOT the old hardcoded `:3333`. Not mining, so the lane
+/// rows + endpoint show the idle (selected-lane) state.
+fn pose_dashboard_m5_idle_prl(app: &mut MinerApp) {
     app.onboarding = None;
     app.screen = Screen::Dashboard;
-    app.set_device(demo_nvidia_device()); // RVN becomes runnable
+    app.set_device(demo_nvidia_device()); // PRL becomes runnable
     install_demo_identity(app);
     app.error = None;
     app.snapshot = None; // idle / not connected → display_endpoint uses the lane
-    app.select_lane(Lane::GpuRvn); // → :8888 (the fix)
+    app.select_lane(Lane::GpuPrl); // → :3340 (the region relay)
     app.hr_display_khs = 0.0;
     app.credit_state = alice_miner_core::CreditState::NotExposed;
 }
 
-/// M5 (the M3 follow-up FIX, definitive visual proof): the Settings → Network
-/// panel on a simulated NVIDIA box with RVN selected. Settings is a short page so
-/// the Network "Endpoint" row — which uses the SAME lane-aware `display_endpoint()`
-/// — is clearly in view, reading `hk.aliceprotocol.org:8888` (NOT the old
-/// hardcoded :3333) while idle.
-fn pose_settings_rvn_endpoint(app: &mut MinerApp) {
+/// M5 (the lane-aware endpoint, definitive visual proof): the Settings → Network
+/// panel on a simulated NVIDIA box with the **PRL mainline** selected. Settings is
+/// a short page so the Network "Endpoint" row — which uses the SAME lane-aware
+/// `display_endpoint()` — is clearly in view, reading a region relay on `:3340`
+/// (NOT the old hardcoded `:3333`) while idle.
+fn pose_settings_prl_endpoint(app: &mut MinerApp) {
     app.onboarding = None;
     app.screen = Screen::Settings;
-    app.set_device(demo_nvidia_device()); // RVN runnable
+    app.set_device(demo_nvidia_device()); // PRL runnable
     install_demo_identity(app);
     app.error = None;
     app.snapshot = None; // idle → endpoint reflects the selected lane
-    app.select_lane(Lane::GpuRvn); // → :8888 (the fix)
+    app.select_lane(Lane::GpuPrl); // → :3340 (the region relay)
 }
 
 /// M5: the Source-B fast-follow path rendered honestly — a CONFIRMED credit state
@@ -810,7 +811,7 @@ fn pose_dashboard_prl_return(app: &mut MinerApp) {
 // ── Change reward address poses (post-onboarding) ────────────────────────────
 
 /// Reset the lane selection to the device default so a prior NVIDIA pose doesn't
-/// leave RVN "selected" on an Apple demo device (purely a shot-harness hygiene
+/// leave PRL "selected" on an Apple demo device (purely a shot-harness hygiene
 /// fix; the product recomputes this from the live device).
 fn reset_lane_to_device_default(app: &mut MinerApp) {
     app.lane_user_picked = false;

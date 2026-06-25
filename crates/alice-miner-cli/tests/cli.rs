@@ -220,7 +220,8 @@ fn dual_refuses_on_a_single_viable_lane_box() {
         .code(2)
         .stderr(
             predicate::str::contains("dual-mine needs 2 viable lanes")
-                .and(predicate::str::contains("GPU · RVN")),
+                // Dual's GPU partner is the PRL mainline → the honest reason names PRL.
+                .and(predicate::str::contains("GPU · PRL")),
         );
 }
 
