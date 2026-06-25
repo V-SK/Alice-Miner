@@ -129,7 +129,7 @@ jobs:
           REL_TAG="${ALICE_ENGINE_REL_TAG:-engine-bin-v0.1.0}"
           fetch() { # <asset> <out>
             [ -f "engine-stage/$2" ] && return 0
-            echo "Fetching engine asset $1 from release $REL_TAG…"
+            echo "Fetching engine asset $1 from release ${REL_TAG}..."
             gh release download "$REL_TAG" -R "$GITHUB_REPOSITORY" -p "$1" -O "engine-stage/$2" --clobber || true
           }
           case "${{ matrix.target }}" in
