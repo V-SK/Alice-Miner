@@ -25,7 +25,9 @@
 
 #![allow(dead_code)]
 
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use super::gpu_rvn::GpuLaunchPlan;
 use super::xmr::{derive_worker_id, MINING_EXECUTION_ALLOWED};
@@ -130,6 +132,119 @@ pub fn build_srbminer_pearl_launch_plan_for(
         pop_token,
         log_path,
     )
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Region selection (lowest-RTT-wins, with an operator override)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Env override: force a specific region by its short tag (`us` / `asia` / `fi`).
+/// When set to a KNOWN tag it REPLACES the RTT probe; an unknown/empty value is
+/// ignored (falls back to the RTT probe).
+pub const ENV_REGION: &str = "ALICE_GPU_RELAY_REGION";
+
+/// Per-region TCP-connect timeout for the RTT probe. A region that doesn't
+/// answer within this is treated as unreachable (skipped). Kept short so the
+/// startup probe over all three regions is bounded (~3×).
+const RTT_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Order the region relay [`Endpoint`]s by ascending TCP-connect RTT to their
+/// `:3340` stratum port, putting the lowest-latency region first. The full set is
+/// always returned (Layer-A failover + the supervisor's Layer-B cursor still want
+/// every region) — only the ORDER changes.
+///
+/// Resolution:
+///   1. `$ALICE_GPU_RELAY_REGION=<tag>` (us/asia/fi) → that region is forced to
+///      the head (no probe); unknown/empty values are ignored.
+///   2. otherwise probe all three with [`probe_rtt`] and sort by latency;
+///      unreachable regions sort last (in their default order).
+///   3. if EVERY region is unreachable, fall back to the US-first default order
+///      (so the lane still launches and the miner's own reconnect can take over).
+pub fn select_region_endpoints() -> Vec<Endpoint> {
+    let defaults = region_default_endpoints();
+
+    // (1) Operator override by region tag.
+    if let Ok(tag) = std::env::var(ENV_REGION) {
+        let tag = tag.trim().to_ascii_lowercase();
+        if let Some(idx) = REGION_HOSTS.iter().position(|(t, _)| *t == tag) {
+            let mut ordered = vec![defaults[idx].clone()];
+            ordered.extend(
+                defaults
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != idx)
+                    .map(|(_, e)| e.clone()),
+            );
+            return ordered;
+        }
+        // unknown/empty tag → fall through to the RTT probe.
+    }
+
+    // (2) RTT probe each region; sort reachable-first by ascending latency.
+    let mut scored: Vec<(Option<Duration>, Endpoint)> = defaults
+        .iter()
+        .map(|e| (probe_rtt(&e.host, e.port), e.clone()))
+        .collect();
+    // Stable sort: Some(rtt) ascending first, None (unreachable) last keeping the
+    // default relative order among unreachable ones.
+    scored.sort_by(|a, b| match (a.0, b.0) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+
+    let ordered: Vec<Endpoint> = scored.into_iter().map(|(_, e)| e).collect();
+    // (3) If nothing was reachable the sort is a no-op (all None) → this is exactly
+    // the US-first default order, which is the desired fallback.
+    if ordered.is_empty() {
+        defaults
+    } else {
+        ordered
+    }
+}
+
+/// TCP-connect RTT to `host:port`, or `None` if it can't be reached within
+/// [`RTT_PROBE_TIMEOUT`]. Resolves the host then times a `connect_timeout` to the
+/// FIRST resolved address (the cheapest reachability+latency signal without a
+/// full stratum handshake). Never panics.
+fn probe_rtt(host: &str, port: u16) -> Option<Duration> {
+    let addr = (host, port)
+        .to_socket_addrs()
+        .ok()?
+        .next()?; // first resolved socket addr
+    let start = Instant::now();
+    match TcpStream::connect_timeout(&addr, RTT_PROBE_TIMEOUT) {
+        Ok(stream) => {
+            // Close immediately; we only wanted the connect latency.
+            drop(stream);
+            Some(start.elapsed())
+        }
+        Err(_) => None,
+    }
+}
+
+/// Build an [`EndpointPlan`] for the GPU-PRL lane with the regions ordered by
+/// lowest RTT (the operator override / probe / US-first fallback from
+/// [`select_region_endpoints`]). The engine uses this so the lane's primary
+/// (cursor-0) endpoint is the nearest region; Layer-B still advances through the
+/// rest on no-progress.
+pub fn region_plan_by_rtt() -> EndpointPlan {
+    EndpointPlan::new(select_region_endpoints())
+        .unwrap_or_else(|_| EndpointPlan::single(default_region_endpoint()))
+}
+
+/// The US-first default region endpoint (the ultimate fallback head).
+pub fn default_region_endpoint() -> Endpoint {
+    Endpoint::plaintext(REGION_HOSTS[0].1, GPU_RELAY_PORT)
+}
+
+/// The `<host>:<port>` authority for the ACTIVE (cursor) endpoint of a plan — the
+/// region the PoP handshake must target (the token is region-bound). Returns the
+/// host (no port) too, since the PoP challenge URL is `https://<host>/m4/challenge`
+/// (port-independent control plane).
+pub fn active_region_host(plan: &EndpointPlan) -> String {
+    plan.current().host.clone()
 }
 
 /// The lane id (for the engine + UI). Always [`Lane::GpuPrl`].
@@ -274,6 +389,83 @@ mod tests {
         .unwrap();
         let pool = lplan.args.iter().position(|x| x == "--pool").unwrap();
         assert_eq!(lplan.args[pool + 1], "stratum+tcp://asia.aliceprotocol.org:3340");
+    }
+
+    // Region-selection env override is process-global; serialize the tests that
+    // read/write it so parallel cargo threads can't observe each other's value.
+    static REGION_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn region_override_forces_tag_to_head_keeping_full_set() {
+        let _g = REGION_ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var(ENV_REGION).ok();
+        // Force asia → asia must be cursor-0, all three regions still present.
+        std::env::set_var(ENV_REGION, "asia");
+        let eps = select_region_endpoints();
+        assert_eq!(eps.len(), 3, "the full region set is always returned");
+        assert_eq!(eps[0].host, "asia.aliceprotocol.org");
+        assert!(eps.iter().all(|e| e.port == GPU_RELAY_PORT));
+        // Every default host is still represented (only the ORDER changed).
+        for (_, host) in REGION_HOSTS {
+            assert!(eps.iter().any(|e| e.host == host), "missing region {host}");
+        }
+        // Case-insensitive.
+        std::env::set_var(ENV_REGION, "FI");
+        assert_eq!(select_region_endpoints()[0].host, "fi.aliceprotocol.org");
+
+        match prev {
+            Some(v) => std::env::set_var(ENV_REGION, v),
+            None => std::env::remove_var(ENV_REGION),
+        }
+    }
+
+    #[test]
+    fn region_override_unknown_tag_does_not_force_head() {
+        let _g = REGION_ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var(ENV_REGION).ok();
+        // An unknown tag is ignored (falls through to the RTT probe). We can't
+        // assert the probe's ORDER offline, but the set must be intact + non-empty
+        // and contain exactly the three region hosts.
+        std::env::set_var(ENV_REGION, "atlantis");
+        let eps = select_region_endpoints();
+        assert_eq!(eps.len(), 3);
+        for (_, host) in REGION_HOSTS {
+            assert!(eps.iter().any(|e| e.host == host));
+        }
+        match prev {
+            Some(v) => std::env::set_var(ENV_REGION, v),
+            None => std::env::remove_var(ENV_REGION),
+        }
+    }
+
+    #[test]
+    fn active_region_host_is_cursor_host() {
+        let mut plan = EndpointPlan::new(vec![
+            Endpoint::plaintext("us.aliceprotocol.org", GPU_RELAY_PORT),
+            Endpoint::plaintext("asia.aliceprotocol.org", GPU_RELAY_PORT),
+        ])
+        .unwrap();
+        assert_eq!(active_region_host(&plan), "us.aliceprotocol.org");
+        plan.advance();
+        assert_eq!(active_region_host(&plan), "asia.aliceprotocol.org");
+    }
+
+    #[test]
+    fn region_plan_by_rtt_is_relay_only_full_set() {
+        let _g = REGION_ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        // Force a deterministic head so this never depends on the network probe.
+        let prev = std::env::var(ENV_REGION).ok();
+        std::env::set_var(ENV_REGION, "us");
+        let plan = region_plan_by_rtt();
+        let ordered = plan.ordered_from_cursor();
+        assert_eq!(ordered.len(), 3);
+        assert!(ordered
+            .iter()
+            .all(|e| e.host.ends_with("aliceprotocol.org") && e.port == GPU_RELAY_PORT));
+        match prev {
+            Some(v) => std::env::set_var(ENV_REGION, v),
+            None => std::env::remove_var(ENV_REGION),
+        }
     }
 
     #[test]

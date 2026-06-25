@@ -399,6 +399,99 @@ fn central_url(env_key: &str, path: &str) -> Result<String, String> {
     Ok(url)
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// High-level PoP startup sequence (region-bound)
+//
+// The mining-side orchestration of the four primitives above: given a region
+// host, the user's Alice address + device id, and the wallet SIGNING key, run the
+// full handshake and return the stratum/OOB password token bound to THAT region.
+// Re-used verbatim by (a) the lane's initial start and (b) the supervisor's
+// Layer-B rebuild (a failover to a DIFFERENT region must re-challenge + re-sign +
+// re-verify because the token is region-bound — a token minted for region A is
+// rejected by region B).
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The region-bound result of a successful PoP handshake: the assembled password
+/// token plus the region host it is bound to (so callers can assert/relog it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopToken {
+    /// `pop=<challenge_id>:<sig>` — rides the stratum `--password`.
+    pub password: String,
+    /// The region relay host this token was minted+verified against.
+    pub region_host: String,
+}
+
+/// Run the full region-bound PoP startup sequence for ONE region:
+///   1. `fetch_challenge(https://<region_host>/m4/challenge)` → mint a nonce.
+///   2. sign `pop_signature_message(alice, Some(device_id), nonce)` with the
+///      wallet sr25519 key (fails closed for a watch-only / display-only secret).
+///   3. `assemble_pop_password(challenge_id, sig)` → the `pop=…` token.
+///   4. best-effort `oob_verify(https://<region_host>/m4/verify, …)` — OOB
+///      enrolment into the relay's allowlist (the real authorization). A `false`
+///      here is logged-and-continued by the caller (the relay is the authority);
+///      it is NOT a hard error so a transient verify hiccup doesn't block mining.
+///
+/// Returns the [`PopToken`] (password + region) on success. Fails closed (Err) if
+/// the signing key is unavailable or the challenge can't be fetched — under the
+/// relay's `REQUIRE_POP=1` a missing/garbage token earns nothing, so there is no
+/// point launching the miner without a real token.
+///
+/// `oob_ok_out`, when supplied, receives the best-effort OOB verify result (so the
+/// caller can surface "not yet in the allowlist" without a second round-trip).
+pub fn establish_pop(
+    region_host: &str,
+    alice_address: &str,
+    device_id: &str,
+    secrets: &WalletSecrets,
+    oob_ok_out: Option<&mut bool>,
+) -> Result<PopToken, String> {
+    // (2-pre) Fail closed BEFORE any network if we can't sign — a watch-only /
+    // display-only identity can never PoP, so there is nothing to fetch.
+    //   (sign_message_b64 also checks this, but checking up front avoids a wasted
+    //    challenge round-trip and gives the clearest user-facing error.)
+    if secrets.to_keypair().is_err() {
+        return Err(
+            "this reward identity is watch-only (address pasted, no signing key); the GPU-PRL \
+             lane needs a wallet key to prove possession — import the mnemonic/seed instead"
+                .into(),
+        );
+    }
+
+    let challenge_url = region_challenge_url(region_host)?;
+    // (1) challenge.
+    let challenge = fetch_challenge(&challenge_url, alice_address, device_id)?;
+    // (2) sign the nonce (region-agnostic bytes, but minted per region).
+    let msg = pop_signature_message(alice_address, Some(device_id), &challenge.challenge_nonce);
+    let sig_b64 = sign_message_b64(secrets, &msg)?;
+    // (3) assemble.
+    let password = assemble_pop_password(&challenge.challenge_id, &sig_b64)?;
+    // (4) best-effort OOB confirm (the relay allowlist is the real gate).
+    let verify_u = verify_url(&challenge_url)?;
+    let ok = oob_verify(&verify_u, alice_address, device_id, &password);
+    if let Some(slot) = oob_ok_out {
+        *slot = ok;
+    }
+    Ok(PopToken {
+        password,
+        region_host: region_host.to_string(),
+    })
+}
+
+/// OOB allowlist TTL: the relay drops a proven `(address, device)` from its PoP
+/// allowlist after this long without a re-verify (server: 1800s). The refresh
+/// task must re-challenge+re-verify BEFORE this elapses or the lane silently
+/// stops being credited.
+pub const OOB_ALLOWLIST_TTL: Duration = Duration::from_secs(1800);
+
+/// Re-verify margin: re-run the PoP handshake when fewer than this many seconds
+/// remain on the TTL (so a re-verify always lands with headroom; 300s per task).
+pub const OOB_REFRESH_MARGIN: Duration = Duration::from_secs(300);
+
+/// How often the refresh task wakes to check whether a re-verify is due. ~60s per
+/// task — cheap, and well inside the [`OOB_REFRESH_MARGIN`] so a due re-verify is
+/// never missed by more than one tick.
+pub const OOB_REFRESH_TICK: Duration = Duration::from_secs(60);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +562,36 @@ mod tests {
         // A display-only secrets value has no key → sign must fail closed.
         let watch = WalletSecrets::display_only(ADDR);
         assert!(sign_message_b64(&watch, b"msg").is_err());
+    }
+
+    #[test]
+    fn establish_pop_fails_closed_for_watch_only_before_any_network() {
+        // A watch-only identity (pasted address, no key) must be rejected up front
+        // with a clear message — and crucially BEFORE any control-plane call (so a
+        // pasted address can never even probe the relay). No network is reached.
+        let watch = WalletSecrets::display_only(ADDR);
+        let mut ok = true;
+        let err = establish_pop(
+            "us.aliceprotocol.org",
+            ADDR,
+            DEV,
+            &watch,
+            Some(&mut ok),
+        )
+        .unwrap_err();
+        assert!(err.contains("watch-only"), "clear watch-only error: {err}");
+        // The oob_ok slot is left untouched (we never reached the verify step).
+        assert!(ok, "no network step ran, so the oob flag was not written");
+    }
+
+    #[test]
+    fn pop_refresh_constants_match_server_ttl() {
+        // The TTL/margin/tick must keep a re-verify comfortably inside the window:
+        // tick < margin < ttl, and margin leaves real headroom.
+        assert_eq!(OOB_ALLOWLIST_TTL, Duration::from_secs(1800));
+        assert_eq!(OOB_REFRESH_MARGIN, Duration::from_secs(300));
+        assert!(OOB_REFRESH_TICK < OOB_REFRESH_MARGIN);
+        assert!(OOB_REFRESH_MARGIN < OOB_ALLOWLIST_TTL);
     }
 
     // ── HTTPS control plane (NO network — pure URL/JSON logic only) ────────────
