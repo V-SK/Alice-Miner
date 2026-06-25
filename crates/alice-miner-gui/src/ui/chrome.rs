@@ -13,7 +13,7 @@ use super::icons::{self, Icon};
 use super::theme::THEME;
 use super::widgets::{self, Tone};
 use crate::app::{MinerApp, Screen};
-use alice_miner_core::EngineState;
+use alice_miner_core::{EngineState, Lane};
 
 /// Render the whole window: titlebar + rail + content.
 pub fn render(ui_root: &mut egui::Ui, app: &mut MinerApp) {
@@ -137,13 +137,31 @@ fn titlebar(ui_root: &mut egui::Ui, app: &mut MinerApp) {
 
 /// Map the engine state to the titlebar pill (tone, label, blink).
 fn status_for(app: &MinerApp) -> (Tone, String, bool) {
-    let lane = "XMR";
     match app.state() {
-        EngineState::Running => (Tone::Live, format!("Mining · {lane}"), true),
+        EngineState::Running => {
+            // Reflect the ACTUAL active lane (was hardcoded "XMR" — wrong for the
+            // GPU-PRL mainline and for dual-mine).
+            let dual = app.snapshot.as_ref().map(|s| s.dual).unwrap_or(false);
+            let lane = pill_lane_label(app.active_lane(), dual);
+            (Tone::Live, format!("Mining · {lane}"), true)
+        }
         EngineState::Starting => (Tone::Warn, "Connecting".into(), true),
         EngineState::Stopping => (Tone::Warn, "Stopping".into(), true),
         EngineState::Error => (Tone::Danger, "Error".into(), false),
         EngineState::Idle => (Tone::Off, "Idle".into(), false),
+    }
+}
+
+/// The short lane tag for the titlebar mining pill. Dual-mine reads "Dual"; a
+/// single lane reads its short tag (XMR / PRL / RVN).
+fn pill_lane_label(lane: Lane, dual: bool) -> &'static str {
+    if dual {
+        return "Dual";
+    }
+    match lane {
+        Lane::Xmr => "XMR",
+        Lane::GpuPrl => "PRL",
+        Lane::GpuRvn => "RVN",
     }
 }
 
@@ -244,5 +262,21 @@ fn nav_item(ui: &mut egui::Ui, icon: Icon, active: bool, enabled: bool) -> egui:
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
         resp
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pill_lane_label_reflects_active_lane_not_hardcoded_xmr() {
+        // Single-lane: the tag is the active lane (regression: was always "XMR").
+        assert_eq!(pill_lane_label(Lane::Xmr, false), "XMR");
+        assert_eq!(pill_lane_label(Lane::GpuPrl, false), "PRL");
+        assert_eq!(pill_lane_label(Lane::GpuRvn, false), "RVN");
+        // Dual-mine reads "Dual" regardless of the primary lane.
+        assert_eq!(pill_lane_label(Lane::Xmr, true), "Dual");
+        assert_eq!(pill_lane_label(Lane::GpuPrl, true), "Dual");
     }
 }

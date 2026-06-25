@@ -216,7 +216,9 @@ pub fn drive(app: &mut MinerApp, ctx: &egui::Context) {
     match runner.phase {
         Phase::Settling => {
             // Re-pose every settle frame so the injected state is not clobbered
-            // by anything else (and `tick_anim` keeps the gauge pinned).
+            // by anything else (and `tick_anim` keeps the gauge pinned). Reset
+            // transient overlays first so a prior pose's modal can't leak in.
+            reset_transient_overlays(app);
             (runner.shots[runner.idx].pose)(app);
             if runner.frame >= SETTLE_FRAMES {
                 // Ask egui for the framebuffer; it arrives next frame as an event.
@@ -231,6 +233,7 @@ pub fn drive(app: &mut MinerApp, ctx: &egui::Context) {
         }
         Phase::Awaiting => {
             // Re-pose (the capture frame paints this) and look for the result.
+            reset_transient_overlays(app);
             (runner.shots[runner.idx].pose)(app);
             let image = ctx.input(|i| {
                 i.events.iter().rev().find_map(|e| {
@@ -278,6 +281,20 @@ pub fn drive(app: &mut MinerApp, ctx: &egui::Context) {
 // Each pose forces the app into a deterministic state WITHOUT the real engine:
 // it overrides `screen`, `onboarding`, `snapshot`, and the animation fields so
 // the hero/cards read exactly as designed. Re-applied every shot frame.
+
+/// Clear the transient overlay/modal state that NOT every pose sets explicitly,
+/// so one pose's overlay can't leak onto the next shot. (The PRL unlock modal
+/// draws whenever `prl_unlock` is `Some` regardless of screen, so without this a
+/// `pose_prl_unlock` earlier in the list would paint its modal over every later
+/// Home/Dashboard shot.) Called right before each pose is (re-)applied; the pose
+/// then re-asserts whatever overlay it actually wants.
+fn reset_transient_overlays(app: &mut MinerApp) {
+    app.prl_unlock = None;
+    app.dual_requested = false;
+    app.dual_confirm_open = false;
+    app.change_addr = None;
+    app.credit_state = alice_miner_core::CreditState::NotExposed;
+}
 
 /// A demo device line so the model row reads like a real machine (this Mac:
 /// Apple Silicon, unified-memory GPU → PRL needs an NVIDIA/AMD GPU, XMR is the lane).
