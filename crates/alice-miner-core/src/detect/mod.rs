@@ -94,6 +94,25 @@ impl GpuVendor {
     }
 }
 
+/// A single enumerated GPU (one physical device). Populated for NVIDIA via
+/// `nvidia-smi --query-gpu=index,name,memory.total,uuid` (one row per card),
+/// which is the prerequisite for **per-card lane scheduling** (multi-GPU). AMD /
+/// Apple / no-GPU machines leave the enumerated list empty (or a single
+/// best-effort entry) — per-GPU enumeration is an NVIDIA-only capability in v1
+/// because only `nvidia-smi` exposes a stable per-device index + UUID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuDevice {
+    /// Stable per-process device index as reported by `nvidia-smi` (0-based).
+    pub index: u32,
+    /// Model string for this card (e.g. `NVIDIA GeForce RTX 3090`).
+    pub name: String,
+    /// This card's total VRAM in whole GB (rounded from the reported MiB).
+    pub vram_gb: u32,
+    /// The card's persistent UUID (e.g. `GPU-abc…`), used to pin a card across
+    /// reboots / index reshuffles. Empty when the probe didn't report one.
+    pub uuid: String,
+}
+
 /// The detected GPU. For NVIDIA we read the model + VRAM from `nvidia-smi`; for
 /// AMD we record the vendor as **label-only** (no confirmed KawPoW path bundled
 /// yet, so `vram_gb` stays 0 and the lane is "coming soon"); for Apple Silicon
@@ -109,6 +128,15 @@ pub struct GpuInfo {
     pub model: String,
     /// Dedicated GPU VRAM in whole GB (NVIDIA only; 0 for Apple/AMD/none).
     pub vram_gb: u32,
+    /// The per-GPU enumeration (one entry per physical card) — the prerequisite
+    /// for per-card lane scheduling. NVIDIA-only in v1 (populated from
+    /// `nvidia-smi`'s `index,name,memory.total,uuid` query); empty for
+    /// AMD/Apple/none and on any probe failure (fail-safe). The existing
+    /// `vendor`/`model`/`vram_gb` summary fields are unchanged for backward
+    /// compatibility; this list is purely additive. `#[serde(default)]` keeps
+    /// older serialized profiles (without this field) deserializable.
+    #[serde(default)]
+    pub gpus: Vec<GpuDevice>,
 }
 
 impl GpuInfo {
@@ -117,6 +145,7 @@ impl GpuInfo {
             vendor: GpuVendor::None,
             model: String::new(),
             vram_gb: 0,
+            gpus: Vec::new(),
         }
     }
 }
@@ -377,6 +406,9 @@ fn probe_gpu(
             vendor: GpuVendor::Apple,
             model,
             vram_gb: 0,
+            // Apple's GPU shares unified memory and `nvidia-smi` can't see it, so
+            // there is no per-card enumeration — leave the list empty.
+            gpus: Vec::new(),
         };
     }
 
@@ -392,6 +424,9 @@ fn probe_gpu(
             vendor: GpuVendor::Amd,
             model,
             vram_gb: 0,
+            // AMD is label-only in v1 (no bundled lane); per-card enumeration is
+            // NVIDIA-only, so the list stays empty.
+            gpus: Vec::new(),
         };
     }
 
@@ -425,11 +460,71 @@ fn probe_nvidia(runner: &dyn Runner, warnings: &mut Vec<String>) -> Option<GpuIn
     } else {
         name.to_string()
     };
+
+    // Per-GPU enumeration (one row per physical card) — the prerequisite for
+    // per-card lane scheduling. Best-effort: a failure here NEVER downgrades the
+    // single-GPU summary above (we already have a viable `GpuInfo`); we simply
+    // leave `gpus` empty, which callers treat as "enumeration unavailable" and
+    // fall back to the existing all-cards default. Fail-safe (any error → []).
+    let gpus = runner
+        .run(
+            "nvidia-smi",
+            &[
+                "--query-gpu=index,name,memory.total,uuid",
+                "--format=csv,noheader,nounits",
+            ],
+        )
+        .map(|out| parse_nvidia_devices(&out))
+        .unwrap_or_default();
+
     Some(GpuInfo {
         vendor: GpuVendor::Nvidia,
         model,
         vram_gb,
+        gpus,
     })
+}
+
+/// Parse the CSV output of
+/// `nvidia-smi --query-gpu=index,name,memory.total,uuid --format=csv,noheader,nounits`
+/// into a [`GpuDevice`] list — one row per physical card. **Pure + fail-safe:**
+/// blank lines and malformed rows (wrong column count, non-numeric index) are
+/// skipped rather than panicking; empty / all-garbage input → an empty vec.
+///
+/// With `nounits` the memory cell is a bare integer **MiB** value (e.g.
+/// `24576`); we round it to whole GB via [`parse_mib_to_gb`] (so the per-card
+/// VRAM uses the exact same rounding as the single-GPU summary). The `uuid`
+/// cell is taken verbatim (trimmed); it may legitimately be empty on drivers
+/// that don't report one.
+fn parse_nvidia_devices(stdout: &str) -> Vec<GpuDevice> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // index, name, memory.total, uuid — split into exactly 4 fields. `name`
+        // is a vendor string that never contains a comma in practice, so a plain
+        // 4-way split is safe; we still guard the column count.
+        let cols: Vec<&str> = line.splitn(4, ',').map(str::trim).collect();
+        if cols.len() != 4 {
+            continue; // malformed row → skip (fail-safe)
+        }
+        let Ok(index) = cols[0].parse::<u32>() else {
+            continue; // non-numeric index → skip
+        };
+        let name = cols[1].to_string();
+        // With `nounits` the cell is a bare MiB integer; reuse the GB rounding.
+        let vram_gb = parse_mib_to_gb(cols[2]);
+        let uuid = cols[3].to_string();
+        out.push(GpuDevice {
+            index,
+            name,
+            vram_gb,
+            uuid,
+        });
+    }
+    out
 }
 
 /// Parse an `nvidia-smi` memory cell (e.g. `"8192 MiB"`) → whole GB (rounded).
@@ -541,26 +636,44 @@ mod tests {
     /// probe is exercised deterministically without a real driver (the same
     /// INJECTABLE contract the Python probe uses).
     struct FakeRunner {
-        /// `Some(stdout)` → `nvidia-smi` succeeds with this output; `None` → it
-        /// "fails" (absent driver), so the probe sees no NVIDIA.
+        /// `Some(stdout)` → the `nvidia-smi` *summary* query (name,memory.total)
+        /// succeeds with this output; `None` → it "fails" (absent driver), so the
+        /// probe sees no NVIDIA.
         nvidia: Option<String>,
+        /// `Some(stdout)` → the `nvidia-smi` *enumeration* query
+        /// (index,name,memory.total,uuid) succeeds with this output; `None` → it
+        /// fails, so `gpus` stays empty (the enumeration-unavailable fallback).
+        nvidia_enum: Option<String>,
     }
 
     impl FakeRunner {
         fn nvidia(out: &str) -> Self {
-            Self { nvidia: Some(out.to_string()) }
+            Self { nvidia: Some(out.to_string()), nvidia_enum: None }
+        }
+        /// Both the summary and the per-GPU enumeration succeed.
+        fn nvidia_with_enum(summary: &str, enumeration: &str) -> Self {
+            Self {
+                nvidia: Some(summary.to_string()),
+                nvidia_enum: Some(enumeration.to_string()),
+            }
         }
         fn no_gpu() -> Self {
-            Self { nvidia: None }
+            Self { nvidia: None, nvidia_enum: None }
         }
     }
 
     impl Runner for FakeRunner {
-        fn run(&self, program: &str, _args: &[&str]) -> Result<String, ()> {
-            if program == "nvidia-smi" {
-                self.nvidia.clone().ok_or(())
+        fn run(&self, program: &str, args: &[&str]) -> Result<String, ()> {
+            if program != "nvidia-smi" {
+                return Err(());
+            }
+            // Dispatch on the query so the summary and enumeration paths can be
+            // driven independently (mirrors the two real nvidia-smi invocations).
+            let is_enum = args.iter().any(|a| a.contains("uuid"));
+            if is_enum {
+                self.nvidia_enum.clone().ok_or(())
             } else {
-                Err(())
+                self.nvidia.clone().ok_or(())
             }
         }
     }
@@ -672,6 +785,97 @@ mod tests {
         let runner = FakeRunner::no_gpu();
         let mut warnings = Vec::new();
         assert!(probe_nvidia(&runner, &mut warnings).is_none());
+    }
+
+    #[test]
+    fn parse_nvidia_devices_parses_multi_gpu_csv() {
+        // Two cards, the `nounits` format (bare MiB integers, no " MiB" suffix).
+        let csv = "0, NVIDIA GeForce RTX 3090, 24576, GPU-abc\n\
+                   1, NVIDIA GeForce RTX 3090, 24576, GPU-def\n";
+        let devices = parse_nvidia_devices(csv);
+        assert_eq!(devices.len(), 2);
+        assert_eq!(
+            devices[0],
+            GpuDevice {
+                index: 0,
+                name: "NVIDIA GeForce RTX 3090".into(),
+                vram_gb: 24,
+                uuid: "GPU-abc".into(),
+            }
+        );
+        assert_eq!(devices[1].index, 1);
+        assert_eq!(devices[1].uuid, "GPU-def");
+    }
+
+    #[test]
+    fn parse_nvidia_devices_single_card() {
+        let devices = parse_nvidia_devices("0, NVIDIA GeForce RTX 3070 Ti, 8192, GPU-xyz\n");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].index, 0);
+        assert_eq!(devices[0].name, "NVIDIA GeForce RTX 3070 Ti");
+        assert_eq!(devices[0].vram_gb, 8);
+        assert_eq!(devices[0].uuid, "GPU-xyz");
+    }
+
+    #[test]
+    fn parse_nvidia_devices_empty_and_blank_is_empty_vec() {
+        assert!(parse_nvidia_devices("").is_empty());
+        assert!(parse_nvidia_devices("\n\n   \n").is_empty());
+    }
+
+    #[test]
+    fn parse_nvidia_devices_malformed_rows_are_skipped_not_panic() {
+        // Too few columns, a non-numeric index, and a blank line interleaved with
+        // one good row → only the good row survives; never panics.
+        let csv = "not,enough\n\
+                   x, Bad Index Card, 8192, GPU-bad\n\
+                   \n\
+                   2, NVIDIA GeForce RTX 4090, 24564, GPU-good\n";
+        let devices = parse_nvidia_devices(csv);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].index, 2);
+        assert_eq!(devices[0].vram_gb, 24);
+        assert_eq!(devices[0].uuid, "GPU-good");
+    }
+
+    #[test]
+    fn parse_nvidia_devices_handles_empty_uuid() {
+        // A driver that doesn't report a UUID leaves the 4th cell empty — still a
+        // valid 4-column row, just with an empty uuid (not skipped).
+        let devices = parse_nvidia_devices("0, NVIDIA GPU, 8192, \n");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].uuid, "");
+        assert_eq!(devices[0].vram_gb, 8);
+    }
+
+    #[test]
+    fn probe_nvidia_populates_gpus_when_enumeration_succeeds() {
+        // The summary query gives the headline card; the enumeration query lists
+        // both physical cards. `gpus` carries the per-card list; the summary
+        // fields are unchanged (backward compatible).
+        let runner = FakeRunner::nvidia_with_enum(
+            "NVIDIA GeForce RTX 3090, 24576 MiB\n",
+            "0, NVIDIA GeForce RTX 3090, 24576, GPU-abc\n\
+             1, NVIDIA GeForce RTX 3090, 24576, GPU-def\n",
+        );
+        let mut warnings = Vec::new();
+        let info = probe_nvidia(&runner, &mut warnings).expect("nvidia detected");
+        assert_eq!(info.vendor, GpuVendor::Nvidia);
+        assert_eq!(info.vram_gb, 24); // summary field unchanged
+        assert_eq!(info.gpus.len(), 2);
+        assert_eq!(info.gpus[0].index, 0);
+        assert_eq!(info.gpus[1].index, 1);
+    }
+
+    #[test]
+    fn probe_nvidia_enumeration_failure_leaves_gpus_empty_but_summary_ok() {
+        // Enumeration unavailable (only the summary query succeeds) → `gpus` is
+        // empty (the all-cards fallback) but the single-GPU summary still works.
+        let runner = FakeRunner::nvidia("NVIDIA GeForce RTX 3070 Ti, 8192 MiB\n");
+        let mut warnings = Vec::new();
+        let info = probe_nvidia(&runner, &mut warnings).expect("nvidia detected");
+        assert_eq!(info.vram_gb, 8);
+        assert!(info.gpus.is_empty());
     }
 
     #[test]

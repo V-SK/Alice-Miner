@@ -393,7 +393,7 @@ mod tests {
         profile_with(
             OsFamily::Macos,
             true,
-            GpuInfo { vendor: GpuVendor::Apple, model: "Apple M2 Max".into(), vram_gb: 0 },
+            GpuInfo { vendor: GpuVendor::Apple, model: "Apple M2 Max".into(), vram_gb: 0, gpus: Vec::new() },
         )
     }
 
@@ -405,6 +405,7 @@ mod tests {
                 vendor: GpuVendor::Nvidia,
                 model: "NVIDIA GeForce RTX 3070 Ti".into(),
                 vram_gb: 8,
+                gpus: Vec::new(),
             },
         )
     }
@@ -413,7 +414,7 @@ mod tests {
         profile_with(
             OsFamily::Linux,
             false,
-            GpuInfo { vendor: GpuVendor::Amd, model: "AMD GPU".into(), vram_gb: 0 },
+            GpuInfo { vendor: GpuVendor::Amd, model: "AMD GPU".into(), vram_gb: 0, gpus: Vec::new() },
         )
     }
 
