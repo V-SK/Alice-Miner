@@ -887,6 +887,9 @@ pub fn parse_share_counts(line: &str) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the `#[cfg(unix)]` failover tests below use these atomics (Windows skips
+    // those tests → the import would be unused there under `-D warnings`).
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 

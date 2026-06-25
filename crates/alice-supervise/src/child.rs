@@ -252,6 +252,9 @@ pub fn read_pid_file(pid_file: &Path) -> Option<u32> {
 mod tests {
     use super::*;
     use std::time::Instant;
+    // Only the `#[cfg(unix)]` spawn tests below use this (Windows skips them → the
+    // import would be unused there under `-D warnings`).
+    #[cfg(unix)]
     use tokio::sync::mpsc::unbounded_channel;
 
     fn rt() -> tokio::runtime::Runtime {
