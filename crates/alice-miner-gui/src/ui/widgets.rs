@@ -341,9 +341,14 @@ pub fn card_min_h<R>(ui: &mut Ui, width: f32, min_h: f32, inner: impl FnOnce(&mu
 
 /// A flat stat card for the dashboard grid. `accent` paints a lane-coloured top
 /// rule. `value` is rendered mono; `pending` makes it brand-coloured (no number).
+#[allow(clippy::too_many_arguments)]
 pub fn stat_card(
     ui: &mut Ui,
     width: f32,
+    // Minimum CONTENT height so a row of cards shares one bottom edge (equal-height
+    // cards) instead of each sizing to its own content — without this the four
+    // dashboard KPI cards were ragged/staircased. Pass 0.0 to size to content.
+    min_content_height: f32,
     label: &str,
     value: RichText,
     meta: Option<RichText>,
@@ -358,6 +363,7 @@ pub fn stat_card(
         .stroke(Stroke::new(1.0, t.line_strong))
         .show(ui, |ui| {
             ui.set_width(width);
+            ui.set_min_height(min_content_height);
             // WRAP (don't extend) so a long label/value/meta can never widen the
             // card past `width` in a horizontal grid — it wraps to a second line
             // instead, so text (incl. the honesty-critical "pending") is always

@@ -134,6 +134,11 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     let cols = if two_up { 2.0 } else { 4.0 };
     // Floor so rounding never pushes the summed row past `total_w`.
     let card_w = (((total_w - gap * (cols - 1.0)) / cols - CARD_CHROME_X).floor()).max(96.0);
+    // Shared minimum CONTENT height so all four cards are EQUAL height → the row has
+    // one clean top AND bottom edge. Sized to the tallest card (Hashrate, which adds
+    // a 26px sparkline under its value); the others pad up to match. Without this the
+    // cards sized to their own content and read as a crooked descending staircase.
+    const CARD_MIN_CONTENT_H: f32 = 84.0;
 
     let spark: Vec<f32> = app.spark.iter().cloned().collect();
     // The four card painters, in order. Boxed so we can lay them out in either
@@ -158,6 +163,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
                 widgets::stat_card(
                     ui,
                     card_w,
+                    CARD_MIN_CONTENT_H,
                     "Hashrate",
                     hr_val.clone(),
                     None,
@@ -177,6 +183,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
             widgets::stat_card(
                 ui,
                 card_w,
+                CARD_MIN_CONTENT_H,
                 "Shares A / R",
                 widgets::mono(format!("{a}"), 25.0, THEME.text).strong(),
                 Some(widgets::mono(format!("/ {r} rejected"), 11.5, THEME.text3)),
@@ -191,6 +198,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
                 widgets::stat_card(
                     ui,
                     card_w,
+                    CARD_MIN_CONTENT_H,
                     "Accepted",
                     widgets::mono(format!("{pct}%"), 25.0, THEME.text).strong(),
                     Some(RichText::new(if a + r > 0 { "rolling · healthy" } else { "no shares yet" }).size(11.0).color(if a + r > 0 { THEME.live } else { THEME.text3 })),
@@ -204,6 +212,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
             widgets::stat_card(
                 ui,
                 card_w,
+                CARD_MIN_CONTENT_H,
                 "Est. rewards",
                 RichText::new(strings::REWARD_PENDING_SHORT).size(20.0).strong().color(THEME.brand300),
                 Some(RichText::new(strings::REWARD_RATE_PENDING).size(11.0).color(THEME.text3)),
@@ -221,7 +230,13 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
         if row_i > 0 {
             ui.add_space(gap);
         }
-        ui.horizontal(|ui| {
+        // TOP-aligned row (cross-axis Align::Min): every card's top sits on the row
+        // baseline. `ui.horizontal()` defaults to Align::Center, which — in egui's
+        // single-pass immediate mode — centres each card against the *running* row
+        // height and produces a descending staircase. Combined with the equal
+        // `CARD_MIN_CONTENT_H` (one shared bottom edge), the four cards read as a
+        // clean grid.
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
             ui.spacing_mut().item_spacing.x = gap;
             for card in row {
                 ui.allocate_ui_with_layout(
