@@ -697,6 +697,7 @@ mod tests {
             }],
             last_line: Some("accepted (142/1)".into()),
             message: None,
+            prl_payout: None,
         }
     }
 

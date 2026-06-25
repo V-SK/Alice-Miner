@@ -15,6 +15,7 @@
 
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -166,6 +167,19 @@ pub struct Snapshot {
     /// Short, sanitised reason for an `Error`/`Stopping` state, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// GPU-PRL **15% PRL 返还** display block (A2c): a render-ready, **credit-only**
+    /// status for the dashboard's "15% PRL 返还" panel — the enrolled flag, the
+    /// user's MASKED `prl1p…` payout address, an honest "pending" text, and a
+    /// `paid` field that is **hard-pinned 0.0**. `Some` only while the primary lane
+    /// is [`Lane::GpuPrl`]; `None`/hidden for every other lane.
+    ///
+    /// **NOT serialized** (`#[serde(skip)]`): the credit-only JSON invariant forbids
+    /// any `paid`/`payout` substring in a `Snapshot`'s wire form, and this is a pure
+    /// UI render struct (it carries no minted / claimable / settleable value — see
+    /// [`crate::prl_payout::PrlPayoutDisplay`]). It is rebuilt locally each snapshot
+    /// from the (read-only) configured payout address + the enroll status flag.
+    #[serde(skip)]
+    pub prl_payout: Option<crate::prl_payout::PrlPayoutDisplay>,
 }
 
 /// One lane's live activity within a (possibly dual) run — the dashboard's
@@ -207,8 +221,26 @@ impl Snapshot {
             lanes: Vec::new(),
             last_line: None,
             message: None,
+            prl_payout: None,
         }
     }
+}
+
+/// The GPU-PRL **payout-enroll status**, shared between the async enroll task
+/// (writer) and `build_snapshot` (reader) via an [`AtomicU8`]. Credit-only: this
+/// is a binding/display status ONLY — it carries no amount, no claim, no payout
+/// value. Maps 1:1 onto the enroll attempt's [`crate::prl_payout::EnrollOutcome`].
+mod enroll_status {
+    /// Enroll not yet attempted / in flight (the default).
+    pub const PENDING: u8 = 0;
+    /// The payout address was bound (enrolled) this session.
+    pub const ENROLLED: u8 = 1;
+    /// No payout address configured → nothing to bind (not an error).
+    pub const NO_ADDRESS: u8 = 2;
+    /// Watch-only identity → we refuse to fabricate a signature (skipped).
+    pub const WATCH_ONLY: u8 = 3;
+    /// A best-effort failure (network / server); can be retried next start.
+    pub const FAILED: u8 = 4;
 }
 
 /// Events the engine emits back to the front-end.
@@ -436,6 +468,11 @@ struct RunSet {
     supervisors: Vec<LaneSupervisor>,
     /// Whether this run is dual-mine (both lanes).
     dual: bool,
+    /// GPU-PRL payout-enroll status (A2c), shared with the async enroll task.
+    /// `Some` only on a GPU-PRL run; the task writes one of the [`enroll_status`]
+    /// codes once it resolves, and `build_snapshot` reads it for the display block.
+    /// Credit-only: a binding/display status, never an amount.
+    prl_enroll: Option<Arc<AtomicU8>>,
 }
 
 impl RunSet {
@@ -570,8 +607,8 @@ fn start_run(
         // a GPU-PRL dual pairing would thread `secrets` into the PRL start here.
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let xmr_threads = dual_xmr_threads(cores);
-        let xmr_sup = start_one_lane(Lane::Xmr, address, Some(xmr_threads), None)?;
-        let rvn_sup = match start_one_lane(Lane::GpuRvn, address, None, None) {
+        let (xmr_sup, _) = start_one_lane(Lane::Xmr, address, Some(xmr_threads), None)?;
+        let (rvn_sup, _) = match start_one_lane(Lane::GpuRvn, address, None, None) {
             Ok(s) => s,
             Err(e) => {
                 // The XMR lane already started; tear it back down so we don't leave
@@ -584,15 +621,17 @@ fn start_run(
             RunSet {
                 supervisors: vec![xmr_sup, rvn_sup],
                 dual: true,
+                prl_enroll: None,
             },
             worker_id,
         ))
     } else {
-        let sup = start_one_lane(lane, address, None, secrets)?;
+        let (sup, prl_enroll) = start_one_lane(lane, address, None, secrets)?;
         Ok((
             RunSet {
                 supervisors: vec![sup],
                 dual: false,
+                prl_enroll,
             },
             worker_id,
         ))
@@ -608,7 +647,7 @@ fn start_one_lane(
     address: &str,
     threads_override: Option<usize>,
     secrets: Option<alice_crypto::WalletSecrets>,
-) -> Result<LaneSupervisor, String> {
+) -> Result<(LaneSupervisor, Option<Arc<AtomicU8>>), String> {
     // GPU-PRL targets the region relays ordered by lowest RTT (operator override /
     // probe / US-first fallback); every other lane uses its compiled plan.
     let plan = if lane == Lane::GpuPrl {
@@ -712,18 +751,23 @@ fn start_one_lane(
     // region every ~60s once fewer than OOB_REFRESH_MARGIN (~300s) remain. It
     // stops as soon as the supervisor is no longer active (a user Stop, a crash,
     // or budget-exhaustion Error), so it shares the lane's lifecycle.
+    let mut prl_enroll: Option<Arc<AtomicU8>> = None;
     if lane == Lane::GpuPrl {
         if let Some(secrets) = secrets {
             // T5: best-effort 15%-PRL payout enroll — bind the user's OWN prl1p…
             // payout address to their Alice address, ONCE, after PoP is up. Skips
             // cleanly (no error, no fake signature) when no payout address is set
             // or the identity is watch-only. Spawned before the refresh task takes
-            // ownership of `secrets`.
-            spawn_prl_enroll_task(sup.clone(), address.clone(), secrets.clone());
+            // ownership of `secrets`. A2c: the task reports its outcome into this
+            // shared status flag so the dashboard's "15% PRL 返还" block can show the
+            // honest enrolled/skipped state (credit-only — a status, never a value).
+            let status = Arc::new(AtomicU8::new(enroll_status::PENDING));
+            spawn_prl_enroll_task(sup.clone(), address.clone(), secrets.clone(), status.clone());
             spawn_pop_refresh_task(sup.clone(), address.clone(), secrets);
+            prl_enroll = Some(status);
         }
     }
-    Ok(sup)
+    Ok((sup, prl_enroll))
 }
 
 /// A unique, supervisor-owned log path for the GPU-PRL SRBMiner child. SRBMiner
@@ -856,6 +900,7 @@ fn spawn_prl_enroll_task(
     sup: LaneSupervisor,
     address: String,
     secrets: alice_crypto::WalletSecrets,
+    status: Arc<AtomicU8>,
 ) {
     tokio::spawn(async move {
         // The lane may have been stopped before we even got scheduled; if so, skip.
@@ -878,11 +923,21 @@ fn spawn_prl_enroll_task(
         // The HTTPS POSTs are blocking (ureq); run them off the async worker so they
         // can't stall the runtime. The outcome is best-effort — we don't surface it
         // as a lane Error (the lane keeps mining regardless of the payout binding).
-        let _outcome = tokio::task::spawn_blocking(move || {
+        let outcome = tokio::task::spawn_blocking(move || {
             crate::prl_payout::run_enroll_best_effort(&address, &device_id, &region, &secrets)
         })
         .await;
-        // `_outcome` is intentionally dropped: enroll is fail-open w.r.t. the lane.
+        // A2c: record the outcome into the shared status flag so the dashboard's
+        // "15% PRL 返还" block shows the honest enrolled/skipped state. The enroll
+        // is still fail-open w.r.t. the lane (a Failed/JoinError never stops mining).
+        use crate::prl_payout::EnrollOutcome;
+        let code = match outcome {
+            Ok(EnrollOutcome::Enrolled) => enroll_status::ENROLLED,
+            Ok(EnrollOutcome::NoPayoutAddress) => enroll_status::NO_ADDRESS,
+            Ok(EnrollOutcome::WatchOnly) => enroll_status::WATCH_ONLY,
+            Ok(EnrollOutcome::Failed(_)) | Err(_) => enroll_status::FAILED,
+        };
+        status.store(code, Ordering::Relaxed);
     });
 }
 
@@ -970,7 +1025,36 @@ fn build_snapshot(
             snap.failovers = fo;
         }
     }
+
+    // A2c: GPU-PRL "15% PRL 返还" display block. Built ONLY when a GPU-PRL lane is
+    // present (single-lane PRL today; the per-lane scan keeps it correct if a future
+    // dual pairing includes PRL). Credit-only by construction — see
+    // [`crate::prl_payout::PrlPayoutDisplay`] (`paid` is hard-pinned 0.0).
+    if run.supervisors.iter().any(|s| s.lane() == Lane::GpuPrl) {
+        snap.prl_payout = Some(build_prl_payout_display(run.prl_enroll.as_ref()));
+    }
     snap
+}
+
+/// Build the credit-only "15% PRL 返还" display block from the (read-only) configured
+/// payout address + the shared enroll-status flag. NO network call (the GUI/CLI can
+/// fold a best-effort `miner-lookup` in via
+/// [`crate::prl_payout::PrlPayoutDisplay::with_pending_from_lookup`] if desired). The
+/// returned struct's `paid` is hard-pinned 0.0 — there is no value path here.
+fn build_prl_payout_display(
+    enroll: Option<&Arc<AtomicU8>>,
+) -> crate::prl_payout::PrlPayoutDisplay {
+    // Best-effort, read-only: a configured (env/file) payout address, masked for the
+    // panel. A shape error / unset address → None (the block shows the honest
+    // "未设置返还地址" / "未绑定" text rather than a number).
+    let payout = crate::prl_payout::load_payout_address().ok().flatten();
+    // `enrolled` is true ONLY when the async enroll task reported ENROLLED; every
+    // other state (pending / no-address / watch-only / failed) is honestly NOT
+    // enrolled, so the panel never claims a binding that didn't happen.
+    let enrolled = enroll
+        .map(|s| s.load(Ordering::Relaxed) == enroll_status::ENROLLED)
+        .unwrap_or(false);
+    crate::prl_payout::PrlPayoutDisplay::new(enrolled, payout.as_deref())
 }
 
 #[cfg(test)]
@@ -1017,6 +1101,13 @@ mod tests {
             ],
             last_line: Some("net accepted (7/1)".into()),
             message: None,
+            // A2c: a populated PRL display block must NOT leak any payout/paid
+            // substring into the wire JSON (it is `#[serde(skip)]`). Set it here so
+            // the credit-only JSON assertion below exercises the skip.
+            prl_payout: Some(crate::prl_payout::PrlPayoutDisplay::new(
+                true,
+                Some("prl1pexamplewalletexamplewalletexamplewallet"),
+            )),
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         assert!(

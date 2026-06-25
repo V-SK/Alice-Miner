@@ -305,6 +305,7 @@ mod tests {
             }],
             last_line: Some("net accepted (142/1) diff 100".into()),
             message: None,
+            prl_payout: None,
         }
     }
 
@@ -343,6 +344,7 @@ mod tests {
             ],
             last_line: Some("Speed 25.00 Mh/s gpu0".into()),
             message: None,
+            prl_payout: None,
         }
     }
 

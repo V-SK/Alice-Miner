@@ -1183,6 +1183,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             lanes: Vec::new(),
             last_line: None,
             message: None,
+            prl_payout: None,
         }
     }
 

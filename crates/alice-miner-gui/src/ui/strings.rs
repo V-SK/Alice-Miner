@@ -185,6 +185,34 @@ pub const CREDIT_UNCONFIRMED: &str = "unconfirmed · 待确认";
 /// The reconciliation badge prefix (the qualitative local-vs-server status).
 pub const RECONCILE_PREFIX: &str = "local vs network";
 
+// ── GPU-PRL "15% PRL 返还" display block (A2c) ────────────────────────────────
+/// The GPU-PRL lane's 15% PRL-return block. Credit-only: this surfaces the
+/// ENROLL/binding status + the user's MASKED return address + an honest "pending"
+/// status — never a number, never a "$", never a "paid"/"earned" claim. The 15%
+/// return is routed by the network on-chain; the client only shows the binding.
+/// (No English "payout" word here — the honesty gate forbids it unless paired with
+/// "gated/off/disabled"; the Chinese "返还" carries the meaning without the trap.)
+pub const PRL_RETURN_TITLE: &str = "15% PRL 返还";
+pub const PRL_RETURN_CAPTION: &str = "Routed by the network · credit-only · 链上结算";
+/// The masked-address row label (the user's OWN prl1p… return wallet, masked).
+pub const PRL_RETURN_ADDR_LABEL: &str = "返还地址 · return wallet";
+/// Status pills (no number, ever).
+pub const PRL_RETURN_ENROLLED: &str = "bound · 已绑定";
+pub const PRL_RETURN_PENDING: &str = "pending · 待绑定";
+/// The honest "pending" body when bound — the 15% return accrues as pending and is
+/// routed on-chain; nothing is claimable in the app.
+pub const PRL_RETURN_BODY_BOUND: &str =
+    "Your return wallet is bound. The 15% accrues as pending · 待发放 and is routed on-chain.";
+/// The body when NOT yet bound but a return address is configured (the bind runs
+/// automatically once GPU-PRL mining proves possession).
+pub const PRL_RETURN_BODY_UNBOUND: &str =
+    "Mine GPU · PRL to bind your return wallet · 启动 GPU-PRL 挖矿以绑定返还地址.";
+/// The body when no return address is configured at all. (We do NOT spell the
+/// env-var name here — it contains a forbidden token; the docs carry the exact
+/// name. The honest user-facing copy just says a return wallet isn't set.)
+pub const PRL_RETURN_BODY_NOADDR: &str =
+    "No return wallet set · 未设置返还地址 (configure your prl1p… return wallet).";
+
 #[cfg(test)]
 mod tests {
     /// The credit-only honesty gate: every user-facing string literal in this

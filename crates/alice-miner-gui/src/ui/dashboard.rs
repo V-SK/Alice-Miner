@@ -289,6 +289,17 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
         rvn_active,
     );
 
+    // ── 15% PRL 返还 (A2c) — GPU-PRL mainline only. Rendered ONLY when the engine
+    // attached a credit-only display block (primary lane == GPU-PRL). Shows the
+    // bind status + the user's MASKED return wallet + an honest "pending" text;
+    // never a number / "$" / paid figure (the block's `paid` is hard-pinned 0.0).
+    if let Some(disp) = snap.as_ref().and_then(|s| s.prl_payout.clone()) {
+        ui.add_space(24.0);
+        source_label(ui, strings::PRL_RETURN_TITLE, strings::PRL_RETURN_CAPTION, Tone::Live);
+        ui.add_space(10.0);
+        prl_return_panel(ui, &disp);
+    }
+
     // ── SOURCE B — server-confirmed credit (read-only). Clearly separated from
     // the live activity above; honest by construction (no fabricated number).
     ui.add_space(24.0);
@@ -603,6 +614,80 @@ fn credit_panel(ui: &mut egui::Ui, app: &MinerApp) {
                     explorer_link(ui);
                 }
             }
+        });
+}
+
+/// The GPU-PRL **15% PRL 返还** panel (A2c). Credit-only by construction: it shows
+/// the bind STATUS (a pill, no number), the user's OWN return wallet **masked**
+/// (`prl1p…`, never the foundation collection address), and an honest pending body
+/// — never a number, never a "$", never a paid/earned claim. The display block's
+/// `paid` field is hard-pinned 0.0 upstream and is NOT rendered here at all.
+fn prl_return_panel(ui: &mut egui::Ui, disp: &alice_miner_core::PrlPayoutDisplay) {
+    egui::Frame::NONE
+        .fill(THEME.surface)
+        .corner_radius(14)
+        .inner_margin(egui::Margin::symmetric(16, 15))
+        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Header row: a globe + the PRL currency label + a right-aligned status
+            // pill (bound / pending). The status mirrors the engine's enroll flag.
+            ui.horizontal(|ui| {
+                super::icons::show(ui, Icon::Globe, 14.0, THEME.brand300);
+                ui.add_space(9.0);
+                ui.label(
+                    RichText::new(format!("{} · 15% 返还", disp.currency))
+                        .size(13.5)
+                        .strong()
+                        .color(THEME.text),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if disp.enrolled {
+                        status_pill(ui, Tone::Live, strings::PRL_RETURN_ENROLLED);
+                    } else {
+                        pending_chip(ui);
+                    }
+                });
+            });
+
+            // The user's MASKED return wallet (only when one is configured). This is
+            // THEIR wallet, masked — confirms "this is mine" without exposing the full
+            // address in a screenshot. Never the collection address.
+            if let Some(masked) = disp.payout_masked.as_deref() {
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(strings::PRL_RETURN_ADDR_LABEL).size(11.0).color(THEME.text3),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(widgets::mono(masked.to_string(), 12.0, THEME.text2));
+                });
+            }
+
+            // The honest pending body — bound / unbound / no-address. No numbers.
+            ui.add_space(8.0);
+            let body = if disp.enrolled {
+                strings::PRL_RETURN_BODY_BOUND
+            } else if disp.payout_masked.is_some() {
+                strings::PRL_RETURN_BODY_UNBOUND
+            } else {
+                strings::PRL_RETURN_BODY_NOADDR
+            };
+            ui.label(RichText::new(body).size(12.0).color(THEME.text3));
+        });
+}
+
+/// A small tinted status pill (a single honest word; never a number). Used by the
+/// PRL-return header for the "bound · 已绑定" state.
+fn status_pill(ui: &mut egui::Ui, tone: Tone, label: &str) {
+    let fg = tone.fg();
+    egui::Frame::NONE
+        .fill(egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 22))
+        .corner_radius(255)
+        .inner_margin(egui::Margin::symmetric(10, 4))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 70)))
+        .show(ui, |ui| {
+            ui.label(RichText::new(label).size(11.0).strong().color(fg));
         });
 }
 

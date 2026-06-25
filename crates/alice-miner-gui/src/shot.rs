@@ -124,6 +124,11 @@ impl ShotRunner {
                 // The Source-B fast-follow path rendered honestly: a CONFIRMED
                 // credit state shows ONLY "pending" (never the number) + "in sync".
                 Shot { file: "dashboard-m5-credit-confirmed.png", pose: pose_dashboard_m5_confirmed },
+                // ── A2c: GPU-PRL "15% PRL 返还" display block ────────────────
+                // The GPU-PRL dashboard while mining: the new "15% PRL 返还" panel
+                // shows the BOUND status pill + the user's MASKED prl1p… return
+                // wallet + the honest pending body (no number / "$" / paid figure).
+                Shot { file: "dashboard-prl-return.png", pose: pose_dashboard_prl_return },
                 // ── Change reward address (post-onboarding) ─────────────────
                 // Settings → Identity: the active address with a keystore-backed
                 // tag + the "Change reward address" action (the new section).
@@ -328,6 +333,7 @@ fn demo_mining_snapshot() -> Snapshot {
         lanes: Vec::new(),
         last_line: Some("accepted (142/1) diff 32001 (12 ms)".into()),
         message: None,
+        prl_payout: None,
     }
 }
 
@@ -411,6 +417,7 @@ fn demo_state_snapshot(state: EngineState, message: Option<&str>) -> Snapshot {
         lanes: Vec::new(),
         last_line: None,
         message: message.map(|m| m.to_string()),
+        prl_payout: None,
     }
 }
 
@@ -634,6 +641,7 @@ fn demo_dual_snapshot() -> Snapshot {
         ],
         last_line: Some("accepted (142/1) diff 32001 (12 ms)".into()),
         message: None,
+        prl_payout: None,
     }
 }
 
@@ -725,6 +733,58 @@ fn pose_dashboard_m5_confirmed(app: &mut MinerApp) {
     app.credit_state = alice_miner_core::CreditState::Confirmed {
         score: alice_miner_core::CreditScore::new(12.56),
     };
+}
+
+// ── A2c pose: GPU-PRL "15% PRL 返还" display block ────────────────────────────
+
+/// A demo GPU-PRL mining snapshot carrying the credit-only [`PrlPayoutDisplay`]
+/// block — ENROLLED, with a MASKED `prl1p…` return wallet. Credit-only: the block's
+/// `paid` stays 0.0 (the panel renders no number).
+fn demo_prl_snapshot() -> Snapshot {
+    let disp = alice_miner_core::PrlPayoutDisplay::new(
+        true,
+        Some("prl1pexamplewalletexamplewalletexamplewallet"),
+    );
+    Snapshot {
+        state: EngineState::Running,
+        device: Some(demo_nvidia_device()),
+        lane: Some(Lane::GpuPrl),
+        hashrate_hs: Some(31_200_000.0), // ~31.2 MH/s pearlhash
+        shares_accepted: 64,
+        shares_rejected: 0,
+        endpoint: Some("hk.aliceprotocol.org:3333".into()),
+        worker_id: Some("rig-7f3a9c21".into()),
+        uptime_s: 38 * 60 + 5,
+        failovers: 0,
+        dual: false,
+        lanes: vec![alice_miner_core::engine::LaneSnapshot {
+            lane: Lane::GpuPrl,
+            state: EngineState::Running,
+            hashrate_hs: Some(31_200_000.0),
+            shares_accepted: 64,
+            shares_rejected: 0,
+            endpoint: Some("hk.aliceprotocol.org:3333".into()),
+            failovers: 0,
+        }],
+        last_line: Some("accepted (64/0) pearlhash".into()),
+        message: None,
+        prl_payout: Some(disp),
+    }
+}
+
+/// A2c: the GPU-PRL dashboard showing the "15% PRL 返还" block — bound status pill,
+/// the user's MASKED return wallet, and an honest pending body (no number / "$").
+fn pose_dashboard_prl_return(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Dashboard;
+    app.set_device(demo_nvidia_device());
+    install_demo_identity_keystore(app); // PRL needs a keystore-backed identity
+    app.select_lane(Lane::GpuPrl);
+    app.error = None;
+    app.snapshot = Some(demo_prl_snapshot());
+    pin_mining_anim(app, 31_200.0);
+    seed_log(app);
+    app.credit_state = alice_miner_core::CreditState::NotExposed;
 }
 
 // ── Change reward address poses (post-onboarding) ────────────────────────────
