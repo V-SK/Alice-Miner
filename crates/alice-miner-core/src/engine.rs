@@ -63,6 +63,17 @@ pub enum Command {
         address: Option<String>,
         #[doc(hidden)]
         dual: bool,
+        /// Keystore unlock password — **required only for the GPU-PRL lane**,
+        /// which must sign a Proof-of-Possession with the wallet sr25519 key
+        /// (the relay's `REQUIRE_POP=1` credits no shares without it). The engine
+        /// unlocks the on-disk keystore with this once at start to obtain the
+        /// signing [`alice_crypto::WalletSecrets`], spawns the lane (+ its OOB
+        /// refresh task), then drops the secrets/password. `None` is fine for
+        /// XMR/RVN (address-only login); for GPU-PRL a `None` (or a watch-only
+        /// identity) is rejected with a clear error. Held only for the brief
+        /// unlock window, never persisted, never sent to the child.
+        #[doc(hidden)]
+        unlock_password: Option<String>,
     },
     /// Stop the running lane (SIGTERM→SIGKILL on the owned child).
     Stop,
@@ -325,7 +336,7 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
                     }
                 }
             }
-            Some(Command::Start { lane, address, dual }) => {
+            Some(Command::Start { lane, address, dual, mut unlock_password }) => {
                 // Resolve the reward address: the explicit one, else the active
                 // identity's, else the on-disk pointer's.
                 let addr = address
@@ -343,7 +354,37 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
                     continue;
                 }
 
-                match start_run(&rt, lane, dual, &addr) {
+                // GPU-PRL needs the wallet SIGNING key (PoP). Unlock the on-disk
+                // keystore ONCE here to obtain the secrets; XMR/RVN don't need it
+                // (address-only). A watch-only identity / missing password / wrong
+                // password surfaces a clear error and the lane never starts (no
+                // earning without PoP). The secrets/password drop at the end of
+                // the start (the lane + refresh task own their own clone).
+                let prl_in_play = lane == Lane::GpuPrl || (dual && matches!(lane, Lane::GpuPrl));
+                let secrets = if prl_in_play {
+                    match resolve_prl_secrets(unlock_password.as_deref()) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            use zeroize::Zeroize;
+                            if let Some(p) = unlock_password.as_mut() {
+                                p.zeroize();
+                            }
+                            let _ = evt_tx.send(Event::Error(e));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                // Password no longer needed once the keystore is unlocked.
+                {
+                    use zeroize::Zeroize;
+                    if let Some(p) = unlock_password.as_mut() {
+                        p.zeroize();
+                    }
+                }
+
+                match start_run(&rt, lane, dual, &addr, secrets) {
                     Ok((new_run, worker_id)) => {
                         run = new_run;
                         active_address = Some(addr);
@@ -451,6 +492,45 @@ fn run_identity(spec: IdentitySpec) -> Result<(Identity, Option<String>), String
     }
 }
 
+/// Resolve the wallet [`alice_crypto::WalletSecrets`] (the sr25519 SIGNING key)
+/// for the GPU-PRL lane's Proof-of-Possession. Loads the active identity pointer
+/// to find the keystore, rejects a **watch-only** (pasted-address) identity with a
+/// clear message (it has no keystore → it can never PoP — mirrors worker-v1's
+/// keyless-identity error), then unlocks the on-disk keystore with `password`.
+///
+/// The returned `WalletSecrets` zeroizes its seed on the last clone's drop; the
+/// caller hands ONE clone to the lane (+ its refresh task) and drops the rest.
+fn resolve_prl_secrets(password: Option<&str>) -> Result<alice_crypto::WalletSecrets, String> {
+    let pointer = identity::load_pointer().ok_or(
+        "no reward identity: create/import an identity (the GPU-PRL lane needs a \
+         wallet key to prove possession)",
+    )?;
+
+    // Watch-only / pasted address → no keystore → cannot sign a PoP. Fail closed
+    // with the same shape worker-v1 uses for a keyless identity.
+    let Some(keystore_path) = pointer.keystore_path.as_deref() else {
+        return Err(
+            "this reward identity is watch-only (address pasted, no signing key); the \
+             GPU-PRL lane needs a wallet key to prove possession — import the mnemonic/seed \
+             for this address instead"
+                .into(),
+        );
+    };
+
+    let password = password.ok_or(
+        "the GPU-PRL lane needs your wallet password to unlock the signing key for \
+         proof-of-possession",
+    )?;
+
+    let bytes = std::fs::read(keystore_path)
+        .map_err(|e| format!("failed to read keystore {keystore_path}: {e}"))?;
+    let payload: alice_crypto::WalletPayload = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("failed to parse keystore {keystore_path}: {e}"))?;
+    let outcome = alice_crypto::unlock_wallet(&payload, password)
+        .map_err(|e| format!("could not unlock the wallet key for proof-of-possession: {e}"))?;
+    Ok(outcome.secrets)
+}
+
 /// In dual-mine mode, leave this many cores free for the GPU lane's host
 /// overhead (driver / DAG feeder threads): XMR runs at `cores - DUAL_XMR_HEADROOM`
 /// (PLAN §5 M4 / §6 D-dual). Single-lane mode stays "拉满" (all cores).
@@ -477,6 +557,7 @@ fn start_run(
     lane: Lane,
     dual: bool,
     address: &str,
+    secrets: Option<alice_crypto::WalletSecrets>,
 ) -> Result<(RunSet, String), String> {
     let worker_id = xmr::derive_worker_id(address)?; // one worker-id fn for both lanes
     // Enter the runtime ONCE for all the start()s — they spawn tokio child-I/O +
@@ -484,11 +565,13 @@ fn start_run(
     let _guard = rt.enter();
 
     if dual {
-        // Both lanes together. XMR gets `cores-2` headroom; RVN runs full.
+        // Both lanes together. XMR gets `cores-2` headroom; RVN runs full. The
+        // current dual pairing is CPU-XMR + GPU-RVN (neither needs PoP secrets);
+        // a GPU-PRL dual pairing would thread `secrets` into the PRL start here.
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let xmr_threads = dual_xmr_threads(cores);
-        let xmr_sup = start_one_lane(Lane::Xmr, address, Some(xmr_threads))?;
-        let rvn_sup = match start_one_lane(Lane::GpuRvn, address, None) {
+        let xmr_sup = start_one_lane(Lane::Xmr, address, Some(xmr_threads), None)?;
+        let rvn_sup = match start_one_lane(Lane::GpuRvn, address, None, None) {
             Ok(s) => s,
             Err(e) => {
                 // The XMR lane already started; tear it back down so we don't leave
@@ -505,7 +588,7 @@ fn start_run(
             worker_id,
         ))
     } else {
-        let sup = start_one_lane(lane, address, None)?;
+        let sup = start_one_lane(lane, address, None, secrets)?;
         Ok((
             RunSet {
                 supervisors: vec![sup],
@@ -524,8 +607,15 @@ fn start_one_lane(
     lane: Lane,
     address: &str,
     threads_override: Option<usize>,
+    secrets: Option<alice_crypto::WalletSecrets>,
 ) -> Result<LaneSupervisor, String> {
-    let plan = EndpointPlan::for_lane(lane);
+    // GPU-PRL targets the region relays ordered by lowest RTT (operator override /
+    // probe / US-first fallback); every other lane uses its compiled plan.
+    let plan = if lane == Lane::GpuPrl {
+        gpu_prl::region_plan_by_rtt()
+    } else {
+        EndpointPlan::for_lane(lane)
+    };
     let address = address.to_string();
 
     // The engine-supplied rebuild closure: given an ordered endpoint list (the
@@ -561,27 +651,51 @@ fn start_one_lane(
             };
             Ok((p.program, p.args))
         }),
-        Lane::GpuPrl => Arc::new(move |eps: &[Endpoint]| {
-            let program =
-                crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::GpuPrl)?;
-            let Some(active) = eps.first() else {
-                return Err("gpu-prl launch plan needs at least one endpoint".into());
+        Lane::GpuPrl => {
+            // GPU-PRL needs the wallet SIGNING key for the region-bound PoP. The
+            // caller (worker_loop) already unlocked it + rejected watch-only; a
+            // missing secret here is a programming error, so fail closed.
+            let Some(secrets) = secrets.clone() else {
+                return Err(
+                    "internal: GPU-PRL lane started without an unlocked signing key".into(),
+                );
             };
-            let region = format!("{}:{}", active.host, active.port);
-            // T2 skeleton: no-PoP SMOKE — placeholder password + a per-lane log
-            // file. T4 replaces this with the region-bound PoP token (fetch →
-            // sign → assemble) and the supervisor-owned log path; under the live
-            // relay's REQUIRE_POP=1 the placeholder is rejected (no earning).
-            let log_path = std::env::temp_dir().join("alice-gpu-prl.log");
-            let p = gpu_prl::build_srbminer_pearl_launch_plan(
-                program,
-                &addr_for_rebuild,
-                &region,
-                "x",
-                &log_path,
-            )?;
-            Ok((p.program, p.args))
-        }),
+            // The supervisor-owned log file SRBMiner writes shares/hashrate to
+            // (it does NOT print them to stdout). Unique per process so two runs
+            // never collide. See the TODO at the bottom: the supervisor must tail
+            // THIS file for the GPU-PRL lane (stdout-only capture misses shares).
+            let log_path = prl_log_path();
+            let addr_prl = addr_for_rebuild.clone();
+            Arc::new(move |eps: &[Endpoint]| {
+                let program =
+                    crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::GpuPrl)?;
+                let Some(active) = eps.first() else {
+                    return Err("gpu-prl launch plan needs at least one endpoint".into());
+                };
+                let region_authority = format!("{}:{}", active.host, active.port);
+                // ── T4: region-bound PoP. The token is minted+verified against
+                // the ACTIVE region (a token for region A is rejected by region B),
+                // so on EVERY (re)build — initial start AND a Layer-B failover to a
+                // different region — we re-challenge → re-sign → re-OOB-verify for
+                // the current region BEFORE building argv.
+                let device_id = xmr::derive_worker_id(&addr_prl)?; // == stratum worker suffix
+                let token = crate::pop::establish_pop(
+                    &active.host, // control plane is `https://<host>/m4/challenge` (port-free)
+                    &addr_prl,
+                    &device_id,
+                    &secrets,
+                    None,
+                )?;
+                let p = gpu_prl::build_srbminer_pearl_launch_plan(
+                    program,
+                    &addr_prl,
+                    &region_authority,
+                    &token.password,
+                    &log_path,
+                )?;
+                Ok((p.program, p.args))
+            })
+        }
     };
 
     // Build the initial launch plan (Layer A: all endpoints, primary first).
@@ -589,7 +703,102 @@ fn start_one_lane(
 
     let sup = LaneSupervisor::with_endpoints(lane, plan);
     sup.start(program, args, rebuild)?;
+
+    // ── T4 item 5: OOB-allowlist refresh task (GPU-PRL only). The relay drops a
+    // proven (address, device) from its PoP allowlist after OOB_ALLOWLIST_TTL
+    // (~1800s) without a re-verify; without a refresh the lane silently stops
+    // being credited after ~25min. Spawn a background task — tied to THIS lane's
+    // lifecycle — that re-challenges → re-signs → re-OOB-verifies the CURRENT
+    // region every ~60s once fewer than OOB_REFRESH_MARGIN (~300s) remain. It
+    // stops as soon as the supervisor is no longer active (a user Stop, a crash,
+    // or budget-exhaustion Error), so it shares the lane's lifecycle.
+    if lane == Lane::GpuPrl {
+        if let Some(secrets) = secrets {
+            spawn_pop_refresh_task(sup.clone(), address.clone(), secrets);
+        }
+    }
     Ok(sup)
+}
+
+/// A unique, supervisor-owned log path for the GPU-PRL SRBMiner child. SRBMiner
+/// writes share/hashrate lines ONLY to its `--log-file` (never stdout), so the
+/// path must be stable for the run and owned by us (the supervisor tails it).
+fn prl_log_path() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("alice-gpu-prl-{}-{}.log", std::process::id(), nanos))
+}
+
+/// Spawn the GPU-PRL OOB-allowlist refresh task (T4 item 5). MUST be called inside
+/// a tokio runtime context (the caller holds `rt.enter()`). The task lives as long
+/// as `sup` is active; it re-runs the region-bound PoP handshake for the lane's
+/// CURRENT region when the TTL is within [`crate::pop::OOB_REFRESH_MARGIN`] of
+/// expiring, so the miner never silently drops out of the allowlist. The wallet
+/// `secrets` clone is owned by the task and zeroizes on the last clone's drop
+/// (here, when the task ends). The token isn't fed to the child — the OOB verify
+/// re-arms the relay's allowlist server-side; the child keeps mining under its
+/// existing connection (a future change can also hot-swap the password via a child
+/// restart, but the allowlist re-verify is what keeps crediting alive).
+fn spawn_pop_refresh_task(
+    sup: LaneSupervisor,
+    address: String,
+    secrets: alice_crypto::WalletSecrets,
+) {
+    use crate::pop::{OOB_ALLOWLIST_TTL, OOB_REFRESH_MARGIN, OOB_REFRESH_TICK};
+    tokio::spawn(async move {
+        // Track when the current region's allowlist entry was last (re)verified.
+        // The initial establish_pop in the rebuild closure just verified, so the
+        // first deadline is one TTL out.
+        let mut verified_at = std::time::Instant::now();
+        let mut last_region = sup.current_endpoint(); // host:port
+        loop {
+            tokio::time::sleep(OOB_REFRESH_TICK).await;
+            // Stop when the lane is no longer active (Stop / crash / Error).
+            if !sup.is_active() {
+                return;
+            }
+            // A Layer-B failover rebuilt the token for a NEW region (the rebuild
+            // closure re-verified there), so re-arm the deadline to that region.
+            let region_now = sup.current_endpoint();
+            if region_now != last_region {
+                last_region = region_now;
+                verified_at = std::time::Instant::now();
+                continue;
+            }
+            // Re-verify only when within the margin of the TTL expiring.
+            let remaining = OOB_ALLOWLIST_TTL.checked_sub(verified_at.elapsed());
+            let due = match remaining {
+                Some(r) => r <= OOB_REFRESH_MARGIN,
+                None => true, // already past the TTL — re-verify now
+            };
+            if !due {
+                continue;
+            }
+            // Re-run the handshake for the CURRENT region host (port-free control
+            // plane). A failure is logged-and-retried next tick (the relay is the
+            // authority; a transient verify hiccup must not kill the lane).
+            let host = sup
+                .current_endpoint()
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let device_id = match crate::lane::xmr::derive_worker_id(&address) {
+                Ok(d) => d,
+                Err(_) => return, // address became invalid — nothing to refresh
+            };
+            match crate::pop::establish_pop(&host, &address, &device_id, &secrets, None) {
+                Ok(_) => {
+                    verified_at = std::time::Instant::now();
+                }
+                Err(_) => {
+                    // Leave `verified_at` as-is so we retry on the next tick.
+                }
+            }
+        }
+    });
 }
 
 /// Heuristic: does this resolved GPU-miner path look like T-Rex (so the engine
@@ -781,7 +990,7 @@ mod tests {
         std::env::set_var("ALICE_IDENTITY_DIR", &empty);
 
         engine
-            .send(Command::Start { lane: Lane::Xmr, address: None, dual: false })
+            .send(Command::Start { lane: Lane::Xmr, address: None, dual: false, unlock_password: None })
             .expect("send start");
         let evt = engine
             .recv_timeout(Duration::from_secs(5))
@@ -794,6 +1003,74 @@ mod tests {
         std::env::remove_var("ALICE_IDENTITY_DIR");
         let _ = std::fs::remove_dir_all(&empty);
         engine.shutdown();
+    }
+
+    /// T4 item 4: the GPU-PRL lane needs the wallet SIGNING key, so a watch-only
+    /// (pasted-address) identity must be REJECTED up front with a clear error —
+    /// before any region probe / control-plane call. Mirrors worker-v1's keyless-
+    /// identity refusal. Also asserts a keystore-backed identity with NO password
+    /// is refused with the "needs your wallet password" message (no wrong-password
+    /// unlock attempt). Pure: uses a temp identity dir, no network.
+    #[test]
+    fn resolve_prl_secrets_rejects_watch_only_and_missing_password() {
+        // Shares the crate-wide identity-env lock with the `identity` tests so the
+        // global `ALICE_WALLET_DATA_ROOT` / `ALICE_IDENTITY_DIR` can't race.
+        let _g = crate::IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Isolate the identity pointer + keystore into fresh temp dirs.
+        let base = std::env::temp_dir().join(format!(
+            "alice-prl-secrets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let wallet_root = base.join("wallet");
+        let id_dir = base.join("dot-alice");
+        std::fs::create_dir_all(&wallet_root).unwrap();
+        std::fs::create_dir_all(&id_dir).unwrap();
+        std::env::set_var("ALICE_WALLET_DATA_ROOT", &wallet_root);
+        std::env::set_var("ALICE_IDENTITY_DIR", &id_dir);
+
+        // `WalletSecrets` is intentionally not `Debug` (no secret in output), so we
+        // extract the Err string without `unwrap_err` (which would need Ok: Debug).
+        fn err_of(r: Result<alice_crypto::WalletSecrets, String>) -> String {
+            match r {
+                Ok(_) => panic!("expected an error, got Ok(secrets)"),
+                Err(e) => e,
+            }
+        }
+
+        // (a) No identity at all → clear "no reward identity" error.
+        let err = err_of(resolve_prl_secrets(Some("pw")));
+        assert!(err.contains("no reward identity"), "got: {err}");
+
+        // (b) Watch-only (pasted) identity → rejected as keyless, regardless of pw.
+        let addr = alice_crypto::create_wallet_payload(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "pw-123456",
+        )
+        .unwrap()
+        .address;
+        identity::paste(&addr, Some("watch".into())).expect("paste");
+        let err = err_of(resolve_prl_secrets(Some("anything")));
+        assert!(err.contains("watch-only"), "watch-only must be refused: {err}");
+
+        // (c) A real keystore-backed identity, but NO password → asks for it
+        // (does not attempt an unlock with a wrong/empty password).
+        let (_id, _m) = identity::create(Some("real".into()), "correct horse battery staple")
+            .expect("create");
+        let err = err_of(resolve_prl_secrets(None));
+        assert!(err.contains("wallet password"), "missing-pw message: {err}");
+
+        // (d) The right password DOES unlock and yields a signing-capable secret.
+        let secrets = resolve_prl_secrets(Some("correct horse battery staple"))
+            .expect("unlock with the right password");
+        assert!(secrets.can_export_private_key(), "secrets must hold a key");
+
+        std::env::remove_var("ALICE_WALLET_DATA_ROOT");
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// DUAL gating math (the M4 gate): under dual-mine the XMR lane gets `cores-2`
@@ -860,6 +1137,7 @@ mod tests {
                 lane: Lane::Xmr,
                 address: Some(address),
                 dual: true,
+                unlock_password: None,
             })
             .expect("send dual start");
 

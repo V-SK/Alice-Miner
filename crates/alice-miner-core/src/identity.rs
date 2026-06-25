@@ -315,16 +315,18 @@ fn persist(tmp: &Path, final_path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     // create/import write the real keystore + the pointer; serialize these so
-    // they don't race on the shared env vars / paths.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // they don't race on the shared env vars / paths. Uses the CRATE-WIDE
+    // identity-env lock (shared with the engine tests) — a module-local mutex
+    // would NOT prevent the cross-module `ALICE_WALLET_DATA_ROOT` race.
 
     /// Run `f` with `$ALICE_WALLET_DATA_ROOT` and `$ALICE_IDENTITY_DIR` pointed
     /// at fresh temp dirs, so tests never touch the real `~/.alice` / keystore.
     fn with_temp_env<F: FnOnce()>(f: F) {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::IDENTITY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!(
             "alice-miner-id-{}-{}",
             std::process::id(),

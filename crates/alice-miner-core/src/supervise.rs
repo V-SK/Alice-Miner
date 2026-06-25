@@ -672,6 +672,23 @@ fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
             // SRBMiner (pearlhash) writes share/hashrate lines to its --log-file
             // (the supervisor tails it). Accepted/rejected can arrive on SEPARATE
             // lines, so update each independently (unlike the kawpow both-or-none).
+            //
+            // TODO(T4 item 7 — log-file tail data source, supervise.rs): SRBMiner
+            // emits share/hashrate lines ONLY to its `--log-file`, NOT to
+            // stdout/stderr. The engine already passes a supervisor-owned
+            // `--log-file <path>` in the GPU-PRL argv (engine.rs `prl_log_path`),
+            // but `spawn_supervised` (alice-supervise/src/child.rs) only pumps the
+            // child's stdout+stderr into this `apply_log_line` path — so for the
+            // GPU-PRL lane TODAY this arm receives almost nothing and the dashboard
+            // reads ~0 shares/hashrate (the Layer-B no-progress watchdog would then
+            // false-trip). To finish: on a GpuPrl start, ALSO spawn a file-tail
+            // task (e.g. poll `--log-file` from offset, or `notify`/inotify) that
+            // feeds each new line into the SAME `LogLine` channel
+            // (`spawn_run`'s `log_tx`), so this parser sees the real SRBMiner
+            // output. The parser (`parse_srbminer`) + this arm are already correct
+            // and unit-tested; only the DATA SOURCE (tailing the file vs. reading
+            // stdout) is missing. Keep it generation-gated like the stdout pump so a
+            // stale tail from a prior child can't clobber newer state.
             if let Some(sample) = parse_srbminer(&line) {
                 if let Some(hr) = sample.hashrate_hs {
                     g.hashrate_hs = Some(hr);

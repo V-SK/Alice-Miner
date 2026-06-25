@@ -591,7 +591,16 @@ impl MinerApp {
         // Dual-mine only when the user opted in AND it's actually viable (≥2 lanes).
         // The GUI gates the toggle on viability, but re-check here defensively.
         let dual = self.dual_requested && self.dual_viable();
-        if let Err(e) = self.engine.send(Command::Start { lane, address: None, dual }) {
+        // TODO(T4/GUI): the GPU-PRL lane needs the wallet password to unlock the
+        // signing key for proof-of-possession (crates/alice-miner-core/src/engine.rs
+        // `resolve_prl_secrets`). Until the GUI adds a password prompt on PRL start,
+        // `unlock_password: None` makes the engine reject a PRL start with a clear
+        // "needs your wallet password" error (XMR/RVN are unaffected). Wire a
+        // modal that captures the password (and zeroizes it) before Start{GpuPrl}.
+        if let Err(e) = self
+            .engine
+            .send(Command::Start { lane, address: None, dual, unlock_password: None })
+        {
             self.error = Some(e);
         }
     }

@@ -176,6 +176,16 @@ struct StartArgs {
     /// Used for the live-connect verification.
     #[arg(long, default_value_t = 0, value_name = "SECONDS")]
     duration_s: u64,
+    /// Wallet keystore password — **only needed for the GPU-PRL (`prl`) lane**,
+    /// which must unlock the signing key to prove possession (the relay credits no
+    /// shares without it). INSECURE on the command line (visible in `ps`); prefer
+    /// `--password-stdin` or the interactive prompt. Ignored for XMR/RVN.
+    #[arg(long, value_name = "PASS")]
+    password: Option<String>,
+    /// Read the GPU-PRL unlock password from the first line of STDIN (secure for
+    /// scripts). Conflicts with `--password`.
+    #[arg(long, conflicts_with = "password")]
+    password_stdin: bool,
 }
 
 #[derive(clap::Args)]
@@ -438,10 +448,25 @@ fn cmd_start(args: StartArgs) -> i32 {
     // to find us, and Ctrl-C still works.
     let pid_guard = pidfile::PidGuard::acquire();
 
+    // GPU-PRL needs the wallet password to unlock the signing key for PoP. Resolve
+    // it (stdin / flag / interactive prompt) only for that lane; XMR/RVN pass None.
+    let unlock_password = if lane == Lane::GpuPrl {
+        match resolve_password(args.password.clone(), args.password_stdin) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return EXIT_USAGE;
+            }
+        }
+    } else {
+        None
+    };
+
     if let Err(e) = engine.send(EngineCommand::Start {
         lane,
         address: args.address.clone(),
         dual: args.dual,
+        unlock_password,
     }) {
         eprintln!("error: {e}");
         return EXIT_RUNTIME;

@@ -49,6 +49,14 @@ pub mod supervise;
 #[cfg(test)]
 pub(crate) static MINER_BIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Test-only: a single process-global lock guarding the keystore / identity-dir
+/// env vars (`ALICE_WALLET_DATA_ROOT` + `ALICE_IDENTITY_DIR`). Both [`identity`]
+/// tests and [`engine`] tests point these at temp dirs; like
+/// [`MINER_BIN_ENV_LOCK`] they MUST serialize through ONE mutex (separate mutexes
+/// don't prevent the cross-module env race). Lives here so both modules share it.
+#[cfg(test)]
+pub(crate) static IDENTITY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // Convenient top-level re-exports for the front-ends.
 pub use dashboard::{
     CreditError, CreditScore, CreditSource, CreditState, DashboardModel, LaneActivity,
