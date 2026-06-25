@@ -88,6 +88,9 @@ impl ShotRunner {
                 Shot { file: "onboarding-confirm.png", pose: pose_ob_confirm },
                 Shot { file: "dashboard.png", pose: pose_dashboard_mining },
                 Shot { file: "settings.png", pose: pose_settings },
+                // A2a: the GPU-PRL unlock-password modal (the prompt that lets a
+                // keystore-backed identity start the PoP-gated PRL mainline lane).
+                Shot { file: "prl-unlock-modal.png", pose: pose_prl_unlock },
                 // Reduced-motion variants (same states, motion off) — proves the
                 // colour/state semantics survive without pulses/sweeps/tween.
                 Shot { file: "home-mining-reduced-motion.png", pose: pose_home_mining_rm },
@@ -277,6 +280,23 @@ pub fn drive(app: &mut MinerApp, ctx: &egui::Context) {
 
 /// A demo device line so the model row reads like a real machine (this Mac:
 /// Apple Silicon, unified-memory GPU → RVN is "coming soon", XMR is the lane).
+/// A2a: pose the GPU-PRL unlock-password modal — a keystore-backed identity asked
+/// to start the PoP-gated PRL lane, so the app prompts for the wallet password.
+/// (The modal draws whenever `prl_unlock` is `Some`, independent of `screen`.)
+fn pose_prl_unlock(app: &mut MinerApp) {
+    app.onboarding = None;
+    app.screen = Screen::Home;
+    app.set_device(demo_nvidia_device()); // a GPU is present → PRL is viable
+    install_demo_identity_keystore(app); // keystore identity → PRL allowed (not watch-only)
+    app.error = None;
+    app.snapshot = None;
+    app.prl_unlock = Some(crate::app::PrlUnlock {
+        password: String::new(),
+        lane: Lane::GpuPrl,
+        dual: false,
+    });
+}
+
 fn demo_device() -> DeviceProfile {
     DeviceProfile {
         os: OsFamily::Macos,
