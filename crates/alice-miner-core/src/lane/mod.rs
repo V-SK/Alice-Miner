@@ -7,8 +7,8 @@ pub mod gpu_rvn;
 pub mod xmr;
 
 /// Which mining lane a [`crate::engine::Command::Start`] selects. CPU→XMR (the
-/// proven path), NVIDIA/AMD-GPU→PRL (SRBMiner pearlhash, the **GPU mainline** — PoP
-/// + region relay :3340), and GPU→RVN (KawPoW, the earlier relay path, kept).
+/// proven path), GPU→PRL (SRBMiner pearlhash — the **GPU mainline**, PoP-gated,
+/// region relays `:3340`), and GPU→RVN (KawPoW, the earlier relay path, kept).
 /// `Ord`/`Hash` are derived so the lane can key the viability matrix's `BTreeMap`
 /// (see [`crate::detect::capability`]).
 #[derive(

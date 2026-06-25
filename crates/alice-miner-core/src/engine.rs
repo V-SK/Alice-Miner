@@ -244,6 +244,10 @@ mod enroll_status {
 }
 
 /// Events the engine emits back to the front-end.
+// `Snapshot` is intentionally the largest variant — it's the hot-path payload sent
+// on every poll; boxing it to satisfy `large_enum_variant` would add a heap alloc
+// per snapshot for no real gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Result of `Detect`.

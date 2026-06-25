@@ -40,7 +40,7 @@ pub fn parse_srbminer(raw: &str) -> Option<KawpowSample> {
 /// lower-cased). Mirrors the Python `\b<keyword>\b[^0-9]*([0-9]+)` shape.
 fn integer_after(lower: &str, keyword: &str) -> Option<u64> {
     let idx = lower.find(keyword)?;
-    let rest = lower[idx + keyword.len()..].as_bytes();
+    let rest = &lower.as_bytes()[idx + keyword.len()..];
     let mut i = 0;
     while i < rest.len() && !rest[i].is_ascii_digit() {
         i += 1;
