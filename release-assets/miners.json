@@ -1,5 +1,5 @@
 {
-  "_comment": "Pinned bundled mining engines for the Alice Miner. Each entry records the engine kind, target triple, on-disk filename, and the SHA-256 of the committed bytes so the resolver / packaging can verify integrity. The macOS arm64 xmrig (CPU-XMR lane) is PROVEN/live-validated against hk.aliceprotocol.org:3333. The kawpowminer (GPU-RVN/KawPoW lane) entries carry a PLACEHOLDER sha256 of all-zeros: the real binaries + their pinned SHAs are obtained at packaging time (M7). KawPowMiner is GPL-3.0, 0% fee, NVIDIA+AMD, cross-OS (PLAN section 6 D-GPU-miner); T-Rex is supported only via the ALICE_MINER_GPU_BIN override, never bundled. If a GPU binary is absent at runtime the resolver fails gracefully with a clear 'GPU miner not installed' status (no panic) and the RVN lane stays unavailable.",
+  "_comment": "Pinned bundled mining engines for the Alice Miner. Each entry records the engine kind, target triple, on-disk filename, and the SHA-256 of the committed bytes so the resolver / packaging can verify integrity. The macOS arm64 xmrig (CPU-XMR lane) is PROVEN/live-validated against hk.aliceprotocol.org:3333. The kawpowminer (GPU-RVN/KawPoW lane) entries carry a PLACEHOLDER sha256 of all-zeros: the real binaries + their pinned SHAs are obtained at packaging time (M7). KawPowMiner is GPL-3.0, 0% fee, NVIDIA+AMD, cross-OS (PLAN section 6 D-GPU-miner); T-Rex is supported only via the ALICE_MINER_GPU_BIN override, never bundled. If a GPU binary is absent at runtime the resolver fails gracefully with a clear 'GPU miner not installed' status (no panic) and the RVN lane stays unavailable. The gpu-prl entries are SRBMiner-MULTI 3.4.1 (the pearlhash GPU mainline) with REAL pinned SHA-256 of the extracted binary, verified 2026-06-25 against the vendor archive md5 + a local sha256 of the unmodified release archive; 3.4.1 improves pearlhash hashrate on 3060Ti/3080 and fixes the 3.4.0 'proof validation failed' regression. The binary is staged at packaging (T6) by fetching archive_url + verifying archive_sha256 then the binary sha256 (SRBMiner ships no macOS build, so GPU-PRL is Linux/Windows only).",
   "engines": [
     {
       "kind": "cpu-xmr",
@@ -30,20 +30,26 @@
     {
       "kind": "gpu-prl",
       "engine": "srbminer-multi",
+      "version": "3.4.1",
       "target": "x86_64-unknown-linux-gnu",
       "filename": "SRBMiner-MULTI",
-      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "_placeholder": true,
-      "source": "PLACEHOLDER — SRBMiner-MULTI (freeware, closed-source) Linux x86_64, the GPU-PRL pearlhash mainline. Real SHA pinned at packaging (T6) by downloading the SRBMiner-Multi 3.3.9 Linux asset + verifying (local shasum + vendor digest), same procedure as the xmrig entries. Until then the resolver fails gracefully (GPU-PRL lane unavailable); ALICE_MINER_PRL_BIN is the override escape hatch."
+      "sha256": "9335b57a97396b9f8a83b9953f69384704443469279694e34eb76cce2b7296f7",
+      "archive_url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.4.1/SRBMiner-Multi-3-4-1-Linux.tar.gz",
+      "archive_sha256": "c2de6da87afad6d536573084a46cfb08e2bd5b38cdbf9245199d093a6ea6970f",
+      "binary_path_in_archive": "SRBMiner-Multi-3-4-1/SRBMiner-MULTI",
+      "source": "SRBMiner-MULTI 3.4.1 (freeware, closed-source) Linux x86_64 — the GPU-PRL pearlhash mainline. PINNED 2026-06-25: sha256 of the EXTRACTED binary (committed bytes the resolver verifies). Verified two ways: (1) vendor archive md5 SRBMiner-Multi-3-4-1-Linux.tar.md5 = 834f26b94aa17064d17f4649d9ea98e7 matched local md5; (2) local shasum -a 256 of the unmodified release archive = c2de6da8…6970f, member SRBMiner-Multi-3-4-1/SRBMiner-MULTI extracted + sha256 = 9335b57a…96f7. 3.4.1 (released 2026-06-25) IMPROVES pearlhash hashrate on 3060Ti/3080 and FIXES the 3.4.0 pearlhash 'proof validation failed' regression — upgraded from 3.3.9. Binary staged at packaging (T6) by fetching archive_url + verifying archive_sha256 then this sha256; ALICE_MINER_PRL_BIN is the override escape hatch."
     },
     {
       "kind": "gpu-prl",
       "engine": "srbminer-multi",
+      "version": "3.4.1",
       "target": "x86_64-pc-windows-msvc",
       "filename": "SRBMiner-MULTI.exe",
-      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "_placeholder": true,
-      "source": "PLACEHOLDER — SRBMiner-MULTI (freeware) Windows x86_64, GPU-PRL pearlhash mainline. Real SHA pinned at packaging (T6). macOS intentionally absent: SRBMiner ships no macOS build, so the GPU-PRL lane is Unavailable on Apple (capability matrix asserts this)."
+      "sha256": "e2fa2dd25f6afc5aed66af29e2616fd9c4223d577f23ce92d5b9f75feb1bb39a",
+      "archive_url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.4.1/SRBMiner-Multi-3-4-1-win64.zip",
+      "archive_sha256": "73451074129cda947c9c63c0b7a08230dc71d589606bbc0664a09a58bfcf0a81",
+      "binary_path_in_archive": "SRBMiner-Multi-3-4-1/SRBMiner-MULTI.exe",
+      "source": "SRBMiner-MULTI 3.4.1 (freeware) Windows x86_64, GPU-PRL pearlhash mainline. PINNED 2026-06-25: vendor archive md5 = 5962b5e4a67789c4bdd6cdcfdf3a70a0 matched local; archive sha256 = 73451074…0a81; extracted SRBMiner-MULTI.exe sha256 = e2fa2dd2…b39a. 3.4.1 improves pearlhash hashrate + fixes the 3.4.0 regression. macOS intentionally absent: SRBMiner ships no macOS build, so the GPU-PRL lane is Unavailable on Apple (capability matrix asserts this). Binary staged at packaging (T6) via archive_url + sha verification."
     }
   ]
 }
