@@ -84,8 +84,9 @@ pub struct LaneViability {
     /// Machine-readable reason per lane (e.g. `cpu_always_viable`,
     /// `rvn_requires_nvidia_apple_excluded`).
     pub reasons: BTreeMap<Lane, String>,
-    /// The lane the UI recommends / defaults to (the best RUNNABLE lane). On a
-    /// device with no runnable GPU lane this is always [`Lane::Xmr`].
+    /// The lane the UI recommends / defaults to (the best RUNNABLE lane,
+    /// GPU-PRL-first as the GPU mainline). On a device with no runnable GPU lane
+    /// this is always [`Lane::Xmr`].
     pub recommended: Lane,
     /// Operator-facing hints (e.g. an AMD "coming soon" note).
     pub notes: Vec<String>,
@@ -138,8 +139,8 @@ pub const ALL_LANES: [Lane; 3] = [Lane::Xmr, Lane::GpuPrl, Lane::GpuRvn];
 ///   * **RVN** = NVIDIA → `Viable`; AMD/Intel GPU → `ComingSoon` (detected but no
 ///     bundled KawPoW path yet); Apple Silicon → `Unavailable` (XMR-only);
 ///     no GPU / all-probes-failed → `Unavailable`.
-///   * **recommended** = the best runnable lane: RVN when it's viable (a real
-///     NVIDIA GPU outruns the CPU), else XMR.
+///   * **recommended** = the best runnable lane, GPU-PRL first (the V-decided
+///     GPU mainline): GpuPrl when runnable, else GpuRvn when runnable, else XMR.
 pub fn derive_lane_viability(profile: &DeviceProfile) -> LaneViability {
     let mut support = BTreeMap::new();
     let mut reasons = BTreeMap::new();
@@ -185,13 +186,19 @@ pub fn derive_lane_viability(profile: &DeviceProfile) -> LaneViability {
     support.insert(Lane::GpuPrl, prl_support);
     reasons.insert(Lane::GpuPrl, prl_reason.to_string());
 
-    // ── recommended: best runnable lane (RVN if viable, else XMR) ───────────
-    let recommended = if support
-        .get(&Lane::GpuRvn)
-        .copied()
-        .unwrap_or(LaneSupport::Unavailable)
-        .is_runnable()
-    {
+    // ── recommended: GPU-PRL is the mainline (V: "GPU 主线 = PRL"). Prefer PRL
+    //    when runnable (one-click default mines PRL on any GPU box), else fall
+    //    back to the GPU-RVN path, else CPU-XMR. ──────────────────────────────
+    let is_runnable = |lane: Lane| {
+        support
+            .get(&lane)
+            .copied()
+            .unwrap_or(LaneSupport::Unavailable)
+            .is_runnable()
+    };
+    let recommended = if is_runnable(Lane::GpuPrl) {
+        Lane::GpuPrl
+    } else if is_runnable(Lane::GpuRvn) {
         Lane::GpuRvn
     } else {
         Lane::Xmr
@@ -294,8 +301,8 @@ pub fn apply_lane_override(
         }
     }
 
-    // Recompute recommended against the new runnable set (RVN > XMR > whatever's
-    // left). Prefer the previously-recommended lane if it's still runnable.
+    // Recompute recommended against the new runnable set (PRL > RVN > XMR).
+    // Prefer the previously-recommended lane if it's still runnable.
     viability.recommended = recompute_recommended(&viability);
     if force {
         viability.notes.push("lane_override_forced".to_string());
@@ -306,10 +313,14 @@ pub fn apply_lane_override(
 }
 
 /// Pick the recommended lane: the prior recommendation if still runnable, else
-/// RVN if runnable, else XMR if runnable, else XMR (fail-safe default).
+/// GPU-PRL (the mainline) if runnable, else GPU-RVN if runnable, else XMR
+/// (fail-safe default).
 fn recompute_recommended(v: &LaneViability) -> Lane {
     if v.is_runnable(v.recommended) {
         return v.recommended;
+    }
+    if v.is_runnable(Lane::GpuPrl) {
+        return Lane::GpuPrl;
     }
     if v.is_runnable(Lane::GpuRvn) {
         return Lane::GpuRvn;
@@ -433,25 +444,32 @@ mod tests {
         assert_eq!(v.support(Lane::GpuPrl), LaneSupport::Viable);
         assert!(v.is_runnable(Lane::GpuRvn));
         assert!(v.is_runnable(Lane::GpuPrl));
-        // recommended is still RVN at T2 (PRL becomes the mainline default once PoP
-        // earning is wired); runnable set = recommended-first, then ALL_LANES order.
-        assert_eq!(v.recommended, Lane::GpuRvn);
+        // GPU-PRL is the mainline default (V: "GPU 主线 = PRL") — a GPU box
+        // one-click-defaults to PRL. runnable set = recommended-first, then
+        // ALL_LANES order ([Xmr, GpuPrl, GpuRvn]).
+        assert_eq!(v.recommended, Lane::GpuPrl);
         assert_eq!(
             v.runnable_lanes(),
-            vec![Lane::GpuRvn, Lane::Xmr, Lane::GpuPrl]
+            vec![Lane::GpuPrl, Lane::Xmr, Lane::GpuRvn]
         );
     }
 
-    /// AMD → RVN "coming soon" (NOT runnable), XMR viable, recommended XMR.
+    /// AMD → RVN "coming soon" (NOT runnable), but PRL viable (SRBMiner supports
+    /// AMD) so PRL is the recommended GPU mainline; XMR viable as the CPU lane.
     #[test]
     fn viability_matrix_amd_rvn_coming_soon() {
         let v = derive_lane_viability(&amd());
         assert_eq!(v.support(Lane::Xmr), LaneSupport::Viable);
         assert_eq!(v.support(Lane::GpuRvn), LaneSupport::ComingSoon);
         assert!(!v.is_runnable(Lane::GpuRvn)); // coming-soon is NOT runnable
-        assert_eq!(v.recommended, Lane::Xmr);
+        // PRL is runnable on AMD (SRBMiner) → it's the recommended mainline lane.
+        assert_eq!(v.support(Lane::GpuPrl), LaneSupport::Viable);
+        assert!(v.is_runnable(Lane::GpuPrl));
+        assert_eq!(v.recommended, Lane::GpuPrl);
         assert_eq!(v.reason(Lane::GpuRvn), Some("rvn_amd_coming_soon"));
         assert!(v.notes.iter().any(|n| n.contains("AMD")));
+        // runnable set = PRL (recommended) first, then XMR; RVN is coming-soon.
+        assert_eq!(v.runnable_lanes(), vec![Lane::GpuPrl, Lane::Xmr]);
     }
 
     /// CPU-only / all-probes-failed → XMR viable everywhere, RVN unavailable.
@@ -492,10 +510,11 @@ mod tests {
     #[test]
     fn restrict_override_demotes_unrequested_runnable_lane() {
         let base = derive_lane_viability(&nvidia());
-        assert_eq!(base.recommended, Lane::GpuRvn);
+        assert_eq!(base.recommended, Lane::GpuPrl);
         let v = apply_lane_override(base, Some(&[Lane::Xmr]), false);
         assert_eq!(v.support(Lane::Xmr), LaneSupport::Viable);
         assert!(!v.is_runnable(Lane::GpuRvn));
+        assert!(!v.is_runnable(Lane::GpuPrl));
         assert_eq!(v.recommended, Lane::Xmr);
         assert_eq!(v.reason(Lane::GpuRvn), Some("override_excluded"));
     }
