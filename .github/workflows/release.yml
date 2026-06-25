@@ -89,8 +89,12 @@ jobs:
       - name: Clippy (workspace, warnings = errors)
         run: cargo clippy --workspace --tests --target ${{ matrix.target }} -- -D warnings
 
-      - name: Build (alice-miner-gui)
-        run: cargo build --release --target ${{ matrix.target }} -p alice-miner-gui
+      - name: Build (alice-miner-gui + alice-miner-cli)
+        # Ship BOTH the desktop GUI and the headless CLI (the CLI is the
+        # performance/throughput path for headless GPU/ASIC rigs).
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p alice-miner-gui
+          cargo build --release --target ${{ matrix.target }} -p alice-miner-cli
 
       # ----------------------------------------------------------------------
       # Stage bundled mining engines (the "bundle the miner" half).
@@ -184,6 +188,9 @@ jobs:
           mkdir -p dist/AliceMiner
           cp target/${{ matrix.target }}/release/alice-miner-gui dist/AliceMiner/AliceMiner
           chmod +x dist/AliceMiner/AliceMiner
+          # Headless CLI alongside the GUI (the performance path for rigs).
+          cp target/${{ matrix.target }}/release/alice-miner-cli dist/AliceMiner/alice-miner-cli
+          chmod +x dist/AliceMiner/alice-miner-cli
           cp crates/alice-miner-gui/assets/brand/alice-logo.svg dist/AliceMiner/
           # Bundled engines (optional) — sibling layout per binaries.rs.
           for e in xmrig kawpowminer; do
@@ -211,6 +218,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist/AliceMiner | Out-Null
           Copy-Item target/${{ matrix.target }}/release/alice-miner-gui.exe dist/AliceMiner/AliceMiner.exe
+          # Headless CLI alongside the GUI (the performance path for rigs).
+          Copy-Item target/${{ matrix.target }}/release/alice-miner-cli.exe dist/AliceMiner/alice-miner-cli.exe
           Copy-Item crates/alice-miner-gui/assets/brand/alice-logo.svg dist/AliceMiner/
           # GPU engine only — xmrig.exe is intentionally NOT bundled on Windows.
           if (Test-Path engine-stage/kawpowminer.exe) {
@@ -226,6 +235,9 @@ jobs:
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp target/${{ matrix.target }}/release/alice-miner-gui "$APP/Contents/MacOS/AliceMiner"
           chmod +x "$APP/Contents/MacOS/AliceMiner"
+          # Headless CLI inside the bundle (run via Terminal: AliceMiner.app/Contents/MacOS/alice-miner-cli).
+          cp target/${{ matrix.target }}/release/alice-miner-cli "$APP/Contents/MacOS/alice-miner-cli"
+          chmod +x "$APP/Contents/MacOS/alice-miner-cli"
           # App icon (committed) → Resources + CFBundleIconFile.
           if [ -f assets/macos/AliceMiner.icns ]; then
             cp assets/macos/AliceMiner.icns "$APP/Contents/Resources/AliceMiner.icns"
