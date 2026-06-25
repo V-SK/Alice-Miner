@@ -6,11 +6,11 @@
 //! the **deliberate Alice-Miner divergences** from the Python reference (PLAN
 //! §6 D-lanes):
 //!
-//!   * **Only two client lanes exist** — CPU→XMR and NVIDIA-GPU→RVN. The Python
-//!     reference also models PRL / LTC / AI; **PRL is NOT a client lane** (ruled
-//!     fake-AI per MEMORY), LTC is upstream-only (not a client lane), and the
-//!     AI-earn lane is M8 (hidden until then). So this module's universe is
-//!     exactly `{Xmr, GpuRvn}` — the [`crate::lane::Lane`] enum.
+//!   * **Three client lanes exist** — CPU→XMR, GPU→PRL (the SRBMiner `pearlhash`
+//!     **mainline**, the V-decided GPU mainline, PoP-gated), and GPU→RVN (the
+//!     earlier KawPoW relay path). LTC is upstream-only (not a client lane), and
+//!     the AI-earn lane is later (hidden until then). So this module's universe is
+//!     exactly `{Xmr, GpuPrl, GpuRvn}` — the [`crate::lane::Lane`] enum.
 //!   * Each lane is classified into a [`LaneSupport`] level: **`Viable`**
 //!     (runnable on this device now), **`ComingSoon`** (the hardware is present
 //!     but the client can't run it yet — e.g. an AMD/Intel GPU for RVN), or
@@ -21,13 +21,12 @@
 //!
 //! The viability rules (the M3 matrix, from the brief / PLAN §5 M3):
 //!
-//! | device                  | XMR      | RVN                         |
-//! |-------------------------|----------|-----------------------------|
-//! | CPU (any)               | Viable   | (per-GPU below)             |
-//! | NVIDIA GPU              | Viable   | **Viable**                  |
-//! | AMD / Intel GPU         | Viable   | **ComingSoon** (not runnable yet) |
-//! | Apple Silicon           | Viable   | **Unavailable** (XMR only)  |
-//! | no GPU / all-probes-fail| Viable   | Unavailable                 |
+//! | device                  | XMR      | PRL (mainline)                | RVN          |
+//! |-------------------------|----------|-------------------------------|--------------|
+//! | CPU only / no GPU       | Viable   | Unavailable                   | Unavailable  |
+//! | NVIDIA GPU              | Viable   | **Viable**                    | Viable       |
+//! | AMD GPU                 | Viable   | **Viable** (SRBMiner)         | ComingSoon   |
+//! | Apple Silicon           | Viable   | Unavailable (no macOS SRBMiner)| Unavailable |
 //!
 //! **CREDIT-ONLY / pure derivation.** This module reads the profile and computes
 //! a lane set; it touches no reward / payout / chain surface and no key.
