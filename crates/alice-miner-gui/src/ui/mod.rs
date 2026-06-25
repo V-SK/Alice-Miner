@@ -9,6 +9,7 @@ pub mod hero;
 pub mod home;
 pub mod icons;
 pub mod onboarding;
+pub mod prl_unlock;
 pub mod strings;
 pub mod theme;
 pub mod widgets;

@@ -58,6 +58,22 @@ pub fn render(ui_root: &mut egui::Ui, app: &mut MinerApp) {
                             super::change_addr::render(ui, app);
                         });
                 }
+
+                // The GPU-PRL unlock-password modal — same overlay treatment.
+                // Opened by `start_mining` when the resolved lane is GPU-PRL and the
+                // identity is keystore-backed (PoP needs the wallet key).
+                if app.prl_unlock.is_some() {
+                    let panel = ui.max_rect();
+                    egui::Area::new(egui::Id::new("prl-unlock-modal"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(panel.min)
+                        .default_size(panel.size())
+                        .show(ui.ctx(), |ui| {
+                            ui.set_min_size(panel.size());
+                            ui.set_max_size(panel.size());
+                            super::prl_unlock::render(ui, app);
+                        });
+                }
             }
         });
 }

@@ -197,6 +197,20 @@ pub fn text_input(ui: &mut Ui, value: &mut String, hint: &str, mono: bool) -> Re
     ui.add(edit)
 }
 
+/// A recessed single-line input that MASKS its content (egui `.password(true)`)
+/// — used for the wallet-unlock password prompt so the passphrase is never shown
+/// on screen. Same recessed styling as [`text_input`]; always non-mono.
+pub fn password_input(ui: &mut Ui, value: &mut String, hint: &str) -> Response {
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .desired_width(f32::INFINITY)
+            .hint_text(hint)
+            .password(true)
+            .margin(egui::vec2(12.0, 10.0))
+            .background_color(THEME.well),
+    )
+}
+
 /// A recessed multi-line text input (mnemonic paste).
 pub fn text_area(ui: &mut Ui, value: &mut String, hint: &str, rows: usize) -> Response {
     ui.add(

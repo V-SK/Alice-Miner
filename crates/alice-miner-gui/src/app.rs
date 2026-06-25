@@ -57,6 +57,25 @@ pub enum ChangeAddr {
     Paste,
 }
 
+/// The GPU-PRL **unlock-password** modal state. The GPU-PRL lane signs a
+/// proof-of-possession with the wallet key, so it needs the keystore password to
+/// start (XMR/RVN are address-only and never raise this). `Some` while the prompt
+/// is open; it carries the captured password (masked in the UI, zeroized the
+/// instant Start is sent or the modal is cancelled) and the exact lane/dual the
+/// user asked to start so confirm can replay it verbatim. Only ever opened for a
+/// keystore-backed identity — a watch-only paste can't sign a PoP and is refused
+/// up-front with a clear message (no modal).
+#[derive(Clone)]
+pub struct PrlUnlock {
+    /// The masked password the user is typing (cleared+zeroized on confirm/cancel).
+    pub password: String,
+    /// The lane the user asked to start (always [`Lane::GpuPrl`] in practice; kept
+    /// so confirm replays the exact request the engine would have received).
+    pub lane: Lane,
+    /// Whether the user asked for dual-mine — replayed verbatim into Start.
+    pub dual: bool,
+}
+
 /// Onboarding sub-flow (only reachable when there is no `~/.alice/identity.json`).
 #[derive(Clone, PartialEq, Eq)]
 pub enum Onboarding {
@@ -110,6 +129,12 @@ pub struct MinerApp {
     /// exists). Mutually exclusive with `onboarding` in practice (onboarding only
     /// runs when there is no identity; the change flow only when there IS one).
     pub change_addr: Option<ChangeAddr>,
+
+    /// `Some` while the GPU-PRL unlock-password prompt is open (the PRL lane needs
+    /// the wallet key to sign a proof-of-possession). Holds the captured password
+    /// (masked + zeroized on confirm/cancel) and the lane/dual to replay. `None`
+    /// for every non-PRL start (XMR/RVN never raise this).
+    pub prl_unlock: Option<PrlUnlock>,
 
     /// The Alice mark texture — a WHITE / alpha mask (rasterised once from the
     /// bundled SVG), tinted to the brand colour at each draw site. See
@@ -216,6 +241,7 @@ impl MinerApp {
             screen: Screen::Home,
             onboarding,
             change_addr: None,
+            prl_unlock: None,
             mark_tex: None,
             form_password: String::new(),
             form_password2: String::new(),
@@ -579,30 +605,100 @@ impl MinerApp {
 
     // ── Engine commands ──────────────────────────────────────────────────────
 
+    /// The lane that a Start would ACTUALLY run, given the user's selection and the
+    /// device viability (falls back to XMR — always viable — when the selection is
+    /// somehow not runnable). Mirrors the resolution in [`start_mining`] so the
+    /// PoP-needed decision is computed from the same lane the engine would launch.
+    pub fn resolved_start_lane(&self) -> Lane {
+        if self.lane_support(self.selected_lane).is_runnable() {
+            self.selected_lane
+        } else {
+            Lane::Xmr
+        }
+    }
+
+    /// Whether a Start of the resolved lane needs the wallet UNLOCK password (a
+    /// proof-of-possession signature). True iff the resolved lane is GPU-PRL — the
+    /// only lane the engine gates on `resolve_prl_secrets` (XMR/RVN are
+    /// address-only). Pure + testable; mirrors `engine.rs` `prl_in_play`.
+    pub fn start_needs_prl_password(&self) -> bool {
+        self.resolved_start_lane() == Lane::GpuPrl
+    }
+
     pub fn start_mining(&mut self) {
         self.error = None;
         // Mine the selected lane (defaults to the recommended one for the device).
         // If somehow not runnable, fall back to XMR (always viable) — defensive.
-        let lane = if self.lane_support(self.selected_lane).is_runnable() {
-            self.selected_lane
-        } else {
-            Lane::Xmr
-        };
+        let lane = self.resolved_start_lane();
         // Dual-mine only when the user opted in AND it's actually viable (≥2 lanes).
         // The GUI gates the toggle on viability, but re-check here defensively.
         let dual = self.dual_requested && self.dual_viable();
-        // TODO(T4/GUI): the GPU-PRL lane needs the wallet password to unlock the
-        // signing key for proof-of-possession (crates/alice-miner-core/src/engine.rs
-        // `resolve_prl_secrets`). Until the GUI adds a password prompt on PRL start,
-        // `unlock_password: None` makes the engine reject a PRL start with a clear
-        // "needs your wallet password" error (XMR/RVN are unaffected). Wire a
-        // modal that captures the password (and zeroizes it) before Start{GpuPrl}.
+
+        // The GPU-PRL lane signs a proof-of-possession with the wallet key, so it
+        // needs the keystore password to start (XMR/RVN never do). Branch here:
+        //   * watch-only identity selected PRL → no keystore to sign → refuse with a
+        //     clear message (no modal; importing the key is the fix), and
+        //   * keystore-backed identity → open the unlock-password modal; the actual
+        //     Start{GpuPrl, unlock_password: Some(pw)} is sent from
+        //     `confirm_prl_start` once the user confirms (then the password is
+        //     zeroized immediately on the GUI side).
+        // Non-PRL lanes send Start{unlock_password: None} straight away (unchanged).
+        if self.start_needs_prl_password() {
+            if self.reward_is_watch_only() {
+                self.error = Some(
+                    "GPU · PRL needs a signable wallet (not a pasted address): import \
+                     the mnemonic/seed for this address, then start PRL."
+                        .into(),
+                );
+                return;
+            }
+            // Keystore-backed → prompt for the unlock password.
+            self.prl_unlock = Some(PrlUnlock { password: String::new(), lane, dual });
+            return;
+        }
+
         if let Err(e) = self
             .engine
             .send(Command::Start { lane, address: None, dual, unlock_password: None })
         {
             self.error = Some(e);
         }
+    }
+
+    /// Confirm the GPU-PRL unlock prompt: send `Start{GpuPrl, unlock_password:
+    /// Some(pw)}` with the captured password, then **immediately zeroize** the
+    /// GUI-side copy (the engine also zeroizes the password it receives once the
+    /// keystore is unlocked — this closes the small window on the UI side). No-op if
+    /// the modal isn't open. The lane/dual are replayed verbatim from the modal.
+    pub fn confirm_prl_start(&mut self) {
+        use zeroize::Zeroize;
+        let Some(mut unlock) = self.prl_unlock.take() else {
+            return;
+        };
+        self.error = None;
+        let PrlUnlock { lane, dual, .. } = unlock;
+        // Send a CLONE; the original buffer is zeroized below regardless of outcome.
+        let send_result = self.engine.send(Command::Start {
+            lane,
+            address: None,
+            dual,
+            unlock_password: Some(unlock.password.clone()),
+        });
+        // Zeroize the GUI-held password the instant Start is dispatched.
+        unlock.password.zeroize();
+        if let Err(e) = send_result {
+            self.error = Some(e);
+        }
+    }
+
+    /// Cancel the GPU-PRL unlock prompt without starting: zeroize+drop the captured
+    /// password and close the modal. No-op if it isn't open.
+    pub fn cancel_prl_start(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(mut unlock) = self.prl_unlock.take() {
+            unlock.password.zeroize();
+        }
+        self.error = None;
     }
 
     /// Whether dual-mine is VIABLE on this device — at least two lanes are
@@ -1188,5 +1284,136 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         app.close_change_addr();
         assert!(app.change_addr.is_none());
         assert!(app.form_address.is_empty());
+    }
+
+    // ── GPU-PRL unlock-password gating (A2a) ──────────────────────────────────
+
+    /// A simulated NVIDIA box (so PRL is a runnable lane the user can select).
+    fn nvidia_device() -> alice_miner_core::detect::DeviceProfile {
+        use alice_miner_core::detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
+        DeviceProfile {
+            os: OsFamily::Linux,
+            arch: "x86_64".into(),
+            apple_silicon: false,
+            logical_cores: 16,
+            cpu_model: "AMD Ryzen 9 5950X".into(),
+            gpu: GpuInfo {
+                vendor: GpuVendor::Nvidia,
+                model: "NVIDIA GeForce RTX 3070 Ti".into(),
+                vram_gb: 8,
+            },
+            memory_gb: 64,
+            display: "AMD Ryzen 9 5950X · 16 cores".into(),
+            warnings: vec![],
+        }
+    }
+
+    fn keystore_identity() -> IdentityPointer {
+        IdentityPointer {
+            address: "a2x9k4f7q2w8e3r5t6y1u0p9s8d7f6g5h4j3k2l1z0x9c8v7b6n5m4Q".into(),
+            pubkey: Some("0x00".into()),
+            keystore_path: Some("/tmp/wallet.json".into()),
+            label: None,
+            created: 0,
+        }
+    }
+
+    fn watch_only_identity() -> IdentityPointer {
+        IdentityPointer {
+            address: "a2x9k4f7q2w8e3r5t6y1u0p9s8d7f6g5h4j3k2l1z0x9c8v7b6n5m4Q".into(),
+            pubkey: None,
+            keystore_path: None,
+            label: None,
+            created: 0,
+        }
+    }
+
+    /// The PoP-needed predicate: only the GPU-PRL lane raises the unlock prompt;
+    /// XMR/RVN are address-only. Computed from the RESOLVED lane (what Start would
+    /// actually launch), so it mirrors the engine's `prl_in_play`.
+    #[test]
+    fn start_needs_prl_password_only_for_resolved_prl_lane() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(nvidia_device());
+
+        app.select_lane(Lane::Xmr);
+        assert!(!app.start_needs_prl_password(), "XMR is address-only");
+
+        app.select_lane(Lane::GpuRvn);
+        assert!(!app.start_needs_prl_password(), "RVN is address-only");
+
+        app.select_lane(Lane::GpuPrl);
+        assert!(app.start_needs_prl_password(), "PRL signs a PoP → needs the key");
+    }
+
+    /// Starting PRL with a KEYSTORE-backed identity opens the unlock-password modal
+    /// (it does NOT send Start yet — the engine receives the password only on
+    /// confirm). XMR never opens it.
+    #[test]
+    fn start_prl_keystore_opens_unlock_modal() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(nvidia_device());
+        app.identity = Some(keystore_identity());
+
+        // XMR → no modal (sends Start straight through).
+        app.select_lane(Lane::Xmr);
+        app.start_mining();
+        assert!(app.prl_unlock.is_none(), "XMR never prompts for a password");
+
+        // PRL → modal opens, carrying the resolved lane + dual, no error.
+        app.select_lane(Lane::GpuPrl);
+        app.start_mining();
+        let unlock = app.prl_unlock.as_ref().expect("PRL opens the unlock modal");
+        assert_eq!(unlock.lane, Lane::GpuPrl);
+        assert!(!unlock.dual);
+        assert!(unlock.password.is_empty(), "starts empty");
+        assert!(app.error.is_none(), "no error — just a prompt");
+    }
+
+    /// Starting PRL with a WATCH-ONLY identity (pasted address, no key) is refused
+    /// up-front with a clear message and NO modal (it can't sign a PoP — importing
+    /// the key is the fix).
+    #[test]
+    fn start_prl_watch_only_refused_without_modal() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(nvidia_device());
+        app.identity = Some(watch_only_identity());
+
+        app.select_lane(Lane::GpuPrl);
+        app.start_mining();
+        assert!(app.prl_unlock.is_none(), "watch-only never opens the modal");
+        let err = app.error.as_deref().expect("a refusal message is set");
+        assert!(err.contains("import"), "message points at importing the key: {err}");
+    }
+
+    /// Cancelling the unlock prompt zeroizes+drops the captured password and closes
+    /// the modal — without starting.
+    #[test]
+    fn cancel_prl_unlock_clears_and_closes() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.prl_unlock = Some(PrlUnlock {
+            password: "secret-pw".into(),
+            lane: Lane::GpuPrl,
+            dual: false,
+        });
+        app.cancel_prl_start();
+        assert!(app.prl_unlock.is_none(), "modal closed on cancel");
+        assert!(app.error.is_none());
+    }
+
+    /// Confirming the unlock prompt consumes the modal (the password is dispatched
+    /// to the engine and the GUI-held copy is zeroized+dropped). After confirm the
+    /// modal is closed regardless of whether the engine accepts the password (the
+    /// outcome surfaces later as an Event::Error snapshot).
+    #[test]
+    fn confirm_prl_unlock_consumes_modal() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.prl_unlock = Some(PrlUnlock {
+            password: "secret-pw".into(),
+            lane: Lane::GpuPrl,
+            dual: false,
+        });
+        app.confirm_prl_start();
+        assert!(app.prl_unlock.is_none(), "modal consumed on confirm");
     }
 }

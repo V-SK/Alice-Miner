@@ -133,6 +133,26 @@ pub const CHANGE_ADDR_PASTE_CAUTION: &str =
 pub const CHANGE_ADDR_MINING_BLOCK: &str =
     "Stop mining first — the reward address can't change while a lane is running.";
 
+// ── GPU-PRL unlock-password prompt (A2a) ──────────────────────────────────────
+/// The GPU-PRL lane signs a proof-of-possession with the wallet key, so starting
+/// it asks for the keystore-unlock password (XMR/RVN never do). These label the
+/// modal that captures it (the password is masked on screen + zeroized the instant
+/// Start is sent). NO reward vocabulary here — it's purely a key-unlock prompt.
+pub const PRL_UNLOCK_EYEBROW: &str = "GPU · PRL";
+pub const PRL_UNLOCK_TITLE: &str = "Unlock your wallet to start";
+pub const PRL_UNLOCK_SUB: &str =
+    "The GPU · PRL lane proves you hold this address (a signature). Enter your wallet \
+     password to unlock the signing key — it is used locally and never leaves this device.";
+/// The password field label.
+pub const PRL_UNLOCK_FIELD: &str = "Wallet password";
+/// The password input placeholder.
+pub const PRL_UNLOCK_HINT: &str = "your keystore password";
+/// The confirm (start) button.
+pub const PRL_UNLOCK_CONFIRM: &str = "Unlock & start";
+/// A small reassurance under the field (the password is wiped right after use).
+pub const PRL_UNLOCK_NOTE: &str =
+    "Your password unlocks the local signing key and is wiped right after.";
+
 // ── M5 dashboard depth: Source A (activity) / Source B (server-confirmed) ─────
 /// Source-A section eyebrow + caption — this is LOCAL ACTIVITY, explicitly NOT
 /// earnings (the brief's hard separation).
