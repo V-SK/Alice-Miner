@@ -39,7 +39,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use alice_miner_core::engine::{Command as EngineCommand, Event, IdentitySpec};
-use alice_miner_core::{EngineHandle, EngineState, Lane, Snapshot};
+use alice_miner_core::{EngineHandle, EngineState, GpuSelection, Lane, Snapshot};
 
 mod dashboard;
 mod pidfile;
@@ -187,6 +187,12 @@ struct StartArgs {
     /// scripts). Conflicts with `--password`.
     #[arg(long, conflicts_with = "password")]
     password_stdin: bool,
+    /// Restrict a GPU lane (`prl`/`gpu`) to specific cards, as a comma-separated
+    /// list of 0-based device indices (e.g. `--gpus 0,1,2`). OMIT this flag to use
+    /// EVERY detected card (the default — argv is unchanged). Indices come from
+    /// `alice-miner detect` (the per-GPU list). Ignored for the CPU-XMR lane.
+    #[arg(long, value_name = "IDS")]
+    gpus: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -394,6 +400,20 @@ fn cmd_start(args: StartArgs) -> i32 {
         Err(code) => return code,
     };
 
+    // A5b: resolve the optional per-card GPU selection. Absent → All (every card,
+    // unchanged argv); a malformed `--gpus` value is a usage error (we never
+    // silently degrade to "all cards" on a typo).
+    let gpus = match args.gpus.as_deref() {
+        None => GpuSelection::All,
+        Some(s) => match GpuSelection::parse_ids(s) {
+            Ok(sel) => sel,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return EXIT_USAGE;
+            }
+        },
+    };
+
     if !cap.support(lane).is_runnable() {
         eprintln!(
             "error: the {} lane is {} on this device ({}). Recommended lane: {}.",
@@ -471,6 +491,7 @@ fn cmd_start(args: StartArgs) -> i32 {
         address: args.address.clone(),
         dual: args.dual,
         unlock_password,
+        gpus,
     }) {
         eprintln!("error: {e}");
         return EXIT_RUNTIME;
@@ -722,6 +743,8 @@ mod tests {
                 assert_eq!(a.lane, "auto");
                 assert!(!a.dual && !a.json);
                 assert_eq!(a.duration_s, 0);
+                // A5b: no --gpus by default (→ GpuSelection::All at runtime).
+                assert!(a.gpus.is_none());
             }
             _ => panic!("expected start"),
         }
@@ -760,6 +783,46 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_rejected() {
         assert!(Cli::try_parse_from(["alice-miner", "mine-everything"]).is_err());
+    }
+
+    /// A5b: `--gpus 0,1,2` parses to the raw string on `StartArgs`; absence leaves
+    /// it `None` (→ `GpuSelection::All`). The string→`GpuSelection` mapping +
+    /// malformed-input rejection is covered by the core `GpuSelection::parse_ids`
+    /// tests; here we confirm the CLI flag itself parses and threads the value.
+    #[test]
+    fn start_gpus_flag_parses_and_maps_to_selection() {
+        let cli = Cli::try_parse_from(["alice-miner", "start", "--gpus", "0,1,2"]).unwrap();
+        match cli.command {
+            Command::Start(a) => {
+                assert_eq!(a.gpus.as_deref(), Some("0,1,2"));
+                // The CLI maps a present, well-formed value to Ids in order.
+                assert_eq!(
+                    GpuSelection::parse_ids(a.gpus.as_deref().unwrap()).unwrap(),
+                    GpuSelection::Ids(vec![0, 1, 2])
+                );
+            }
+            _ => panic!("expected start"),
+        }
+        // Absent → None → All.
+        let cli = Cli::try_parse_from(["alice-miner", "start"]).unwrap();
+        match cli.command {
+            Command::Start(a) => {
+                assert!(a.gpus.is_none());
+                let sel = match a.gpus.as_deref() {
+                    None => GpuSelection::All,
+                    Some(s) => GpuSelection::parse_ids(s).unwrap(),
+                };
+                assert_eq!(sel, GpuSelection::All);
+            }
+            _ => panic!("expected start"),
+        }
+        // A malformed value still PARSES at the clap layer (it's a free string);
+        // the rejection happens in cmd_start via parse_ids (asserted in core).
+        let cli = Cli::try_parse_from(["alice-miner", "start", "--gpus", "0,x"]).unwrap();
+        match cli.command {
+            Command::Start(a) => assert!(GpuSelection::parse_ids(a.gpus.as_deref().unwrap()).is_err()),
+            _ => panic!("expected start"),
+        }
     }
 
     #[test]

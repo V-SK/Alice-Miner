@@ -68,5 +68,5 @@ pub use detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
 pub use endpoint::{Endpoint, EndpointPlan, Transport};
 pub use engine::{Command, EngineHandle, EngineState, Event, IdentitySpec, Snapshot};
 pub use identity::{Identity, IdentityPointer};
-pub use lane::Lane;
+pub use lane::{GpuSelection, Lane};
 pub use prl_payout::{EnrollOutcome, PrlPayoutDisplay};

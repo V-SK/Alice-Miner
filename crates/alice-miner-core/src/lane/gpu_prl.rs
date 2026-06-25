@@ -31,11 +31,24 @@ use std::time::{Duration, Instant};
 
 use super::gpu_rvn::GpuLaunchPlan;
 use super::xmr::{derive_worker_id, MINING_EXECUTION_ALLOWED};
-use super::Lane;
+use super::{GpuSelection, Lane};
 use crate::endpoint::{Endpoint, EndpointPlan};
 
 /// SRBMiner's algorithm token for the Alice GPU-PRL lane. argv-only.
 const PEARLHASH_ALGO: &str = "pearlhash";
+
+/// SRBMiner's per-card device-selection flag. argv-only; appended ONLY when the
+/// lane is restricted to a [`GpuSelection::Ids`] set (its value is the
+/// comma-separated 0-based index list, e.g. `0,1,2`). With [`GpuSelection::All`]
+/// no flag is appended at all, so SRBMiner uses every detected card (the
+/// pre-A5b default — byte-for-byte unchanged argv).
+///
+/// TODO(gpu-box): the EXACT flag spelling (`--gpu-id`) and the index→physical-card
+/// mapping (does SRBMiner's `--gpu-id 0` track CUDA ordinal / nvidia-smi index?)
+/// must be confirmed against SRBMiner-MULTI 3.4.1 on a real multi-GPU box. This
+/// constant fixes the argv *shape* only; the live correctness check is deferred
+/// to the GPU-box e2e (same gate as the earn-proof), not this credit-only batch.
+const SRBMINER_GPU_ID_FLAG: &str = "--gpu-id";
 
 /// Client-facing stratum port for the GPU-PRL lane on the region relays.
 pub const GPU_RELAY_PORT: u16 = 3340;
@@ -73,12 +86,19 @@ pub fn region_default_endpoints() -> Vec<Endpoint> {
 /// * `log_path` — the supervisor-owned log file. SRBMiner emits share/hashrate
 ///   lines ONLY to `--log-file`, so it is **mandatory** (without it the dashboard
 ///   reads 0 and health checks false-error).
+/// `gpus` selects which physical card(s) to run on (A5b):
+/// * [`GpuSelection::All`] (the default) appends **no** device flag — SRBMiner
+///   uses every detected card, so the argv is **byte-for-byte identical** to the
+///   pre-A5b plan (no multi-GPU regression).
+/// * [`GpuSelection::Ids`] appends `--gpu-id <0-based,comma,list>` at the END of
+///   the existing argv (the order of the other args is untouched).
 pub fn build_srbminer_pearl_launch_plan(
     program: PathBuf,
     reward_identity: &str,
     region_endpoint: &str,
     pop_token: &str,
     log_path: &Path,
+    gpus: &GpuSelection,
 ) -> Result<GpuLaunchPlan, String> {
     if !MINING_EXECUTION_ALLOWED {
         return Err("mining execution is not enabled in this build".into());
@@ -87,7 +107,7 @@ pub fn build_srbminer_pearl_launch_plan(
     let worker = derive_worker_id(reward)?; // fail-closed Alice-address validation
     let wallet = format!("{reward}.{worker}");
     let pool = format!("stratum+tcp://{region_endpoint}");
-    let args = vec![
+    let mut args = vec![
         "--algorithm".into(),
         PEARLHASH_ALGO.into(),
         "--pool".into(),
@@ -100,6 +120,11 @@ pub fn build_srbminer_pearl_launch_plan(
         "--log-file".into(),
         log_path.display().to_string(),
     ];
+    // A5b: opt-in per-card restriction. `All` adds nothing (default = all cards).
+    if let Some(csv) = gpus.csv() {
+        args.push(SRBMINER_GPU_ID_FLAG.into());
+        args.push(csv);
+    }
     Ok(GpuLaunchPlan { program, args })
 }
 
@@ -120,6 +145,7 @@ pub fn build_srbminer_pearl_launch_plan_for(
     plan: &EndpointPlan,
     pop_token: &str,
     log_path: &Path,
+    gpus: &GpuSelection,
 ) -> Result<GpuLaunchPlan, String> {
     let ordered = plan.ordered_from_cursor();
     let Some(active) = ordered.first() else {
@@ -131,6 +157,7 @@ pub fn build_srbminer_pearl_launch_plan_for(
         &endpoint_authority(active),
         pop_token,
         log_path,
+        gpus,
     )
 }
 
@@ -292,6 +319,7 @@ mod tests {
             "us.aliceprotocol.org:3340",
             "pop=ch123:c2lnYmFzZTY0",
             &lp,
+            &GpuSelection::All,
         )
         .expect("plan");
         let a = &plan.args;
@@ -311,6 +339,115 @@ mod tests {
         assert!(a.iter().any(|x| x == "--disable-cpu"));
         let lf = a.iter().position(|x| x == "--log-file").expect("--log-file mandatory");
         assert_eq!(a[lf + 1], lp.display().to_string());
+        // A5b: with the DEFAULT GpuSelection::All, NO --gpu-id flag is present
+        // (all cards — the pre-A5b default).
+        assert!(!a.iter().any(|x| x == "--gpu-id"));
+    }
+
+    /// A5b REGRESSION GUARD: with [`GpuSelection::All`] the argv must be
+    /// **byte-for-byte identical** to the pre-A5b builder (the new `gpus` param
+    /// is purely additive — `All` appends nothing). We pin the exact expected
+    /// argv so any accidental reordering / extra flag fails loudly.
+    #[test]
+    fn srbminer_argv_all_is_unchanged_from_pre_a5b() {
+        let addr = valid_address();
+        let lp = log_path();
+        let plan = build_srbminer_pearl_launch_plan(
+            PathBuf::from("/opt/SRBMiner-MULTI"),
+            addr,
+            "us.aliceprotocol.org:3340",
+            "pop=ch:sig",
+            &lp,
+            &GpuSelection::All,
+        )
+        .expect("plan");
+        let worker = derive_worker_id(addr).unwrap();
+        let expected: Vec<String> = vec![
+            "--algorithm".into(),
+            "pearlhash".into(),
+            "--pool".into(),
+            "stratum+tcp://us.aliceprotocol.org:3340".into(),
+            "--wallet".into(),
+            format!("{addr}.{worker}"),
+            "--password".into(),
+            "pop=ch:sig".into(),
+            "--disable-cpu".into(),
+            "--log-file".into(),
+            lp.display().to_string(),
+        ];
+        assert_eq!(plan.args, expected, "GpuSelection::All must not change the argv");
+    }
+
+    /// A5b: [`GpuSelection::Ids`] APPENDS `--gpu-id 0,1,2` at the end, leaving the
+    /// rest of the argv (and its order) exactly as `All` produces it.
+    #[test]
+    fn srbminer_argv_ids_appends_gpu_id_flag() {
+        let addr = valid_address();
+        let lp = log_path();
+        let plan = build_srbminer_pearl_launch_plan(
+            PathBuf::from("/opt/SRBMiner-MULTI"),
+            addr,
+            "us.aliceprotocol.org:3340",
+            "pop=ch:sig",
+            &lp,
+            &GpuSelection::Ids(vec![0, 1, 2]),
+        )
+        .expect("plan");
+        // The flag is present with the comma-joined index list as its value.
+        let g = plan
+            .args
+            .iter()
+            .position(|x| x == "--gpu-id")
+            .expect("--gpu-id present for Ids");
+        assert_eq!(plan.args[g + 1], "0,1,2");
+        // It is APPENDED last (the prior argv is untouched): the two new tokens
+        // are exactly the trailing two.
+        let n = plan.args.len();
+        assert_eq!(&plan.args[n - 2..], &["--gpu-id".to_string(), "0,1,2".to_string()]);
+        // A single non-zero index also works (e.g. only the 2nd card).
+        let plan1 = build_srbminer_pearl_launch_plan(
+            PathBuf::from("/opt/SRBMiner-MULTI"),
+            addr,
+            "us.aliceprotocol.org:3340",
+            "pop=ch:sig",
+            &lp,
+            &GpuSelection::Ids(vec![1]),
+        )
+        .unwrap();
+        let g1 = plan1.args.iter().position(|x| x == "--gpu-id").unwrap();
+        assert_eq!(plan1.args[g1 + 1], "1");
+    }
+
+    /// A5b HONESTY: selecting specific cards must NOT introduce any forbidden
+    /// substring — `--gpu-id 0,1` is digits only, so the honesty gate (no prl1p
+    /// collection address / herominers / core IP / seed) still holds.
+    #[test]
+    fn honesty_gate_holds_with_gpu_ids_selection() {
+        let addr = valid_address();
+        let lp = log_path();
+        let plan = build_srbminer_pearl_launch_plan(
+            PathBuf::from("/opt/SRBMiner-MULTI"),
+            addr,
+            "asia.aliceprotocol.org:3340",
+            "pop=abc:def",
+            &lp,
+            &GpuSelection::Ids(vec![0, 1]),
+        )
+        .unwrap();
+        let joined = plan.args.join(" ");
+        assert!(joined.contains(addr));
+        assert!(joined.contains(":3340"));
+        assert!(!joined.contains("prl1p"), "a prl1p address leaked: {joined}");
+        assert!(!joined.contains("herominers"), "upstream pool host leaked: {joined}");
+        assert!(!joined.contains("203.0.113.10"), "core IP leaked: {joined}");
+        assert!(!plan
+            .args
+            .iter()
+            .any(|a| a.contains("seed") || a.contains("priv") || a.contains("0x")));
+        // Only *.aliceprotocol.org appears as a stratum authority.
+        for tok in plan.args.iter().filter(|a| a.starts_with("stratum+")) {
+            assert!(tok.contains("aliceprotocol.org:"), "non-Alice relay host: {tok}");
+        }
     }
 
     /// THE HONESTY GATE (GPU-PRL): pearlhash + region host are OPEN, but no
@@ -325,6 +462,7 @@ mod tests {
             "asia.aliceprotocol.org:3340",
             "pop=abc:def",
             &lp,
+            &GpuSelection::All,
         )
         .unwrap();
         let joined = plan.args.join(" ");
@@ -356,6 +494,7 @@ mod tests {
             "us.aliceprotocol.org:3340",
             "pop=a:b",
             &lp,
+            &GpuSelection::All,
         )
         .is_err());
         // Wrong-network (substrate-42) address rejected.
@@ -365,6 +504,7 @@ mod tests {
             "us.aliceprotocol.org:3340",
             "pop=a:b",
             &lp,
+            &GpuSelection::All,
         )
         .is_err());
     }
@@ -385,6 +525,7 @@ mod tests {
             &plan,
             "pop=a:b",
             &lp,
+            &GpuSelection::All,
         )
         .unwrap();
         let pool = lplan.args.iter().position(|x| x == "--pool").unwrap();

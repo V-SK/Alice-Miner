@@ -27,8 +27,8 @@ use tokio::runtime::Runtime;
 use crate::detect::DeviceProfile;
 use crate::endpoint::{Endpoint, EndpointPlan};
 use crate::identity::{self, Identity};
-use crate::lane::Lane;
 use crate::lane::{gpu_prl, gpu_rvn, xmr};
+use crate::lane::{GpuSelection, Lane};
 use crate::supervise::LaneSupervisor;
 
 /// How a [`Command::Identity`] establishes the reward identity.
@@ -75,6 +75,12 @@ pub enum Command {
         /// unlock window, never persisted, never sent to the child.
         #[doc(hidden)]
         unlock_password: Option<String>,
+        /// Which physical GPU(s) the GPU lane should run on (A5b). Defaults to
+        /// [`GpuSelection::All`] (every detected card — the argv is unchanged vs.
+        /// pre-A5b, so the existing multi-card behavior is preserved). Only the
+        /// GPU lanes (PRL / RVN) consult it; the CPU-XMR lane ignores it.
+        #[doc(hidden)]
+        gpus: GpuSelection,
     },
     /// Stop the running lane (SIGTERM→SIGKILL on the owned child).
     Stop,
@@ -372,7 +378,7 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
                     }
                 }
             }
-            Some(Command::Start { lane, address, dual, mut unlock_password }) => {
+            Some(Command::Start { lane, address, dual, mut unlock_password, gpus }) => {
                 // Resolve the reward address: the explicit one, else the active
                 // identity's, else the on-disk pointer's.
                 let addr = address
@@ -427,7 +433,7 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
                     }
                 }
 
-                match start_run(&rt, lane, dual, &addr, secrets) {
+                match start_run(&rt, lane, dual, &addr, secrets, &gpus) {
                     Ok((new_run, worker_id)) => {
                         run = new_run;
                         active_address = Some(addr);
@@ -606,6 +612,7 @@ fn start_run(
     dual: bool,
     address: &str,
     secrets: Option<alice_crypto::WalletSecrets>,
+    gpus: &GpuSelection,
 ) -> Result<(RunSet, String), String> {
     let worker_id = xmr::derive_worker_id(address)?; // one worker-id fn for both lanes
     // Enter the runtime ONCE for all the start()s — they spawn tokio child-I/O +
@@ -619,8 +626,11 @@ fn start_run(
         let gpu_lane = if lane == Lane::GpuRvn { Lane::GpuRvn } else { Lane::GpuPrl };
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let xmr_threads = dual_xmr_threads(cores);
-        let (xmr_sup, _) = start_one_lane(Lane::Xmr, address, Some(xmr_threads), None)?;
-        let (gpu_sup, prl_enroll) = match start_one_lane(gpu_lane, address, None, secrets) {
+        // CPU-XMR ignores GPU selection (pass All); the GPU partner (PRL mainline,
+        // or RVN if explicitly selected) honors it and is threaded its PoP `secrets`.
+        let (xmr_sup, _) =
+            start_one_lane(Lane::Xmr, address, Some(xmr_threads), None, &GpuSelection::All)?;
+        let (gpu_sup, prl_enroll) = match start_one_lane(gpu_lane, address, None, secrets, gpus) {
             Ok(s) => s,
             Err(e) => {
                 // The XMR lane already started; tear it back down so we don't leave
@@ -638,7 +648,7 @@ fn start_run(
             worker_id,
         ))
     } else {
-        let (sup, prl_enroll) = start_one_lane(lane, address, None, secrets)?;
+        let (sup, prl_enroll) = start_one_lane(lane, address, None, secrets, gpus)?;
         Ok((
             RunSet {
                 supervisors: vec![sup],
@@ -659,6 +669,7 @@ fn start_one_lane(
     address: &str,
     threads_override: Option<usize>,
     secrets: Option<alice_crypto::WalletSecrets>,
+    gpus: &GpuSelection,
 ) -> Result<(LaneSupervisor, Option<Arc<AtomicU8>>), String> {
     // GPU-PRL targets the region relays ordered by lowest RTT (operator override /
     // probe / US-first fallback); every other lane uses its compiled plan.
@@ -687,21 +698,25 @@ fn start_one_lane(
             )?;
             Ok((p.program, p.args))
         }),
-        Lane::GpuRvn => Arc::new(move |eps: &[Endpoint]| {
-            let program =
-                crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::GpuRvn)?;
-            let p = if is_trex_binary(&program) {
-                // T-Rex (override path) takes a single endpoint; use the first.
-                gpu_rvn::build_trex_launch_plan(program, &addr_for_rebuild)?
-            } else {
-                gpu_rvn::build_kawpowminer_launch_plan_with_endpoints(
-                    program,
-                    &addr_for_rebuild,
-                    eps,
-                )?
-            };
-            Ok((p.program, p.args))
-        }),
+        Lane::GpuRvn => {
+            let gpus_rvn = gpus.clone();
+            Arc::new(move |eps: &[Endpoint]| {
+                let program =
+                    crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::GpuRvn)?;
+                let p = if is_trex_binary(&program) {
+                    // T-Rex (override path) takes a single endpoint; use the first.
+                    gpu_rvn::build_trex_launch_plan(program, &addr_for_rebuild, &gpus_rvn)?
+                } else {
+                    gpu_rvn::build_kawpowminer_launch_plan_with_endpoints(
+                        program,
+                        &addr_for_rebuild,
+                        eps,
+                        &gpus_rvn,
+                    )?
+                };
+                Ok((p.program, p.args))
+            })
+        }
         Lane::GpuPrl => {
             // GPU-PRL needs the wallet SIGNING key for the region-bound PoP. The
             // caller (worker_loop) already unlocked it + rejected watch-only; a
@@ -717,6 +732,7 @@ fn start_one_lane(
             // THIS file for the GPU-PRL lane (stdout-only capture misses shares).
             let log_path = prl_log_path();
             let addr_prl = addr_for_rebuild.clone();
+            let gpus_prl = gpus.clone();
             Arc::new(move |eps: &[Endpoint]| {
                 let program =
                     crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::GpuPrl)?;
@@ -743,6 +759,7 @@ fn start_one_lane(
                     &region_authority,
                     &token.password,
                     &log_path,
+                    &gpus_prl,
                 )?;
                 Ok((p.program, p.args))
             })
@@ -1178,7 +1195,13 @@ mod tests {
         std::env::set_var("ALICE_IDENTITY_DIR", &empty);
 
         engine
-            .send(Command::Start { lane: Lane::Xmr, address: None, dual: false, unlock_password: None })
+            .send(Command::Start {
+                lane: Lane::Xmr,
+                address: None,
+                dual: false,
+                unlock_password: None,
+                gpus: GpuSelection::All,
+            })
             .expect("send start");
         let evt = engine
             .recv_timeout(Duration::from_secs(5))
@@ -1330,6 +1353,7 @@ mod tests {
                 address: Some(address),
                 dual: true,
                 unlock_password: None,
+                gpus: GpuSelection::All,
             })
             .expect("send dual start");
 

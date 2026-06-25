@@ -12,8 +12,8 @@ use std::time::Instant;
 use alice_miner_core::engine::{Command, EngineHandle, Event, IdentitySpec, Snapshot};
 use alice_miner_core::identity::{self, IdentityPointer};
 use alice_miner_core::{
-    CreditState, DashboardModel, DeviceProfile, EngineState, Identity, Lane, LaneSupport,
-    LaneViability, LocalActivity, PoolStatsClient, Reconciliation,
+    CreditState, DashboardModel, DeviceProfile, EngineState, GpuSelection, Identity, Lane,
+    LaneSupport, LaneViability, LocalActivity, PoolStatsClient, Reconciliation,
 };
 use eframe::egui::{self, TextureHandle};
 
@@ -659,7 +659,15 @@ impl MinerApp {
 
         if let Err(e) = self
             .engine
-            .send(Command::Start { lane, address: None, dual, unlock_password: None })
+            .send(Command::Start {
+                lane,
+                address: None,
+                dual,
+                unlock_password: None,
+                // A5b: the GUI has no per-card picker yet → All (every card,
+                // unchanged behavior). CLI `--gpus` is the opt-in entry point.
+                gpus: GpuSelection::All,
+            })
         {
             self.error = Some(e);
         }
@@ -683,6 +691,7 @@ impl MinerApp {
             address: None,
             dual,
             unlock_password: Some(unlock.password.clone()),
+            gpus: GpuSelection::All,
         });
         // Zeroize the GUI-held password the instant Start is dispatched.
         unlock.password.zeroize();

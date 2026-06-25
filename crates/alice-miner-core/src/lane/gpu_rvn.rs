@@ -31,8 +31,24 @@
 use std::path::PathBuf;
 
 use super::xmr::{derive_worker_id, MINING_EXECUTION_ALLOWED};
-use super::Lane;
+use super::{GpuSelection, Lane};
 use crate::endpoint::{Endpoint, EndpointPlan};
+
+/// kawpowminer's per-card device-selection flag (ethminer-derived). Appended
+/// ONLY for a [`GpuSelection::Ids`] set; its value is the comma-separated 0-based
+/// index list (e.g. `0,1,2`). [`GpuSelection::All`] appends nothing (all cards).
+///
+/// TODO(gpu-box): confirm the exact spelling (`--cuda-devices` vs `--devices`)
+/// and the index→card mapping against the bundled kawpowminer build on a real
+/// multi-GPU box. This fixes the argv *shape* only; the live correctness check is
+/// deferred to the GPU-box e2e (same gate as the earn-proof), not this batch.
+const KAWPOWMINER_DEVICES_FLAG: &str = "--cuda-devices";
+
+/// T-Rex's per-card device-selection flag. Same opt-in semantics as
+/// [`KAWPOWMINER_DEVICES_FLAG`]; value is the comma-separated 0-based index list.
+///
+/// TODO(gpu-box): confirm `--devices` spelling + index mapping on a real box.
+const TREX_DEVICES_FLAG: &str = "--devices";
 
 // ── Mining engine wiring (Alice re-hash relay, KawPoW/RVN) ──────────────────
 
@@ -103,25 +119,14 @@ pub fn build_kawpowminer_launch_plan(
     program: PathBuf,
     reward_identity: &str,
 ) -> Result<GpuLaunchPlan, String> {
-    if !MINING_EXECUTION_ALLOWED {
-        return Err("mining execution is not enabled in this build".into());
-    }
-    let reward = reward_identity.trim();
-    let rig_id = derive_worker_id(reward)?; // fail-closed Alice-address validation
-    let url = connection_url(reward, &rig_id);
-    let args = vec![
-        "-P".into(),
-        url,
-        // Surface the per-GPU hashrate to the pool/log (so the dashboard reads it).
-        "--report-hashrate".into(),
-        // EthereumStratum/NiceHash v2 (the modern KawPoW stratum the relay speaks).
-        "--stratum-protocol".into(),
-        "2".into(),
-        // Print a speed line on a 10s cadence (matches the XMR lane's --print-time).
-        "--display-interval".into(),
-        "10".into(),
-    ];
-    Ok(GpuLaunchPlan { program, args })
+    // Single-endpoint convenience over the multi-endpoint builder so the
+    // device-selection / argv shape lives in ONE place. `All` = unchanged argv.
+    build_kawpowminer_launch_plan_with_endpoints(
+        program,
+        reward_identity,
+        &[Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT)],
+        &GpuSelection::All,
+    )
 }
 
 /// Build the **KawPowMiner** launch plan with **multi-endpoint failover (Layer A)
@@ -143,6 +148,7 @@ pub fn build_kawpowminer_launch_plan_with_endpoints(
     program: PathBuf,
     reward_identity: &str,
     endpoints: &[Endpoint],
+    gpus: &GpuSelection,
 ) -> Result<GpuLaunchPlan, String> {
     if !MINING_EXECUTION_ALLOWED {
         return Err("mining execution is not enabled in this build".into());
@@ -153,7 +159,7 @@ pub fn build_kawpowminer_launch_plan_with_endpoints(
     let reward = reward_identity.trim();
     let rig_id = derive_worker_id(reward)?; // fail-closed Alice-address validation
 
-    let mut args: Vec<String> = Vec::with_capacity(endpoints.len() * 2 + 4);
+    let mut args: Vec<String> = Vec::with_capacity(endpoints.len() * 2 + 6);
     // Layer A: one `-P <url>` per endpoint, in order.
     for ep in endpoints {
         args.push("-P".into());
@@ -166,6 +172,11 @@ pub fn build_kawpowminer_launch_plan_with_endpoints(
         "--display-interval".into(),
         "10".into(),
     ]);
+    // A5b: opt-in per-card restriction. `All` appends nothing → unchanged argv.
+    if let Some(csv) = gpus.csv() {
+        args.push(KAWPOWMINER_DEVICES_FLAG.into());
+        args.push(csv);
+    }
     Ok(GpuLaunchPlan { program, args })
 }
 
@@ -175,11 +186,13 @@ pub fn build_kawpowminer_launch_plan_for(
     program: PathBuf,
     reward_identity: &str,
     plan: &EndpointPlan,
+    gpus: &GpuSelection,
 ) -> Result<GpuLaunchPlan, String> {
     build_kawpowminer_launch_plan_with_endpoints(
         program,
         reward_identity,
         &plan.ordered_from_cursor(),
+        gpus,
     )
 }
 
@@ -195,13 +208,14 @@ pub fn build_kawpowminer_launch_plan_for(
 pub fn build_trex_launch_plan(
     program: PathBuf,
     reward_identity: &str,
+    gpus: &GpuSelection,
 ) -> Result<GpuLaunchPlan, String> {
     if !MINING_EXECUTION_ALLOWED {
         return Err("mining execution is not enabled in this build".into());
     }
     let reward = reward_identity.trim();
     let rig_id = derive_worker_id(reward)?;
-    let args = vec![
+    let mut args = vec![
         "-a".into(),
         KAWPOW_ALGO.into(),
         "-o".into(),
@@ -213,6 +227,11 @@ pub fn build_trex_launch_plan(
         "-w".into(),
         rig_id,
     ];
+    // A5b: opt-in per-card restriction. `All` appends nothing → unchanged argv.
+    if let Some(csv) = gpus.csv() {
+        args.push(TREX_DEVICES_FLAG.into());
+        args.push(csv);
+    }
     Ok(GpuLaunchPlan { program, args })
 }
 
@@ -280,7 +299,9 @@ mod tests {
     #[test]
     fn trex_plan_uses_kawpow_o_u_p_w_shape() {
         let addr = valid_address();
-        let plan = build_trex_launch_plan(PathBuf::from("/opt/t-rex"), addr).expect("plan");
+        let plan =
+            build_trex_launch_plan(PathBuf::from("/opt/t-rex"), addr, &GpuSelection::All)
+                .expect("plan");
 
         // Ported T-Rex shape: -a kawpow -o <pool> -u <addr> -p x -w <rig>.
         assert!(plan.args.windows(2).any(|w| w[0] == "-a" && w[1] == "kawpow"));
@@ -292,6 +313,8 @@ mod tests {
         assert_eq!(plan.args[pw + 1].as_str(), "x");
         let w = plan.args.iter().position(|a| a == "-w").expect("-w");
         assert_eq!(plan.args[w + 1], derive_worker_id(addr).unwrap());
+        // A5b: the DEFAULT (All) appends no --devices flag (all cards).
+        assert!(!plan.args.iter().any(|x| x == "--devices"));
     }
 
     /// THE HONESTY GATE (PLAN §3, the brief — per lane): both KawPoW arg forms
@@ -302,7 +325,7 @@ mod tests {
         let addr = valid_address();
         for plan in [
             build_kawpowminer_launch_plan(PathBuf::from("/opt/kawpowminer"), addr).unwrap(),
-            build_trex_launch_plan(PathBuf::from("/opt/t-rex"), addr).unwrap(),
+            build_trex_launch_plan(PathBuf::from("/opt/t-rex"), addr, &GpuSelection::All).unwrap(),
         ] {
             let joined = plan.args.join(" ");
 
@@ -352,7 +375,7 @@ mod tests {
     #[test]
     fn rvn_plan_fails_closed_on_bad_reward_identity() {
         assert!(build_kawpowminer_launch_plan(PathBuf::from("kawpowminer"), "not-an-address").is_err());
-        assert!(build_trex_launch_plan(PathBuf::from("t-rex"), "not-an-address").is_err());
+        assert!(build_trex_launch_plan(PathBuf::from("t-rex"), "not-an-address", &GpuSelection::All).is_err());
         // A generic-substrate (network 42) address is the WRONG network → rejected.
         assert!(build_kawpowminer_launch_plan(
             PathBuf::from("kawpowminer"),
@@ -385,9 +408,13 @@ mod tests {
             Endpoint::plaintext("blackhole.invalid", 65000),
             Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT),
         ];
-        let plan =
-            build_kawpowminer_launch_plan_with_endpoints(PathBuf::from("kawpowminer"), addr, &eps)
-                .unwrap();
+        let plan = build_kawpowminer_launch_plan_with_endpoints(
+            PathBuf::from("kawpowminer"),
+            addr,
+            &eps,
+            &GpuSelection::All,
+        )
+        .unwrap();
         let p_values: Vec<&String> = plan
             .args
             .iter()
@@ -414,9 +441,13 @@ mod tests {
     fn tls_endpoint_yields_ssl_scheme_in_kawpow_url() {
         let addr = valid_address();
         let eps = vec![Endpoint::tls(ALICE_POOL_HOST, 8889)];
-        let plan =
-            build_kawpowminer_launch_plan_with_endpoints(PathBuf::from("kawpowminer"), addr, &eps)
-                .unwrap();
+        let plan = build_kawpowminer_launch_plan_with_endpoints(
+            PathBuf::from("kawpowminer"),
+            addr,
+            &eps,
+            &GpuSelection::All,
+        )
+        .unwrap();
         let p = plan.args.iter().position(|a| a == "-P").unwrap();
         assert!(plan.args[p + 1].starts_with("stratum+ssl://"));
         assert!(plan.args[p + 1].ends_with("@hk.aliceprotocol.org:8889"));
@@ -432,8 +463,13 @@ mod tests {
         ])
         .unwrap();
         ep_plan.advance(); // cursor → the relay
-        let plan =
-            build_kawpowminer_launch_plan_for(PathBuf::from("kawpowminer"), addr, &ep_plan).unwrap();
+        let plan = build_kawpowminer_launch_plan_for(
+            PathBuf::from("kawpowminer"),
+            addr,
+            &ep_plan,
+            &GpuSelection::All,
+        )
+        .unwrap();
         let first_p = plan.args.iter().position(|a| a == "-P").unwrap();
         assert!(plan.args[first_p + 1].contains(&format!("@{ALICE_POOL_HOST}:{ALICE_POOL_PORT}")));
     }
@@ -448,9 +484,13 @@ mod tests {
             Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT),
             Endpoint::tls(ALICE_POOL_HOST, 8889),
         ];
-        let plan =
-            build_kawpowminer_launch_plan_with_endpoints(PathBuf::from("kawpowminer"), addr, &eps)
-                .unwrap();
+        let plan = build_kawpowminer_launch_plan_with_endpoints(
+            PathBuf::from("kawpowminer"),
+            addr,
+            &eps,
+            &GpuSelection::All,
+        )
+        .unwrap();
         let joined = plan.args.join(" ");
         assert!(joined.contains(addr));
         assert!(!joined.contains("203.0.113.10"));
@@ -467,15 +507,95 @@ mod tests {
         assert!(build_kawpowminer_launch_plan_with_endpoints(
             PathBuf::from("kawpowminer"),
             addr,
-            &[]
+            &[],
+            &GpuSelection::All,
         )
         .is_err());
         let eps = vec![Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT)];
         assert!(build_kawpowminer_launch_plan_with_endpoints(
             PathBuf::from("kawpowminer"),
             "not-an-address",
-            &eps
+            &eps,
+            &GpuSelection::All,
         )
         .is_err());
+    }
+
+    /// A5b REGRESSION GUARD (RVN): with [`GpuSelection::All`] the multi-endpoint
+    /// kawpowminer argv is **byte-for-byte identical** to the pre-A5b argv (the
+    /// `gpus` param appends nothing for `All`).
+    #[test]
+    fn kawpow_argv_all_is_unchanged_from_pre_a5b() {
+        let addr = valid_address();
+        let rig = derive_worker_id(addr).unwrap();
+        let eps = vec![Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT)];
+        let plan = build_kawpowminer_launch_plan_with_endpoints(
+            PathBuf::from("kawpowminer"),
+            addr,
+            &eps,
+            &GpuSelection::All,
+        )
+        .unwrap();
+        let expected: Vec<String> = vec![
+            "-P".into(),
+            format!("stratum+tcp://{addr}.{rig}@{ALICE_POOL_HOST}:{ALICE_POOL_PORT}"),
+            "--report-hashrate".into(),
+            "--stratum-protocol".into(),
+            "2".into(),
+            "--display-interval".into(),
+            "10".into(),
+        ];
+        assert_eq!(plan.args, expected, "GpuSelection::All must not change the kawpow argv");
+        // And the single-endpoint convenience builder matches it exactly.
+        let single = build_kawpowminer_launch_plan(PathBuf::from("kawpowminer"), addr).unwrap();
+        assert_eq!(single.args, expected);
+    }
+
+    /// A5b: [`GpuSelection::Ids`] APPENDS `--cuda-devices 0,1` to the kawpowminer
+    /// argv (last), leaving the `-P`/flag order intact; the honesty gate holds.
+    #[test]
+    fn kawpow_argv_ids_appends_cuda_devices_flag() {
+        let addr = valid_address();
+        let eps = vec![Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT)];
+        let plan = build_kawpowminer_launch_plan_with_endpoints(
+            PathBuf::from("kawpowminer"),
+            addr,
+            &eps,
+            &GpuSelection::Ids(vec![0, 1]),
+        )
+        .unwrap();
+        let n = plan.args.len();
+        assert_eq!(
+            &plan.args[n - 2..],
+            &["--cuda-devices".to_string(), "0,1".to_string()]
+        );
+        // Honesty still holds with the digit-only device list appended.
+        let joined = plan.args.join(" ");
+        assert!(joined.contains(addr));
+        assert!(joined.contains(&format!("{ALICE_POOL_HOST}:{ALICE_POOL_PORT}")));
+        assert!(!joined.contains("203.0.113.10"));
+        assert!(!joined.contains("herominers"));
+        assert!(!plan
+            .args
+            .iter()
+            .any(|a| a.contains("seed") || a.contains("priv") || a.contains("0x")));
+    }
+
+    /// A5b: T-Rex [`GpuSelection::Ids`] appends `--devices 0,1`; `All` appends none.
+    #[test]
+    fn trex_argv_ids_appends_devices_flag() {
+        let addr = valid_address();
+        let plan =
+            build_trex_launch_plan(PathBuf::from("t-rex"), addr, &GpuSelection::Ids(vec![0, 1]))
+                .unwrap();
+        let n = plan.args.len();
+        assert_eq!(&plan.args[n - 2..], &["--devices".to_string(), "0,1".to_string()]);
+        // Honesty unaffected (digits only).
+        let joined = plan.args.join(" ");
+        assert!(joined.contains(addr));
+        assert!(!plan
+            .args
+            .iter()
+            .any(|a| a.contains("seed") || a.contains("priv") || a.contains("0x")));
     }
 }
