@@ -9,6 +9,7 @@
 //! 待发放"). Every string here is presentation only; no mining logic.
 
 use alice_miner_core::detect::capability::ALL_LANES;
+use alice_miner_core::detect::GpuDevice;
 use alice_miner_core::{CapabilityProfile, GpuInfo, GpuVendor, Lane, Snapshot};
 
 /// The ONLY way the CLI ever renders rewards: pending, bilingual, never a
@@ -33,6 +34,9 @@ pub fn render_detect(cap: &CapabilityProfile) -> String {
         out.push_str(&format!("  cpu_model:     {}\n", p.cpu_model));
     }
     out.push_str(&format!("  gpu:           {}\n", fmt_gpu(&p.gpu)));
+    // Per-card enumeration (NVIDIA) so multi-GPU rigs can see each card + its
+    // index — the token for `start --lane gpu --gpus 0,1,…`.
+    out.push_str(&fmt_gpu_list(&p.gpu.gpus));
     out.push_str(&format!("  memory_gb:     {}\n", p.memory_gb));
     if !p.warnings.is_empty() {
         out.push_str(&format!("  warnings:      {}\n", p.warnings.join(", ")));
@@ -56,6 +60,30 @@ pub fn render_detect(cap: &CapabilityProfile) -> String {
 
 /// Human-friendly one-line GPU description (model + VRAM, the vendor when no
 /// model was probed, or `none` when CPU-only). No emoji / vendor glyph.
+/// The per-card enumeration block for `detect`. Lists every physical card with
+/// its index (the `--gpus` token), name, and VRAM, plus a hint on restricting to
+/// specific cards. Empty for a 0/1-card machine — the `gpu:` summary line above
+/// already covers a single GPU, so this only adds value on a ≥2-GPU rig (where
+/// per-card scheduling matters). NVIDIA-only (only `nvidia-smi` enumerates).
+fn fmt_gpu_list(gpus: &[GpuDevice]) -> String {
+    if gpus.len() < 2 {
+        return String::new();
+    }
+    let mut s = String::new();
+    for d in gpus {
+        let vram = if d.vram_gb > 0 {
+            format!(" · {} GB", d.vram_gb)
+        } else {
+            String::new()
+        };
+        s.push_str(&format!("    gpu[{}]:        {}{}\n", d.index, d.name, vram));
+    }
+    s.push_str(
+        "    (mine specific cards: start --lane gpu --gpus 0,1,… · omit --gpus = every card)\n",
+    );
+    s
+}
+
 fn fmt_gpu(gpu: &GpuInfo) -> String {
     match gpu.vendor {
         GpuVendor::None => "none (CPU-only)".to_string(),
@@ -285,6 +313,25 @@ mod tests {
     use super::*;
     use alice_miner_core::engine::{LaneSnapshot, Snapshot};
     use alice_miner_core::EngineState;
+
+    fn gpu(index: u32, name: &str, vram: u32) -> GpuDevice {
+        GpuDevice { index, name: name.into(), vram_gb: vram, uuid: String::new() }
+    }
+
+    /// A ≥2-GPU rig enumerates every card with its index (the `--gpus` token),
+    /// name, and VRAM, plus the restrict-to-cards hint. 0/1-card → empty (the
+    /// summary line covers a single GPU).
+    #[test]
+    fn multi_gpu_list_enumerates_cards_with_indices() {
+        assert_eq!(fmt_gpu_list(&[]), "");
+        assert_eq!(fmt_gpu_list(&[gpu(0, "RTX 3090", 24)]), "", "single card → summary only");
+        let two = fmt_gpu_list(&[gpu(0, "RTX 3090", 24), gpu(1, "RTX 3070 Ti", 8)]);
+        assert!(two.contains("gpu[0]:"), "lists index 0: {two}");
+        assert!(two.contains("RTX 3090 · 24 GB"));
+        assert!(two.contains("gpu[1]:"), "lists index 1");
+        assert!(two.contains("RTX 3070 Ti · 8 GB"));
+        assert!(two.contains("--gpus 0,1"), "hints the per-card flag");
+    }
 
     fn running_snapshot() -> Snapshot {
         Snapshot {
