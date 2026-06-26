@@ -507,6 +507,31 @@ pub fn download_and_verify(artifact: &Artifact) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Generic capped HTTPS GET, exposed for the runtime engine auto-download path
+/// (`alice-miner-core::binaries`). TLS-only (`https_only`), with the long
+/// download read timeout. Reads at most `cap_bytes`+1 so an oversized body is
+/// detected rather than silently truncated to a hash-matching prefix.
+///
+/// SECURITY: this function provides NO integrity guarantee — the URL is just a
+/// CDN. The CALLER MUST verify the returned bytes against the SHA-256 pin baked
+/// into the binary (the embedded `miners.json`) and refuse/delete on mismatch,
+/// exactly as `download_and_verify` does for the app artifact. Returns the body
+/// as a `String`-error result so core callers need not import `UpdateError`.
+pub fn https_get_capped(url: &str, cap_bytes: u64) -> std::result::Result<Vec<u8>, String> {
+    if cap_bytes > MAX_ARTIFACT_BYTES {
+        return Err(format!(
+            "requested download cap {cap_bytes} exceeds max {MAX_ARTIFACT_BYTES}"
+        ));
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(DOWNLOAD_READ_TIMEOUT)
+        .https_only(true) // never silently downgrade off TLS
+        .user_agent(concat!("alice-miner-updater/", env!("CARGO_PKG_VERSION")))
+        .build();
+    http_get_bytes(&agent, url, cap_bytes.saturating_add(1)).map_err(|e| e.to_string())
+}
+
 /// Ad-hoc codesign a macOS bundle or binary, inner Mach-O first then the bundle
 /// (NO reliance on `--deep`). On non-macOS this is a no-op success.
 ///

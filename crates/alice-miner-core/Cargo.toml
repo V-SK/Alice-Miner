@@ -29,3 +29,12 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 # enroll). Pinned to the SAME ureq config as `alice-release` so the TLS/gzip
 # feature set and transitive deps stay byte-identical across the workspace.
 ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }
+
+# Engine auto-download extraction (binaries.rs `ensure_cached_engine`): a missing
+# engine is fetched + SHA-pin-verified into the per-user cache dir. SRBMiner ships
+# a `.tar.gz` (Linux) / `.zip` (Windows); xmrig is a direct binary. `zip` is
+# deflate-only + path-traversal-guarded by our extractor. The fetched bytes are
+# ALWAYS verified against the embedded pin before install (the URL is just a CDN).
+tar = "0.4.40"
+flate2 = "1.0"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }

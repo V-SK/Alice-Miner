@@ -55,6 +55,20 @@ struct MinerPin {
     #[serde(default)]
     #[serde(rename = "_placeholder")]
     placeholder: bool,
+    /// Auto-download: a direct URL to the engine BINARY (e.g. a frozen xmrig).
+    /// The fetched bytes are verified against `sha256` before install.
+    #[serde(default)]
+    binary_url: Option<String>,
+    /// Auto-download (archive form): a URL to an archive (`.tar.gz` / `.zip`)
+    /// containing the engine at `binary_path_in_archive`. The archive bytes are
+    /// verified against `archive_sha256`, then the extracted binary against
+    /// `sha256`. Used for SRBMiner-MULTI (GPU-PRL).
+    #[serde(default)]
+    archive_url: Option<String>,
+    #[serde(default)]
+    archive_sha256: Option<String>,
+    #[serde(default)]
+    binary_path_in_archive: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,6 +140,268 @@ fn pinned_sha256_for(kind: MinerKind) -> Option<String> {
             Some(sha)
         }
     })
+}
+
+/// The full embedded manifest entry for `kind` on the current target triple
+/// (filename-matched), or `None` if absent. Unlike [`pinned_sha256_for`], this
+/// returns the WHOLE entry so the auto-download path can read the fetch URLs.
+fn manifest_entry_for(kind: MinerKind) -> Option<MinerPin> {
+    let triple = current_target_triple();
+    let manifest: MinersManifest = serde_json::from_str(MINERS_MANIFEST).ok()?;
+    manifest.engines.into_iter().find(|e| {
+        e.kind == kind.manifest_kind()
+            && e.target == triple
+            && e.filename == kind.binary_name()
+    })
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Engine auto-download (v0.3.2): a MISSING engine self-provisions into a
+// per-user cache, fetched over TLS and verified against the SAME embedded
+// SHA-256 pin the bundled path checks. The URL is only a CDN — the embedded
+// `miners.json` is the sole trust root. Fetched bytes are ALWAYS verified before
+// install; a mismatch is deleted and NEVER run (fail-closed-but-recoverable).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Generous ceiling for an engine download (binary or archive). Real engines are
+/// ~5–20 MiB; this only guards against an unbounded body, the SHA pin does the
+/// real integrity work.
+const ENGINE_DOWNLOAD_CAP: u64 = 256 * 1024 * 1024;
+
+/// A phase of the auto-download, for optional progress reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchPhase {
+    Downloading,
+    Verifying,
+    Extracting,
+    Installing,
+}
+
+impl FetchPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            FetchPhase::Downloading => "Downloading",
+            FetchPhase::Verifying => "Verifying",
+            FetchPhase::Extracting => "Extracting",
+            FetchPhase::Installing => "Installing",
+        }
+    }
+}
+
+/// The per-user engine cache directory for the current triple:
+/// `<data_local_dir>/AliceMiner/engines/<triple>/`. This is DELIBERATELY outside
+/// the `~/.alice` keystore root (asserted in tests) — a downloaded engine binary
+/// must never share a directory tree with wallet secrets. Returns an error if no
+/// data-local dir can be resolved (the auto-download then simply doesn't run).
+pub fn engine_cache_dir() -> Result<PathBuf, String> {
+    let base = dirs::data_local_dir()
+        .ok_or_else(|| "no per-user data directory available for the engine cache".to_string())?;
+    Ok(base.join("AliceMiner").join("engines").join(current_target_triple()))
+}
+
+/// How to obtain a missing engine, parsed from its manifest entry.
+enum FetchSpec {
+    /// Download a single binary directly; verify it against `sha256`.
+    Direct { url: String, sha256: String },
+    /// Download an archive (`.tar.gz`/`.zip`), verify it against `archive_sha256`,
+    /// extract `member`, and verify the extracted binary against `sha256`.
+    Archive {
+        url: String,
+        archive_sha256: String,
+        member: String,
+        binary_sha256: String,
+    },
+}
+
+/// Build a [`FetchSpec`] for `kind` from the embedded manifest, or `None` if the
+/// entry is a placeholder / has no real pin / has no download URL configured.
+/// A direct `binary_url` wins over an `archive_url` if both are present.
+fn fetch_spec_for(kind: MinerKind) -> Option<FetchSpec> {
+    let pin = pinned_sha256_for(kind)?; // refuses placeholders / non-64-hex
+    let e = manifest_entry_for(kind)?;
+    if let Some(url) = e.binary_url.filter(|u| u.starts_with("https://")) {
+        return Some(FetchSpec::Direct { url, sha256: pin });
+    }
+    let url = e.archive_url.filter(|u| u.starts_with("https://"))?;
+    let archive_sha256 = e.archive_sha256.filter(|s| s.len() == 64)?;
+    let member = e.binary_path_in_archive.filter(|m| !m.is_empty())?;
+    Some(FetchSpec::Archive { url, archive_sha256, member, binary_sha256: pin })
+}
+
+/// Whether a missing `kind` COULD be auto-downloaded on this platform (a real pin
+/// + a usable fetch URL exist). Used by capability honesty so a fetchable lane is
+/// surfaced as viable even before the engine is on disk.
+pub fn is_fetchable(kind: MinerKind) -> bool {
+    fetch_spec_for(kind).is_some()
+}
+
+/// Ensure the engine for `kind` is present in the per-user cache and matches its
+/// embedded SHA-256 pin, downloading + verifying it if absent. Returns the cached
+/// path. Cache hit (already-pinned bytes on disk) does NO network. A fetched
+/// binary whose hash != the pin is deleted and an error returned — never run.
+///
+/// SECURITY: the only trust anchor is the embedded pin (`pinned_sha256_for`). The
+/// URL, the archive hash, and the member path all come from the SAME embedded
+/// manifest; nothing fetched is trusted until its bytes hash to the pin.
+pub fn ensure_cached_engine(kind: MinerKind) -> Result<PathBuf, String> {
+    ensure_cached_engine_with_progress(kind, &mut |_phase, _done, _total| {})
+}
+
+/// As [`ensure_cached_engine`], but reports progress via `cb(phase, done, total)`
+/// (`total` is `None` when unknown). Bytes are downloaded fully into memory, then
+/// verified, then atomically installed — so a partial/aborted download never
+/// leaves a runnable file behind.
+pub fn ensure_cached_engine_with_progress(
+    kind: MinerKind,
+    cb: &mut dyn FnMut(FetchPhase, u64, Option<u64>),
+) -> Result<PathBuf, String> {
+    let dir = engine_cache_dir()?;
+    let dest = dir.join(kind.binary_name());
+
+    // Cache hit: already present AND matches the pin → no network.
+    if dest.is_file() && verify_pinned(kind, &dest).is_ok() {
+        return Ok(dest);
+    }
+
+    let spec = fetch_spec_for(kind).ok_or_else(|| {
+        format!(
+            "the {} engine is not installed and no verified download is configured \
+             for this platform (the lane stays unavailable).",
+            kind.binary_name()
+        )
+    })?;
+
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("cannot create engine cache {}: {e}", dir.display()))?;
+
+    // Fetch + verify ENTIRELY before touching the destination path.
+    let verified_bytes = match spec {
+        FetchSpec::Direct { url, sha256 } => {
+            cb(FetchPhase::Downloading, 0, None);
+            let bytes = alice_release::https_get_capped(&url, ENGINE_DOWNLOAD_CAP)?;
+            cb(FetchPhase::Verifying, bytes.len() as u64, None);
+            verify_bytes_sha256(&bytes, &sha256, kind.binary_name())?;
+            bytes
+        }
+        FetchSpec::Archive { url, archive_sha256, member, binary_sha256 } => {
+            cb(FetchPhase::Downloading, 0, None);
+            let archive = alice_release::https_get_capped(&url, ENGINE_DOWNLOAD_CAP)?;
+            cb(FetchPhase::Verifying, archive.len() as u64, None);
+            verify_bytes_sha256(&archive, &archive_sha256, "engine archive")?;
+            cb(FetchPhase::Extracting, 0, None);
+            let bytes = extract_member(&url, &archive, &member)?;
+            verify_bytes_sha256(&bytes, &binary_sha256, kind.binary_name())?;
+            bytes
+        }
+    };
+
+    cb(FetchPhase::Installing, verified_bytes.len() as u64, None);
+    cache_install_atomic(&dir, &dest, &verified_bytes)?;
+
+    // Final defence: re-read from disk and re-verify the pin before we hand the
+    // path back (catches a truncated write / racing writer).
+    verify_pinned(kind, &dest).map_err(|e| {
+        let _ = std::fs::remove_file(&dest);
+        format!("{e}\n(the freshly-installed engine failed re-verification; removed)")
+    })?;
+    Ok(dest)
+}
+
+/// Verify `bytes` hash to the expected lowercase-hex SHA-256, or a clear error
+/// naming `what`. The single chokepoint that enforces "fetched == pinned".
+fn verify_bytes_sha256(bytes: &[u8], expected: &str, what: &str) -> Result<(), String> {
+    let got = alice_release::sha256_hex(bytes);
+    if got.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to install {what}: downloaded SHA-256 {got} does not match the \
+             pinned {expected}. The download was tampered with or corrupted; nothing \
+             was written."
+        ))
+    }
+}
+
+/// Extract one member from an in-memory archive, dispatching on the URL suffix
+/// (`.tar.gz`/`.tgz` → tar+gzip, `.zip` → zip). The member path is matched
+/// exactly (the manifest pins it); we never honour an archive-supplied absolute
+/// or `..` path. Returns the member's bytes.
+fn extract_member(url: &str, archive: &[u8], member: &str) -> Result<Vec<u8>, String> {
+    let lower = url.to_ascii_lowercase();
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        extract_tar_gz_member(archive, member)
+    } else if lower.ends_with(".zip") {
+        extract_zip_member(archive, member)
+    } else {
+        Err(format!("unsupported engine archive format for {url} (expected .tar.gz or .zip)"))
+    }
+}
+
+fn extract_tar_gz_member(archive: &[u8], member: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let gz = flate2::read::GzDecoder::new(archive);
+    let mut tar = tar::Archive::new(gz);
+    let entries = tar.entries().map_err(|e| format!("reading tar: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("reading tar entry: {e}"))?;
+        let path = entry.path().map_err(|e| format!("tar entry path: {e}"))?;
+        if path.to_string_lossy() == member {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).map_err(|e| format!("extracting {member}: {e}"))?;
+            return Ok(buf);
+        }
+    }
+    Err(format!("member {member:?} not found in the .tar.gz archive"))
+}
+
+fn extract_zip_member(archive: &[u8], member: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let reader = std::io::Cursor::new(archive);
+    let mut zip = zip::ZipArchive::new(reader).map_err(|e| format!("reading zip: {e}"))?;
+    let mut file = zip
+        .by_name(member)
+        .map_err(|e| format!("member {member:?} not found in the .zip archive: {e}"))?;
+    // Defence: never trust the entry's declared path for filesystem writes — we
+    // only return the bytes; the caller installs to a fixed cache path.
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).map_err(|e| format!("extracting {member}: {e}"))?;
+    Ok(buf)
+}
+
+/// Atomically install verified engine bytes at `dest`: write to a temp file in
+/// the SAME directory (so `rename` is atomic on the same filesystem), make it
+/// executable, strip macOS quarantine, then rename over `dest`. A failure leaves
+/// no partially-written runnable file at `dest`.
+fn cache_install_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = dir.join(format!(".{}.partial-{}", dest.file_name().and_then(|n| n.to_str()).unwrap_or("engine"), std::process::id()));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&tmp)
+            .map_err(|e| format!("stat {}: {e}", tmp.display()))?
+            .permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perm)
+            .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
+    }
+
+    // Best-effort: clear the macOS quarantine xattr so Gatekeeper doesn't block a
+    // freshly-downloaded helper binary. Non-fatal if it fails.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("/usr/bin/xattr")
+            .args(["-d", "com.apple.quarantine"])
+            .arg(&tmp)
+            .output();
+    }
+
+    std::fs::rename(&tmp, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("installing engine to {}: {e}", dest.display())
+    })?;
+    Ok(())
 }
 
 /// Compute the lowercase-hex SHA-256 of a file on disk (streamed via the audited
@@ -242,6 +518,9 @@ pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
     }
 
     // 2) sibling of this executable (the packaged layout). Verified before exec.
+    //    A sibling that EXISTS but fails the pin is NOT run — we fall through to
+    //    the verified auto-download (the canonical pinned bytes win) instead of
+    //    dead-ending, so a corrupted/drifted bundled engine self-heals.
     let exe =
         std::env::current_exe().map_err(|e| format!("cannot locate miner executable: {e}"))?;
     let dir = exe
@@ -249,8 +528,13 @@ pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
         .ok_or_else(|| "miner executable has no parent directory".to_string())?;
     let candidate = dir.join(kind.binary_name());
     if candidate.is_file() {
-        verify_pinned(kind, &candidate)?;
-        return Ok(candidate);
+        match verify_pinned(kind, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) => eprintln!(
+                "[alice-miner] bundled {} failed integrity ({e}); trying verified auto-download",
+                kind.binary_name()
+            ),
+        }
     }
 
     // 3) dev fallback: the committed asset in the source tree (debug only), so
@@ -264,9 +548,24 @@ pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
             .join(current_target_triple())
             .join(kind.binary_name());
         if dev.is_file() {
-            verify_pinned(kind, &dev)?;
-            return Ok(dev);
+            match verify_pinned(kind, &dev) {
+                Ok(()) => return Ok(dev),
+                Err(e) => eprintln!(
+                    "[alice-miner] dev-asset {} failed integrity ({e}); trying auto-download",
+                    kind.binary_name()
+                ),
+            }
         }
+    }
+
+    // 4) auto-download into the per-user cache, verified against the embedded pin
+    //    (the URL is just a CDN). Only engines with a real pin + a configured
+    //    fetch URL are fetchable; the rest fall through to the not-installed error
+    //    so a placeholder lane (kawpowminer / macOS-only xmrig) stays honest.
+    if is_fetchable(kind) {
+        return ensure_cached_engine(kind).map_err(|e| {
+            format!("the {} engine is not installed and auto-download failed: {e}", kind.binary_name())
+        });
     }
 
     // Graceful, kind-specific "not installed" status (NEVER a panic). The GPU
@@ -516,6 +815,162 @@ mod tests {
         assert_eq!(resolved, tmp);
         clear_env(MinerKind::GpuRvn);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ── Auto-download (v0.3.2) ──────────────────────────────────────────────
+
+    /// The engine cache dir is under the per-user data dir and DELIBERATELY NOT
+    /// under the `~/.alice` keystore root — a downloaded engine must never share a
+    /// tree with wallet secrets.
+    #[test]
+    fn engine_cache_dir_is_outside_keystore_root() {
+        let dir = engine_cache_dir().expect("a data dir exists in test env");
+        let s = dir.to_string_lossy();
+        assert!(s.contains("AliceMiner"), "cache under an AliceMiner dir: {s}");
+        assert!(s.contains(current_target_triple()), "cache is per-triple: {s}");
+        // Must not be inside the keystore root.
+        if let Some(home) = dirs::home_dir() {
+            let keystore = home.join(".alice");
+            assert!(!dir.starts_with(&keystore), "engine cache must not live under {}", keystore.display());
+        }
+    }
+
+    /// The verify chokepoint accepts matching bytes and refuses any mismatch —
+    /// this is the "fetched == pinned" gate the whole auto-download trusts.
+    #[test]
+    fn verify_bytes_sha256_accepts_match_refuses_mismatch() {
+        let bytes = b"the real engine bytes";
+        let good = alice_release::sha256_hex(bytes);
+        assert!(verify_bytes_sha256(bytes, &good, "engine").is_ok());
+        let bad = "0".repeat(64);
+        let err = verify_bytes_sha256(bytes, &bad, "engine").expect_err("mismatch must refuse");
+        assert!(err.contains("does not match the pinned"), "got: {err}");
+        assert!(err.contains("nothing"), "must promise no write: {err}");
+    }
+
+    fn make_tar_gz(member: &str, content: &[u8]) -> Vec<u8> {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut b = tar::Builder::new(&mut gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            b.append_data(&mut header, member, content).unwrap();
+            b.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    }
+
+    fn make_zip(member: &str, content: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut buf);
+            let opts: zip::write::FileOptions<()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file(member, opts).unwrap();
+            zw.write_all(content).unwrap();
+            zw.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// A `.tar.gz` member round-trips through the extractor; a missing member is a
+    /// clear error (not a silent empty file).
+    #[test]
+    fn tar_gz_member_extracts_and_missing_errors() {
+        let content = b"#!/bin/sh\necho SRBMiner\n";
+        let arc = make_tar_gz("SRBMiner-Multi-3-4-1/SRBMiner-MULTI", content);
+        let got = extract_member(
+            "https://x/SRBMiner.tar.gz",
+            &arc,
+            "SRBMiner-Multi-3-4-1/SRBMiner-MULTI",
+        )
+        .expect("member extracts");
+        assert_eq!(got, content);
+        let err = extract_member("https://x/SRBMiner.tar.gz", &arc, "not/here")
+            .expect_err("missing member errors");
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    /// A `.zip` member round-trips; the format is chosen by URL suffix.
+    #[test]
+    fn zip_member_extracts_by_url_suffix() {
+        let content = b"MZ\x90\x00 fake exe bytes";
+        let arc = make_zip("SRBMiner-Multi-3-4-1/SRBMiner-MULTI.exe", content);
+        let got = extract_member(
+            "https://x/SRBMiner-win64.zip",
+            &arc,
+            "SRBMiner-Multi-3-4-1/SRBMiner-MULTI.exe",
+        )
+        .expect("zip member extracts");
+        assert_eq!(got, content);
+        // An unknown suffix is refused, not guessed.
+        let err = extract_member("https://x/engine.7z", &arc, "x").expect_err("unknown format refused");
+        assert!(err.contains("unsupported"), "got: {err}");
+    }
+
+    /// `cache_install_atomic` writes the bytes, makes the file executable, and the
+    /// install is observable at the destination (atomic rename).
+    #[test]
+    fn cache_install_atomic_writes_executable() {
+        let dir = std::env::temp_dir().join(format!("alice-eng-inst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("xmrig");
+        let bytes = b"engine payload";
+        cache_install_atomic(&dir, &dest, bytes).expect("install");
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "installed engine must be executable, mode={mode:o}");
+        }
+        // No leftover .partial temp.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("partial"))
+            .collect();
+        assert!(leftovers.is_empty(), "no .partial temp must remain");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On macOS-arm64 the committed xmrig matches the cpu-xmr pin, so pre-placing
+    /// it in the cache makes `ensure_cached_engine` a CACHE HIT — it returns the
+    /// path with NO network. Proves the cache-reuse path + the pin re-check.
+    #[cfg(all(debug_assertions, target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn ensure_cached_engine_is_a_cache_hit_when_pinned_bytes_present() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env(MinerKind::CpuXmr);
+        // The committed dev xmrig == the pin. Place a copy in the real cache dir.
+        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../release-assets")
+            .join(current_target_triple())
+            .join("xmrig");
+        let cache = engine_cache_dir().unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let dest = cache.join("xmrig");
+        std::fs::copy(&dev, &dest).unwrap();
+        // Cache hit: returns the cached path, verified against the pin, no fetch.
+        let got = ensure_cached_engine(MinerKind::CpuXmr).expect("cache hit");
+        assert_eq!(got, dest);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// A non-placeholder gpu-prl entry yields an Archive fetch spec on the triples
+    /// that carry one (linux/windows). On the dev mac there's no gpu-prl entry, so
+    /// it's correctly NOT fetchable — assert the platform-appropriate result.
+    #[test]
+    fn gpu_prl_fetch_spec_matches_platform() {
+        let fetchable = is_fetchable(MinerKind::GpuPrl);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert!(!fetchable, "SRBMiner has no macOS build → GPU-PRL not fetchable on Apple");
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        assert!(fetchable, "GPU-PRL ships an archive fetch spec on linux/windows");
+        let _ = fetchable;
     }
 
     #[test]
