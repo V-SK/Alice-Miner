@@ -168,7 +168,16 @@ if [[ -z "${VERSION}" ]]; then
   # Default to the GUI crate version so the manifest never drifts from the binary.
   VERSION="$(grep -m1 '^version' "${GUI_CRATE_DIR}/Cargo.toml" | sed -E 's/version *= *"([^"]+)".*/\1/')"
 fi
-[[ -z "${MIN_SUPPORTED}" ]] && MIN_SUPPORTED="${VERSION}"
+# min_supported is the FLOOR below which a client is hard-blocked ("must
+# download manually") instead of offered a one-click update — see
+# alice-release::evaluate, which returns CheckOutcome::Unsupported when
+# current < min_supported. Defaulting it to ${VERSION} (the old behaviour) made
+# every release retroactively un-auto-updatable: a 0.3.0 client checking the
+# 0.3.1 manifest saw min_supported=0.3.1 > 0.3.0 → hard block, never an offer.
+# That was the v0.3.1 "couldn't auto-update" report. Default to the first public
+# release (0.3.0); only raise it via --min-supported for a genuine forced-upgrade
+# (e.g. an incompatible manifest/protocol change), never per-release.
+[[ -z "${MIN_SUPPORTED}" ]] && MIN_SUPPORTED="0.3.0"
 # Default targets to the platform key matching the build host.
 if [[ -z "${TARGETS}" ]]; then
   case "${HOST_TRIPLE}" in

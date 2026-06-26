@@ -210,7 +210,18 @@ fn rail(ui_root: &mut egui::Ui, app: &mut MinerApp) {
                 if nav_item(ui, Icon::Grid, app.screen == Screen::Dashboard && enabled, enabled).clicked() {
                     app.screen = Screen::Dashboard;
                 }
-                if nav_item(ui, Icon::Gear, app.screen == Screen::Settings && enabled, enabled).clicked() {
+                let gear = nav_item(ui, Icon::Gear, app.screen == Screen::Settings && enabled, enabled);
+                // Update badge: a brand dot on the gear when the launch-time check
+                // surfaced something actionable (an offer / manual-download / forced
+                // upgrade / applied-pending-restart), so the user notices without
+                // opening Settings — the v0.3.1 "didn't know it could update" fix.
+                if enabled && app.updater.ui.wants_attention() {
+                    let c = gear.rect.right_top() + egui::vec2(-8.0, 8.0);
+                    let p = ui.painter();
+                    p.circle_filled(c, 4.5, THEME.brand);
+                    p.circle_stroke(c, 4.5, Stroke::new(1.5, THEME.rail_top));
+                }
+                if gear.clicked() {
                     app.screen = Screen::Settings;
                 }
 

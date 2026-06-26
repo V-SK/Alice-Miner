@@ -212,12 +212,19 @@ pub struct MinerApp {
     pub shot: Option<crate::shot::ShotRunner>,
 
     /// The signed self-updater (ed25519 + SHA-256, last-known-good rollback).
-    /// User-initiated only (Settings → "Check for updates"); v1 never
-    /// silent-applies. See [`crate::update`].
+    /// Auto-CHECKS once at launch (notify-only; surfaces availability in the
+    /// chrome/Settings) and can be re-checked from Settings → "Check for
+    /// updates". It NEVER silent-applies — the user clicks Apply. See
+    /// [`crate::update`].
     pub updater: crate::update::UpdateManager,
     /// A one-time "updated to vX" note set when the health gate confirmed a
     /// freshly-applied build at startup. Shown once in Settings, then cleared.
     pub update_committed_note: Option<String>,
+    /// Guards the one-shot launch-time update check so it fires exactly once
+    /// (on the first real `ui()` frame, never in screenshot mode). Without a
+    /// launch check the user only learned of a new build by manually opening
+    /// Settings — the v0.3.1 "didn't know it could update" report.
+    pub launch_update_checked: bool,
 }
 
 impl MinerApp {
@@ -285,6 +292,7 @@ impl MinerApp {
             shot,
             updater: crate::update::UpdateManager::default(),
             update_committed_note,
+            launch_update_checked: false,
         })
     }
 
@@ -1108,6 +1116,16 @@ impl eframe::App for MinerApp {
             return;
         }
         self.drain_events();
+        // One-shot launch-time update check (notify-only): kick a background
+        // `check_for_update` on the first real frame so a new build is surfaced
+        // without the user having to open Settings (the v0.3.1 "didn't auto-
+        // update" report). Never applies on its own — the result just populates
+        // the updater UI state, and the user clicks Apply. Off the screenshot path
+        // (this runs after the shot early-return above).
+        if !self.launch_update_checked {
+            self.launch_update_checked = true;
+            self.updater.check();
+        }
         // Drain any completed background updater results (check / apply) into the
         // UI state. Cheap + non-blocking; the actual network/FS work runs on a
         // worker thread (see `crate::update`). Kept off the screenshot path.

@@ -71,6 +71,21 @@ impl UpdateUi {
     pub fn is_busy(&self) -> bool {
         matches!(self, UpdateUi::Checking | UpdateUi::Applying)
     }
+
+    /// Whether this state should draw a badge on the Settings nav so the user
+    /// notices it without opening Settings — i.e. there is something actionable
+    /// about the build (an offer, a manual-download pointer, a forced-upgrade
+    /// notice, or an applied build waiting on a restart). `Idle`/`Checking`/
+    /// `UpToDate`/`Applying`/`Failed` carry no standing call-to-action here.
+    pub fn wants_attention(&self) -> bool {
+        matches!(
+            self,
+            UpdateUi::Available { .. }
+                | UpdateUi::AvailableNoArtifact { .. }
+                | UpdateUi::Unsupported { .. }
+                | UpdateUi::Applied { .. }
+        )
+    }
 }
 
 /// A message from a background updater job back to the UI thread.
@@ -306,6 +321,32 @@ mod tests {
         match ui {
             UpdateUi::Unsupported { min_supported, .. } => assert_eq!(min_supported, "2.0.0"),
             other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// The nav badge lights up exactly for the actionable states (an offer, a
+    /// manual-download pointer, a forced-upgrade notice, or an applied build
+    /// pending restart) and stays dark for the no-action states. This is what the
+    /// launch-time check feeds, so a real update is never silently invisible.
+    #[test]
+    fn wants_attention_only_for_actionable_states() {
+        let actionable = [
+            UpdateUi::AvailableNoArtifact { current: "0.3.0".into(), version: "0.3.2".into() },
+            UpdateUi::Unsupported { current: "0.2.0".into(), min_supported: "0.3.0".into() },
+            UpdateUi::Applied { version: "0.3.2".into() },
+        ];
+        for ui in actionable {
+            assert!(ui.wants_attention(), "expected a badge for {ui:?}");
+        }
+        let quiet = [
+            UpdateUi::Idle,
+            UpdateUi::Checking,
+            UpdateUi::UpToDate { current: "0.3.2".into() },
+            UpdateUi::Applying,
+            UpdateUi::Failed { message: "network down".into() },
+        ];
+        for ui in quiet {
+            assert!(!ui.wants_attention(), "expected NO badge for {ui:?}");
         }
     }
 
