@@ -435,9 +435,35 @@ fn cache_install_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), Str
 /// Compute the lowercase-hex SHA-256 of a file on disk (streamed via the audited
 /// `alice_release::sha256_hex`). Returns an `Err` string on a read failure.
 fn file_sha256(path: &Path) -> Result<String, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("cannot read {} for integrity check: {e}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|e| read_error_message(path, &e))?;
     Ok(alice_release::sha256_hex(&bytes))
+}
+
+/// A clear, actionable message for a failed engine-binary read. On Windows a read
+/// that fails with `ERROR_VIRUS_INFECTED` (225) means an antivirus — almost always
+/// Windows Defender — quarantined the binary as a "potentially unwanted
+/// application". That is a well-known FALSE POSITIVE for mining engines (SRBMiner /
+/// xmrig / kawpowminer). Surface it plainly with the exact fix, instead of the raw
+/// localized OS string (which renders as mojibake on non-UTF-8 system locales).
+fn read_error_message(path: &Path, e: &std::io::Error) -> String {
+    // winerror.h ERROR_VIRUS_INFECTED. Only ever set on Windows; harmless elsewhere.
+    const ERROR_VIRUS_INFECTED: i32 = 225;
+    if e.raw_os_error() == Some(ERROR_VIRUS_INFECTED) {
+        let folder = path
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        return format!(
+            "the mining engine {} was blocked/quarantined by antivirus. Windows Defender flags \
+             mining software as a \"potentially unwanted application\" — a known false positive. \
+             To mine, allow this folder in Defender: open an elevated PowerShell (Run as \
+             administrator) and run\n    Add-MpPreference -ExclusionPath '{}'\nthen start mining \
+             again. (You can undo it later with Remove-MpPreference -ExclusionPath.)",
+            path.display(),
+            folder
+        );
+    }
+    format!("cannot read {} for integrity check: {e}", path.display())
 }
 
 /// Verify the resolved bundled binary at `path` against the pinned SHA-256 for
@@ -1058,5 +1084,21 @@ mod tests {
         }
         std::env::remove_var(ALLOW_UNVERIFIED_ENV);
         assert!(!allow_unverified(), "unset → off (safe default)");
+    }
+
+    #[test]
+    fn defender_quarantine_read_error_is_clean_and_actionable() {
+        let path = Path::new("C:\\Users\\Naris\\AppData\\Local\\AliceMiner\\engines\\x86_64-pc-windows-msvc\\SRBMiner-MULTI.exe");
+        // ERROR_VIRUS_INFECTED (225) → a clear Defender message with the exact fix,
+        // NOT the raw localized OS string (which renders as mojibake).
+        let msg = read_error_message(path, &std::io::Error::from_raw_os_error(225));
+        assert!(msg.contains("antivirus"), "names the cause: {msg}");
+        assert!(msg.contains("Add-MpPreference -ExclusionPath"), "gives the fix: {msg}");
+        assert!(msg.contains("SRBMiner-MULTI.exe"), "names the engine: {msg}");
+        assert!(msg.contains("AliceMiner"), "names the folder to exclude: {msg}");
+        // A normal IO error keeps the plain integrity-check wording.
+        let plain = read_error_message(path, &std::io::Error::from_raw_os_error(2));
+        assert!(plain.contains("for integrity check"), "plain path: {plain}");
+        assert!(!plain.contains("Add-MpPreference"), "no AV noise for a normal error");
     }
 }
