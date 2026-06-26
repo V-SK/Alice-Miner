@@ -228,9 +228,9 @@ fn fetch_spec_for(kind: MinerKind) -> Option<FetchSpec> {
     Some(FetchSpec::Archive { url, archive_sha256, member, binary_sha256: pin })
 }
 
-/// Whether a missing `kind` COULD be auto-downloaded on this platform (a real pin
-/// + a usable fetch URL exist). Used by capability honesty so a fetchable lane is
-/// surfaced as viable even before the engine is on disk.
+/// Whether a missing `kind` COULD be auto-downloaded on this platform (a real
+/// pin AND a usable fetch URL both exist). Used by capability honesty so a
+/// fetchable lane is surfaced as viable even before the engine is on disk.
 pub fn is_fetchable(kind: MinerKind) -> bool {
     fetch_spec_for(kind).is_some()
 }
