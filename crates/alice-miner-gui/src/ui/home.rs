@@ -66,8 +66,12 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     ui.spacing_mut().item_spacing.y = 0.0;
     let state = app.state();
 
-    // Eyebrow reflects the state (live vs setup vs the calm fault label).
+    // Eyebrow reflects the state (live vs setup vs the calm fault label). While
+    // Running-but-no-hashrate (connecting / RandomX warm-up / a reconnecting
+    // miner), show "Connecting" instead of a confident "live" so a 0 H/s screen
+    // never reads as healthy mining (the macOS "0 under LIVE" symptom).
     let eyebrow = match state {
+        EngineState::Running if app.is_warming_up() => "Connecting · 连接中",
         EngineState::Running => "Mining · live",
         EngineState::Starting => "Connecting · 连接中",
         EngineState::Stopping => "Stopping · 停止中",
@@ -345,6 +349,11 @@ fn cta_readout(ui: &mut egui::Ui, label: &str, sub: &str, color: egui::Color32, 
 fn status_line(ui: &mut egui::Ui, app: &MinerApp) {
     let blink = app.motion_enabled();
     let (tone, text) = match app.state() {
+        // Running but no hashrate yet → connecting/warming up (not a confident
+        // green "live" next to 0.00 kH/s).
+        EngineState::Running if app.is_warming_up() => {
+            (Tone::Warn, strings::STATUS_CONNECTING.to_string())
+        }
         EngineState::Running => {
             let a = app.snapshot.as_ref().map(|s| s.shares_accepted).unwrap_or(0);
             let r = app.snapshot.as_ref().map(|s| s.shares_rejected).unwrap_or(0);

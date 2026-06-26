@@ -215,6 +215,17 @@ pub fn build_miner_launch_plan(
         reward.to_string(),
         "-p".into(),
         "x".into(),
+        // Stratum keepalive + reconnect: a low-traffic RandomX relay over a NAT/
+        // firewall can silently drop an idle TCP socket, after which xmrig sits
+        // connected-but-jobless at 0 H/s. `--keepalive` pings the pool so the
+        // socket stays up; retries/retry-pause (defaults 5/5, explicit here) make
+        // a genuine drop reconnect instead of stalling. (Fixes the "mining then
+        // suddenly 0" idle-disconnect path; xmrig 6.26 supports all three.)
+        "--keepalive".into(),
+        "--retries".into(),
+        "5".into(),
+        "--retry-pause".into(),
+        "5".into(),
         "--rig-id".into(),
         rig_id,
         "--coin".into(),
@@ -287,6 +298,12 @@ pub fn build_miner_launch_plan_with_endpoints(
         reward.to_string(),
         "-p".into(),
         "x".into(),
+        // Stratum keepalive + reconnect — see build_miner_launch_plan.
+        "--keepalive".into(),
+        "--retries".into(),
+        "5".into(),
+        "--retry-pause".into(),
+        "5".into(),
         "--rig-id".into(),
         rig_id,
         "--coin".into(),
@@ -414,6 +431,10 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--coin" && w[1] == "monero"));
         assert!(plan.args.iter().any(|a| a == "--no-color"));
+        // Stratum keepalive + reconnect (the "mining then suddenly 0" idle-drop fix).
+        assert!(plan.args.iter().any(|a| a == "--keepalive"), "keepalive present");
+        assert!(plan.args.windows(2).any(|w| w[0] == "--retries" && w[1] == "5"));
+        assert!(plan.args.windows(2).any(|w| w[0] == "--retry-pause" && w[1] == "5"));
         assert!(plan
             .args
             .windows(2)

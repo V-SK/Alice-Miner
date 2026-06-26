@@ -781,6 +781,20 @@ impl MinerApp {
         self.resolved_start_lane() == Lane::GpuPrl
     }
 
+    /// True when the engine reports Running but no hashrate has materialised yet
+    /// (no xmrig speed line) AND no shares are in — i.e. the lane is connecting /
+    /// warming up (RandomX dataset init, or a stalled/reconnecting miner). Shown
+    /// honestly as "Connecting" rather than a confident green "live · 0.00 kH/s"
+    /// (the macOS "0 H/s under MINING LIVE" symptom).
+    pub fn is_warming_up(&self) -> bool {
+        if self.state() != EngineState::Running {
+            return false;
+        }
+        let hr = self.snapshot.as_ref().and_then(|s| s.hashrate_hs).unwrap_or(0.0);
+        let acc = self.snapshot.as_ref().map(|s| s.shares_accepted).unwrap_or(0);
+        hr <= 0.0 && acc == 0
+    }
+
     pub fn start_mining(&mut self) {
         self.error = None;
         // Single owner: don't start a foreground miner while the background service

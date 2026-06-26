@@ -337,6 +337,50 @@ impl Drop for EngineHandle {
     }
 }
 
+/// Keeps the Mac awake for the lifetime of a mining session. On macOS, mining
+/// must survive the user going idle: if the system idle-sleeps, xmrig stops; and
+/// if the GUI is App-Napped, its stdout pump stalls, xmrig's pipe fills, and
+/// xmrig blocks — both surface as a sudden drop to 0 H/s while the lane still
+/// reads "Running". `caffeinate -i` (held for the session, killed on Stop / engine
+/// exit via Drop) prevents idle sleep; the bundle's `NSAppSleepDisabled` handles
+/// App Nap. A no-op on other platforms / if `caffeinate` is missing.
+struct CaffeinateGuard {
+    #[cfg(target_os = "macos")]
+    child: Option<std::process::Child>,
+}
+
+impl CaffeinateGuard {
+    fn new() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            // -i = prevent idle system sleep while mining. Best-effort: a missing
+            // /usr/bin/caffeinate just means no assertion (mining still works).
+            let child = std::process::Command::new("/usr/bin/caffeinate")
+                .arg("-i")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok();
+            Self { child }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self {}
+        }
+    }
+}
+
+impl Drop for CaffeinateGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
 /// The worker loop. Owns the runtime, the active supervisor, and the latest
 /// device/identity so each `Snapshot` is fully populated. (Structure ported
 /// from the Wallet's `spawn_worker`: enter the runtime before any
@@ -350,6 +394,9 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
     // in its own process group. Empty when idle.
     let mut run = RunSet::default();
     let mut active_worker_id: Option<String> = None;
+    // Held while ANY lane is running (macOS: prevents idle sleep stalling the
+    // miner). Dropped (→ kills caffeinate) on Stop and on engine exit.
+    let mut caffeinate: Option<CaffeinateGuard> = None;
 
     loop {
         // Poll for a command with a short timeout so we can push periodic
@@ -436,6 +483,8 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
                 match start_run(&rt, lane, dual, &addr, secrets, &gpus) {
                     Ok((new_run, worker_id)) => {
                         run = new_run;
+                        // Keep the Mac awake for the session (no-op off macOS).
+                        caffeinate.get_or_insert_with(CaffeinateGuard::new);
                         active_address = Some(addr);
                         active_worker_id = Some(worker_id);
                         let snap = build_snapshot(&device, &run, &active_worker_id);
@@ -448,6 +497,7 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
             }
             Some(Command::Stop) => {
                 run.request_stop_all();
+                caffeinate = None; // release the wake assertion (Drop kills caffeinate)
                 let snap = build_snapshot(&device, &run, &active_worker_id);
                 let _ = evt_tx.send(Event::Snapshot(snap));
             }

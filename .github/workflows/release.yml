@@ -304,6 +304,9 @@ jobs:
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>LSMinimumSystemVersion</key><string>11.0</string>
             <key>NSHighResolutionCapable</key><true/>
+            <key>NSAppSleepDisabled</key><true/>
+            <key>NSSupportsAutomaticTermination</key><false/>
+            <key>NSSupportsSuddenTermination</key><false/>
           </dict>
           </plist>
           EOF

@@ -252,6 +252,13 @@ for plat in ${TARGETS}; do
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <!-- Mining must keep running when the window is occluded / the user is idle.
+       NSAppSleepDisabled exempts the process from App Nap, so the stdout pump
+       keeps draining xmrig's pipe (a stalled pump fills the 64KB pipe and blocks
+       xmrig → 0 H/s). Don't let the OS auto/sudden-terminate the miner either. -->
+  <key>NSAppSleepDisabled</key><true/>
+  <key>NSSupportsAutomaticTermination</key><false/>
+  <key>NSSupportsSuddenTermination</key><false/>
 </dict></plist>
 PLIST
       # Ad-hoc sign inner-first then the bundle (NO --deep) — seals the nested
