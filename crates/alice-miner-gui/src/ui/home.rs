@@ -213,6 +213,17 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     ui.add_space(10.0);
     status_line(ui, app);
 
+    // ── Error banner ──────────────────────────────────────────────────────────
+    // Unconditional surface for `app.error`, independent of engine state. The
+    // engine emits `Event::Error` on a pre-spawn failure (engine-resolve /
+    // SHA-pin mismatch / watch-only-PRL refusal) WITHOUT transitioning to the
+    // Error state (engine.rs:444 `start_run` Err arm) — so the status line, which
+    // only shows the error text in `EngineState::Error`, would otherwise swallow
+    // it and Start appears to do nothing (the v0.3.1 macOS silence). This banner
+    // makes every such failure visible; it auto-clears on the next Start (which
+    // sets `error = None`).
+    error_banner(ui, app);
+
     // ── Stop button + dashboard link while mining/connecting/stopping ─────────
     if matches!(
         state,
@@ -357,6 +368,40 @@ fn status_line(ui: &mut egui::Ui, app: &MinerApp) {
         ui.add_space(9.0);
         ui.label(RichText::new(text.clone()).size(12.5).color(THEME.text2));
     });
+}
+
+/// A danger banner that surfaces `app.error` whenever it is set — UNLESS the
+/// engine is in the Error state, where `status_line` already shows it (avoid a
+/// double message). This catches the pre-spawn failures the status line misses:
+/// `start_run` (engine.rs) reports an engine-resolve / SHA-pin / watch-only-PRL
+/// failure via `Event::Error` while leaving the engine Idle, so without this the
+/// message is invisible and Start silently does nothing. Full-width within the
+/// hero card; wraps long messages. The text is the engine's own honest string.
+fn error_banner(ui: &mut egui::Ui, app: &MinerApp) {
+    let Some(err) = app.error.as_ref() else {
+        return;
+    };
+    if matches!(app.state(), EngineState::Error) {
+        return; // already surfaced by the status line
+    }
+    ui.add_space(11.0);
+    let fg = THEME.err;
+    egui::Frame::NONE
+        .fill(egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 20))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 80),
+        ))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::symmetric(13, 10))
+        .show(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.horizontal(|ui| {
+                ui.add_space(0.0);
+                ui.label(RichText::new("⚠  ").size(13.0).color(fg).strong());
+                ui.label(RichText::new(err).size(12.5).color(THEME.text));
+            });
+        });
 }
 
 /// The lane row beneath the device line: the SELECTED lane as a filled chip,
