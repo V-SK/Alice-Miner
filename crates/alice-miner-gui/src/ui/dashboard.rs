@@ -143,8 +143,11 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     let spark: Vec<f32> = app.spark.iter().cloned().collect();
     // The four card painters, in order. Boxed so we can lay them out in either
     // one row of four or two rows of two without duplicating the bodies.
+    // Auto-scaled hashrate (kH/s for CPU-XMR … TH/s for GPU-PRL) — never a fixed
+    // "kH/s" that turns a real ~0.87 TH/s pearlhash rate into a 9-digit number.
+    let (hr_txt, hr_unit) = widgets::fmt_hashrate(app.hr_display_khs);
     let hr_val = if mining {
-        widgets::mono(format!("{:.2}", app.hr_display_khs), 25.0, THEME.text).strong()
+        widgets::mono(hr_txt.clone(), 25.0, THEME.text).strong()
     } else {
         widgets::mono("—", 25.0, THEME.text3)
     };
@@ -170,7 +173,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
                     Some(THEME.lane_xmr),
                     Some(&move |ui: &mut egui::Ui| {
                         if spark_ref.is_empty() {
-                            ui.label(RichText::new("kH/s").size(11.0).color(THEME.text3));
+                            ui.label(RichText::new(hr_unit).size(11.0).color(THEME.text3));
                         } else {
                             widgets::sparkline(ui, spark_ref, ui.available_width().min(card_w - 4.0), 26.0);
                         }
@@ -400,7 +403,12 @@ fn lane_row(
                     };
                     ui.label(widgets::mono(sh, 12.0, if dim { THEME.text4 } else { THEME.text2 }));
                     ui.add_space(16.0);
-                    let hr = hr_khs.map(|h| format!("{h:.2} kH/s")).unwrap_or_else(|| "—".into());
+                    let hr = hr_khs
+                        .map(|h| {
+                            let (v, u) = widgets::fmt_hashrate(h);
+                            format!("{v} {u}")
+                        })
+                        .unwrap_or_else(|| "—".into());
                     ui.label(widgets::mono(hr, 12.0, if dim { THEME.text4 } else { THEME.text }));
                 });
             });

@@ -277,7 +277,11 @@ pub fn fmt_hashrate_human(h: f64) -> String {
     const K: f64 = 1_000.0;
     const M: f64 = 1_000_000.0;
     const G: f64 = 1_000_000_000.0;
-    if h >= G {
+    const T: f64 = 1_000_000_000_000.0;
+    if h >= T {
+        // GPU-PRL pearlhash can exceed 1 TH/s on a strong card.
+        format!("{:.2} TH/s", h / T)
+    } else if h >= G {
         format!("{:.2} GH/s", h / G)
     } else if h >= M {
         format!("{:.2} MH/s", h / M)

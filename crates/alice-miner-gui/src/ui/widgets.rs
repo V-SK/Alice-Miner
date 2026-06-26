@@ -426,3 +426,44 @@ pub fn sparkline(ui: &mut Ui, samples: &[f32], width: f32, height: f32) {
         painter.rect_filled(bar, 2.0, col);
     }
 }
+
+/// Format a hashrate (given in **kH/s**, the smoothed readout value) auto-scaled
+/// to a human unit, returning `(number, unit)`. CPU-XMR sits at a few kH/s; a
+/// GPU-PRL pearlhash lane runs MH/s–TH/s, so a fixed "kH/s" makes a real ~0.87
+/// TH/s rate read as "865549824.00 kH/s". Picks H/s · kH/s · MH/s · GH/s · TH/s
+/// by magnitude. Shared by the Home hero, the Dashboard hero, and lane rows.
+pub fn fmt_hashrate(khs: f32) -> (String, &'static str) {
+    let hs = (khs as f64) * 1000.0;
+    let (v, unit) = if !hs.is_finite() || hs < 1_000.0 {
+        (hs.max(0.0), "H/s")
+    } else if hs < 1_000_000.0 {
+        (hs / 1_000.0, "kH/s")
+    } else if hs < 1_000_000_000.0 {
+        (hs / 1_000_000.0, "MH/s")
+    } else if hs < 1_000_000_000_000.0 {
+        (hs / 1_000_000_000.0, "GH/s")
+    } else {
+        (hs / 1_000_000_000_000.0, "TH/s")
+    };
+    (format!("{v:.2}"), unit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_hashrate;
+
+    #[test]
+    fn hashrate_unit_auto_scales_by_magnitude() {
+        // CPU-XMR: a few kH/s stays kH/s.
+        assert_eq!(fmt_hashrate(8.4), ("8.40".into(), "kH/s"));
+        // The reported PRL value 865549824 kH/s is really ~0.87 TH/s → GH/s, NOT a
+        // 9-digit "kH/s". This is the exact field bug.
+        assert_eq!(fmt_hashrate(865_549_824.0), ("865.55".into(), "GH/s"));
+        // Sub-kH/s → H/s; >1 TH/s → TH/s.
+        assert_eq!(fmt_hashrate(0.5), ("500.00".into(), "H/s"));
+        assert_eq!(fmt_hashrate(2_000_000_000.0), ("2.00".into(), "TH/s"));
+        // Non-finite / negative → 0 H/s (never panics).
+        assert_eq!(fmt_hashrate(f32::NAN).1, "H/s");
+        assert_eq!(fmt_hashrate(-1.0), ("0.00".into(), "H/s"));
+    }
+}

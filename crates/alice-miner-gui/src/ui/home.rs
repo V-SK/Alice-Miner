@@ -286,12 +286,15 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
 fn readout(ui: &mut egui::Ui, app: &MinerApp, mode: HeroMode) {
     match mode {
         HeroMode::Mining => {
-            // The live hashrate number (mono) + unit, then the hashing sub-line.
-            let txt = format!("{:.2}", app.hr_display_khs);
+            // The live hashrate number (mono) + AUTO-SCALED unit, then the hashing
+            // sub-line. CPU-XMR is kH/s; GPU-PRL (pearlhash) is MH/s–TH/s, so a
+            // fixed "kH/s" would render a real ~0.87 TH/s rate as the absurd
+            // "865549824.00 kH/s". `fmt_hashrate` picks H/s … TH/s by magnitude.
+            let (txt, unit) = widgets::fmt_hashrate(app.hr_display_khs);
             centered(ui, |ui| {
                 ui.label(widgets::mono(txt.clone(), 31.0, THEME.text).strong());
                 ui.add_space(5.0);
-                ui.label(RichText::new("kH/s").size(13.0).strong().color(THEME.text3));
+                ui.label(RichText::new(unit).size(13.0).strong().color(THEME.text3));
             });
             ui.add_space(4.0);
             centered(ui, |ui| {
