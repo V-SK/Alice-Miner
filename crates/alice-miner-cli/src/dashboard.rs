@@ -79,7 +79,40 @@ fn fmt_gpu_list(gpus: &[GpuDevice]) -> String {
         s.push_str(&format!("    gpu[{}]:        {}{}\n", d.index, d.name, vram));
     }
     s.push_str(
-        "    (mine specific cards: start --lane gpu --gpus 0,1,… · omit --gpus = every card)\n",
+        "    (--gpus selects by the MINER's device ids, which can differ from gpu[n]\n     above and may include an integrated GPU — run `gpu-devices` to list them.\n     Omit --gpus = every card.)\n",
+    );
+    s
+}
+
+/// The `gpu-devices` block: the GPUs as the SRBMiner engine enumerates them, i.e.
+/// the exact ids `start --lane gpu --gpus <id>` selects. CUDA cards (NVIDIA) do
+/// pearlhash; an OpenCL integrated GPU is flagged so it's never picked by mistake.
+pub fn render_gpu_devices(devices: &[alice_miner_core::lane::gpu_prl::SrbGpuDevice]) -> String {
+    if devices.is_empty() {
+        return "No GPU devices reported by the miner (no usable GPU, or the engine \
+                couldn't enumerate one).\n"
+            .to_string();
+    }
+    let mut s = String::from("GPU devices (the ids `start --lane gpu --gpus <id>` selects):\n");
+    for d in devices {
+        let note = if d.backend != "CUDA" {
+            "  (integrated/OpenCL — not for pearlhash)"
+        } else {
+            ""
+        };
+        let pci = if d.pci.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", d.pci)
+        };
+        s.push_str(&format!(
+            "  --gpus {:<2}  {:<7} {}{}{}\n",
+            d.id, d.backend, d.name, pci, note
+        ));
+    }
+    s.push_str(
+        "  Pick the id(s) above (NOT detect's gpu[n]); comma-separate for several, \
+         e.g. --gpus 1,2.\n",
     );
     s
 }
@@ -334,7 +367,9 @@ mod tests {
         assert!(two.contains("RTX 3090 · 24 GB"));
         assert!(two.contains("gpu[1]:"), "lists index 1");
         assert!(two.contains("RTX 3070 Ti · 8 GB"));
-        assert!(two.contains("--gpus 0,1"), "hints the per-card flag");
+        assert!(two.contains("--gpus"), "hints the per-card flag");
+        assert!(two.contains("gpu-devices"), "points to the authoritative id list");
+        assert!(two.contains("integrated GPU"), "warns the ids can differ / include an iGPU");
     }
 
     fn running_snapshot() -> Snapshot {

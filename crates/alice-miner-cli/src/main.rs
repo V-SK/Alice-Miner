@@ -80,6 +80,15 @@ enum Command {
         recommended. Use --json for machine-readable output.")]
     Detect(DetectArgs),
 
+    /// List the GPU device ids the miner sees (the numbers `--gpus` selects).
+    #[command(long_about = "List the GPUs as the bundled SRBMiner engine enumerates them — the\n\
+        device ids that `start --lane gpu --gpus <ids>` selects. These are the MINER's\n\
+        OWN ids: they can differ from the OS / `detect` order and may include an\n\
+        integrated GPU at id 0, so always pick the id from THIS list (not the gpu[n]\n\
+        index in `detect`). Resolves (downloads + verifies) the GPU engine if needed.\n\
+        Use --json for machine-readable output.")]
+    GpuDevices(GpuDevicesArgs),
+
     /// Create, import, paste, or show the Alice reward identity.
     #[command(long_about = "Manage the Alice reward identity stored at ~/.alice/identity.json.\n\
         \n\
@@ -131,6 +140,13 @@ enum Command {
 #[derive(clap::Args)]
 struct DetectArgs {
     /// Emit the full capability profile as a single JSON object (machine-readable).
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct GpuDevicesArgs {
+    /// Emit the device list as a JSON array (machine-readable).
     #[arg(long)]
     json: bool,
 }
@@ -247,6 +263,7 @@ fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
         Command::Detect(args) => cmd_detect(args),
+        Command::GpuDevices(args) => cmd_gpu_devices(args),
         Command::Identity(args) => cmd_identity(args),
         Command::Start(args) => cmd_start(args),
         Command::Stop(args) => cmd_stop(args),
@@ -350,6 +367,32 @@ fn cmd_detect(args: DetectArgs) -> i32 {
         }
     } else {
         print!("{}", dashboard::render_detect(&cap));
+        EXIT_OK
+    }
+}
+
+/// `gpu-devices`: list the GPUs as the SRBMiner engine enumerates them (the ids
+/// `--gpus` selects). Resolves/downloads the engine to ask it directly, so the ids
+/// are authoritative (and may differ from `detect`'s gpu[n] / include an iGPU).
+fn cmd_gpu_devices(args: GpuDevicesArgs) -> i32 {
+    let devices = match alice_miner_core::lane::gpu_prl::list_srbminer_devices() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return EXIT_RUNTIME;
+        }
+    };
+    if args.json {
+        let arr: Vec<serde_json::Value> = devices
+            .iter()
+            .map(|d| {
+                serde_json::json!({"id": d.id, "backend": d.backend, "pci": d.pci, "name": d.name})
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(arr));
+        EXIT_OK
+    } else {
+        print!("{}", dashboard::render_gpu_devices(&devices));
         EXIT_OK
     }
 }

@@ -43,12 +43,100 @@ const PEARLHASH_ALGO: &str = "pearlhash";
 /// no flag is appended at all, so SRBMiner uses every detected card (the
 /// pre-A5b default — byte-for-byte unchanged argv).
 ///
-/// TODO(gpu-box): the EXACT flag spelling (`--gpu-id`) and the index→physical-card
-/// mapping (does SRBMiner's `--gpu-id 0` track CUDA ordinal / nvidia-smi index?)
-/// must be confirmed against SRBMiner-MULTI 3.4.1 on a real multi-GPU box. This
-/// constant fixes the argv *shape* only; the live correctness check is deferred
-/// to the GPU-box e2e (same gate as the earn-proof), not this credit-only batch.
+/// CONFIRMED (2026-06-26, SRBMiner-MULTI 3.4.1 `--list-devices` on a real box): the
+/// `--gpu-id` value is SRBMiner's OWN global device index across ALL backends
+/// (OpenCL + CUDA). It does NOT track nvidia-smi / OS order and CAN include an
+/// integrated GPU at id 0 (observed: id 0 = Intel iGPU, id 1 = RTX 3070 Ti, id 2 =
+/// RTX 4070 Ti). So a `--gpus` value is the MINER's device id — list them with
+/// [`list_srbminer_devices`] (the `gpu-devices` CLI command); they are NOT the
+/// `detect` / nvidia-smi indices. The one stable cross-tool key is the PCI address.
 const SRBMINER_GPU_ID_FLAG: &str = "--gpu-id";
+
+/// One GPU as SRBMiner-MULTI's `--list-devices` enumerates it. `id` is exactly what
+/// `--gpu-id` (and the client's `--gpus`) selects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SrbGpuDevice {
+    /// SRBMiner's global device id (the `--gpu-id` / `--gpus` value).
+    pub id: u32,
+    /// `"CUDA"` (NVIDIA, pearlhash-capable) or `"OpenCL"` (may be an integrated GPU).
+    pub backend: String,
+    /// PCI address, e.g. `0000:01:00.0` — the stable key shared with nvidia-smi
+    /// (empty if SRBMiner didn't report one).
+    pub pci: String,
+    /// SRBMiner's device name, e.g. `nvidia_geforce_rtx_3070_ti_laptop_gpu`.
+    pub name: String,
+}
+
+/// Parse SRBMiner-MULTI `--list-devices` stdout. Real 3.4.1 lines:
+///   `GPU1  [CUDA][1] [0000:01:00.0] : nvidia_geforce_rtx_3070_ti_laptop_gpu [ampere] ...`
+///   `GPU0  [1][0] [0000:00:02.0] : intel_r__iris_r__xe_graphics [unknown_intel] ...`
+/// Header lines (`OPENCL devices`, `CUDA devices`) and any non-`GPU<n>` line ignored.
+pub fn parse_srbminer_devices(stdout: &str) -> Vec<SrbGpuDevice> {
+    let mut out = Vec::new();
+    for raw in stdout.lines() {
+        let line = raw.trim();
+        let Some(after) = line.strip_prefix("GPU") else {
+            continue;
+        };
+        let id_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let Ok(id) = id_str.parse::<u32>() else {
+            continue;
+        };
+        let brackets = bracket_contents(line);
+        let backend = if brackets.first().map(String::as_str) == Some("CUDA") {
+            "CUDA"
+        } else {
+            "OpenCL"
+        }
+        .to_string();
+        let pci = brackets.iter().find(|b| looks_like_pci(b)).cloned().unwrap_or_default();
+        let name = line
+            .split(" : ")
+            .nth(1)
+            .map(|s| s.split(" [").next().unwrap_or(s).trim().to_string())
+            .unwrap_or_default();
+        out.push(SrbGpuDevice { id, backend, pci, name });
+    }
+    out
+}
+
+/// The contents of each `[...]` on a line, in order.
+fn bracket_contents(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            if let Some(end) = line[i + 1..].find(']') {
+                out.push(line[i + 1..i + 1 + end].trim().to_string());
+                i = i + 1 + end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// A PCI address like `0000:01:00.0` (domain:bus:device.function).
+fn looks_like_pci(s: &str) -> bool {
+    s.contains(':')
+        && s.contains('.')
+        && s.chars().all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+}
+
+/// Resolve (download + verify if needed) the SRBMiner-MULTI engine and run it with
+/// `--list-devices`, returning the parsed device list. The `id`s match exactly what
+/// a GPU-PRL `--gpus` selection passes to `--gpu-id`, so this is the authoritative
+/// "which number is which card" source (the `gpu-devices` CLI command).
+pub fn list_srbminer_devices() -> Result<Vec<SrbGpuDevice>, String> {
+    let bin = crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::GpuPrl)?;
+    let output = std::process::Command::new(&bin)
+        .arg("--list-devices")
+        .output()
+        .map_err(|e| format!("running {} --list-devices: {e}", bin.display()))?;
+    Ok(parse_srbminer_devices(&String::from_utf8_lossy(&output.stdout)))
+}
 
 /// Client-facing stratum port for the GPU-PRL lane on the region relays.
 pub const GPU_RELAY_PORT: u16 = 3340;
@@ -628,5 +716,41 @@ mod tests {
             derive_worker_id(addr).unwrap(),
             super::super::xmr::derive_worker_id(addr).unwrap()
         );
+    }
+
+    /// REAL SRBMiner-MULTI 3.4.1 `--list-devices` output (captured on narissa
+    /// 2026-06-26). Proves the parser + documents the trap: the iGPU is id 0, so a
+    /// `--gpus 0` is NOT the first NVIDIA card (the 3070 Ti is id 1, the 4070 Ti id 2).
+    #[test]
+    fn parse_srbminer_devices_real_list() {
+        let out = "OPENCL devices\n\
+            GPU0  [1][0] [0000:00:02.0] : intel_r__iris_r__xe_graphics [unknown_intel] [7092 MB] [CU: 96] [MaxBuf: 3546 MB]\n\
+            CUDA devices\n\
+            GPU1  [CUDA][1] [0000:01:00.0] : nvidia_geforce_rtx_3070_ti_laptop_gpu [ampere] [CC: 8.6] [SM: 46] [8191 MB]\n\
+            GPU2  [CUDA][0] [0000:06:00.0] : nvidia_geforce_rtx_4070_ti [ada] [CC: 8.9] [SM: 60] [12281 MB]\n";
+        let d = parse_srbminer_devices(out);
+        assert_eq!(d.len(), 3, "header lines ignored, 3 GPUs parsed");
+        assert_eq!(d[0], SrbGpuDevice {
+            id: 0,
+            backend: "OpenCL".into(),
+            pci: "0000:00:02.0".into(),
+            name: "intel_r__iris_r__xe_graphics".into(),
+        });
+        assert_eq!(d[1].id, 1);
+        assert_eq!(d[1].backend, "CUDA");
+        assert_eq!(d[1].pci, "0000:01:00.0");
+        assert!(d[1].name.contains("3070_ti"), "{:?}", d[1].name);
+        assert_eq!(d[2].id, 2);
+        assert_eq!(d[2].backend, "CUDA");
+        assert!(d[2].name.contains("4070_ti"));
+        // The trap, asserted: the first NVIDIA (CUDA) card is id 1, not 0.
+        let first_nvidia = d.iter().find(|x| x.backend == "CUDA").unwrap();
+        assert_eq!(first_nvidia.id, 1, "the iGPU occupies id 0");
+    }
+
+    #[test]
+    fn parse_srbminer_devices_ignores_noise() {
+        assert!(parse_srbminer_devices("List of devices:\nDone.\n").is_empty());
+        assert!(parse_srbminer_devices("").is_empty());
     }
 }
