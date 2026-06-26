@@ -846,6 +846,43 @@ mod tests {
         assert!(targets.contains("x86_64-pc-windows-msvc"));
     }
 
+    /// The GPU-Alpha (alpha-miner) entries: 2 (linux+windows), NO macOS (NVIDIA-CUDA
+    /// only), each a real 64-hex pin + an https binary_url (bare binary, not archive).
+    #[test]
+    fn gpu_alpha_manifest_entries_have_real_pin_and_fetch_spec() {
+        let v: serde_json::Value = serde_json::from_str(MINERS_MANIFEST).unwrap();
+        let engines = v["engines"].as_array().expect("engines array");
+        let is_hex64 = |s: &str| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit());
+
+        let alpha: Vec<&serde_json::Value> = engines
+            .iter()
+            .filter(|e| e["kind"].as_str() == Some("gpu-alpha"))
+            .collect();
+        assert_eq!(alpha.len(), 2, "expected exactly 2 gpu-alpha entries (linux + windows)");
+
+        let mut targets = std::collections::BTreeSet::new();
+        for e in &alpha {
+            let target = e["target"].as_str().expect("gpu-alpha target");
+            targets.insert(target.to_string());
+            assert!(
+                target != "aarch64-apple-darwin",
+                "alpha-miner is NVIDIA-CUDA only — gpu-alpha must not list an Apple target"
+            );
+            assert_ne!(e.get("_placeholder").and_then(|p| p.as_bool()), Some(true));
+            let sha = e["sha256"].as_str().unwrap_or("");
+            assert!(is_hex64(sha) && !sha.chars().all(|c| c == '0'),
+                "gpu-alpha {target}: sha256 must be a real 64-hex pin, got {sha:?}");
+            // Bare-binary fetch spec: an https binary_url (NO archive fields needed).
+            assert!(e["binary_url"].as_str().unwrap_or("").starts_with("https://"),
+                "gpu-alpha {target}: binary_url must be an https URL");
+            let fname = e["filename"].as_str().unwrap_or("");
+            assert!(fname == "alpha-miner" || fname == "alpha-miner.exe",
+                "gpu-alpha {target}: unexpected filename {fname:?}");
+        }
+        assert!(targets.contains("x86_64-unknown-linux-gnu"));
+        assert!(targets.contains("x86_64-pc-windows-msvc"));
+    }
+
     /// The CPU-XMR (xmrig) lane must be deliverable on EVERY shipped platform so
     /// "any device one-click mines ALICE" holds: macOS arm64 BUNDLES xmrig (pin,
     /// no URL), Linux + Windows FETCH it (real pin + complete archive spec). This

@@ -74,6 +74,26 @@
       "archive_sha256": "73451074129cda947c9c63c0b7a08230dc71d589606bbc0664a09a58bfcf0a81",
       "binary_path_in_archive": "SRBMiner-Multi-3-4-1/SRBMiner-MULTI.exe",
       "source": "SRBMiner-MULTI 3.4.1 (freeware) Windows x86_64, GPU-PRL pearlhash mainline. PINNED 2026-06-25: vendor archive md5 = 5962b5e4a67789c4bdd6cdcfdf3a70a0 matched local; archive sha256 = 73451074…0a81; extracted SRBMiner-MULTI.exe sha256 = e2fa2dd2…b39a. 3.4.1 improves pearlhash hashrate + fixes the 3.4.0 regression. macOS intentionally absent: SRBMiner ships no macOS build, so the GPU-PRL lane is Unavailable on Apple (capability matrix asserts this). Binary staged at packaging (T6) via archive_url + sha verification."
+    },
+    {
+      "kind": "gpu-alpha",
+      "engine": "alpha-miner",
+      "version": "1.8.3",
+      "target": "x86_64-unknown-linux-gnu",
+      "filename": "alpha-miner",
+      "sha256": "927f50f63343bb63b9e6eeed77d2959200e2c1df2022c84f47a117af50475fdb",
+      "binary_url": "https://github.com/AlphaMine-Tech/alpha-miner/releases/download/v1.8.3/alpha-miner",
+      "source": "alpha-miner v1.8.3 (AlphaMine-Tech) Linux x86_64 — the GPU-Alpha pearlhash lane for Volta/V100 (where SRBMiner can't run). A bare ELF binary (not an archive). PINNED + VERIFIED 2026-06-26: this sha256 matches the official SHA256SUMS at github.com/AlphaMine-Tech/alpha-miner/releases/tag/v1.8.3 AND a local `shasum -a 256` of the downloaded 32032568-byte binary (== 927f50f6…50475fdb). NOT bundled: the resolver auto-downloads binary_url at runtime and verifies this sha256 before install (binaries.rs ensure_cached_engine). Live-validated on a real Tesla V100 (backend=volta_sm70, real shares to AlphaPool) 2026-06-26. ALICE_MINER_ALPHA_BIN is the override escape hatch."
+    },
+    {
+      "kind": "gpu-alpha",
+      "engine": "alpha-miner",
+      "version": "1.8.3",
+      "target": "x86_64-pc-windows-msvc",
+      "filename": "alpha-miner.exe",
+      "sha256": "9e3b52d63e12f1f1a00d5c6753d4f8e3b5df035caa00c453ff1598d630797081",
+      "binary_url": "https://github.com/AlphaMine-Tech/alpha-miner/releases/download/v1.8.3/alpha-miner-windows-1.8.3.exe",
+      "source": "alpha-miner v1.8.3 (AlphaMine-Tech) Windows x86_64 — the GPU-Alpha pearlhash lane for Volta/V100. A bare .exe (not an archive). PINNED 2026-06-26: this sha256 matches the official SHA256SUMS at github.com/AlphaMine-Tech/alpha-miner/releases/tag/v1.8.3 (asset alpha-miner-windows-1.8.3.exe, 17688576 bytes). NOT bundled: the resolver auto-downloads binary_url at runtime and verifies this sha256 before install. macOS intentionally absent: alpha-miner is NVIDIA-CUDA only, so GPU-Alpha is Unavailable on Apple (capability matrix asserts NVIDIA-only). Windows binary not yet live-validated (the Linux V100 run proved the lane); flip after a Windows-NVIDIA e2e."
     }
   ]
 }
