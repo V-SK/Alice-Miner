@@ -58,7 +58,15 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: AliceMiner-windows-x86_64.zip
           - name: macos-arm64
-            os: macos-latest
+            # PINNED (was macos-latest): the runner image determines the codesign
+            # toolchain. Ad-hoc codesign is non-deterministic across macOS images,
+            # and when `macos-latest` rolled forward (13→14) the re-signed nested
+            # xmrig's bytes changed → its SHA drifted from the miners.json pin →
+            # the client fail-closed at Start (the v0.3.1 macOS bug). We now also
+            # skip re-signing engines entirely (scripts/adhoc_sign_macos.sh) and
+            # gate the packaged engine hashes below, but pinning the image keeps
+            # OUR binary's signature reproducible for the self-updater too.
+            os: macos-14
             target: aarch64-apple-darwin
             artifact: AliceMiner-macos-arm64.zip
 
@@ -299,11 +307,35 @@ jobs:
           </dict>
           </plist>
           EOF
-          # Inner-first ad-hoc codesign (NOT --deep): sign nested engines first,
-          # then seal the bundle (matches scripts/adhoc_sign_macos.sh +
-          # alice-release::adhoc_codesign).
+          # Inner-first ad-hoc codesign (NOT --deep): sign OUR Mach-O deepest-first,
+          # then seal the bundle. The signer SKIPS the bundled engines (xmrig /
+          # kawpowminer / SRBMiner-MULTI) so their committed bytes — and thus their
+          # pinned SHA-256 — are never mutated (matches alice-release::adhoc_codesign).
           chmod +x scripts/adhoc_sign_macos.sh
           scripts/adhoc_sign_macos.sh "$APP"
+          # POST-SIGN GATE (fail-closed): re-hash every engine INSIDE the signed
+          # bundle and abort if it != the miners.json pin baked into the binary.
+          # This is the check that would have caught the v0.3.1 drift: the engine
+          # must read back byte-identical to the pin AFTER codesign, or the client
+          # would fail-closed at Start. Runs before `ditto` so a bad bundle is
+          # never even zipped.
+          triple="${{ matrix.target }}"
+          read_pin() { python3 -c 'import json,sys; name,triple=sys.argv[1],sys.argv[2]; m=json.load(open("release-assets/miners.json")); e=next((x for x in m["engines"] if x.get("filename")==name and x.get("target")==triple), None); sha=((e or {}).get("sha256") or "").strip().lower(); print("" if (e is None or e.get("_placeholder") or len(sha)!=64 or set(sha)=={"0"}) else sha)' "$1" "$2"; }
+          gate_fail=0
+          for name in xmrig kawpowminer; do
+            f="$APP/Contents/MacOS/$name"
+            [ -f "$f" ] || continue
+            pin=$(read_pin "$name" "$triple")
+            if [ -z "$pin" ]; then echo "::error::$name packaged but has no real pin in miners.json"; gate_fail=1; continue; fi
+            act=$(shasum -a 256 "$f" | awk '{print $1}')
+            echo "  post-sign $name: pinned=$pin packaged=$act"
+            if [ "$pin" != "$act" ]; then
+              echo "::error::$name SHA-256 != pin AFTER signing — the signer mutated the engine bytes; client would fail-closed at Start"
+              gate_fail=1
+            fi
+          done
+          [ "$gate_fail" = 0 ] || { echo "post-sign engine integrity check failed"; exit 1; }
+          echo "Post-sign engine integrity OK."
           ditto -c -k --keepParent "$APP" ${{ matrix.artifact }}
 
       - name: Upload artifact
