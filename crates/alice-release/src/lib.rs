@@ -569,10 +569,29 @@ fn collect_macho(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect_macho(root, &path, out);
-        } else if path != root && is_macho(&path) {
+        } else if path != root && is_macho(&path) && !is_engine_basename(&path) {
+            // Skip the bundled mining ENGINES: they ship with their own committed
+            // ad-hoc signature whose SHA-256 == the pin baked into the client.
+            // Re-signing them here (per-user, with whatever codesign the user's
+            // macOS has) drifts the on-disk SHA off the pin and would brick mining
+            // after a self-update — the same class of bug as the CI signer. The
+            // bundle seal (not --deep) records their hashes without re-signing.
             out.push(path);
         }
     }
+}
+
+/// The bundled third-party mining engines, which must NEVER be re-signed (their
+/// pinned SHA-256 is the runtime trust check). Mirrors scripts/adhoc_sign_macos.sh.
+#[cfg(target_os = "macos")]
+fn is_engine_basename(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some(
+            "xmrig" | "xmrig.exe" | "kawpowminer" | "kawpowminer.exe" | "SRBMiner-MULTI"
+                | "SRBMiner-MULTI.exe"
+        )
+    )
 }
 
 /// Cheap Mach-O sniff by magic number (no `file`/external dep): handles the

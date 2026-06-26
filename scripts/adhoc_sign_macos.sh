@@ -56,9 +56,28 @@ if [[ -d "${TARGET}" ]]; then
   # Mach-O (thin or universal). Newline-delimited is fine: bundle paths produced
   # by our release pipeline contain no newlines.
   echo "Signing nested Mach-O (inner-first) under ${TARGET}…"
+  # The bundled mining ENGINES (xmrig / kawpowminer / SRBMiner-MULTI) ship with
+  # their OWN committed ad-hoc signature, and the SHA-256 of those exact bytes is
+  # the pin baked into the client (release-assets/miners.json). Re-signing them
+  # here mutates their bytes — and ad-hoc codesign is NON-deterministic across
+  # macos runner images — so the on-disk SHA drifts from the pin and the runtime
+  # integrity check fail-closes ("Start does nothing", the v0.3.1 macOS bug).
+  # SKIP engine basenames: sign only OUR Mach-O (AliceMiner / alice-miner /
+  # alice-miner-cli). The final bundle seal below is NOT --deep, so it records the
+  # engines' existing hashes in CodeResources without re-signing the engine bytes.
+  is_engine_basename() {
+    case "$(basename "$1")" in
+      xmrig|xmrig.exe|kawpowminer|kawpowminer.exe|SRBMiner-MULTI|SRBMiner-MULTI.exe) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
   machos=""
   while IFS= read -r f; do
     if file -b "${f}" | grep -q 'Mach-O'; then
+      if is_engine_basename "${f}"; then
+        echo "  skip engine (keep committed signature == pin): ${f}"
+        continue
+      fi
       depth=$(printf '%s' "${f}" | tr -cd '/' | wc -c | tr -d ' ')
       machos+="${depth} ${f}"$'\n'
     fi
