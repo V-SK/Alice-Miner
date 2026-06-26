@@ -42,6 +42,7 @@ pub mod prl_payout;
 pub mod service;
 pub mod stats;
 pub mod supervise;
+pub mod terminal;
 
 /// Test-only: a single process-global lock guarding the `ALICE_MINER_*_BIN` env
 /// vars. Both [`binaries`] and [`engine`] tests set/read these, and Rust runs

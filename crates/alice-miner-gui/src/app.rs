@@ -842,29 +842,37 @@ impl MinerApp {
             return;
         }
 
-        if let Err(e) = self
-            .engine
-            .send(Command::Start {
-                lane,
-                address: None,
-                dual,
-                unlock_password: None,
-                // A5c: the simple per-GPU picker resolves to All (every card,
-                // unchanged behavior) unless the user unchecked some cards on a
-                // ≥2-GPU box with a GPU lane — then Ids(selected indices). CPU-XMR
-                // and single-GPU machines always resolve to All.
-                gpus: self.resolved_gpu_selection(),
-            })
-        {
+        // A5c: the simple per-GPU picker resolves to All (every card, unchanged
+        // behavior) unless the user unchecked some cards on a ≥2-GPU box with a GPU
+        // lane — then Ids(selected indices). CPU-XMR / single-GPU → All.
+        let gpus = self.resolved_gpu_selection();
+        // Prefer the visible-terminal persistence path (production builds with the
+        // bundled CLI); fall back to the in-window engine on a dev build. XMR/RVN
+        // are address-only, so no password is involved here.
+        if self.launch_in_terminal(lane, &gpus) {
+            return;
+        }
+        if let Err(e) = self.engine.send(Command::Start {
+            lane,
+            address: None,
+            dual,
+            unlock_password: None,
+            gpus,
+        }) {
             self.error = Some(e);
         }
     }
 
-    /// Confirm the GPU-PRL unlock prompt: send `Start{GpuPrl, unlock_password:
-    /// Some(pw)}` with the captured password, then **immediately zeroize** the
-    /// GUI-side copy (the engine also zeroizes the password it receives once the
-    /// keystore is unlocked — this closes the small window on the UI side). No-op if
-    /// the modal isn't open. The lane/dual are replayed verbatim from the modal.
+    /// Confirm the GPU-PRL unlock prompt. The GPU mainline persists best in a
+    /// **visible terminal** (the operator's chosen model: Start → a real terminal
+    /// running the headless CLI, which prompts for the wallet password ITSELF and
+    /// keeps mining after the GUI closes). So when the bundled CLI is present we
+    /// pop the terminal and DROP the just-typed password unused (the CLI re-prompts
+    /// securely in its own window — no secret is ever passed on a command line).
+    /// On a dev build with no adjacent CLI we fall back to the in-window engine,
+    /// sending `Start{unlock_password: Some(pw)}`. Either way the GUI-held password
+    /// is **zeroized** the instant we're done. No-op if the modal isn't open; the
+    /// lane/dual are replayed verbatim from the modal.
     pub fn confirm_prl_start(&mut self) {
         use zeroize::Zeroize;
         let Some(mut unlock) = self.prl_unlock.take() else {
@@ -875,7 +883,15 @@ impl MinerApp {
         // A5c: PRL is a GPU lane, so honour the multi-GPU picker here too (resolves
         // to All unless the user picked a subset on a ≥2-GPU box).
         let gpus = self.resolved_gpu_selection();
-        // Send a CLONE; the original buffer is zeroized below regardless of outcome.
+        // Prefer the visible-terminal persistence path (the GPU mainline). The
+        // password the user typed is NOT forwarded — the CLI prompts in its own
+        // terminal — so we zeroize it here regardless of which path we take.
+        if self.launch_in_terminal(lane, &gpus) {
+            unlock.password.zeroize();
+            return;
+        }
+        // Fallback (no bundled CLI — dev build): the in-window engine path needs
+        // the unlock password. Send a CLONE; the original is zeroized below.
         let send_result = self.engine.send(Command::Start {
             lane,
             address: None,
@@ -888,6 +904,37 @@ impl MinerApp {
         if let Err(e) = send_result {
             self.error = Some(e);
         }
+    }
+
+    /// Try to launch the headless CLI in a **visible OS terminal** for `lane` (the
+    /// GPU-persistence path: the user sees live output + mining survives the GUI
+    /// closing; for the PRL/Alpha lanes the CLI prompts for the wallet password in
+    /// its own terminal, so NO secret is passed here). The argv is secret-free —
+    /// only `start --lane <lane> [--gpus <ids>]`.
+    ///
+    /// Returns `true` when a terminal launch was ATTEMPTED (so the caller skips the
+    /// in-window engine — single owner). Returns `false` only when the bundled CLI
+    /// isn't present next to the app (a dev build), so the caller falls back to the
+    /// in-window engine. A terminal-spawn failure still returns `true` (we tried,
+    /// and surfaced the error) so we never double-launch. Dual-mine is left to the
+    /// in-window engine for now (the CLI `--dual` path is a follow-up), so this
+    /// returns `false` when `dual` is requested.
+    fn launch_in_terminal(&mut self, lane: Lane, gpus: &GpuSelection) -> bool {
+        use alice_miner_core::terminal;
+        // Dual-mine isn't wired into the terminal launcher yet → use the engine.
+        if self.dual_requested && self.dual_viable() {
+            return false;
+        }
+        let cli_path = match terminal::resolve_cli_path() {
+            Ok(p) => p,
+            // No adjacent CLI (dev build) → signal the caller to use the engine.
+            Err(_) => return false,
+        };
+        let args = terminal::terminal_start_args(lane.cli_lane_arg(), gpus.csv().as_deref());
+        if let Err(e) = terminal::spawn_in_terminal(&cli_path, &args) {
+            self.error = Some(e);
+        }
+        true
     }
 
     /// Cancel the GPU-PRL unlock prompt without starting: zeroize+drop the captured
@@ -1618,6 +1665,41 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         let err = app.error.as_deref().expect("single-owner refusal is set");
         assert!(err.contains("Background mining is on"), "got: {err}");
         assert!(app.prl_unlock.is_none(), "no modal opened — refused before lane handling");
+    }
+
+    /// PIECE 1 — the terminal-launch argv the GUI hands the headless CLI is
+    /// SECRET-FREE and replays the user's lane + (subset) GPU selection. We exercise
+    /// the exact building blocks `launch_in_terminal` uses (lane→CLI token +
+    /// resolved GPU CSV → `terminal_start_args`) without spawning a process.
+    #[test]
+    fn terminal_launch_args_are_secret_free_and_replay_selection() {
+        use alice_miner_core::terminal;
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(multigpu_device(3));
+        app.select_lane(Lane::GpuPrl);
+
+        // All cards checked → `start --lane prl` (no --gpus; every-card argv).
+        let gpus = app.resolved_gpu_selection();
+        assert_eq!(gpus, GpuSelection::All);
+        let args = terminal::terminal_start_args(Lane::GpuPrl.cli_lane_arg(), gpus.csv().as_deref());
+        assert_eq!(args, vec!["start", "--lane", "prl"]);
+
+        // Uncheck the middle card → `start --lane prl --gpus 0,2`.
+        app.toggle_gpu(1);
+        let gpus = app.resolved_gpu_selection();
+        let args = terminal::terminal_start_args(Lane::GpuPrl.cli_lane_arg(), gpus.csv().as_deref());
+        assert_eq!(args, vec!["start", "--lane", "prl", "--gpus", "0,2"]);
+
+        // SECRET-FREE under both shapes (no password / address / seed token).
+        for tok in &args {
+            let l = tok.to_lowercase();
+            assert!(!l.contains("password") && !l.contains("prl1p") && !l.contains("seed"),
+                "terminal argv leaked a secret: {tok}");
+        }
+
+        // RVN must spell `rvn` for the CLI (its id() "gpu" would launch PRL).
+        let rvn = terminal::terminal_start_args(Lane::GpuRvn.cli_lane_arg(), None);
+        assert_eq!(rvn, vec!["start", "--lane", "rvn"]);
     }
 
     /// Cancelling the unlock prompt zeroizes+drops the captured password and closes

@@ -57,6 +57,20 @@ impl Lane {
     pub fn is_prl_lane(self) -> bool {
         matches!(self, Lane::GpuPrl | Lane::GpuAlpha)
     }
+
+    /// The exact `--lane` token the headless CLI (`alice-miner-cli start --lane …`)
+    /// accepts for this lane. Distinct from [`Lane::id`] because the CLI's `gpu`
+    /// alias means the PRL **mainline**, so `GpuRvn` must spell `rvn` (its `id()` of
+    /// `"gpu"` would launch PRL instead). Used by the [`crate::terminal`] launcher
+    /// to replay the GUI's selected lane verbatim into a visible-terminal CLI start.
+    pub fn cli_lane_arg(self) -> &'static str {
+        match self {
+            Lane::Xmr => "xmr",
+            Lane::GpuPrl => "prl",
+            Lane::GpuAlpha => "alpha",
+            Lane::GpuRvn => "rvn",
+        }
+    }
 }
 
 /// Which physical GPU(s) a GPU lane should run on (multi-GPU scheduling, A5b).
@@ -157,6 +171,18 @@ mod gpu_selection_tests {
             GpuSelection::Ids(vec![0, 1, 2]).csv().as_deref(),
             Some("0,1,2")
         );
+    }
+
+    #[test]
+    fn cli_lane_arg_maps_each_lane_to_the_cli_token() {
+        // The CLI `gpu` alias means PRL, so RVN must spell `rvn` (NOT id()'s "gpu").
+        assert_eq!(Lane::Xmr.cli_lane_arg(), "xmr");
+        assert_eq!(Lane::GpuPrl.cli_lane_arg(), "prl");
+        assert_eq!(Lane::GpuAlpha.cli_lane_arg(), "alpha");
+        assert_eq!(Lane::GpuRvn.cli_lane_arg(), "rvn");
+        // Guard the RVN footgun explicitly: id() collides with the CLI's PRL alias.
+        assert_eq!(Lane::GpuRvn.id(), "gpu");
+        assert_ne!(Lane::GpuRvn.cli_lane_arg(), Lane::GpuRvn.id());
     }
 
     #[test]
