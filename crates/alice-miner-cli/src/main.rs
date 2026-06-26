@@ -168,6 +168,15 @@ struct IdentityArgs {
     /// Print the active reward address from ~/.alice/identity.json (no secret).
     #[arg(long, conflicts_with_all = ["create", "import", "import_seed", "paste"])]
     show: bool,
+    /// Set your 15%-PRL RETURN address — where the foundation sends your 15% PRL
+    /// kickback (a public `prl1p…` address). Stored at ~/.alice/prl_payout_address
+    /// and bound to your Alice address on the next GPU-lane start (PoP). OPTIONAL:
+    /// mining works without it; you just forgo the 15% return until it is set.
+    #[arg(long, value_name = "PRL1", conflicts_with_all = ["create", "import", "import_seed", "paste", "show", "show_prl_payout"])]
+    set_prl_payout: Option<String>,
+    /// Print your stored 15%-PRL return address (masked), or `not set`.
+    #[arg(long, conflicts_with_all = ["create", "import", "import_seed", "paste", "show", "set_prl_payout"])]
+    show_prl_payout: bool,
     /// Optional label for the identity.
     #[arg(long)]
     label: Option<String>,
@@ -406,6 +415,14 @@ fn cmd_identity(args: IdentityArgs) -> i32 {
     if args.show {
         return cmd_identity_show(args.json);
     }
+    // The 15%-PRL return address ops are pure local file IO (public address, no
+    // engine, no secret, never touches the keystore).
+    if let Some(addr) = args.set_prl_payout.as_deref() {
+        return cmd_set_prl_payout(addr, args.json);
+    }
+    if args.show_prl_payout {
+        return cmd_show_prl_payout(args.json);
+    }
 
     let spec = match build_identity_spec(
         args.create,
@@ -500,6 +517,59 @@ fn cmd_identity_show(json: bool) -> i32 {
                 );
             }
             EXIT_RUNTIME
+        }
+    }
+}
+
+/// `identity --set-prl-payout <prl1p…>`: store the user's 15%-PRL return address
+/// (public, shape-validated, no engine/secret). Bound to the Alice address on the
+/// next GPU-lane start.
+fn cmd_set_prl_payout(addr: &str, json: bool) -> i32 {
+    match alice_miner_core::prl_payout::save_payout_address(addr) {
+        Ok(path) => {
+            let masked = alice_miner_core::prl_payout::mask_payout(addr.trim());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "prl_payout": masked, "set": true, "stored": path.display().to_string() })
+                );
+            } else {
+                println!("15% PRL return address saved: {masked}");
+                println!("  binds to your Alice address on the next GPU mining start (PoP).");
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            EXIT_USAGE
+        }
+    }
+}
+
+/// `identity --show-prl-payout`: print the stored 15%-PRL return address (masked).
+fn cmd_show_prl_payout(json: bool) -> i32 {
+    match alice_miner_core::prl_payout::load_payout_address() {
+        Ok(Some(addr)) => {
+            let masked = alice_miner_core::prl_payout::mask_payout(&addr);
+            if json {
+                println!("{}", serde_json::json!({ "prl_payout": masked, "set": true }));
+            } else {
+                println!("15% PRL return address: {masked}");
+            }
+            EXIT_OK
+        }
+        Ok(None) => {
+            if json {
+                println!("{}", serde_json::json!({ "prl_payout": null, "set": false }));
+            } else {
+                println!("15% PRL return address: not set");
+                println!("  set one with:  alice-miner identity --set-prl-payout <prl1p…>");
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            EXIT_USAGE
         }
     }
 }

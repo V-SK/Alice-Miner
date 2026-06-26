@@ -124,6 +124,41 @@ pub fn load_payout_address() -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// Persist the user's 15%-PRL payout address to `~/.alice/prl_payout_address` (the
+/// exact file [`load_payout_address`] reads). **Shape-validated first** — a typo is
+/// rejected and NEVER written. The address is PUBLIC (not a secret), written
+/// atomically (temp + rename). Returns the path written so the caller can confirm.
+///
+/// NOTE: this is independent of the keystore — it touches only the small public
+/// pointer file, never `miner-keystore.json` / `wallet.json`.
+pub fn save_payout_address(addr: &str) -> Result<PathBuf, String> {
+    let trimmed = addr.trim();
+    validate_payout_shape(trimmed)?;
+    let path = payout_file_path().ok_or("no home directory to store the payout address")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let tmp = path.with_file_name(format!(".prl_payout_address.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, format!("{trimmed}\n")).map_err(|e| format!("failed to write payout address: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("failed to store payout address: {e}")
+    })?;
+    Ok(path)
+}
+
+/// Remove the stored payout address (the user opts out of the 15% return). `Ok` if
+/// it was already absent.
+pub fn clear_payout_address() -> Result<(), String> {
+    let Some(path) = payout_file_path() else { return Ok(()) };
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to remove payout address: {e}")),
+    }
+}
+
 /// A masked rendering of a payout address for the UI: keep the `prl1p…` prefix
 /// and the last 4 chars, eliding the middle (so the panel can confirm "this is
 /// my wallet" without exposing the full address in a screenshot). Short/garbage
@@ -520,6 +555,53 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var(ENV_MINER_LOOKUP_URL, v),
             None => std::env::remove_var(ENV_MINER_LOOKUP_URL),
+        }
+    }
+
+    #[test]
+    fn save_then_load_round_trips_and_clear() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_addr = std::env::var(ENV_PAYOUT_ADDRESS).ok();
+        let prev_home = std::env::var("HOME").ok();
+        let prev_up = std::env::var("USERPROFILE").ok();
+        std::env::remove_var(ENV_PAYOUT_ADDRESS); // force the FILE path (not the env override)
+        let home = std::env::temp_dir().join(format!(
+            "alice-prl-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("USERPROFILE");
+
+        // Nothing stored yet.
+        assert_eq!(load_payout_address().unwrap(), None);
+        // A typo is rejected and NEVER written.
+        assert!(save_payout_address("not-a-prl1p").is_err());
+        assert_eq!(load_payout_address().unwrap(), None);
+        // Save a legal address → load reads it back; the file lives under ~/.alice.
+        let p = save_payout_address(PAYOUT_OK).expect("save ok");
+        assert!(p.ends_with(".alice/prl_payout_address"));
+        assert_eq!(load_payout_address().unwrap().as_deref(), Some(PAYOUT_OK));
+        // Whitespace is trimmed on save.
+        save_payout_address(&format!("  {PAYOUT_OK}  ")).unwrap();
+        assert_eq!(load_payout_address().unwrap().as_deref(), Some(PAYOUT_OK));
+        // Clear → back to None; clearing again is Ok (idempotent).
+        clear_payout_address().unwrap();
+        assert_eq!(load_payout_address().unwrap(), None);
+        clear_payout_address().unwrap();
+
+        let _ = std::fs::remove_dir_all(&home);
+        match prev_addr {
+            Some(v) => std::env::set_var(ENV_PAYOUT_ADDRESS, v),
+            None => std::env::remove_var(ENV_PAYOUT_ADDRESS),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        if let Some(v) = prev_up {
+            std::env::set_var("USERPROFILE", v);
         }
     }
 
