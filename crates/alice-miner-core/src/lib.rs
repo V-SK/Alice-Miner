@@ -39,6 +39,7 @@ pub mod identity;
 pub mod lane;
 pub mod pop;
 pub mod prl_payout;
+pub mod service;
 pub mod stats;
 pub mod supervise;
 

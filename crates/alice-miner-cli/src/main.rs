@@ -112,6 +112,20 @@ enum Command {
         process handles exactly like Ctrl-C: Command::Stop → SIGTERM→SIGKILL on the\n\
         owned child), and escalates to SIGKILL if it doesn't exit. Leaves no orphan.")]
     Stop(StopArgs),
+
+    /// Run mining in the background so it PERSISTS when you close the window.
+    #[command(long_about = "Install / remove a background mining service so mining keeps running\n\
+        after you close the window (and, with --at-login, restarts at login/boot).\n\
+        macOS only for now (launchd LaunchAgent). The CPU-XMR lane runs with NO\n\
+        stored secret — the reward address is read from your ~/.alice identity at\n\
+        runtime, never written into the service definition.\n\
+        \n\
+        --install     install + start the background agent\n\
+        --uninstall   stop + remove the background agent\n\
+        --status      print whether it is installed / running (the default)\n\
+        --lane xmr    the lane to background (xmr only today; GPU needs a follow-up)\n\
+        --at-login    also start mining automatically at login/boot")]
+    Service(ServiceArgs),
 }
 
 #[derive(clap::Args)]
@@ -202,6 +216,28 @@ struct StopArgs {
     timeout_s: u64,
 }
 
+#[derive(clap::Args)]
+struct ServiceArgs {
+    /// Install + start the background mining agent.
+    #[arg(long, conflicts_with_all = ["uninstall", "status"])]
+    install: bool,
+    /// Stop + remove the background mining agent.
+    #[arg(long, conflicts_with_all = ["install", "status"])]
+    uninstall: bool,
+    /// Print whether the agent is installed / running (the default action).
+    #[arg(long, conflicts_with_all = ["install", "uninstall"])]
+    status: bool,
+    /// Which lane to background (xmr only today — a GPU lane needs the keychain).
+    #[arg(long, default_value = "xmr", value_name = "LANE")]
+    lane: String,
+    /// Also start mining automatically at login / boot (launchd RunAtLoad).
+    #[arg(long)]
+    at_login: bool,
+    /// Machine-readable status output.
+    #[arg(long)]
+    json: bool,
+}
+
 fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
@@ -209,8 +245,74 @@ fn main() {
         Command::Identity(args) => cmd_identity(args),
         Command::Start(args) => cmd_start(args),
         Command::Stop(args) => cmd_stop(args),
+        Command::Service(args) => cmd_service(args),
     };
     std::process::exit(code);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// service (background mining persistence)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmd_service(args: ServiceArgs) -> i32 {
+    use alice_miner_core::service::{self, ServiceSpec, ServiceState};
+
+    // Default + explicit --status: report state.
+    if args.status || (!args.install && !args.uninstall) {
+        let (word, msg) = match service::status() {
+            ServiceState::Running => ("running", "Background mining is installed and running."),
+            ServiceState::Loaded => (
+                "loaded",
+                "Background mining is installed (not currently running; it will keep retrying).",
+            ),
+            ServiceState::NotInstalled => ("not_installed", "Background mining is not installed."),
+        };
+        if args.json {
+            println!("{{\"service\":\"{word}\"}}");
+        } else {
+            println!("{msg}");
+        }
+        return EXIT_OK;
+    }
+
+    if args.uninstall {
+        return match service::uninstall() {
+            Ok(()) => {
+                println!("Background mining removed.");
+                EXIT_OK
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                EXIT_RUNTIME
+            }
+        };
+    }
+
+    // install: the bundled CLI to run in the background is THIS binary.
+    let cli_path = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: cannot locate the miner CLI to background: {e}");
+            return EXIT_RUNTIME;
+        }
+    };
+    let cap = alice_miner_core::CapabilityProfile::detect();
+    let lane = match resolve_lane(&args.lane, &cap) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    let spec = ServiceSpec { lane, cli_path, run_at_login: args.at_login };
+    match service::install(&spec) {
+        Ok(()) => {
+            let tail = if args.at_login { " It will also start at login." } else { "" };
+            println!("Background mining installed and started.{tail}");
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            EXIT_USAGE
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
