@@ -25,6 +25,7 @@ pub fn lane_chip_label(lane: Lane) -> &'static str {
     match lane {
         Lane::Xmr => "XMR · RandomX",
         Lane::GpuPrl => "PRL · pearlhash",
+        Lane::GpuAlpha => "Alpha · pearlhash (V100)",
         Lane::GpuRvn => "RVN · KawPoW",
     }
 }
@@ -33,8 +34,9 @@ pub fn lane_chip_label(lane: Lane) -> &'static str {
 pub fn lane_accent(lane: Lane) -> Color32 {
     match lane {
         Lane::Xmr => theme::THEME.lane_xmr,
-        // Both GPU lanes share the GPU accent.
+        // All GPU lanes share the GPU accent.
         Lane::GpuPrl => theme::THEME.lane_gpu,
+        Lane::GpuAlpha => theme::THEME.lane_gpu,
         Lane::GpuRvn => theme::THEME.lane_gpu,
     }
 }

@@ -161,6 +161,7 @@ fn pill_lane_label(lane: Lane, dual: bool) -> &'static str {
     match lane {
         Lane::Xmr => "XMR",
         Lane::GpuPrl => "PRL",
+        Lane::GpuAlpha => "Alpha",
         Lane::GpuRvn => "RVN",
     }
 }

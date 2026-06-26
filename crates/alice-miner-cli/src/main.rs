@@ -197,8 +197,9 @@ struct IdentityArgs {
 
 #[derive(clap::Args)]
 struct StartArgs {
-    /// Which lane to mine: `xmr` (CPU/RandomX), `gpu`/`prl` (NVIDIA/AMD pearlhash —
-    /// the GPU mainline), `rvn` (legacy KawPoW), or `auto` (the recommended lane).
+    /// Which lane to mine: `xmr` (CPU/RandomX), `gpu`/`prl` (NVIDIA/AMD pearlhash via
+    /// SRBMiner — the GPU mainline, CC≥7.5), `alpha` (pearlhash via AlphaMiner — the
+    /// Volta/V100 path, where SRBMiner can't run), `rvn` (legacy KawPoW), or `auto`.
     #[arg(long, default_value = "auto", value_name = "LANE")]
     lane: String,
     /// Override the reward address (defaults to the active ~/.alice identity).
@@ -836,10 +837,12 @@ fn resolve_lane(s: &str, cap: &alice_miner_core::CapabilityProfile) -> Result<La
         // `gpu` means the GPU **mainline** = PRL (pearlhash). `rvn` selects the
         // legacy KawPoW lane explicitly.
         "gpu" | "prl" => Ok(Lane::GpuPrl),
+        // `alpha` = the AlphaMiner pearlhash lane (V100/Volta — where SRBMiner can't run).
+        "alpha" => Ok(Lane::GpuAlpha),
         "rvn" => Ok(Lane::GpuRvn),
         "auto" => Ok(cap.recommended_lane()),
         other => {
-            eprintln!("error: unknown lane `{other}` (use: xmr | gpu | prl | rvn | auto)");
+            eprintln!("error: unknown lane `{other}` (use: xmr | gpu | prl | alpha | rvn | auto)");
             Err(EXIT_USAGE)
         }
     }
@@ -1079,8 +1082,11 @@ mod tests {
         // `gpu` now means the GPU mainline (PRL); `rvn` selects the legacy lane.
         assert_eq!(resolve_lane("gpu", &cap).unwrap(), Lane::GpuPrl);
         assert_eq!(resolve_lane("prl", &cap).unwrap(), Lane::GpuPrl);
+        assert_eq!(resolve_lane("alpha", &cap).unwrap(), Lane::GpuAlpha);
+        assert_eq!(resolve_lane("ALPHA", &cap).unwrap(), Lane::GpuAlpha);
         assert_eq!(resolve_lane("rvn", &cap).unwrap(), Lane::GpuRvn);
         assert_eq!(resolve_lane("AUTO", &cap).unwrap(), cap.recommended_lane());
+        assert!(resolve_lane("bogus", &cap).is_err());
     }
 
     /// build_identity_spec maps each flag and errors when none is given.

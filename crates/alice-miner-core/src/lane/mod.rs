@@ -2,6 +2,7 @@
 //! lane ([`xmr`]); the GPU-RVN (KawPoW) lane is M3. Each lane owns its own
 //! verbatim-ported argv builder, address validation, and (later) log parsers.
 
+pub mod gpu_alpha;
 pub mod gpu_prl;
 pub mod gpu_rvn;
 pub mod xmr;
@@ -19,8 +20,13 @@ pub enum Lane {
     /// CPU RandomX/XMR against `hk.aliceprotocol.org:3333` (the proven path).
     Xmr,
     /// GPU pearlhash/PRL against the region relays `:3340` with mandatory M4 PoP —
-    /// the GPU **mainline** (V: "GPU 主线 = PRL,展示不隐藏").
+    /// the GPU **mainline** (V: "GPU 主线 = PRL,展示不隐藏"). SRBMiner; needs CC ≥ 7.5.
     GpuPrl,
+    /// GPU pearlhash/PRL via **AlphaMiner** against the alpha relay `:3341` (pearl/v1
+    /// transparent proxy to AlphaPool) — the **Volta/V100 path** (SRBMiner cannot mine
+    /// on Volta CC 7.0; alpha-miner can). Same PoP + 15% return as GpuPrl; same credit
+    /// ledger. See [`gpu_alpha`] + `_launch/artifacts/alphaminer-v100-dual-path-design.md`.
+    GpuAlpha,
     /// NVIDIA-GPU KawPoW/RVN against `hk.aliceprotocol.org:8888` (the earlier path).
     GpuRvn,
 }
@@ -30,6 +36,7 @@ impl Lane {
         match self {
             Lane::Xmr => "CPU · XMR",
             Lane::GpuPrl => "GPU · PRL",
+            Lane::GpuAlpha => "GPU · Alpha (V100)",
             Lane::GpuRvn => "GPU · RVN",
         }
     }
@@ -39,8 +46,16 @@ impl Lane {
         match self {
             Lane::Xmr => "xmr",
             Lane::GpuPrl => "prl",
+            Lane::GpuAlpha => "alpha",
             Lane::GpuRvn => "gpu",
         }
+    }
+
+    /// Whether this lane earns the 15%-PRL return (and therefore needs the signable
+    /// wallet for M4 PoP + fires the payout-enroll task): the two pearlhash lanes
+    /// (SRBMiner `GpuPrl` + AlphaMiner `GpuAlpha`). XMR/RVN are address-only.
+    pub fn is_prl_lane(self) -> bool {
+        matches!(self, Lane::GpuPrl | Lane::GpuAlpha)
     }
 }
 

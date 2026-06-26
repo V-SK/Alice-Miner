@@ -171,6 +171,10 @@ impl EndpointPlan {
                     gpu_prl::GPU_RELAY_PORT,
                 ))
             }),
+            // GPU-Alpha (V100/Volta) ships the same THREE region relays on the alpha
+            // relay port (:3341); relay-only, no core IP / collection address.
+            Lane::GpuAlpha => Self::new(crate::lane::gpu_alpha::region_default_endpoints())
+                .unwrap_or_else(|_| Self::single(crate::lane::gpu_alpha::default_region_endpoint())),
         }
     }
 

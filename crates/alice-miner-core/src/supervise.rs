@@ -735,6 +735,24 @@ fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
                 }
             }
         }
+        Lane::GpuAlpha => {
+            // alpha-miner (V100/Volta pearlhash) writes logfmt to STDOUT (the stdout
+            // pump feeds this arm — no --log-file needed). `parse_alpha`, validated
+            // against the real V100 capture, reads the periodic miner-status line:
+            // `hashrate_th_s` (→ H/s) + the cumulative `hits` (submitted shares). The
+            // client never sees a pool accept/reject (async submit; acceptance is the
+            // relay's truth), so `rejected` stays None — only hashrate + accepted move.
+            if let Some(sample) = crate::stats::parse_alpha(&line) {
+                if let Some(hr) = sample.hashrate_hs {
+                    g.hashrate_hs = Some(hr);
+                    note_hashrate_progress(g, hr);
+                }
+                if let Some(a) = sample.accepted {
+                    g.accepted = a;
+                    note_accepted_progress(g, a);
+                }
+            }
+        }
     }
     g.last_line = line;
 }

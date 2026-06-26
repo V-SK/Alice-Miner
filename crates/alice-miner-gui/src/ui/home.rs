@@ -789,6 +789,7 @@ fn lane_short(lane: Lane) -> &'static str {
     match lane {
         Lane::Xmr => "XMR",
         Lane::GpuPrl => "PRL",
+        Lane::GpuAlpha => "Alpha",
         Lane::GpuRvn => "RVN",
     }
 }
@@ -800,6 +801,8 @@ fn unavailable_tail(lane: Lane) -> &'static str {
         Lane::GpuRvn => "needs NVIDIA",
         // PRL (SRBMiner) needs an NVIDIA/AMD GPU; no macOS build.
         Lane::GpuPrl => "needs NVIDIA/AMD GPU",
+        // Alpha (alpha-miner) is NVIDIA-CUDA only (the Volta/V100 path).
+        Lane::GpuAlpha => "needs NVIDIA GPU",
         Lane::Xmr => "not supported",
     }
 }

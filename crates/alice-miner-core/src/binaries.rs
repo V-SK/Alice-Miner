@@ -86,6 +86,8 @@ pub enum MinerKind {
     GpuRvn,
     /// SRBMiner-MULTI on the `pearlhash` algorithm — the GPU-PRL mainline lane.
     GpuPrl,
+    /// alpha-miner (pearl/v1) — the GPU-Alpha (V100/Volta) lane.
+    GpuAlpha,
 }
 
 impl MinerKind {
@@ -95,6 +97,7 @@ impl MinerKind {
             MinerKind::CpuXmr => XMRIG_BINARY_NAME,
             MinerKind::GpuRvn => KAWPOW_BINARY_NAME,
             MinerKind::GpuPrl => SRBMINER_BINARY_NAME,
+            MinerKind::GpuAlpha => ALPHA_BINARY_NAME,
         }
     }
 
@@ -104,6 +107,7 @@ impl MinerKind {
             MinerKind::CpuXmr => "ALICE_MINER_XMR_BIN",
             MinerKind::GpuRvn => "ALICE_MINER_GPU_BIN",
             MinerKind::GpuPrl => "ALICE_MINER_PRL_BIN",
+            MinerKind::GpuAlpha => "ALICE_MINER_ALPHA_BIN",
         }
     }
 
@@ -113,6 +117,7 @@ impl MinerKind {
             MinerKind::CpuXmr => "cpu-xmr",
             MinerKind::GpuRvn => "gpu-rvn",
             MinerKind::GpuPrl => "gpu-prl",
+            MinerKind::GpuAlpha => "gpu-alpha",
         }
     }
 }
@@ -508,6 +513,11 @@ pub const SRBMINER_BINARY_NAME: &str = "SRBMiner-MULTI.exe";
 #[cfg(not(target_os = "windows"))]
 pub const SRBMINER_BINARY_NAME: &str = "SRBMiner-MULTI";
 
+#[cfg(target_os = "windows")]
+pub const ALPHA_BINARY_NAME: &str = "alpha-miner.exe";
+#[cfg(not(target_os = "windows"))]
+pub const ALPHA_BINARY_NAME: &str = "alpha-miner";
+
 /// The committed release-asset target-triple directory for the current build,
 /// used by the dev fallback (matches the `release-assets/<triple>/` layout the
 /// Wallet ships and the M1 brief specifies). Mirrors the platform strings the
@@ -642,6 +652,13 @@ pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
             "GPU miner not installed: the SRBMiner-MULTI engine `{}` was not found \
              (set {} to an SRBMiner-MULTI binary, or install the bundled engine). \
              The GPU-PRL lane stays unavailable.",
+            kind.binary_name(),
+            kind.env_override(),
+        ),
+        MinerKind::GpuAlpha => format!(
+            "GPU miner not installed: the AlphaMiner engine `{}` was not found \
+             (set {} to an alpha-miner binary, or install the bundled engine). \
+             The GPU-Alpha (V100/Volta) lane stays unavailable.",
             kind.binary_name(),
             kind.env_override(),
         ),

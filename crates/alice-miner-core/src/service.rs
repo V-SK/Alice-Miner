@@ -63,7 +63,10 @@ pub enum ServiceState {
 fn background_lane_arg(lane: Lane) -> Result<&'static str, String> {
     match lane {
         Lane::Xmr => Ok("xmr"),
-        Lane::GpuPrl | Lane::GpuRvn => Err(
+        // Every GPU lane (incl. GPU-Alpha, which needs the wallet unlock for its
+        // out-of-band PoP) is NOT secret-free, so it cannot background via launchd —
+        // use the one-click terminal launcher for GPU persistence instead.
+        Lane::GpuPrl | Lane::GpuAlpha | Lane::GpuRvn => Err(
             "background mining for a GPU lane needs the keystore unlock stored in the OS \
              keychain (a follow-up). The CPU-XMR lane runs in the background today with no \
              stored secret — switch to XMR for background mining, or keep the window open."

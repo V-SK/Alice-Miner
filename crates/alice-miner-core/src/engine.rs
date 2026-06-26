@@ -27,8 +27,17 @@ use tokio::runtime::Runtime;
 use crate::detect::DeviceProfile;
 use crate::endpoint::{Endpoint, EndpointPlan};
 use crate::identity::{self, Identity};
-use crate::lane::{gpu_prl, gpu_rvn, xmr};
+use crate::lane::{gpu_alpha, gpu_prl, gpu_rvn, xmr};
 use crate::lane::{GpuSelection, Lane};
+
+/// Lab bring-up escape hatch: `ALICE_ALPHA_REQUIRE_POP=0` skips the GPU-Alpha lane's
+/// out-of-band M4 PoP (used ONLY for the initial e2e before the relay's alpha PoP
+/// gate ships). Any other value (or unset) keeps PoP ON — V's decision.
+fn alpha_pop_disabled() -> bool {
+    std::env::var("ALICE_ALPHA_REQUIRE_POP")
+        .map(|v| v.trim() == "0")
+        .unwrap_or(false)
+}
 use crate::supervise::LaneSupervisor;
 
 /// How a [`Command::Identity`] establishes the reward identity.
@@ -455,7 +464,7 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
                 let prl_in_play = if dual {
                     lane != Lane::GpuRvn
                 } else {
-                    lane == Lane::GpuPrl
+                    lane.is_prl_lane() // GpuPrl OR GpuAlpha — both sign the OOB M4 PoP
                 };
                 let secrets = if prl_in_play {
                     match resolve_prl_secrets(unlock_password.as_deref()) {
@@ -814,6 +823,55 @@ fn start_one_lane(
                 Ok((p.program, p.args))
             })
         }
+        Lane::GpuAlpha => {
+            // GPU-Alpha (V100/Volta) also needs the wallet SIGNING key for its
+            // out-of-band M4 PoP (require_pop=ON — V's decision); the caller already
+            // unlocked it + rejected watch-only, so a missing secret is a bug.
+            let Some(secrets) = secrets.clone() else {
+                return Err(
+                    "internal: GPU-Alpha lane started without an unlocked signing key".into(),
+                );
+            };
+            let addr_alpha = addr_for_rebuild.clone();
+            let gpus_alpha = gpus.clone();
+            Arc::new(move |eps: &[Endpoint]| {
+                let program =
+                    crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::GpuAlpha)?;
+                let Some(active) = eps.first() else {
+                    return Err("gpu-alpha launch plan needs at least one endpoint".into());
+                };
+                let authority = format!("{}:{}", active.host, active.port);
+                // device_id == the relay worker-tail (`<alice>.<device_id>`) so the
+                // OOB PoP allowlist key matches what the login presents (the device_id
+                // contract that keeps a require_pop=ON relay from locking the miner out).
+                let device_id = xmr::derive_worker_id(&addr_alpha)?;
+                // OOB M4 PoP: prove possession of the Alice key so the relay credits
+                // ONLY an owned address. The token rides the allowlist OUT-OF-BAND, NOT
+                // argv — alpha-miner's stratum `--password` is AlphaPool's plain `x`
+                // (the pool owns the pearl.challenge). Lab bring-up before the relay's
+                // alpha PoP gate ships: ALICE_ALPHA_REQUIRE_POP=0 skips this step.
+                if !alpha_pop_disabled() {
+                    let _token = crate::pop::establish_pop(
+                        &active.host,
+                        &addr_alpha,
+                        &device_id,
+                        &secrets,
+                        None,
+                    )?;
+                }
+                let placeholder = gpu_alpha::alpha_placeholder_address();
+                // backend=None → alpha-miner auto-selects (volta_sm70 on a V100, verified).
+                let p = gpu_alpha::build_alphaminer_launch_plan(
+                    program,
+                    &addr_alpha,
+                    &authority,
+                    &placeholder,
+                    None,
+                    &gpus_alpha,
+                )?;
+                Ok((p.program, p.args))
+            })
+        }
     };
 
     // Build the initial launch plan (Layer A: all endpoints, primary first).
@@ -831,18 +889,25 @@ fn start_one_lane(
     // stops as soon as the supervisor is no longer active (a user Stop, a crash,
     // or budget-exhaustion Error), so it shares the lane's lifecycle.
     let mut prl_enroll: Option<Arc<AtomicU8>> = None;
-    if lane == Lane::GpuPrl {
+    if lane.is_prl_lane() {
         if let Some(secrets) = secrets {
             // T5: best-effort 15%-PRL payout enroll — bind the user's OWN prl1p…
             // payout address to their Alice address, ONCE, after PoP is up. Skips
             // cleanly (no error, no fake signature) when no payout address is set
-            // or the identity is watch-only. Spawned before the refresh task takes
-            // ownership of `secrets`. A2c: the task reports its outcome into this
-            // shared status flag so the dashboard's "15% PRL 返还" block can show the
-            // honest enrolled/skipped state (credit-only — a status, never a value).
+            // or the identity is watch-only. Lane-independent (central HTTP keyed by
+            // the Alice address), so BOTH GPU-PRL and GPU-Alpha enroll the same way.
+            // A2c: the task reports its outcome into this shared status flag so the
+            // dashboard's "15% PRL 返还" block can show the honest enrolled/skipped
+            // state (credit-only — a status, never a value).
             let status = Arc::new(AtomicU8::new(enroll_status::PENDING));
             spawn_prl_enroll_task(sup.clone(), address.clone(), secrets.clone(), status.clone());
-            spawn_pop_refresh_task(sup.clone(), address.clone(), secrets);
+            // The OOB-allowlist refresh currently targets the GPU-PRL (herominers)
+            // relay; the GPU-Alpha relay's refresh ships with its alpha PoP gate (a
+            // follow-up), so spawn it only for GPU-PRL today. `secrets` is moved here
+            // for GPU-PRL, or dropped for GPU-Alpha.
+            if lane == Lane::GpuPrl {
+                spawn_pop_refresh_task(sup.clone(), address.clone(), secrets);
+            }
             prl_enroll = Some(status);
         }
     }

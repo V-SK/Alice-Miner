@@ -128,7 +128,7 @@ impl LaneViability {
 /// The full universe of client lanes. Declared here so every derivation covers
 /// exactly this set: CPU-XMR, the GPU-PRL **mainline** (SRBMiner pearlhash), and
 /// the earlier GPU-RVN path. LTC/AI are intentionally absent.
-pub const ALL_LANES: [Lane; 3] = [Lane::Xmr, Lane::GpuPrl, Lane::GpuRvn];
+pub const ALL_LANES: [Lane; 4] = [Lane::Xmr, Lane::GpuPrl, Lane::GpuAlpha, Lane::GpuRvn];
 
 /// Derive the lane-viability matrix from a detected [`DeviceProfile`].
 ///
@@ -184,6 +184,21 @@ pub fn derive_lane_viability(profile: &DeviceProfile) -> LaneViability {
     };
     support.insert(Lane::GpuPrl, prl_support);
     reasons.insert(Lane::GpuPrl, prl_reason.to_string());
+
+    // ── Alpha (alpha-miner pearl/v1, V100/Volta): NVIDIA-only (alpha-miner is
+    //    CUDA, backends volta/turing/ampere/ada/hopper/blackwell). This is the lane
+    //    that COVERS Volta (CC 7.0), where SRBMiner/GPU-PRL cannot run. AMD/Apple/none
+    //    → Unavailable. NOTE: auto-recommending it for a Volta card (vs GPU-PRL) needs
+    //    compute-capability detection — a follow-up; today it is viable + selectable
+    //    (`--lane alpha` / the GUI lane list), and GPU-PRL stays the auto-default. ───
+    let (alpha_support, alpha_reason) = match profile.gpu.vendor {
+        GpuVendor::Nvidia => (LaneSupport::Viable, "nvidia_present"),
+        GpuVendor::Amd => (LaneSupport::Unavailable, "alpha_requires_nvidia_cuda"),
+        GpuVendor::Apple => (LaneSupport::Unavailable, "alpha_requires_nvidia_apple_excluded"),
+        GpuVendor::None => (LaneSupport::Unavailable, "alpha_requires_nvidia_cpu_only"),
+    };
+    support.insert(Lane::GpuAlpha, alpha_support);
+    reasons.insert(Lane::GpuAlpha, alpha_reason.to_string());
 
     // ── recommended: GPU-PRL is the mainline (V: "GPU 主线 = PRL"). Prefer PRL
     //    when runnable (one-click default mines PRL on any GPU box), else fall
@@ -431,26 +446,30 @@ mod tests {
         assert_eq!(v.support(Lane::Xmr), LaneSupport::Viable);
         assert!(!v.is_runnable(Lane::GpuRvn));
         assert_eq!(v.support(Lane::GpuRvn), LaneSupport::Unavailable);
-        // PRL (SRBMiner) is also unavailable on Apple (no macOS SRBMiner build).
+        // PRL (SRBMiner) + Alpha (alpha-miner CUDA) are also unavailable on Apple.
         assert_eq!(v.support(Lane::GpuPrl), LaneSupport::Unavailable);
         assert!(!v.is_runnable(Lane::GpuPrl));
+        assert_eq!(v.support(Lane::GpuAlpha), LaneSupport::Unavailable);
+        assert!(!v.is_runnable(Lane::GpuAlpha));
         assert_eq!(v.recommended, Lane::Xmr);
         assert_eq!(v.reason(Lane::GpuRvn), Some("rvn_requires_nvidia_apple_excluded"));
 
-        // Simulated NVIDIA: RVN + PRL viable; XMR still viable.
+        // Simulated NVIDIA: RVN + PRL + Alpha viable; XMR still viable.
         let v = derive_lane_viability(&nvidia());
         assert_eq!(v.support(Lane::Xmr), LaneSupport::Viable);
         assert_eq!(v.support(Lane::GpuRvn), LaneSupport::Viable);
         assert_eq!(v.support(Lane::GpuPrl), LaneSupport::Viable);
+        assert_eq!(v.support(Lane::GpuAlpha), LaneSupport::Viable); // V100/Volta path, selectable
         assert!(v.is_runnable(Lane::GpuRvn));
         assert!(v.is_runnable(Lane::GpuPrl));
+        assert!(v.is_runnable(Lane::GpuAlpha));
         // GPU-PRL is the mainline default (V: "GPU 主线 = PRL") — a GPU box
         // one-click-defaults to PRL. runnable set = recommended-first, then
-        // ALL_LANES order ([Xmr, GpuPrl, GpuRvn]).
+        // ALL_LANES order ([Xmr, GpuPrl, GpuAlpha, GpuRvn]).
         assert_eq!(v.recommended, Lane::GpuPrl);
         assert_eq!(
             v.runnable_lanes(),
-            vec![Lane::GpuPrl, Lane::Xmr, Lane::GpuRvn]
+            vec![Lane::GpuPrl, Lane::Xmr, Lane::GpuAlpha, Lane::GpuRvn]
         );
     }
 
