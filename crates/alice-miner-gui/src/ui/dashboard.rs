@@ -820,6 +820,12 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                 });
             });
 
+            // Background-mining panel (macOS launchd) — keep mining after the
+            // window closes / at login. macOS only for now; the CPU-XMR lane runs
+            // with no stored secret.
+            #[cfg(target_os = "macos")]
+            render_background_panel(ui, app);
+
             // Software-update panel — the USER-INITIATED signed self-updater
             // (ed25519 manifest + SHA-256 artifact + atomic swap with rollback;
             // the keystore is never touched). v1 never silent-applies: a check
@@ -911,6 +917,71 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
             );
             ui.add_space(28.0);
         });
+}
+
+/// The Settings → Background mining panel (macOS). A single "keep mining when the
+/// window is closed" toggle that installs/removes the launchd LaunchAgent for the
+/// CPU-XMR lane via the (tested) `core::service` API. The reward address is read
+/// from the keystore at runtime and never written into the service definition.
+#[cfg(target_os = "macos")]
+fn render_background_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
+    use alice_miner_core::service::ServiceState;
+    // Lazily query the state once (spawns launchctl) and cache it.
+    if app.bg_service.is_none() {
+        app.refresh_bg_service();
+    }
+    let state = app.bg_service.unwrap_or(ServiceState::NotInstalled);
+    let on = !matches!(state, ServiceState::NotInstalled);
+
+    panel(ui, "Background mining", Icon::Activity, |ui| {
+        let mut do_enable = false;
+        let mut do_disable = false;
+        srow(
+            ui,
+            "Keep mining when closed",
+            "Runs the CPU (XMR) lane in the background so mining continues after you close the \
+             window, and restarts at login. Your reward address stays in the keystore — it is \
+             never written into the background service.",
+            |ui| {
+                let (label, fill, ink, stroke) = if on {
+                    ("Turn off", THEME.well, THEME.text2, THEME.line_strong)
+                } else {
+                    ("Turn on", THEME.brand, THEME.ink_on_brand, THEME.brand)
+                };
+                let btn = egui::Button::new(RichText::new(label).size(12.5).strong().color(ink))
+                    .fill(fill)
+                    .stroke(egui::Stroke::new(1.0, stroke))
+                    .corner_radius(9)
+                    .min_size(egui::vec2(0.0, 32.0));
+                if ui.add(btn).clicked() {
+                    if on {
+                        do_disable = true;
+                    } else {
+                        do_enable = true;
+                    }
+                }
+            },
+        );
+        let (word, tone) = match state {
+            ServiceState::Running => ("On — mining in the background", THEME.live),
+            ServiceState::Loaded => ("On — installed (the miner will keep retrying)", THEME.warn),
+            ServiceState::NotInstalled => ("Off", THEME.text3),
+        };
+        srow(ui, "Status", "Background agent state.", |ui| {
+            ui.label(RichText::new(word).size(12.5).color(tone));
+        });
+        if let Some(err) = app.bg_service_error.clone() {
+            srow(ui, "Last error", "The toggle action reported this.", |ui| {
+                ui.label(RichText::new(err).size(11.5).color(THEME.err));
+            });
+        }
+        if do_enable {
+            app.enable_bg_service();
+        }
+        if do_disable {
+            app.disable_bg_service();
+        }
+    });
 }
 
 /// The Settings → Software update panel. Renders the current updater state and

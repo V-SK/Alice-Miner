@@ -225,6 +225,12 @@ pub struct MinerApp {
     /// launch check the user only learned of a new build by manually opening
     /// Settings — the v0.3.1 "didn't know it could update" report.
     pub launch_update_checked: bool,
+    /// Cached background-mining service state (launchd), queried lazily when the
+    /// Settings panel opens and after a toggle — querying spawns `launchctl`, so
+    /// we never do it per-frame. `None` = not yet queried this session.
+    pub bg_service: Option<alice_miner_core::service::ServiceState>,
+    /// Last error from a background-mining enable/disable, shown inline.
+    pub bg_service_error: Option<String>,
 }
 
 impl MinerApp {
@@ -293,7 +299,57 @@ impl MinerApp {
             updater: crate::update::UpdateManager::default(),
             update_committed_note,
             launch_update_checked: false,
+            bg_service: None,
+            bg_service_error: None,
         })
+    }
+
+    /// Lazily query + cache the background-mining service state. Spawns
+    /// `launchctl`, so call only on demand (Settings open / after a toggle), not
+    /// every frame.
+    pub fn refresh_bg_service(&mut self) {
+        self.bg_service = Some(alice_miner_core::service::status());
+    }
+
+    /// The headless miner CLI bundled next to this GUI executable
+    /// (`Contents/MacOS/alice-miner-cli`), if present. The launchd agent runs it.
+    fn bundled_cli_path(&self) -> Option<std::path::PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        let name = if cfg!(windows) { "alice-miner-cli.exe" } else { "alice-miner-cli" };
+        let cli = dir.join(name);
+        cli.is_file().then_some(cli)
+    }
+
+    /// Enable background mining: install the launchd agent for the CPU-XMR lane
+    /// (start at login). Stops the foreground miner first so there is a single
+    /// owner (no double-mining to the same address). Refreshes the cached state.
+    pub fn enable_bg_service(&mut self) {
+        use alice_miner_core::service::{self, ServiceSpec};
+        self.bg_service_error = None;
+        let Some(cli) = self.bundled_cli_path() else {
+            self.bg_service_error = Some(
+                "the bundled miner CLI wasn't found next to the app — reinstall Alice Miner."
+                    .into(),
+            );
+            return;
+        };
+        // Single owner: stop foreground mining so the agent doesn't double-mine.
+        let _ = self.engine.send(Command::Stop);
+        let spec = ServiceSpec { lane: Lane::Xmr, cli_path: cli, run_at_login: true };
+        if let Err(e) = service::install(&spec) {
+            self.bg_service_error = Some(e);
+        }
+        self.refresh_bg_service();
+    }
+
+    /// Disable background mining: stop + remove the launchd agent.
+    pub fn disable_bg_service(&mut self) {
+        self.bg_service_error = None;
+        if let Err(e) = alice_miner_core::service::uninstall() {
+            self.bg_service_error = Some(e);
+        }
+        self.refresh_bg_service();
     }
 
     /// Source-B credit tick (called each frame). The credit state is sourced from
