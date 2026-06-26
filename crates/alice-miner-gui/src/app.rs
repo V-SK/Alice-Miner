@@ -231,6 +231,20 @@ pub struct MinerApp {
     pub bg_service: Option<alice_miner_core::service::ServiceState>,
     /// Last error from a background-mining enable/disable, shown inline.
     pub bg_service_error: Option<String>,
+
+    // ── 15%-PRL return address (Settings · Identity) — A2c GUI parity ──────────
+    /// The PRL return-address text the user is editing in Settings. PUBLIC (a
+    /// `prl1p…` address, not a secret), so it's plainly stored — not zeroized.
+    pub form_prl_payout: String,
+    /// The currently-stored 15%-PRL return address, **masked** for display
+    /// (`prl1p…XXXX`), or `None` when none is set. Refreshed from disk on save +
+    /// lazily when the Settings panel first renders (see [`MinerApp::load_prl_payout`]).
+    pub prl_payout_masked: Option<String>,
+    /// Inline validation/save error for the PRL return field (shown red beneath it).
+    pub prl_payout_error: Option<String>,
+    /// Guards the one-shot lazy load of the stored PRL return address (so we read
+    /// the small public pointer file once, not every frame).
+    pub prl_payout_loaded: bool,
 }
 
 impl MinerApp {
@@ -301,7 +315,57 @@ impl MinerApp {
             launch_update_checked: false,
             bg_service: None,
             bg_service_error: None,
+            form_prl_payout: String::new(),
+            prl_payout_masked: None,
+            prl_payout_error: None,
+            prl_payout_loaded: false,
         })
+    }
+
+    /// Lazily load the stored 15%-PRL return address (masked) from disk, ONCE. The
+    /// payout address is a PUBLIC pointer file (never the keystore), so this is a
+    /// cheap read with no secret. A configured-but-malformed value surfaces as the
+    /// inline error rather than crashing the panel.
+    pub fn load_prl_payout(&mut self) {
+        use alice_miner_core::prl_payout;
+        self.prl_payout_loaded = true;
+        match prl_payout::load_payout_address() {
+            Ok(Some(addr)) => self.prl_payout_masked = Some(prl_payout::mask_payout(&addr)),
+            Ok(None) => self.prl_payout_masked = None,
+            Err(e) => {
+                // A stored value that no longer passes the shape check: show it.
+                self.prl_payout_masked = None;
+                self.prl_payout_error = Some(e);
+            }
+        }
+    }
+
+    /// Save the PRL return address the user typed in Settings: shape-validate via
+    /// [`alice_miner_core::prl_payout::validate_payout_shape`] (a typo is REJECTED
+    /// inline, never written), then persist with
+    /// [`alice_miner_core::prl_payout::save_payout_address`] and refresh the masked
+    /// display. The address is PUBLIC — fine to store + show masked. An empty field
+    /// is a no-op with a gentle hint (use the CLI `--set-prl-payout` to clear).
+    pub fn save_prl_payout(&mut self) {
+        use alice_miner_core::prl_payout;
+        self.prl_payout_error = None;
+        let buf = self.form_prl_payout.trim().to_string();
+        if buf.is_empty() {
+            self.prl_payout_error =
+                Some("Enter your prl1p… return address (or leave it unset to forgo the 15% return).".into());
+            return;
+        }
+        if let Err(e) = prl_payout::validate_payout_shape(&buf) {
+            self.prl_payout_error = Some(e);
+            return;
+        }
+        match prl_payout::save_payout_address(&buf) {
+            Ok(_) => {
+                self.prl_payout_masked = Some(prl_payout::mask_payout(&buf));
+                self.form_prl_payout.clear();
+            }
+            Err(e) => self.prl_payout_error = Some(e),
+        }
     }
 
     /// Lazily query + cache the background-mining service state. Spawns
@@ -1836,6 +1900,98 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         assert_eq!(app.gpu_selected, vec![false, true], "last card stays checked");
         // It resolves to the single remaining card (index 1).
         assert_eq!(app.resolved_gpu_selection(), GpuSelection::Ids(vec![1]));
+    }
+
+    // ── Piece 2: the 15%-PRL return-address field (save / validate) ───────────
+
+    /// Process env (`HOME` / the payout override) is global; serialize the PRL
+    /// payout tests through this lock so parallel test threads can't race.
+    static PRL_PAYOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `save_prl_payout` shape-validates: a typo shows the inline error and is NEVER
+    /// written; a legal prl1p… address is stored, the masked display updates, and the
+    /// edit field clears. `load_prl_payout` reads it back masked.
+    #[test]
+    fn prl_payout_save_validates_and_masks() {
+        let _g = PRL_PAYOUT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_home = std::env::var("HOME").ok();
+        let prev_up = std::env::var("USERPROFILE").ok();
+        let prev_env = std::env::var(alice_miner_core::prl_payout::ENV_PAYOUT_ADDRESS).ok();
+        // Force the FILE path (not the env override) at a fresh temp HOME.
+        std::env::remove_var(alice_miner_core::prl_payout::ENV_PAYOUT_ADDRESS);
+        let home = std::env::temp_dir().join(format!(
+            "alice-gui-prl-payout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("USERPROFILE");
+
+        let mut app = MinerApp::new().expect("engine spawns");
+        // A keystore-backed (not watch-only) identity so the field is enabled.
+        app.identity = Some(keystore_identity());
+
+        // Nothing stored yet.
+        app.load_prl_payout();
+        assert!(app.prl_payout_masked.is_none(), "nothing stored at a fresh HOME");
+
+        // A typo is REJECTED inline and never written.
+        app.form_prl_payout = "not-a-prl1p-address".into();
+        app.save_prl_payout();
+        assert!(app.prl_payout_error.is_some(), "a bad shape sets the inline error");
+        assert!(app.prl_payout_masked.is_none(), "a typo is never stored");
+        assert_eq!(app.form_prl_payout, "not-a-prl1p-address", "the field keeps the bad text to fix");
+
+        // An empty field is a gentle no-op error (not a crash / write).
+        app.form_prl_payout = "   ".into();
+        app.save_prl_payout();
+        assert!(app.prl_payout_error.is_some());
+        assert!(app.prl_payout_masked.is_none());
+
+        // A legal prl1p… address saves, masks, and clears the field.
+        let good = format!("prl1p{}", "q".repeat(40));
+        app.form_prl_payout = good.clone();
+        app.save_prl_payout();
+        assert!(app.prl_payout_error.is_none(), "a legal address saves cleanly");
+        let masked = app.prl_payout_masked.clone().expect("masked value set");
+        assert!(masked.starts_with("prl1p") && masked.contains('…'), "shown masked: {masked}");
+        assert!(app.form_prl_payout.is_empty(), "the edit field clears after save");
+
+        // A fresh load reads it back masked (round-trip through disk).
+        app.prl_payout_masked = None;
+        app.load_prl_payout();
+        let reloaded = app.prl_payout_masked.clone().expect("reloaded from disk");
+        assert_eq!(reloaded, masked);
+
+        let _ = std::fs::remove_dir_all(&home);
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        if let Some(v) = prev_up {
+            std::env::set_var("USERPROFILE", v);
+        }
+        match prev_env {
+            Some(v) => std::env::set_var(alice_miner_core::prl_payout::ENV_PAYOUT_ADDRESS, v),
+            None => std::env::remove_var(alice_miner_core::prl_payout::ENV_PAYOUT_ADDRESS),
+        }
+    }
+
+    /// A watch-only identity gates the field (can't sign the PoP that binds the 15%
+    /// return) — `reward_is_watch_only()` drives the disabled state + gating note in
+    /// the row. (The row's rendering checks this flag; here we assert the predicate
+    /// the row keys off.)
+    #[test]
+    fn prl_payout_field_gated_for_watch_only_identity() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.identity = Some(watch_only_identity());
+        assert!(app.reward_is_watch_only(), "pasted address → watch-only → field gated");
+        app.identity = Some(keystore_identity());
+        assert!(!app.reward_is_watch_only(), "keystore-backed → field enabled");
     }
 
     /// Re-detecting the SAME-sized GPU list must NOT clobber a deliberate user

@@ -213,6 +213,27 @@ pub const PRL_RETURN_BODY_UNBOUND: &str =
 pub const PRL_RETURN_BODY_NOADDR: &str =
     "No return wallet set · 未设置返还地址 (configure your prl1p… return wallet).";
 
+// ── Settings · 15%-PRL return-address INPUT (A2c GUI parity) ──────────────────
+/// The labeled return-address field in Settings → Identity. PUBLIC address (not a
+/// secret); shown masked once saved. No reward vocabulary — just an address input.
+pub const PRL_PAYOUT_FIELD_LABEL: &str = "PRL 返还地址 (可选 · 15% 返还)";
+/// The input placeholder (a prl1p… address).
+pub const PRL_PAYOUT_FIELD_HINT: &str = "prl1p… (your own return wallet)";
+/// The Save button.
+pub const PRL_PAYOUT_SAVE: &str = "Save · 保存";
+/// The row hint under the field.
+pub const PRL_PAYOUT_ROW_HINT: &str =
+    "Where the network sends your 15% PRL 返还. A public prl1p… address — bound to your Alice \
+     address on the next GPU mining start.";
+/// The masked-current-value prefix (the stored address follows, mono + masked).
+pub const PRL_PAYOUT_CURRENT: &str = "Saved · 已保存";
+/// Shown when nothing is stored yet.
+pub const PRL_PAYOUT_UNSET: &str = "未设置 · not set";
+/// Watch-only gating copy: a pasted address can't sign the PoP that binds the 15%
+/// return, so it must import the signing key first (mirrors the start-PRL gating).
+pub const PRL_PAYOUT_WATCH_ONLY: &str =
+    "GPU-PRL/Alpha 需要可签名钱包才能绑定 15% 返还 — import this address's key first.";
+
 #[cfg(test)]
 mod tests {
     /// The credit-only honesty gate: every user-facing string literal in this

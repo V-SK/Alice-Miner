@@ -794,6 +794,11 @@ fn fmt_uptime(secs: u64) -> String {
 // ── Settings (minimal, honest) ────────────────────────────────────────────────
 
 pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
+    // Lazily read the stored 15%-PRL return address (masked) once, so the Identity
+    // panel can show it without a per-frame file read.
+    if !app.prl_payout_loaded {
+        app.load_prl_payout();
+    }
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -914,6 +919,10 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                         app.open_change_addr();
                     }
                 });
+                // The 15%-PRL RETURN address input (A2c GUI parity with the CLI's
+                // `identity --set-prl-payout`). A PUBLIC prl1p… address — stored +
+                // shown masked, validated on save, watch-only-gated.
+                prl_payout_row(ui, app);
             });
 
             ui.add_space(18.0);
@@ -1213,6 +1222,94 @@ fn panel(ui: &mut egui::Ui, title: &str, icon: Icon, body: impl FnOnce(&mut egui
                 .show(ui, |ui| body(ui));
         });
     ui.add_space(16.0);
+}
+
+/// The Settings → Identity **15%-PRL return-address** row (A2c GUI parity with the
+/// CLI's `identity --set-prl-payout`). A labeled text field + Save button: on Save
+/// the value is shape-validated (`prl_payout::validate_payout_shape`) — a typo shows
+/// the red helper text inline and is NEVER written — else persisted
+/// (`prl_payout::save_payout_address`). The currently-stored value is shown MASKED.
+/// A watch-only identity (pasted address, no signing key) can't sign the PoP that
+/// binds the 15% return, so the field is disabled with the gating note. The address
+/// is PUBLIC (not a secret) — fine to store + show masked. No reward number ever.
+fn prl_payout_row(ui: &mut egui::Ui, app: &mut MinerApp) {
+    // Watch-only identities can't bind the 15% return (no signing key) — mirror the
+    // start-PRL gating copy and disable the input.
+    let watch_only = app.reward_is_watch_only();
+
+    egui::Frame::NONE
+        .inner_margin(egui::Margin::symmetric(0, 11))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                // Title + the masked current value (or "not set") on the right.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(strings::PRL_PAYOUT_FIELD_LABEL)
+                            .size(13.5)
+                            .strong()
+                            .color(THEME.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        match app.prl_payout_masked.as_deref() {
+                            Some(masked) => {
+                                ui.label(widgets::mono(masked.to_string(), 12.0, THEME.text2));
+                                ui.add_space(6.0);
+                                ui.label(RichText::new(strings::PRL_PAYOUT_CURRENT).size(10.5).color(THEME.text3));
+                            }
+                            None => {
+                                ui.label(RichText::new(strings::PRL_PAYOUT_UNSET).size(11.5).color(THEME.text4));
+                            }
+                        }
+                    });
+                });
+                ui.add_space(3.0);
+                ui.label(RichText::new(strings::PRL_PAYOUT_ROW_HINT).size(11.5).color(THEME.text3));
+                ui.add_space(9.0);
+
+                if watch_only {
+                    // Gated: no input, just the honest reason (import the key first).
+                    ui.horizontal_top(|ui| {
+                        super::icons::show(ui, Icon::Eye, 13.0, THEME.text4);
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(strings::PRL_PAYOUT_WATCH_ONLY).size(11.0).color(THEME.text4));
+                    });
+                    return;
+                }
+
+                // The input + Save on one row. Enter in the field also saves.
+                let mut do_save = false;
+                ui.horizontal(|ui| {
+                    let resp = widgets::text_input(
+                        ui,
+                        &mut app.form_prl_payout,
+                        strings::PRL_PAYOUT_FIELD_HINT,
+                        true,
+                    );
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        do_save = true;
+                    }
+                    ui.add_space(8.0);
+                    let has_text = !app.form_prl_payout.trim().is_empty();
+                    if widgets::primary_button(ui, strings::PRL_PAYOUT_SAVE, has_text, false).clicked() {
+                        do_save = true;
+                    }
+                });
+                if do_save {
+                    app.save_prl_payout();
+                }
+
+                // Inline validation/save error (red), if any.
+                if let Some(err) = app.prl_payout_error.clone() {
+                    ui.add_space(7.0);
+                    ui.label(RichText::new(err).size(11.0).color(THEME.err));
+                }
+            });
+        });
+    ui.painter().hline(
+        ui.available_rect_before_wrap().x_range(),
+        ui.cursor().top(),
+        egui::Stroke::new(1.0, THEME.line),
+    );
 }
 
 fn srow(ui: &mut egui::Ui, title: &str, hint: &str, rhs: impl FnOnce(&mut egui::Ui)) {
