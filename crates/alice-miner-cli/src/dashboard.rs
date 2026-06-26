@@ -260,6 +260,15 @@ pub fn render_snapshot(snap: &Snapshot) -> String {
         }
     }
 
+    // The GPU "15% PRL 返还 (credit-only)" line — present only on a PRL-earning lane
+    // (the engine attaches the display block for `is_prl_lane()`). Credit-only by
+    // construction: the masked return wallet + an honest enrolled/pending TEXT, never
+    // a number / "$" / paid figure (the block's `paid` is hard-pinned 0.0 and is not
+    // rendered here at all).
+    if let Some(disp) = snap.prl_payout.as_ref() {
+        out.push_str(&render_prl_return_line(disp));
+    }
+
     // A sanitised hint line (the engine already sanitised it; we just surface
     // the last line as context). Only when present + non-empty.
     if let Some(line) = snap.last_line.as_deref() {
@@ -268,6 +277,25 @@ pub fn render_snapshot(snap: &Snapshot) -> String {
         }
     }
     out
+}
+
+/// Render the GPU **15% PRL 返还 (credit-only)** line for the human dashboard. Shows
+/// the bind state (`已绑定 · bound` / `待绑定 · pending`), the user's MASKED return
+/// wallet (`prl1p…XXXX`, only when one is configured — never the foundation
+/// collection address), and the engine's honest pending TEXT. NEVER prints a "$" or
+/// a number: the `PrlPayoutDisplay.paid` field (hard-pinned 0.0) is not read here.
+fn render_prl_return_line(disp: &alice_miner_core::PrlPayoutDisplay) -> String {
+    let state = if disp.enrolled { "已绑定 · bound" } else { "待绑定 · pending" };
+    let wallet = match disp.payout_masked.as_deref() {
+        Some(masked) => format!(" · {masked}"),
+        None => String::new(),
+    };
+    // The engine's pending_text is already number-free + honest (see
+    // `prl_payout::default_pending_text`); surface it verbatim.
+    format!(
+        "    └ 15% PRL 返还 (credit-only) [{state}]{wallet} · {}\n",
+        disp.pending_text
+    )
 }
 
 /// Map an engine state to a short, lower-case label for the dashboard.
@@ -536,6 +564,97 @@ mod tests {
         }
         // The only host that may appear is the public relay.
         assert!(all.contains("hk.aliceprotocol.org"));
+    }
+
+    // ── Piece 3: the 15% PRL 返还 (credit-only) dashboard line ──────────────────
+
+    /// A legal-shaped masked return wallet for the display block.
+    const PAYOUT_OK: &str = "prl1pexamplewalletexamplewalletexamplewallet";
+
+    /// A snapshot carrying a populated PRL display block (the engine attaches this
+    /// for a PRL-earning lane). `prl_payout` is `#[serde(skip)]` on `Snapshot`, so it
+    /// only affects the HUMAN dashboard (never the JSON shape).
+    fn prl_snapshot(disp: alice_miner_core::PrlPayoutDisplay) -> Snapshot {
+        Snapshot {
+            state: EngineState::Running,
+            device: None,
+            lane: Some(Lane::GpuPrl),
+            hashrate_hs: Some(870_000_000_000.0), // ~0.87 TH/s pearlhash
+            shares_accepted: 70,
+            shares_rejected: 0,
+            endpoint: Some("us.aliceprotocol.org:3340".into()),
+            worker_id: Some("rig-7f3a9c21".into()),
+            uptime_s: 120,
+            failovers: 0,
+            dual: false,
+            lanes: vec![LaneSnapshot {
+                lane: Lane::GpuPrl,
+                state: EngineState::Running,
+                hashrate_hs: Some(870_000_000_000.0),
+                shares_accepted: 70,
+                shares_rejected: 0,
+                endpoint: Some("us.aliceprotocol.org:3340".into()),
+                failovers: 0,
+            }],
+            last_line: None,
+            message: None,
+            prl_payout: Some(disp),
+        }
+    }
+
+    /// The PRL-return line renders the bound state + the MASKED wallet + the honest
+    /// pending text — and NEVER a number / "$".
+    #[test]
+    fn prl_return_line_renders_bound_masked_and_no_number() {
+        // Bound, with a configured return wallet.
+        let disp = alice_miner_core::PrlPayoutDisplay::new(true, Some(PAYOUT_OK));
+        let s = render_snapshot(&prl_snapshot(disp));
+        assert!(s.contains("15% PRL 返还 (credit-only)"), "renders the block: {s}");
+        assert!(s.contains("已绑定 · bound"), "shows the bound state");
+        // The wallet is MASKED (prefix + … + suffix), never the full address.
+        assert!(s.contains("prl1p") && s.contains('…'), "masked wallet shown");
+        assert!(!s.contains(PAYOUT_OK), "the FULL return wallet is never printed");
+        // CREDIT-ONLY: no "$" and no paid figure on the PRL line.
+        assert!(!s.contains('$'));
+    }
+
+    /// When no return wallet is configured the line still renders (pending), with no
+    /// masked address and no number.
+    #[test]
+    fn prl_return_line_renders_unbound_no_address() {
+        let disp = alice_miner_core::PrlPayoutDisplay::new(false, None);
+        let s = render_snapshot(&prl_snapshot(disp));
+        assert!(s.contains("15% PRL 返还 (credit-only)"));
+        assert!(s.contains("待绑定 · pending"), "unbound → pending state");
+        assert!(!s.contains('$'));
+    }
+
+    /// Non-PRL snapshots carry NO display block → the line is absent (no regression
+    /// to the XMR/RVN dashboard).
+    #[test]
+    fn prl_return_line_absent_for_non_prl_snapshot() {
+        let s = render_snapshot(&running_snapshot()); // prl_payout: None
+        assert!(!s.contains("15% PRL 返还"), "XMR dashboard has no PRL line");
+    }
+
+    /// CREDIT-ONLY: a PRL snapshot's rendered HUMAN output carries no forbidden
+    /// reward token, and the serialized JSON keeps its no-`paid`/no-`payout` shape
+    /// (the field is `#[serde(skip)]`).
+    #[test]
+    fn prl_snapshot_is_credit_only_in_human_and_json() {
+        let disp = alice_miner_core::PrlPayoutDisplay::new(true, Some(PAYOUT_OK));
+        let snap = prl_snapshot(disp);
+        // Human render: no fiat / paid token (the masked wallet + honest text only).
+        let human = render_snapshot(&snap);
+        let lower = human.to_lowercase();
+        for forbidden in ["$", "usd", "fiat", "paid", "earned", "已发放"] {
+            assert!(!lower.contains(forbidden), "PRL human line leaked `{forbidden}`: {human}");
+        }
+        // JSON: prl_payout is skipped, so the wire shape carries no payout substring.
+        let json = serde_json::to_string(&snap).expect("serialize");
+        for forbidden in ["paid", "payout", "prl_payout", "masked"] {
+            assert!(!json.contains(forbidden), "Snapshot JSON leaked `{forbidden}`: {json}");
+        }
     }
 
     /// The detect render shows the model string, both lanes, and the recommended

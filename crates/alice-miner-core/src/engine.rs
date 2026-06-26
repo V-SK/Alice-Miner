@@ -1170,11 +1170,12 @@ fn build_snapshot(
         }
     }
 
-    // A2c: GPU-PRL "15% PRL 返还" display block. Built ONLY when a GPU-PRL lane is
-    // present (single-lane PRL today; the per-lane scan keeps it correct if a future
-    // dual pairing includes PRL). Credit-only by construction — see
+    // A2c: GPU "15% PRL 返还" display block. Built whenever a PRL-EARNING lane is
+    // present — both pearlhash lanes (`GpuPrl` SRBMiner + `GpuAlpha` AlphaMiner/V100,
+    // `lane.is_prl_lane()`), single-lane today and any future dual pairing that
+    // includes one. Credit-only by construction — see
     // [`crate::prl_payout::PrlPayoutDisplay`] (`paid` is hard-pinned 0.0).
-    if run.supervisors.iter().any(|s| s.lane() == Lane::GpuPrl) {
+    if run.supervisors.iter().any(|s| s.lane().is_prl_lane()) {
         snap.prl_payout = Some(build_prl_payout_display(run.prl_enroll.as_ref()));
     }
     snap
@@ -1264,6 +1265,43 @@ mod tests {
                 !json.contains(forbidden),
                 "Snapshot JSON must not contain `{forbidden}`: {json}"
             );
+        }
+    }
+
+    /// A2c / Piece 3: `build_snapshot` attaches the credit-only "15% PRL 返还"
+    /// display block for ANY PRL-EARNING lane — both `GpuPrl` (SRBMiner) AND
+    /// `GpuAlpha` (AlphaMiner/V100), via `lane.is_prl_lane()` — and never for the
+    /// address-only lanes (`Xmr`/`GpuRvn`). Uses un-started supervisors (no child) so
+    /// the test is pure: the gate keys off `supervisor.lane()`, not a live run.
+    #[test]
+    fn snapshot_attaches_prl_block_for_both_pearlhash_lanes() {
+        fn has_block(lane: Lane) -> bool {
+            let run = RunSet {
+                supervisors: vec![LaneSupervisor::new(lane)],
+                dual: false,
+                prl_enroll: None,
+            };
+            build_snapshot(&None, &run, &None).prl_payout.is_some()
+        }
+        // Both pearlhash lanes get the block.
+        assert!(has_block(Lane::GpuPrl), "GpuPrl (SRBMiner) → block");
+        assert!(has_block(Lane::GpuAlpha), "GpuAlpha (AlphaMiner/V100) → block");
+        // Address-only lanes never do.
+        assert!(!has_block(Lane::Xmr), "XMR is address-only → no block");
+        assert!(!has_block(Lane::GpuRvn), "RVN is address-only → no block");
+
+        // And the credit-only JSON invariant still holds with the block attached on
+        // the GpuAlpha path (the block is #[serde(skip)] → no payout substring).
+        let run = RunSet {
+            supervisors: vec![LaneSupervisor::new(Lane::GpuAlpha)],
+            dual: false,
+            prl_enroll: None,
+        };
+        let snap = build_snapshot(&None, &run, &None);
+        assert!(snap.prl_payout.is_some());
+        let json = serde_json::to_string(&snap).expect("serialize");
+        for forbidden in ["paid", "payout", "prl_payout"] {
+            assert!(!json.contains(forbidden), "GpuAlpha Snapshot JSON leaked `{forbidden}`: {json}");
         }
     }
 
