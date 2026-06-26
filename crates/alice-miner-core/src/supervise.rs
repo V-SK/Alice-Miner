@@ -13,7 +13,7 @@
 //!     hashrate + accepted/rejected shares with [`parse_hashrate_hs`] /
 //!     [`parse_share_counts`] (ported **VERBATIM** from the Wallet, ~L273/L299);
 //!   * runs the **Layer-B "no-progress" watchdog** (M4): if no accepted share /
-//!     no hashrate progress for [`NO_PROGRESS_WINDOW`] (~120s), it advances the
+//!     no hashrate progress for [`NO_PROGRESS_WINDOW`] (~600s), it advances the
 //!     [`crate::endpoint::EndpointPlan`] cursor and `restart_with`s the child
 //!     pointed at the NEXT endpoint — **gated by [`alice_supervise::RestartPolicy`]**
 //!     (bounded retries + backoff; budget exhaustion → clean `Error`, no
@@ -44,9 +44,21 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Layer-B failover window: if the lane makes no progress (no new accepted share
 /// AND no hashrate increase) for this long, the watchdog advances the endpoint
-/// cursor and restarts on the next endpoint (PLAN §5 M4 — "~120s"). Generous so
-/// it never trips during normal warm-up (RandomX dataset alloc, first job).
-pub const NO_PROGRESS_WINDOW: Duration = Duration::from_secs(120);
+/// cursor and restarts on the next endpoint.
+///
+/// Sized from a LIVE measurement (2026-06-26 — shipped v0.3.0 SRBMiner `pearlhash`
+/// on an RTX A4000 vs `us.aliceprotocol.org:3340`, credit-only): the PRL pool is
+/// low-traffic and after warm-up the hashrate plateaus, so ONLY new accepted
+/// shares mark progress. Observed accepted-share gaps ranged 6–110s, with the max
+/// (110s) sitting right at the old 120s window — on weaker GPUs / after a vardiff
+/// difficulty bump, gaps routinely exceed 120s, which spuriously tripped this
+/// watchdog and caused region churn (each failover costs a ~15s SRBMiner re-init
+/// and the lane never settles). 600s gives comfortable headroom for a
+/// healthy-but-slow lane (any device, weak GPUs included) while still catching a
+/// genuinely dead endpoint within 10 min; a hard disconnect is caught sooner by
+/// the engine's own connection handling. Generous so it never trips during normal
+/// warm-up or slow-pool operation.
+pub const NO_PROGRESS_WINDOW: Duration = Duration::from_secs(600);
 
 /// How often the watchdog wakes to check progress. Cheap; just compares the
 /// stored progress timestamp against `NO_PROGRESS_WINDOW`.
@@ -166,7 +178,7 @@ struct Inner {
     /// Number of Layer-B endpoint advances this run.
     failovers: u64,
     /// The no-progress window before the watchdog rotates endpoints. Defaults to
-    /// [`NO_PROGRESS_WINDOW`] (~120s); tunable (tests use a tiny value for speed).
+    /// [`NO_PROGRESS_WINDOW`] (~600s); tunable (tests use a tiny value for speed).
     no_progress_window: Duration,
     /// Override for the per-failover backoff. `None` ⇒ use the [`RestartPolicy`]'s
     /// growing backoff (production). `Some(d)` ⇒ a fixed backoff (tests use a tiny
