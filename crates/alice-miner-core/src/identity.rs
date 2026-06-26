@@ -2,10 +2,14 @@
 //! `~/.alice/identity.json` pointer contract (PLAN §2.5).
 //!
 //! Two layers (PLAN §2.5):
-//!   * **Keystore (the secret)** stays at the Wallet's path
-//!     (`data_local_dir()/AliceWallet/wallet.json`, honoring
-//!     `$ALICE_WALLET_DATA_ROOT`) in the shared `WalletPayload` schema, written
-//!     by `alice_crypto::write_wallet_payload`. One keystore, never two.
+//!   * **Keystore (the secret)** is the MINER's OWN file at `miner_keystore_path()`
+//!     (`~/.alice/miner-keystore.json`, honoring `$ALICE_IDENTITY_DIR`) in the
+//!     shared `WalletPayload` schema, written by `alice_crypto::write_wallet_payload`.
+//!     ISOLATED from the Wallet app's `AliceWallet/wallet.json` so a miner
+//!     `identity --create` can NEVER clobber the user's real wallet (the documented
+//!     hazard). The mining/PoP path unlocks whatever `pointer.keystore_path` names,
+//!     so pre-existing identities that still point at the old shared keystore keep
+//!     working untouched.
 //!   * **Identity pointer (public only)** is `~/.alice/identity.json` — a tiny,
 //!     unencrypted, world-public file naming the active `address`, `pubkey`,
 //!     `keystore_path`, `label`, and `created` timestamp. Holds NO secret.
@@ -88,6 +92,34 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// The MINER's OWN keystore path, ISOLATED from the Wallet app's `wallet.json`.
+///
+/// `identity --create`/`--import` write the signing keystore HERE — next to the
+/// `~/.alice/identity.json` pointer (honoring `$ALICE_IDENTITY_DIR`) — and NEVER
+/// to the Wallet app's `data_local_dir()/AliceWallet/wallet.json`. This closes the
+/// documented clobber hazard: creating a miner identity can no longer overwrite
+/// (nor even back up + replace) the user's real wallet. The mining/PoP path reads
+/// the keystore from `pointer.keystore_path` (see `engine.rs`), so every identity
+/// always unlocks the exact file it was written to — pre-existing pointers that
+/// still name the old shared `wallet.json` keep working untouched (no migration).
+pub fn miner_keystore_path() -> PathBuf {
+    identity_dir().join("miner-keystore.json")
+}
+
+/// Guard: refuse to write the miner keystore onto the Wallet app's path. Defense
+/// in depth against a misconfigured `$ALICE_IDENTITY_DIR` that resolves onto the
+/// wallet file — the miner must NEVER touch the user's real wallet.
+fn assert_not_wallet_path(path: &Path) -> Result<(), String> {
+    if path == alice_crypto::default_wallet_path() {
+        return Err(
+            "refusing to write the miner keystore onto the Wallet app's wallet.json \
+             (that would clobber the user's real wallet)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Create a brand-new identity: generate a 24-word mnemonic, build + write the
 /// keystore (`WalletPayload`) at the Wallet path, unlock ONCE to derive+verify
 /// the address (secrets drop here), and write the `~/.alice/identity.json`
@@ -101,8 +133,11 @@ pub fn create(label: Option<String>, password: &str) -> Result<(Identity, Zeroiz
     let mnemonic = alice_crypto::generate_mnemonic();
     let payload = alice_crypto::create_wallet_payload(&mnemonic, password)?;
 
-    let keystore_path = alice_crypto::default_wallet_path();
-    // Never silently clobber an existing keystore (the two-keystore footgun):
+    let keystore_path = miner_keystore_path();
+    // ISOLATED from the Wallet app's wallet.json (clobber-hazard fix); guarded so
+    // a misconfigured env can't redirect us onto the real wallet.
+    assert_not_wallet_path(&keystore_path)?;
+    // Never silently clobber an existing MINER keystore (the two-keystore footgun):
     // back it up first, exactly like the Wallet's import path.
     alice_crypto::backup_existing_wallet(&keystore_path)?;
     alice_crypto::write_wallet_payload(&keystore_path, &payload)?;
@@ -152,7 +187,8 @@ fn import_payload(
     label: Option<String>,
     password: &str,
 ) -> Result<Identity, String> {
-    let keystore_path = alice_crypto::default_wallet_path();
+    let keystore_path = miner_keystore_path();
+    assert_not_wallet_path(&keystore_path)?;
     alice_crypto::backup_existing_wallet(&keystore_path)?;
     alice_crypto::write_wallet_payload(&keystore_path, &payload)?;
 
@@ -215,7 +251,7 @@ pub fn load_pointer() -> Option<IdentityPointer> {
 /// is touched: this only reads the path + a file-exists flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeystoreStatus {
-    /// Absolute path to the active keystore (`…/AliceWallet/wallet.json`).
+    /// Absolute path to the active MINER keystore (`…/.alice/miner-keystore.json`).
     pub path: PathBuf,
     /// Whether a keystore file exists there right now (i.e. an overwrite would
     /// have something to back up first).
@@ -240,9 +276,11 @@ impl KeystoreStatus {
     }
 }
 
-/// The active keystore's path + whether it currently exists. Pure read; no unlock.
+/// The active MINER keystore's path + whether it currently exists. Pure read; no
+/// unlock. Reports the ISOLATED miner keystore (`miner_keystore_path()`), never
+/// the Wallet app's `wallet.json`.
 pub fn keystore_status() -> KeystoreStatus {
-    let path = alice_crypto::default_wallet_path();
+    let path = miner_keystore_path();
     let exists = path.is_file();
     KeystoreStatus { path, exists }
 }
@@ -366,7 +404,7 @@ mod tests {
             // The keystore exists at the Wallet path and decrypts back to the
             // SAME address (parity: the unlock the engine would refuse to repeat
             // still proves the address derivation).
-            let ks = alice_crypto::default_wallet_path();
+            let ks = miner_keystore_path();
             assert!(ks.is_file());
             let payload: alice_crypto::WalletPayload =
                 serde_json::from_slice(&std::fs::read(&ks).unwrap()).unwrap();
@@ -460,7 +498,7 @@ mod tests {
             // Establish a keystore-backed identity first (the "current" reward id).
             let (orig, _m) = create(Some("orig".into()), "correct horse battery staple")
                 .expect("create original");
-            let ks = alice_crypto::default_wallet_path();
+            let ks = miner_keystore_path();
             let before = std::fs::read(&ks).expect("keystore exists");
             assert!(!orig.watch_only);
 
@@ -501,7 +539,7 @@ mod tests {
         with_temp_env(|| {
             let (orig, _m) = create(Some("orig".into()), "correct horse battery staple")
                 .expect("create original");
-            let ks = alice_crypto::default_wallet_path();
+            let ks = miner_keystore_path();
             // The status helper reports the keystore as present (drives the UI's
             // "this overwrites + backs up" warning + the projected `.bak-…` path).
             let status = keystore_status();
@@ -520,7 +558,7 @@ mod tests {
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .map(|e| e.file_name().to_string_lossy().to_string())
-                .filter(|n| n.contains("wallet.json.bak-"))
+                .filter(|n| n.contains("miner-keystore.json.bak-"))
                 .collect();
             assert!(!baks.is_empty(), "old keystore backed up (.bak-…)");
 
@@ -571,6 +609,28 @@ mod tests {
             .address;
             paste(&addr, None).expect("paste");
             assert!(!keystore_status().exists, "paste leaves no keystore");
+        });
+    }
+
+    /// THE clobber-hazard regression: creating a miner identity writes its keystore to the
+    /// ISOLATED miner path and must NEVER create / touch the Wallet app's `wallet.json`.
+    #[test]
+    fn create_isolates_keystore_and_never_writes_the_wallet_app_path() {
+        with_temp_env(|| {
+            let wallet_app = alice_crypto::default_wallet_path();
+            assert!(!wallet_app.exists(), "precondition: no wallet.json yet");
+
+            let (identity, _m) = create(None, "correct horse battery staple").expect("create");
+
+            // The miner keystore landed at its OWN isolated path...
+            let miner_ks = miner_keystore_path();
+            assert!(miner_ks.is_file(), "miner keystore written to its own path");
+            assert_ne!(miner_ks, wallet_app, "miner path must differ from the wallet path");
+            // ...and the Wallet app's wallet.json was NEVER created (no clobber, no backup of it).
+            assert!(!wallet_app.exists(), "the Wallet app's wallet.json must stay untouched");
+            // The pointer names the miner keystore, so the unlock path (engine.rs) follows it.
+            assert_eq!(identity.keystore_path.as_deref(), Some(miner_ks.as_path()));
+            assert_eq!(load_pointer().unwrap().keystore_path.as_deref(), miner_ks.to_str());
         });
     }
 }
