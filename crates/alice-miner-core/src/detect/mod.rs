@@ -137,6 +137,13 @@ pub struct GpuInfo {
     /// older serialized profiles (without this field) deserializable.
     #[serde(default)]
     pub gpus: Vec<GpuDevice>,
+    /// The HIGHEST NVIDIA CUDA compute capability across the detected cards, as
+    /// `CC × 10` (e.g. `70` = 7.0 Volta, `75` = 7.5 Turing, `86` = 8.6 Ampere).
+    /// `None` for non-NVIDIA / when `nvidia-smi` doesn't report it. Stored ×10 (not
+    /// `f32`) so `GpuInfo` keeps `Eq`. Used to pick the pearlhash engine: SRBMiner
+    /// (GPU-PRL) needs `≥ 75`; a Volta card (`70`) routes to AlphaMiner (GPU-Alpha).
+    #[serde(default)]
+    pub max_compute_cap_x10: Option<u32>,
 }
 
 impl GpuInfo {
@@ -146,6 +153,7 @@ impl GpuInfo {
             model: String::new(),
             vram_gb: 0,
             gpus: Vec::new(),
+            max_compute_cap_x10: None,
         }
     }
 }
@@ -409,6 +417,7 @@ fn probe_gpu(
             // Apple's GPU shares unified memory and `nvidia-smi` can't see it, so
             // there is no per-card enumeration — leave the list empty.
             gpus: Vec::new(),
+            max_compute_cap_x10: None,
         };
     }
 
@@ -427,6 +436,7 @@ fn probe_gpu(
             // AMD is label-only in v1 (no bundled lane); per-card enumeration is
             // NVIDIA-only, so the list stays empty.
             gpus: Vec::new(),
+            max_compute_cap_x10: None,
         };
     }
 
@@ -477,12 +487,43 @@ fn probe_nvidia(runner: &dyn Runner, warnings: &mut Vec<String>) -> Option<GpuIn
         .map(|out| parse_nvidia_devices(&out))
         .unwrap_or_default();
 
+    // Best-effort compute-capability probe (one row per card, e.g. `7.0` / `8.6`).
+    // Drives the pearlhash engine pick (SRBMiner needs CC ≥ 7.5; Volta 7.0 → AlphaMiner).
+    // Fail-safe: any error / unparseable output → None (the lane viability then falls
+    // back to the vendor-only rule, NVIDIA-viable for both engines).
+    let max_compute_cap_x10 = runner
+        .run("nvidia-smi", &["--query-gpu=compute_cap", "--format=csv,noheader"])
+        .ok()
+        .and_then(|out| parse_max_compute_cap_x10(&out));
+
     Some(GpuInfo {
         vendor: GpuVendor::Nvidia,
         model,
         vram_gb,
         gpus,
+        max_compute_cap_x10,
     })
+}
+
+/// Parse `nvidia-smi --query-gpu=compute_cap` output (one `MAJOR.MINOR` per line,
+/// e.g. `7.0`, `8.6`) into the HIGHEST capability as `CC × 10` (e.g. `86`). Pure +
+/// fail-safe: blank / unparseable lines are skipped; empty input → `None`.
+fn parse_max_compute_cap_x10(stdout: &str) -> Option<u32> {
+    stdout
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            if t.is_empty() {
+                return None;
+            }
+            // "7.0" → 70, "8.6" → 86. Tolerate a bare "7" (→ 70). Reject non-numeric.
+            let f: f32 = t.parse().ok()?;
+            if f <= 0.0 || f >= 100.0 {
+                return None;
+            }
+            Some((f * 10.0).round() as u32)
+        })
+        .max()
 }
 
 /// Parse the CSV output of
@@ -785,6 +826,22 @@ mod tests {
         let runner = FakeRunner::no_gpu();
         let mut warnings = Vec::new();
         assert!(probe_nvidia(&runner, &mut warnings).is_none());
+    }
+
+    #[test]
+    fn parse_max_compute_cap_x10_takes_the_highest() {
+        // Multi-GPU: the highest CC wins (×10).
+        assert_eq!(parse_max_compute_cap_x10("7.0\n8.6\n7.5\n"), Some(86));
+        // Volta-only → 70 (< the 75 SRBMiner floor → routes to Alpha).
+        assert_eq!(parse_max_compute_cap_x10("7.0\n"), Some(70));
+        // Turing 7.5 → exactly the floor.
+        assert_eq!(parse_max_compute_cap_x10("7.5"), Some(75));
+        // Blank / unparseable / empty → None (fail-safe, no panic).
+        assert_eq!(parse_max_compute_cap_x10(""), None);
+        assert_eq!(parse_max_compute_cap_x10("\n  \n"), None);
+        assert_eq!(parse_max_compute_cap_x10("not-a-number"), None);
+        // A bad row among good ones is skipped (max of the valid).
+        assert_eq!(parse_max_compute_cap_x10("8.9\nN/A\n"), Some(89));
     }
 
     #[test]

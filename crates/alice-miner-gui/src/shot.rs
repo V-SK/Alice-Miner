@@ -333,6 +333,7 @@ fn demo_device() -> DeviceProfile {
             model: "Apple M2 Max".into(),
             vram_gb: 0,
             gpus: Vec::new(),
+            max_compute_cap_x10: None,
         },
         memory_gb: 32,
         display: "Apple M2 Max · 12 cores".into(),
@@ -354,6 +355,7 @@ fn demo_nvidia_device() -> DeviceProfile {
             model: "NVIDIA GeForce RTX 3070 Ti".into(),
             vram_gb: 8,
             gpus: Vec::new(),
+            max_compute_cap_x10: Some(86),
         },
         memory_gb: 64,
         display: "AMD Ryzen 9 5950X · 16 cores".into(),
@@ -376,6 +378,7 @@ fn demo_multigpu_device() -> DeviceProfile {
             vendor: GpuVendor::Nvidia,
             model: "NVIDIA GeForce RTX 3090".into(),
             vram_gb: 24,
+            max_compute_cap_x10: Some(86),
             gpus: vec![
                 GpuDevice {
                     index: 0,

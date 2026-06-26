@@ -171,9 +171,28 @@ pub fn derive_lane_viability(profile: &DeviceProfile) -> LaneViability {
     support.insert(Lane::GpuRvn, rvn_support);
     reasons.insert(Lane::GpuRvn, rvn_reason.to_string());
 
-    // ── PRL (SRBMiner pearlhash): NVIDIA + AMD viable (SRBMiner supports both);
-    //    Apple/none unavailable (SRBMiner ships no macOS build). ────────────────
+    // SRBMiner (GPU-PRL) pearlhash needs CUDA compute capability ≥ 7.5 (Turing+);
+    // a KNOWN Volta card (CC 7.0) CANNOT run it — those route to AlphaMiner (Alpha).
+    // Unknown CC (probe missing) does NOT exclude PRL (fail-open to the vendor rule).
+    const SRBMINER_CC_FLOOR_X10: u32 = 75;
+    let nvidia_below_srbminer_floor = profile.gpu.vendor == GpuVendor::Nvidia
+        && profile
+            .gpu
+            .max_compute_cap_x10
+            .map(|cc| cc < SRBMINER_CC_FLOOR_X10)
+            .unwrap_or(false);
+
+    // ── PRL (SRBMiner pearlhash): NVIDIA (CC≥7.5) + AMD viable; a Volta NVIDIA card
+    //    (CC<7.5) is Unavailable here (→ Alpha); Apple/none unavailable. ──────────
     let (prl_support, prl_reason) = match profile.gpu.vendor {
+        GpuVendor::Nvidia if nvidia_below_srbminer_floor => {
+            notes.push(
+                "Volta-class NVIDIA GPU (CC 7.0) detected — SRBMiner can't mine \
+                 pearlhash on it; using the AlphaMiner (Alpha) lane instead."
+                    .to_string(),
+            );
+            (LaneSupport::Unavailable, "prl_srbminer_needs_cc_7_5_use_alpha")
+        }
         GpuVendor::Nvidia => (LaneSupport::Viable, "nvidia_present"),
         GpuVendor::Amd => (LaneSupport::Viable, "amd_srbminer_supported"),
         GpuVendor::Apple => (
@@ -212,6 +231,10 @@ pub fn derive_lane_viability(profile: &DeviceProfile) -> LaneViability {
     };
     let recommended = if is_runnable(Lane::GpuPrl) {
         Lane::GpuPrl
+    } else if is_runnable(Lane::GpuAlpha) {
+        // GPU-PRL not runnable but Alpha is = a Volta/V100 NVIDIA box (SRBMiner can't
+        // run there): AlphaMiner IS the GPU mainline for this card → one-click default.
+        Lane::GpuAlpha
     } else if is_runnable(Lane::GpuRvn) {
         Lane::GpuRvn
     } else {
@@ -408,11 +431,12 @@ mod tests {
         profile_with(
             OsFamily::Macos,
             true,
-            GpuInfo { vendor: GpuVendor::Apple, model: "Apple M2 Max".into(), vram_gb: 0, gpus: Vec::new() },
+            GpuInfo { vendor: GpuVendor::Apple, model: "Apple M2 Max".into(), vram_gb: 0, gpus: Vec::new(), max_compute_cap_x10: None },
         )
     }
 
     fn nvidia() -> DeviceProfile {
+        // An Ampere card (CC 8.6 → SRBMiner-capable, GPU-PRL the mainline).
         profile_with(
             OsFamily::Linux,
             false,
@@ -421,6 +445,22 @@ mod tests {
                 model: "NVIDIA GeForce RTX 3070 Ti".into(),
                 vram_gb: 8,
                 gpus: Vec::new(),
+                max_compute_cap_x10: Some(86),
+            },
+        )
+    }
+
+    fn nvidia_volta() -> DeviceProfile {
+        // A Volta card (CC 7.0 → SRBMiner CANNOT run; GPU-Alpha is the path).
+        profile_with(
+            OsFamily::Linux,
+            false,
+            GpuInfo {
+                vendor: GpuVendor::Nvidia,
+                model: "Tesla V100-PCIE-16GB".into(),
+                vram_gb: 16,
+                gpus: Vec::new(),
+                max_compute_cap_x10: Some(70),
             },
         )
     }
@@ -429,7 +469,7 @@ mod tests {
         profile_with(
             OsFamily::Linux,
             false,
-            GpuInfo { vendor: GpuVendor::Amd, model: "AMD GPU".into(), vram_gb: 0, gpus: Vec::new() },
+            GpuInfo { vendor: GpuVendor::Amd, model: "AMD GPU".into(), vram_gb: 0, gpus: Vec::new(), max_compute_cap_x10: None },
         )
     }
 
@@ -471,6 +511,24 @@ mod tests {
             v.runnable_lanes(),
             vec![Lane::GpuPrl, Lane::Xmr, Lane::GpuAlpha, Lane::GpuRvn]
         );
+    }
+
+    /// Volta/V100 (CC 7.0): SRBMiner CANNOT run → GPU-PRL Unavailable; AlphaMiner
+    /// (GPU-Alpha) IS runnable and becomes the recommended one-click GPU lane.
+    #[test]
+    fn viability_matrix_volta_routes_prl_to_alpha() {
+        let v = derive_lane_viability(&nvidia_volta());
+        // GPU-PRL (SRBMiner) is excluded on Volta...
+        assert_eq!(v.support(Lane::GpuPrl), LaneSupport::Unavailable);
+        assert!(!v.is_runnable(Lane::GpuPrl));
+        assert_eq!(v.reason(Lane::GpuPrl), Some("prl_srbminer_needs_cc_7_5_use_alpha"));
+        // ...and GPU-Alpha is the runnable GPU mainline → recommended (one-click V100).
+        assert_eq!(v.support(Lane::GpuAlpha), LaneSupport::Viable);
+        assert!(v.is_runnable(Lane::GpuAlpha));
+        assert_eq!(v.recommended, Lane::GpuAlpha);
+        assert!(v.notes.iter().any(|n| n.contains("Volta")));
+        // RVN still viable (NVIDIA) but Alpha leads the runnable set.
+        assert_eq!(v.runnable_lanes(), vec![Lane::GpuAlpha, Lane::Xmr, Lane::GpuRvn]);
     }
 
     /// AMD → RVN "coming soon" (NOT runnable), but PRL viable (SRBMiner supports
