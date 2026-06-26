@@ -207,6 +207,11 @@ struct StartArgs {
     /// `alice-miner detect` (the per-GPU list). Ignored for the CPU-XMR lane.
     #[arg(long, value_name = "IDS")]
     gpus: Option<String>,
+    /// Internal marker set on the invocation the BACKGROUND SERVICE runs, so the
+    /// single-owner check below doesn't make the agent refuse to start itself.
+    /// Not for manual use. Hidden.
+    #[arg(long, hide = true)]
+    from_service: bool,
 }
 
 #[derive(clap::Args)]
@@ -301,6 +306,13 @@ fn cmd_service(args: ServiceArgs) -> i32 {
         Ok(l) => l,
         Err(code) => return code,
     };
+    // Single owner: stop any running FOREGROUND miner before handing the machine
+    // to the background service, so we never double-mine to the same address.
+    if let Some(pid) = pidfile::read_pid() {
+        if pidfile::is_alive(pid) {
+            let _ = pidfile::stop_pid(pid, std::time::Duration::from_secs(8));
+        }
+    }
     let spec = ServiceSpec { lane, cli_path, run_at_login: args.at_login };
     match service::install(&spec) {
         Ok(()) => {
@@ -515,6 +527,25 @@ fn cmd_start(args: StartArgs) -> i32 {
             }
         },
     };
+
+    // Single-owner lock: a MANUAL `start` refuses while the background service is
+    // installed/running — two miners to the same address only waste the machine.
+    // The service's own invocation passes `--from-service` to bypass this (it IS
+    // the single owner). See `alice_miner_core::service`.
+    if !args.from_service {
+        use alice_miner_core::service::ServiceState;
+        if matches!(
+            alice_miner_core::service::status(),
+            ServiceState::Running | ServiceState::Loaded
+        ) {
+            eprintln!(
+                "error: background mining is already active (one miner per machine). Stop it with \
+                 `alice-miner-cli service --uninstall` first, then run start — or just let the \
+                 background service keep mining."
+            );
+            return EXIT_USAGE;
+        }
+    }
 
     if !cap.support(lane).is_runnable() {
         eprintln!(

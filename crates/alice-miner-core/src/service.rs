@@ -16,10 +16,14 @@
 //! readable plist. A GPU lane (which would need a keystore unlock) is refused
 //! here until the Keychain-backed keyring ships (honest "coming soon").
 //!
-//! Windows (Task Scheduler / service) and Linux (systemd --user) backends are
-//! the same shape and are deliberately deferred — the trait makes them
-//! mechanical to add. On a non-macOS host every entry point returns a clear
-//! "not supported yet" error (never a panic).
+//! Three backends, same shape (install/uninstall/status over a per-OS unit
+//! definition): **macOS launchd** (`~/Library/LaunchAgents`), **Linux systemd
+//! `--user`** (`~/.config/systemd/user`), **Windows Task Scheduler** (a logon
+//! task). Each unit/task runs `<cli> start --lane <lane> --json` — NO secret,
+//! address, or payout — and restarts on exit (KeepAlive / Restart=always /
+//! RestartOnFailure). Background mining is still **CPU-XMR only** on every
+//! platform: a GPU lane needs the keystore unlock, which can't go in a
+//! world-readable unit, so it's refused until the OS-keyring integration lands.
 
 #![allow(dead_code)]
 
@@ -112,6 +116,7 @@ pub fn launchd_plist_xml(spec: &ServiceSpec) -> Result<String, String> {
         <string>--lane</string>
         <string>{lane}</string>
         <string>--json</string>
+        <string>--from-service</string>
     </array>
     <key>RunAtLoad</key>
     {run_at_load}
@@ -125,6 +130,71 @@ pub fn launchd_plist_xml(spec: &ServiceSpec) -> Result<String, String> {
     <string>{log}</string>
 </dict>
 </plist>
+"#
+    ))
+}
+
+/// Render the Linux systemd `--user` unit for `spec`. Pure + fully testable.
+/// `ExecStart` is exactly `<cli> start --lane <lane> --json` — no `--address`,
+/// no secret, no payout. `Restart=always` is the KeepAlive equivalent; the unit
+/// is wanted by `default.target` so `enable` makes it start at login.
+pub fn systemd_unit(spec: &ServiceSpec) -> Result<String, String> {
+    let lane = background_lane_arg(spec.lane)?;
+    let cli = spec.cli_path.to_string_lossy();
+    // systemd unit ExecStart: arguments are space-separated; quote the cli path so
+    // a space in it can't split the argv. The lane token is a fixed [a-z] literal.
+    Ok(format!(
+        "[Unit]\n\
+         Description=Alice Miner (background mining)\n\
+         After=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart=\"{cli}\" start --lane {lane} --json --from-service\n\
+         Restart=always\n\
+         RestartSec=5\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    ))
+}
+
+/// Render the Windows Task Scheduler task XML for `spec`. Pure + fully testable.
+/// The action runs `<cli> start --lane <lane> --json` at logon, restarting on
+/// failure (KeepAlive equivalent). No `--address`, no secret, no payout.
+pub fn windows_task_xml(spec: &ServiceSpec) -> Result<String, String> {
+    let lane = background_lane_arg(spec.lane)?;
+    let cli = xml_escape(&spec.cli_path.to_string_lossy());
+    // Arguments element is XML-escaped; the lane token is a fixed [a-z] literal.
+    let args = xml_escape(&format!("start --lane {lane} --json --from-service"));
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Alice Miner (background mining)</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions>
+    <Exec>
+      <Command>{cli}</Command>
+      <Arguments>{args}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
 "#
     ))
 }
@@ -212,20 +282,169 @@ pub fn status() -> ServiceState {
     }
 }
 
-// ── Non-macOS stubs (Windows / Linux backends are a deferred follow-up) ──────
-#[cfg(not(target_os = "macos"))]
-pub fn install(_spec: &ServiceSpec) -> Result<(), String> {
-    Err("background mining is currently supported on macOS only (Windows/Linux \
-         backends are a follow-up). Keep the window open to keep mining."
-        .to_string())
+// ── Linux backend (systemd --user) ──────────────────────────────────────────
+/// The on-disk path of the systemd user unit (`~/.config/systemd/user/<label>.service`).
+#[cfg(target_os = "linux")]
+pub fn systemd_unit_path() -> Result<PathBuf, String> {
+    let base = dirs::config_dir().ok_or_else(|| "no user config directory".to_string())?;
+    Ok(base.join("systemd").join("user").join(format!("{SERVICE_LABEL}.service")))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn run_systemctl(args: &[&str]) -> Result<(), String> {
+    use std::process::Command;
+    let out = Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .map_err(|e| format!("systemctl --user {}: {e}", args.join(" ")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "systemctl --user {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn install(spec: &ServiceSpec) -> Result<(), String> {
+    use std::process::Command;
+    if !spec.cli_path.is_file() {
+        return Err(format!(
+            "the headless miner CLI was not found at {} — cannot install the background service.",
+            spec.cli_path.display()
+        ));
+    }
+    let unit = systemd_unit(spec)?; // validates the lane
+    let path = systemd_unit_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, unit).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    run_systemctl(&["daemon-reload"])?;
+    let svc = format!("{SERVICE_LABEL}.service");
+    if spec.run_at_login {
+        run_systemctl(&["enable", "--now", svc.as_str()])?;
+        // Best-effort: survive logout/reboot (otherwise --user units stop at logout).
+        let _ = Command::new("loginctl").arg("enable-linger").output();
+    } else {
+        run_systemctl(&["start", svc.as_str()])?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn uninstall() -> Result<(), String> {
+    let svc = format!("{SERVICE_LABEL}.service");
+    let _ = run_systemctl(&["disable", "--now", svc.as_str()]); // best-effort
+    let path = systemd_unit_path()?;
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("removing {}: {e}", path.display()))?;
+    }
+    let _ = run_systemctl(&["daemon-reload"]);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn status() -> ServiceState {
+    use std::process::Command;
+    let installed = systemd_unit_path().map(|p| p.exists()).unwrap_or(false);
+    if !installed {
+        return ServiceState::NotInstalled;
+    }
+    let svc = format!("{SERVICE_LABEL}.service");
+    match Command::new("systemctl").args(["--user", "is-active", svc.as_str()]).output() {
+        Ok(out) if String::from_utf8_lossy(&out.stdout).trim() == "active" => ServiceState::Running,
+        _ => ServiceState::Loaded,
+    }
+}
+
+// ── Windows backend (Task Scheduler) ────────────────────────────────────────
+#[cfg(target_os = "windows")]
+const WIN_TASK_NAME: &str = "AliceMiner";
+
+#[cfg(target_os = "windows")]
+pub fn install(spec: &ServiceSpec) -> Result<(), String> {
+    use std::process::Command;
+    if !spec.cli_path.is_file() {
+        return Err(format!(
+            "the headless miner CLI was not found at {} — cannot install the background task.",
+            spec.cli_path.display()
+        ));
+    }
+    let xml = windows_task_xml(spec)?; // validates the lane
+    let tmp = std::env::temp_dir().join(format!("alice-miner-task-{}.xml", std::process::id()));
+    std::fs::write(&tmp, xml).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+    let out = Command::new("schtasks")
+        .args(["/Create", "/TN", WIN_TASK_NAME, "/F", "/XML"])
+        .arg(&tmp)
+        .output()
+        .map_err(|e| format!("schtasks /Create: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    if !out.status.success() {
+        return Err(format!(
+            "schtasks /Create failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // The LogonTrigger fires at next logon; start it now too.
+    let _ = Command::new("schtasks").args(["/Run", "/TN", WIN_TASK_NAME]).output();
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn uninstall() -> Result<(), String> {
+    use std::process::Command;
+    let out = Command::new("schtasks")
+        .args(["/Delete", "/TN", WIN_TASK_NAME, "/F"])
+        .output()
+        .map_err(|e| format!("schtasks /Delete: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    // Deleting a non-existent task is non-zero — treat "not found" as success.
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    if err.contains("cannot find") || err.contains("does not exist") {
+        Ok(())
+    } else {
+        Err(format!("schtasks /Delete failed: {}", err.trim()))
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn status() -> ServiceState {
+    use std::process::Command;
+    match Command::new("schtasks")
+        .args(["/Query", "/TN", WIN_TASK_NAME, "/FO", "LIST", "/V"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if s.lines().any(|l| l.trim_start().starts_with("Status:") && l.contains("Running")) {
+                ServiceState::Running
+            } else {
+                ServiceState::Loaded
+            }
+        }
+        _ => ServiceState::NotInstalled,
+    }
+}
+
+// ── Fallback for any other OS ────────────────────────────────────────────────
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn install(_spec: &ServiceSpec) -> Result<(), String> {
+    Err("background mining is not supported on this platform yet.".to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn uninstall() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn status() -> ServiceState {
     ServiceState::NotInstalled
 }
@@ -252,6 +471,7 @@ mod tests {
         assert!(xml.contains("<string>--lane</string>"));
         assert!(xml.contains("<string>xmr</string>"));
         assert!(xml.contains("<string>--json</string>"));
+        assert!(xml.contains("<string>--from-service</string>"), "marks the agent's own start");
         assert!(xml.contains("alice-miner-cli"));
         assert!(xml.contains("<key>KeepAlive</key>\n    <true/>"));
         assert!(xml.contains("<key>RunAtLoad</key>\n    <true/>"), "run_at_login=true → RunAtLoad true");
@@ -297,5 +517,63 @@ mod tests {
     #[test]
     fn xml_escape_neutralises_specials() {
         assert_eq!(xml_escape("a & b < c > d \" e"), "a &amp; b &lt; c &gt; d &quot; e");
+    }
+
+    /// The same no-secret/address/payout invariant the plist test enforces, reused
+    /// for the Linux unit + Windows task definitions.
+    fn assert_no_secret(def: &str, what: &str) {
+        for forbidden in [
+            "--address", "address", "seed", "mnemonic", "password", "passwd",
+            "unlock", "payout", "prl1", "private", "secret",
+        ] {
+            assert!(
+                !def.to_ascii_lowercase().contains(forbidden),
+                "{what} must not contain {forbidden:?} — the reward address is resolved from \
+                 ~/.alice at runtime, never written into the world-readable service definition"
+            );
+        }
+    }
+
+    /// The systemd --user unit runs exactly `start --lane xmr --json`, restarts
+    /// always (KeepAlive), is wanted by default.target (so `enable` = at-login),
+    /// and carries NO secret / address / payout.
+    #[test]
+    fn linux_systemd_unit_argv_and_no_secret() {
+        let unit = systemd_unit(&xmr_spec()).expect("xmr unit renders");
+        assert!(unit.contains("start --lane xmr --json --from-service"), "exact argv: {unit}");
+        assert!(unit.contains("Restart=always"));
+        assert!(unit.contains("WantedBy=default.target"));
+        assert!(unit.contains("alice-miner-cli"));
+        assert_no_secret(&unit, "systemd unit");
+    }
+
+    /// The Windows Task Scheduler XML runs the CLI with the same argv, restarts on
+    /// failure (KeepAlive), triggers at logon, and carries NO secret / address /
+    /// payout.
+    #[test]
+    fn windows_task_xml_argv_and_no_secret() {
+        let xml = windows_task_xml(&xmr_spec()).expect("xmr task renders");
+        assert!(xml.contains("<Arguments>start --lane xmr --json --from-service</Arguments>"), "exact argv: {xml}");
+        assert!(xml.contains("alice-miner-cli"));
+        assert!(xml.contains("<LogonTrigger>"));
+        assert!(xml.contains("<RestartOnFailure>"));
+        assert_no_secret(&xml, "windows task xml");
+    }
+
+    /// Every backend's definition refuses a GPU lane (needs the keyring) — so no
+    /// platform can accidentally background a lane that needs the keystore secret.
+    #[test]
+    fn all_backends_refuse_gpu_lane_until_keyring() {
+        for lane in [Lane::GpuPrl, Lane::GpuRvn] {
+            let spec = ServiceSpec { lane, cli_path: PathBuf::from("/x/alice-miner-cli"), run_at_login: true };
+            for (name, res) in [
+                ("launchd", launchd_plist_xml(&spec)),
+                ("systemd", systemd_unit(&spec)),
+                ("schtasks", windows_task_xml(&spec)),
+            ] {
+                let err = res.expect_err(&format!("{name} must refuse a GPU lane"));
+                assert!(err.contains("keychain") || err.contains("keystore"), "{name}: {err}");
+            }
+        }
     }
 }

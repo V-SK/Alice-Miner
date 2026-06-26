@@ -783,6 +783,21 @@ impl MinerApp {
 
     pub fn start_mining(&mut self) {
         self.error = None;
+        // Single owner: don't start a foreground miner while the background service
+        // is active — two miners to the same address only waste the machine. Point
+        // the user to Settings to turn it off first.
+        if matches!(
+            self.bg_service,
+            Some(alice_miner_core::service::ServiceState::Running)
+                | Some(alice_miner_core::service::ServiceState::Loaded)
+        ) {
+            self.error = Some(
+                "Background mining is on — turn it off in Settings (Background mining) to mine \
+                 in the foreground."
+                    .into(),
+            );
+            return;
+        }
         // Mine the selected lane (defaults to the recommended one for the device).
         // If somehow not runnable, fall back to XMR (always viable) — defensive.
         let lane = self.resolved_start_lane();
@@ -1181,6 +1196,10 @@ impl eframe::App for MinerApp {
         if !self.launch_update_checked {
             self.launch_update_checked = true;
             self.updater.check();
+            // Also learn the background-service state once at launch so the Home
+            // Start control can enforce single-owner (don't foreground-mine while
+            // the background agent is active) without re-querying every frame.
+            self.refresh_bg_service();
         }
         // Drain any completed background updater results (check / apply) into the
         // UI state. Cheap + non-blocking; the actual network/FS work runs on a
@@ -1568,6 +1587,20 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         assert!(app.prl_unlock.is_none(), "watch-only never opens the modal");
         let err = app.error.as_deref().expect("a refusal message is set");
         assert!(err.contains("import"), "message points at importing the key: {err}");
+    }
+
+    /// Single-owner lock: a foreground Start is refused while the background
+    /// service is active (would double-mine to the same address).
+    #[test]
+    fn start_refused_while_background_service_active() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(nvidia_device());
+        app.identity = Some(watch_only_identity());
+        app.bg_service = Some(alice_miner_core::service::ServiceState::Running);
+        app.start_mining();
+        let err = app.error.as_deref().expect("single-owner refusal is set");
+        assert!(err.contains("Background mining is on"), "got: {err}");
+        assert!(app.prl_unlock.is_none(), "no modal opened — refused before lane handling");
     }
 
     /// Cancelling the unlock prompt zeroizes+drops the captured password and closes
