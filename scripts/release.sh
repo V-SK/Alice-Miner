@@ -257,6 +257,24 @@ PLIST
       # Ad-hoc sign inner-first then the bundle (NO --deep) — seals the nested
       # engines before the outer bundle (mirrors alice-release::adhoc_codesign).
       "${ROOT_DIR}/scripts/adhoc_sign_macos.sh" "${app}"
+      # POST-sign gate (defence-in-depth, mirrors the CI gate in release.yml):
+      # re-hash every bundled engine AFTER signing and abort if it drifted from its
+      # miners.json pin. The signer skips engines so this must pass; it backstops
+      # any future regression that would re-introduce the v0.3.1 macOS Start-fail.
+      for ename in xmrig kawpowminer; do
+        ef="${app}/Contents/MacOS/${ename}"
+        [[ -f "${ef}" ]] || continue
+        epin="$(pinned_engine_sha256 "${ename}" "${triple}")"
+        if [[ -z "${epin}" ]]; then
+          echo "  !! ${ename} bundled but has no real pin in miners.json — refusing" >&2; exit 1
+        fi
+        egot="$(sha256_of "${ef}")"
+        if [[ "${epin}" != "${egot}" ]]; then
+          echo "  !! POST-SIGN DRIFT: ${ename} SHA ${egot} != pin ${epin} — the signer mutated the engine bytes; aborting" >&2
+          exit 1
+        fi
+        echo "  ✓ post-sign ${ename} == pin (${egot:0:12}…)"
+      done
       # Zip the bundle preserving metadata (matches the in-app updater's ditto).
       ( cd "${stage}" && ditto -c -k --keepParent "AliceMiner.app" "${OUT_DIR}/${artifact}" )
       ;;

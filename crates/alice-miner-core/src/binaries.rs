@@ -343,11 +343,16 @@ fn extract_tar_gz_member(archive: &[u8], member: &str) -> Result<Vec<u8>, String
     let mut tar = tar::Archive::new(gz);
     let entries = tar.entries().map_err(|e| format!("reading tar: {e}"))?;
     for entry in entries {
-        let mut entry = entry.map_err(|e| format!("reading tar entry: {e}"))?;
+        let entry = entry.map_err(|e| format!("reading tar entry: {e}"))?;
         let path = entry.path().map_err(|e| format!("tar entry path: {e}"))?;
         if path.to_string_lossy() == member {
             let mut buf = Vec::new();
-            entry.read_to_end(&mut buf).map_err(|e| format!("extracting {member}: {e}"))?;
+            // Bound decompression so a tar bomb can't exhaust memory; a truncated
+            // read just fails the binary-pin check downstream (fail-closed).
+            entry
+                .take(ENGINE_DOWNLOAD_CAP)
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("extracting {member}: {e}"))?;
             return Ok(buf);
         }
     }
@@ -358,13 +363,17 @@ fn extract_zip_member(archive: &[u8], member: &str) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let reader = std::io::Cursor::new(archive);
     let mut zip = zip::ZipArchive::new(reader).map_err(|e| format!("reading zip: {e}"))?;
-    let mut file = zip
+    let file = zip
         .by_name(member)
         .map_err(|e| format!("member {member:?} not found in the .zip archive: {e}"))?;
     // Defence: never trust the entry's declared path for filesystem writes — we
-    // only return the bytes; the caller installs to a fixed cache path.
+    // only return the bytes; the caller installs to a fixed cache path. Bound
+    // decompression (see extract_tar_gz_member) so a zip bomb is truncated at the
+    // cap and then fails the binary-pin check.
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).map_err(|e| format!("extracting {member}: {e}"))?;
+    file.take(ENGINE_DOWNLOAD_CAP)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("extracting {member}: {e}"))?;
     Ok(buf)
 }
 
@@ -373,8 +382,27 @@ fn extract_zip_member(archive: &[u8], member: &str) -> Result<Vec<u8>, String> {
 /// executable, strip macOS quarantine, then rename over `dest`. A failure leaves
 /// no partially-written runnable file at `dest`.
 fn cache_install_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = dir.join(format!(".{}.partial-{}", dest.file_name().and_then(|n| n.to_str()).unwrap_or("engine"), std::process::id()));
-    std::fs::write(&tmp, bytes).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Per-call-unique temp name (pid + a monotonic counter) so concurrent installs
+    // never collide.
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let base = dest.file_name().and_then(|n| n.to_str()).unwrap_or("engine");
+    let tmp = dir.join(format!(
+        ".{base}.partial-{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    // O_EXCL create (create_new): if a symlink or file is pre-planted at this path
+    // (the engine cache is per-user but defence-in-depth), fail CLOSED instead of
+    // following/truncating it. Audit hardening — never write through a planted link.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+    f.write_all(bytes).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+    drop(f);
 
     #[cfg(unix)]
     {
