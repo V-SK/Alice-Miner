@@ -820,10 +820,9 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                 });
             });
 
-            // Background-mining panel (macOS launchd) — keep mining after the
-            // window closes / at login. macOS only for now; the CPU-XMR lane runs
-            // with no stored secret.
-            #[cfg(target_os = "macos")]
+            // Background-mining panel — keep mining after the window closes / at
+            // login (macOS launchd backend today; the toggle is shown "coming
+            // soon" off macOS). The CPU-XMR lane runs with no stored secret.
             render_background_panel(ui, app);
 
             // Software-update panel — the USER-INITIATED signed self-updater
@@ -919,14 +918,21 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
         });
 }
 
-/// The Settings → Background mining panel (macOS). A single "keep mining when the
-/// window is closed" toggle that installs/removes the launchd LaunchAgent for the
-/// CPU-XMR lane via the (tested) `core::service` API. The reward address is read
-/// from the keystore at runtime and never written into the service definition.
-#[cfg(target_os = "macos")]
+/// The Settings → Background mining panel. A single "keep mining when the window
+/// is closed" toggle that installs/removes the launchd LaunchAgent for the CPU-XMR
+/// lane via the (tested) `core::service` API. The reward address is read from the
+/// keystore at runtime and never written into the service definition. Rendered on
+/// every platform (so the field/method references aren't dead code off macOS); the
+/// toggle is enabled only where a backend exists (macOS today) and otherwise shows
+/// an honest "coming soon".
 fn render_background_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
     use alice_miner_core::service::ServiceState;
-    // Lazily query the state once (spawns launchctl) and cache it.
+    // macOS is the only platform with a background backend today; on Windows/Linux
+    // the toggle is shown disabled with a "coming soon" note (service::install
+    // would return a clear "not supported yet" error anyway).
+    let supported = cfg!(target_os = "macos");
+    // Lazily query the state once (spawns launchctl on macOS; a cheap stub
+    // elsewhere) and cache it.
     if app.bg_service.is_none() {
         app.refresh_bg_service();
     }
@@ -943,6 +949,10 @@ fn render_background_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
              window, and restarts at login. Your reward address stays in the keystore — it is \
              never written into the background service.",
             |ui| {
+                if !supported {
+                    ui.label(RichText::new("macOS only for now").size(12.0).color(THEME.text3));
+                    return;
+                }
                 let (label, fill, ink, stroke) = if on {
                     ("Turn off", THEME.well, THEME.text2, THEME.line_strong)
                 } else {
@@ -962,10 +972,11 @@ fn render_background_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                 }
             },
         );
-        let (word, tone) = match state {
-            ServiceState::Running => ("On — mining in the background", THEME.live),
-            ServiceState::Loaded => ("On — installed (the miner will keep retrying)", THEME.warn),
-            ServiceState::NotInstalled => ("Off", THEME.text3),
+        let (word, tone) = match (supported, state) {
+            (false, _) => ("Windows/Linux background mining is on the way", THEME.text3),
+            (true, ServiceState::Running) => ("On — mining in the background", THEME.live),
+            (true, ServiceState::Loaded) => ("On — installed (the miner will keep retrying)", THEME.warn),
+            (true, ServiceState::NotInstalled) => ("Off", THEME.text3),
         };
         srow(ui, "Status", "Background agent state.", |ui| {
             ui.label(RichText::new(word).size(12.5).color(tone));
