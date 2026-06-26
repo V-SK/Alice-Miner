@@ -803,6 +803,54 @@ mod tests {
         assert!(targets.contains("x86_64-pc-windows-msvc"));
     }
 
+    /// The CPU-XMR (xmrig) lane must be deliverable on EVERY shipped platform so
+    /// "any device one-click mines ALICE" holds: macOS arm64 BUNDLES xmrig (pin,
+    /// no URL), Linux + Windows FETCH it (real pin + complete archive spec). This
+    /// guards the regression where only Apple Silicon could mine (Linux/Windows
+    /// had no xmrig pin → the only runnable lane never started).
+    #[test]
+    fn cpu_xmr_is_deliverable_on_all_shipped_platforms() {
+        let v: serde_json::Value = serde_json::from_str(MINERS_MANIFEST).unwrap();
+        let engines = v["engines"].as_array().expect("engines array");
+        let is_hex64 = |s: &str| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit());
+        let xmr: Vec<&serde_json::Value> = engines
+            .iter()
+            .filter(|e| e["kind"].as_str() == Some("cpu-xmr"))
+            .collect();
+
+        let mut by_target = std::collections::BTreeMap::new();
+        for e in &xmr {
+            let target = e["target"].as_str().expect("cpu-xmr target").to_string();
+            // Every cpu-xmr entry carries a REAL (non-placeholder, non-zero) binary pin.
+            assert_ne!(e.get("_placeholder").and_then(|p| p.as_bool()), Some(true));
+            let sha = e["sha256"].as_str().unwrap_or("");
+            assert!(is_hex64(sha) && !sha.chars().all(|c| c == '0'),
+                "cpu-xmr {target}: sha256 must be a real 64-hex pin, got {sha:?}");
+            by_target.insert(target, *e);
+        }
+
+        // macOS arm64: bundled (pin, NO fetch url).
+        let mac = by_target.get("aarch64-apple-darwin").expect("macOS arm64 cpu-xmr present");
+        assert!(mac.get("archive_url").is_none() && mac.get("binary_url").is_none(),
+            "macOS xmrig is bundled, not fetched");
+
+        // Linux + Windows: a COMPLETE fetch spec (archive_url + archive_sha256 +
+        // binary_path_in_archive) so the runtime auto-download can deliver xmrig.
+        for t in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
+            let e = by_target.get(t).unwrap_or_else(|| panic!("cpu-xmr {t} must be fetchable"));
+            let arc = e["archive_sha256"].as_str().unwrap_or("");
+            assert!(is_hex64(arc) && !arc.chars().all(|c| c == '0'),
+                "cpu-xmr {t}: archive_sha256 must be real 64-hex, got {arc:?}");
+            assert!(e["archive_url"].as_str().unwrap_or("").starts_with("https://"),
+                "cpu-xmr {t}: archive_url must be https");
+            assert!(!e["binary_path_in_archive"].as_str().unwrap_or("").is_empty(),
+                "cpu-xmr {t}: binary_path_in_archive must be set");
+            let fname = e["filename"].as_str().unwrap_or("");
+            assert!(fname == "xmrig" || fname == "xmrig.exe",
+                "cpu-xmr {t}: unexpected filename {fname:?}");
+        }
+    }
+
     #[test]
     fn gpu_kind_has_distinct_binary_name_and_override() {
         // kawpowminer (not xmrig) + its own env override.

@@ -10,6 +10,30 @@
       "source": "alice-wallet/gui/release-assets/aarch64-apple-darwin/xmrig (proven, live-validated against hk.aliceprotocol.org:3333)"
     },
     {
+      "kind": "cpu-xmr",
+      "engine": "xmrig",
+      "version": "6.26.0",
+      "target": "x86_64-unknown-linux-gnu",
+      "filename": "xmrig",
+      "sha256": "b20f39fc00d242e706b6c30367ad811c676e0575050a4ec2f30104b696944b49",
+      "archive_url": "https://github.com/xmrig/xmrig/releases/download/v6.26.0/xmrig-6.26.0-linux-static-x64.tar.gz",
+      "archive_sha256": "fc6f8ae5f64e4f17481f7e3be29a1c56949f216a998414188003eae1db20c9e5",
+      "binary_path_in_archive": "xmrig-6.26.0/xmrig",
+      "source": "XMRig 6.26.0 official linux-static-x64 (the CPU-XMR engine — RandomX → ALICE). PINNED 2026-06-26: archive_sha256 + extracted-binary sha256 VERIFIED against xmrig's official SHA256SUMS at github.com/xmrig/xmrig/releases/tag/v6.26.0 (`shasum -c` = OK). NOT bundled (keeps the ~3.5MB .tar.gz off git): the resolver auto-downloads archive_url at runtime and verifies BOTH the archive_sha256 and this binary sha256 before install (binaries.rs ensure_cached_engine). Static build = no glibc dependency. Same 6.26.0 as the macOS arm64 xmrig so the lane argv (--keepalive etc.) is uniform."
+    },
+    {
+      "kind": "cpu-xmr",
+      "engine": "xmrig",
+      "version": "6.26.0",
+      "target": "x86_64-pc-windows-msvc",
+      "filename": "xmrig.exe",
+      "sha256": "6fa80698d7268f6e88aa88c06fb27ee99e1bcee747c2e76911e6206a5b1aeeb3",
+      "archive_url": "https://github.com/xmrig/xmrig/releases/download/v6.26.0/xmrig-6.26.0-windows-x64.zip",
+      "archive_sha256": "bba8097cb37d9b458a1cb1137876b27cde6740d17fe4ccbc086ba07d87d9e147",
+      "binary_path_in_archive": "xmrig-6.26.0/xmrig.exe",
+      "source": "XMRig 6.26.0 official windows-x64 (MSVC). PINNED 2026-06-26: archive_sha256 + extracted-binary sha256 VERIFIED against xmrig's official SHA256SUMS (release v6.26.0). Windows intentionally does NOT bundle xmrig.exe (Defender flags it PUA); the CPU-XMR lane FETCHES it on first run and verifies this pin — the designed on-demand path. May trip Defender PUA on the user's box; the download page notes adding an exclusion."
+    },
+    {
       "kind": "gpu-rvn",
       "engine": "kawpowminer",
       "target": "x86_64-unknown-linux-gnu",
