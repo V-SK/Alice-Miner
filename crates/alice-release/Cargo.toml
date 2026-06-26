@@ -1,6 +1,6 @@
 [package]
 name = "alice-release"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 
 # Signed self-update kernel shared with the Alice Wallet. `src/lib.rs` is the
