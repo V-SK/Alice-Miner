@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use zeroize::Zeroizing;
 
 use alice_miner_core::engine::{Command as EngineCommand, Event, IdentitySpec};
 use alice_miner_core::{EngineHandle, EngineState, GpuSelection, Lane, Snapshot};
@@ -409,19 +410,24 @@ fn cmd_service(args: ServiceArgs) -> i32 {
             );
             return EXIT_USAGE;
         };
-        let pw = match resolve_password(args.password.clone(), args.password_stdin) {
+        // Wrap in `Zeroizing` so the in-memory passphrase is scrubbed on EVERY exit of
+        // this block (success and the early-return error paths) — parity with the GUI
+        // (`confirm_bg_enable`) + engine (`start_run`), which both zeroize. Without it
+        // the validated `String` dropped un-scrubbed, leaving heap residue (in-process
+        // only — no disk/log/argv exposure; the validate→store flow is unchanged).
+        let pw = Zeroizing::new(match resolve_password(args.password.clone(), args.password_stdin) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("error: {e}");
                 return EXIT_USAGE;
             }
-        };
+        });
         // Unlock to validate (the returned secrets zeroize on drop — we keep nothing).
-        if let Err(e) = alice_miner_core::engine::resolve_prl_secrets(Some(&pw)) {
+        if let Err(e) = alice_miner_core::engine::resolve_prl_secrets(Some(pw.as_str())) {
             eprintln!("error: {e}");
             return EXIT_USAGE;
         }
-        if let Err(e) = alice_miner_core::keyring::store_unlock_password(&addr, &pw) {
+        if let Err(e) = alice_miner_core::keyring::store_unlock_password(&addr, pw.as_str()) {
             eprintln!("error: {e}");
             return EXIT_RUNTIME;
         }

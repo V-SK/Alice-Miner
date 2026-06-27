@@ -24,6 +24,10 @@ rpassword = "7.3"
 # `--json` machine-readable output (detect/start). serde_json is already in the
 # engine's tree (a core dep), so this pulls in NO new transitive crates.
 serde_json = "1.0"
+# Scrub the in-memory keystore unlock passphrase after the `service --install`
+# validate→store flow (parity with the GUI + engine, which both zeroize). Already
+# in the tree via `alice-miner-core`, so this adds NO new transitive crates.
+zeroize = "1.8"
 # In-place live dashboard for an INTERACTIVE TTY (the `start` loop). A non-TTY
 # (piped / CI) and `--json` keep the plain line renderer untouched — the TUI is a
 # render-layer swap only. `crossterm` is ratatui's default backend; we use

@@ -109,6 +109,7 @@ dependencies = [
  "ratatui",
  "rpassword",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
