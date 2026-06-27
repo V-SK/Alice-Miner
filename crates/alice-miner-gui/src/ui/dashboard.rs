@@ -171,6 +171,14 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     let (rh_label, rh_tone) = reject_health_sub(snap.as_ref(), app.active_lane(), a, r);
     let (accepted_sub, accepted_sub_color): (String, egui::Color32) =
         (rh_label, rh_tone.color());
+    // SHOULD-FIX B: AlphaMiner reports `hits` = SUBMITTED shares (it async-submits and
+    // never logs a pool accept; acceptance is the relay's truth — see parse_alpha). So on
+    // the GpuAlpha lane the third card is labelled "Submitted" with the COUNT (not an
+    // "Accepted %" headline, which would imply a 100% accept rate we can't know). Every
+    // other lane keeps the "Accepted" % headline. The reject-tone sub-label is already
+    // suppressed to "rejects n/a" for GpuAlpha via `reject_health_sub`.
+    let (accepted_title, accepted_headline) =
+        accepted_card(mining, app.active_lane(), a, &pct);
     let cards: Vec<CardFn> = vec![
         // Hashrate (accent, with sparkline).
         Box::new({
@@ -209,9 +217,10 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
                 None,
             );
         }),
-        // Accepted %.
+        // Accepted % — or, on the GpuAlpha lane, the SUBMITTED count (SHOULD-FIX B).
         Box::new({
-            let pct = pct.clone();
+            let title = accepted_title;
+            let headline = accepted_headline.clone();
             let sub = accepted_sub.clone();
             let sub_color = accepted_sub_color;
             move |ui: &mut egui::Ui| {
@@ -219,8 +228,8 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
                     ui,
                     card_w,
                     CARD_MIN_CONTENT_H,
-                    "Accepted",
-                    widgets::mono(format!("{pct}%"), 25.0, THEME.text).strong(),
+                    title,
+                    widgets::mono(headline.clone(), 25.0, THEME.text).strong(),
                     Some(RichText::new(sub.clone()).size(11.0).color(sub_color)),
                     None,
                     None,
@@ -432,6 +441,21 @@ fn reject_health_sub(
         return ("rejects n/a".to_string(), RejectTone::Neutral);
     }
     classify_reject_pct(sum_r as f64 / (sum_a + sum_r) as f64 * 100.0)
+}
+
+/// The third stat card's (title, headline). Pure + testable.
+///
+/// SHOULD-FIX B: AlphaMiner's `hits` is a SUBMITTED-share count (the client never sees a
+/// pool accept; the relay owns acceptance — see `stats::parse_alpha`). So on the GpuAlpha
+/// lane the card is "Submitted" + the raw COUNT, suppressing the "Accepted %" headline
+/// (which would imply a 100% accept rate we can't know). Every other lane keeps
+/// "Accepted" + the `pct%` headline.
+fn accepted_card(mining: bool, active_lane: Lane, accepted: u64, pct: &str) -> (&'static str, String) {
+    if mining && active_lane == Lane::GpuAlpha {
+        ("Submitted", format!("{accepted}"))
+    } else {
+        ("Accepted", format!("{pct}%"))
+    }
 }
 
 /// Map a reject percentage to the (label, tone) the "Accepted" card shows.
@@ -1595,6 +1619,27 @@ mod tests {
         let (label, tone) = reject_health_sub(Some(&s), Lane::Xmr, 5_050, 2);
         assert_eq!(tone, RejectTone::Neutral);
         assert_eq!(label, "rejects n/a");
+    }
+
+    // ── SHOULD-FIX B: GpuAlpha card shows SUBMITTED, not an accepted% ──────────
+
+    /// On the GpuAlpha lane the third card is "Submitted" + the raw count (no "%"); every
+    /// other lane keeps "Accepted" + the pct% headline. Idle (not mining) keeps "Accepted".
+    #[test]
+    fn accepted_card_alpha_shows_submitted_count_not_pct() {
+        // GpuAlpha while mining → "Submitted" + count, NO percent sign.
+        let (title, headline) = accepted_card(true, Lane::GpuAlpha, 42, "100.0");
+        assert_eq!(title, "Submitted");
+        assert_eq!(headline, "42");
+        assert!(!headline.contains('%'), "alpha headline must not imply an accept rate");
+        // Other lanes → "Accepted" + pct% (unchanged).
+        let (title, headline) = accepted_card(true, Lane::Xmr, 142, "99.3");
+        assert_eq!(title, "Accepted");
+        assert_eq!(headline, "99.3%");
+        // GpuPrl keeps the accepted% framing (it DOES have an accept signal).
+        assert_eq!(accepted_card(true, Lane::GpuPrl, 10, "100.0").0, "Accepted");
+        // Idle GpuAlpha (not mining) → still "Accepted" (the dash placeholder path).
+        assert_eq!(accepted_card(false, Lane::GpuAlpha, 0, "—").0, "Accepted");
     }
 
     /// Single-lane behaviour is unchanged: the summed counters ARE the active lane, so

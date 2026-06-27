@@ -228,14 +228,26 @@ pub fn render_snapshot(snap: &Snapshot) -> String {
         String::new()
     };
     let dual_tag = if snap.dual { " [dual]" } else { "" };
-    let accepted_pct = fmt_accepted_pct(snap.shares_accepted, snap.shares_rejected);
+
+    // SHOULD-FIX B: AlphaMiner reports `hits` = SUBMITTED shares (it async-submits and
+    // never logs a pool accept; acceptance is the relay's truth — see `parse_alpha`). So
+    // on a single GpuAlpha lane the share segment reads "{N} submitted" with NO accepted%
+    // (a 100% accept rate we can't know); every other lane keeps the "{A}A/{R}R (pct%)"
+    // framing. (Dual mode mirrors the PRIMARY lane here; the per-lane rows below show each
+    // lane's own counts, so we scope this to a single GpuAlpha primary.)
+    let shares_seg = if snap.lane == Some(Lane::GpuAlpha) && !snap.dual {
+        format!("shares {} submitted", snap.shares_accepted)
+    } else {
+        let accepted_pct = fmt_accepted_pct(snap.shares_accepted, snap.shares_rejected);
+        format!(
+            "shares {}A/{}R{}",
+            snap.shares_accepted, snap.shares_rejected, accepted_pct
+        )
+    };
 
     out.push_str(&format!(
-        "[{}]{dual_tag} {hr} · shares {}A/{}R{} · up {} · {}{} · rewards {}\n",
+        "[{}]{dual_tag} {hr} · {shares_seg} · up {} · {}{} · rewards {}\n",
         fmt_state(snap.state),
-        snap.shares_accepted,
-        snap.shares_rejected,
-        accepted_pct,
         fmt_uptime(snap.uptime_s),
         endpoint,
         failover,
@@ -277,12 +289,17 @@ pub fn render_snapshot(snap: &Snapshot) -> String {
             } else {
                 String::new()
             };
+            // SHOULD-FIX B: a GpuAlpha row's count is SUBMITTED (not accepted) — the
+            // relay owns acceptance — so label it honestly; other lanes show A/R.
+            let lshares = if l.lane == Lane::GpuAlpha {
+                format!("{} submitted", l.shares_accepted)
+            } else {
+                format!("{}A/{}R", l.shares_accepted, l.shares_rejected)
+            };
             out.push_str(&format!(
-                "    └ {:<9} [{}] {lhr} · {}A/{}R · {}{}\n",
+                "    └ {:<9} [{}] {lhr} · {lshares} · {}{}\n",
                 l.lane.label(),
                 fmt_state(l.state),
-                l.shares_accepted,
-                l.shares_rejected,
                 l.endpoint.as_deref().unwrap_or("—"),
                 lfo,
             ));
@@ -608,6 +625,30 @@ mod tests {
         assert!(s.contains("01:01:01"));
         assert!(s.contains("hk.aliceprotocol.org:3333"));
         assert!(s.contains("net accepted (142/1)"));
+    }
+
+    /// SHOULD-FIX B: a single GpuAlpha lane's count is SUBMITTED (the client never sees a
+    /// pool accept — the relay owns acceptance). The line must read "{N} submitted" with
+    /// NO "(100%)" accepted-rate (which would imply an accept rate we can't know).
+    #[test]
+    fn gpu_alpha_renders_submitted_not_accepted_pct() {
+        let mut s = running_snapshot();
+        s.lane = Some(Lane::GpuAlpha);
+        s.shares_accepted = 42; // = AlphaMiner `hits` = submitted shares
+        s.shares_rejected = 0; // the client never knows a pool reject
+        s.lanes = vec![LaneSnapshot {
+            lane: Lane::GpuAlpha,
+            state: EngineState::Running,
+            hashrate_hs: Some(9.58e12),
+            shares_accepted: 42,
+            shares_rejected: 0,
+            endpoint: s.endpoint.clone(),
+            failovers: 0,
+        }];
+        let out = render_snapshot(&s);
+        assert!(out.contains("42 submitted"), "submitted label + count: {out}");
+        assert!(!out.contains("42A/0R"), "no accepted/rejected framing: {out}");
+        assert!(!out.contains("(100%)"), "no fabricated 100% accept rate: {out}");
     }
 
     #[test]
