@@ -177,6 +177,11 @@ pub struct MinerApp {
     // ── Transient UI feedback ────────────────────────────────────────────────
     pub error: Option<String>,
     pub last_spark_push: Option<Instant>,
+    /// C2 stall signal: the accepted-share count + the instant it last CHANGED, so the
+    /// status line can show "no new share for Ns" while STILL hashing (a stalled pool
+    /// job-feed otherwise reads as a confident green "Mining"). Re-baselined each run.
+    pub last_acc_count: u64,
+    pub last_acc_change: Option<Instant>,
     pub copied_at: Option<Instant>,
     /// Language toggle (display-only; copy is bilingual already).
     pub lang_zh: bool,
@@ -298,6 +303,8 @@ impl MinerApp {
             gauge_ceiling_khs: 1.0,
             error: None,
             last_spark_push: None,
+            last_acc_count: 0,
+            last_acc_change: None,
             copied_at: None,
             lang_zh: false,
             reduce_motion: false,
@@ -754,7 +761,38 @@ impl MinerApp {
                 }
             }
         }
+        // C2: track when the accepted-share count last advanced (for the stall banner).
+        // A non-Running snapshot re-baselines the clock; a change re-arms it; the first
+        // Running tick at a steady count starts it now (so the banner is relative to
+        // when we began watching, never to a stale prior run).
+        if s.state != EngineState::Running {
+            self.last_acc_change = None;
+            self.last_acc_count = s.shares_accepted;
+        } else if s.shares_accepted != self.last_acc_count {
+            self.last_acc_count = s.shares_accepted;
+            self.last_acc_change = Some(Instant::now());
+        } else if self.last_acc_change.is_none() {
+            self.last_acc_change = Some(Instant::now());
+        }
         self.snapshot = Some(s);
+    }
+
+    /// C2 stall signal: seconds since the accepted-share count last advanced — but ONLY
+    /// when the lane is Running with live hashrate AND has already landed at least one
+    /// share (so it WAS producing and has gone quiet, distinct from warming up where
+    /// `acc == 0`). `None` otherwise. The status line shows a gentle banner past a
+    /// threshold so a stalled-but-connected pool feed is visible before the ~600s
+    /// watchdog rotates endpoints.
+    pub fn share_stall_secs(&self) -> Option<u64> {
+        if self.state() != EngineState::Running {
+            return None;
+        }
+        let hr = self.snapshot.as_ref().and_then(|s| s.hashrate_hs).unwrap_or(0.0);
+        let acc = self.snapshot.as_ref().map(|s| s.shares_accepted).unwrap_or(0);
+        if hr <= 0.0 || acc == 0 {
+            return None; // warming up / not producing yet
+        }
+        self.last_acc_change.map(|t| t.elapsed().as_secs())
     }
 
     /// The engine lifecycle state (Idle until the first snapshot).
@@ -1691,6 +1729,31 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             message: None,
             prl_payout: None,
         }
+    }
+
+    /// C2 stall: `share_stall_secs` flags a lane that is Running WITH hashrate and has
+    /// landed shares but has gone quiet; it returns None when idle or warming up.
+    #[test]
+    fn share_stall_secs_flags_a_quiet_but_hashing_lane() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        // Idle (no snapshot) → None.
+        assert_eq!(app.share_stall_secs(), None);
+
+        // Running, hashing, has landed shares, change-clock old → stalled (>= ~400s).
+        app.snapshot = Some(running_snapshot()); // hr 8400, acc 10
+        app.last_acc_count = 10;
+        app.last_acc_change = Some(Instant::now() - std::time::Duration::from_secs(400));
+        assert!(
+            app.share_stall_secs().unwrap() >= 300,
+            "a producing-then-quiet lane is flagged"
+        );
+
+        // Warming up (acc == 0, hr 0) → never a stall, even with an old clock.
+        let mut warming = running_snapshot();
+        warming.shares_accepted = 0;
+        warming.hashrate_hs = Some(0.0);
+        app.snapshot = Some(warming);
+        assert_eq!(app.share_stall_secs(), None, "warming up is not a stall");
     }
 
     /// `open_change_addr` opens the modal at its launcher and wipes any stale

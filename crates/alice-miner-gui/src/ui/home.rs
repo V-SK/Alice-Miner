@@ -349,6 +349,12 @@ fn cta_readout(ui: &mut egui::Ui, label: &str, sub: &str, color: egui::Color32, 
     });
 }
 
+/// How long a Running lane can go without a NEW accepted share (while still hashing)
+/// before the status line shows a gentle stall banner. Generous — share cadence varies
+/// by lane/difficulty — but well under the ~600s no-progress watchdog so a stalled feed
+/// is visible before the engine auto-rotates endpoints.
+const STALL_WARN_SECS: u64 = 300;
+
 fn status_line(ui: &mut egui::Ui, app: &MinerApp) {
     let blink = app.motion_enabled();
     let (tone, text) = match app.state() {
@@ -361,9 +367,15 @@ fn status_line(ui: &mut egui::Ui, app: &MinerApp) {
             // A transient warning pushed while STILL mining (e.g. the PoP-refresh
             // "crediting may pause" note) must be visible — a full-hashrate lane can be
             // earning nothing. Show it in a Warn tone rather than a confident green
-            // "Mining"; otherwise the calm share line.
+            // "Mining". Next, a stall: hashing but no NEW share for a while (a stalled
+            // pool feed reads healthy otherwise). Otherwise the calm share line.
             if let Some(msg) = app.snapshot.as_ref().and_then(|s| s.message.clone()) {
                 (Tone::Warn, msg)
+            } else if let Some(secs) = app.share_stall_secs().filter(|s| *s >= STALL_WARN_SECS) {
+                (
+                    Tone::Warn,
+                    format!("No new share for {}m — still hashing, checking the pool", secs / 60),
+                )
             } else {
                 let a = app.snapshot.as_ref().map(|s| s.shares_accepted).unwrap_or(0);
                 let r = app.snapshot.as_ref().map(|s| s.shares_rejected).unwrap_or(0);
