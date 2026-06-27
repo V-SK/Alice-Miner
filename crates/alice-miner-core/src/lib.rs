@@ -36,6 +36,7 @@ pub mod detect;
 pub mod endpoint;
 pub mod engine;
 pub mod identity;
+pub mod keyring;
 pub mod lane;
 pub mod pop;
 pub mod prl_payout;

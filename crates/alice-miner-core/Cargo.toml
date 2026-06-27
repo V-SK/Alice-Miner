@@ -38,3 +38,17 @@ ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] 
 tar = "0.4.40"
 flate2 = "1.0"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+# OS-native secret store for the background-mining unlock password (B4). The launchd/
+# systemd/Task-Scheduler unit carries NO secret; the wallet unlock password lives in the
+# OS keyring (macOS Keychain / Windows Credential Manager / Linux Secret Service) and is
+# read by the `--from-service` start so a GPU (pearlhash) lane can persist headless. The
+# keystore stays encrypted on disk — only the password is stored, protected by the OS
+# account. Native backends per platform; a headless Linux box without a running Secret
+# Service probes as unavailable so GPU background is refused honestly (no plaintext path).
+keyring = { version = "3", default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+] }
