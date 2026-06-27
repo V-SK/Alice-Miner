@@ -111,8 +111,11 @@ pub fn assemble_pop_password(challenge_id: &str, signature_b64: &str) -> Result<
 // Four POST endpoints carry the PoP handshake over HTTPS:
 //   * region (per-relay): `m4/challenge` (mint a nonce) + `m4/verify` (best-effort
 //     OOB confirm of a login token).
-//   * central (`api.aliceprotocol.org`): `m4/enroll/nonce` + `m4/enroll` (bind the
-//     15%-payout `prl1p…` address to the Alice address).
+//   * central (`api.aliceprotocol.org`): `/acp/m4/enroll/nonce` + `/acp/m4/enroll`
+//     (bind the 15%-payout `prl1p…` address to the Alice address). The `/acp` prefix
+//     is REQUIRED — verified 2026-06-27 against the acp gateway dispatch
+//     (`shadow_server/http_app.py` POST `/acp/m4/enroll/nonce` + `/acp/m4/enroll`); a
+//     bare `/m4/enroll` would 404 and silently leave the 15% return unbound.
 //
 // HARD RULES (mirror the server's transport guard):
 //   * every URL MUST be `https://` — a plaintext url fails closed (a PoP token /

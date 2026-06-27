@@ -467,6 +467,7 @@ fn seed_log(app: &mut MinerApp) {
 fn install_demo_identity(app: &mut MinerApp) {
     if app.identity.is_none() {
         app.identity = Some(alice_miner_core::identity::IdentityPointer {
+            schema: alice_miner_core::identity::POINTER_SCHEMA,
             address: "a2x9k4f7q2w8e3r5t6y1u0p9s8d7f6g5h4j3k2l1z0x9c8v7b6n5m4Q".into(),
             pubkey: None,
             keystore_path: None,
@@ -482,6 +483,7 @@ fn install_demo_identity(app: &mut MinerApp) {
 /// any watch-only one) so the tag is deterministic across re-poses.
 fn install_demo_identity_keystore(app: &mut MinerApp) {
     app.identity = Some(alice_miner_core::identity::IdentityPointer {
+        schema: alice_miner_core::identity::POINTER_SCHEMA,
         address: "a2x9k4f7q2w8e3r5t6y1u0p9s8d7f6g5h4j3k2l1z0x9c8v7b6n5m4Q".into(),
         pubkey: Some("0x8f3a…c21b".into()),
         keystore_path: Some("/Users/demo/Library/Application Support/AliceWallet/wallet.json".into()),

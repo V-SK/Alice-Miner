@@ -27,7 +27,7 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::lane::Lane;
 
@@ -95,6 +95,35 @@ fn agent_log_path() -> PathBuf {
         .join("miner.background.log")
 }
 
+/// Cap the background-agent log so it can't grow without bound. The launchd plist
+/// points `StandardOutPath`/`StandardErrorPath` at a single fixed file with no native
+/// rotation; a crash-looping or very-long-uptime agent would otherwise accumulate
+/// forever. Called once at each `--from-service` start: if the file exceeds the cap,
+/// truncate it in place. launchd holds the path open in `O_APPEND`, so truncating the
+/// inode resets growth (the next append lands at the new EOF) without breaking the
+/// writer. Best-effort — any error is ignored so it can never block mining. The file
+/// isn't read by anything today (the GUI tails its own in-memory ring); this only
+/// bounds disk use. No-op on a box where the file doesn't exist (Linux=journald,
+/// Windows=Task Scheduler don't use it).
+pub fn rotate_background_log_if_oversized() {
+    const MAX_BYTES: u64 = 8 * 1024 * 1024; // 8 MiB
+    rotate_log_if_oversized(&agent_log_path(), MAX_BYTES);
+}
+
+/// Inner, path-parameterised body of [`rotate_background_log_if_oversized`] (testable
+/// without touching the real data dir). Truncates `path` to 0 iff it exceeds
+/// `max_bytes`; any IO error is swallowed (best-effort).
+fn rotate_log_if_oversized(path: &Path, max_bytes: u64) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > max_bytes {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .and_then(|f| f.set_len(0));
+        }
+    }
+}
+
 /// Render the launchd LaunchAgent plist for `spec`. Pure + fully testable.
 ///
 /// The ProgramArguments are exactly `[cli, start, --lane, <lane>, --json]` — no
@@ -125,6 +154,8 @@ pub fn launchd_plist_xml(spec: &ServiceSpec) -> Result<String, String> {
     {run_at_load}
     <key>KeepAlive</key>
     <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
     <key>ProcessType</key>
     <string>Background</string>
     <key>StandardOutPath</key>
@@ -146,10 +177,18 @@ pub fn systemd_unit(spec: &ServiceSpec) -> Result<String, String> {
     let cli = spec.cli_path.to_string_lossy();
     // systemd unit ExecStart: arguments are space-separated; quote the cli path so
     // a space in it can't split the argv. The lane token is a fixed [a-z] literal.
+    // Restart-storm bound: with Restart=always + RestartSec=5 and NO explicit
+    // StartLimit, a hard-failing start (e.g. the identity pointer was deleted after
+    // install) would relaunch every 5s forever — the 5s gap never accumulates against
+    // systemd's default 10s window, so the burst limit is never reached. Set an explicit
+    // 5-failures-per-5-minutes limit so a persistently-failing unit lands in `failed`
+    // instead of looping; a healthy miner that restarts occasionally never trips it.
     Ok(format!(
         "[Unit]\n\
          Description=Alice Miner (background mining)\n\
          After=network-online.target\n\
+         StartLimitIntervalSec=300\n\
+         StartLimitBurst=5\n\
          \n\
          [Service]\n\
          Type=simple\n\
@@ -188,7 +227,7 @@ pub fn windows_task_xml(spec: &ServiceSpec) -> Result<String, String> {
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <RestartOnFailure>
       <Interval>PT1M</Interval>
-      <Count>999</Count>
+      <Count>10</Count>
     </RestartOnFailure>
   </Settings>
   <Actions>
@@ -561,6 +600,41 @@ mod tests {
         assert!(xml.contains("<LogonTrigger>"));
         assert!(xml.contains("<RestartOnFailure>"));
         assert_no_secret(&xml, "windows task xml");
+    }
+
+    /// Restart-storm bound: each backend caps a hard-failing relaunch loop (e.g. the
+    /// identity pointer deleted after install). systemd gets an explicit StartLimit
+    /// (with RestartSec=5 the gap never trips the 10s DEFAULT window → infinite loop);
+    /// launchd gets a ThrottleInterval; Windows caps RestartOnFailure Count.
+    #[test]
+    fn restart_storm_is_bounded() {
+        let plist = launchd_plist_xml(&xmr_spec()).unwrap();
+        assert!(plist.contains("<key>ThrottleInterval</key>"), "launchd throttle: {plist}");
+
+        let unit = systemd_unit(&xmr_spec()).unwrap();
+        assert!(unit.contains("StartLimitIntervalSec="), "systemd start-limit window: {unit}");
+        assert!(unit.contains("StartLimitBurst="), "systemd start-limit burst: {unit}");
+
+        let task = windows_task_xml(&xmr_spec()).unwrap();
+        assert!(task.contains("<Count>10</Count>"), "windows bounded restart count");
+        assert!(!task.contains("<Count>999</Count>"), "the unbounded 999 is gone");
+    }
+
+    /// The background log is truncated when it exceeds the cap, and left alone below it.
+    #[test]
+    fn background_log_rotates_when_oversized() {
+        let dir = std::env::temp_dir();
+        let big = dir.join(format!("alice-rotate-big-{}.log", std::process::id()));
+        let small = dir.join(format!("alice-rotate-small-{}.log", std::process::id()));
+        std::fs::write(&big, vec![b'x'; 1024]).unwrap();
+        std::fs::write(&small, vec![b'x'; 10]).unwrap();
+        // Cap at 100 bytes: the 1 KiB file is truncated, the 10-byte file is untouched.
+        rotate_log_if_oversized(&big, 100);
+        rotate_log_if_oversized(&small, 100);
+        assert_eq!(std::fs::metadata(&big).unwrap().len(), 0, "oversized → truncated");
+        assert_eq!(std::fs::metadata(&small).unwrap().len(), 10, "under cap → untouched");
+        let _ = std::fs::remove_file(&big);
+        let _ = std::fs::remove_file(&small);
     }
 
     /// Every backend's definition refuses a GPU lane (needs the keyring) — so no

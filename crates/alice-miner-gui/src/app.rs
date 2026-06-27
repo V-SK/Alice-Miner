@@ -688,6 +688,7 @@ impl MinerApp {
         // reward address — every reward-address read goes through `self.identity`
         // / `reward_address()`.
         self.identity = identity::load_pointer().or(Some(IdentityPointer {
+            schema: identity::POINTER_SCHEMA,
             address: identity.address.clone(),
             pubkey: identity.pubkey.clone(),
             keystore_path: identity
@@ -1832,6 +1833,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         let mut app = MinerApp::new().expect("engine spawns");
         // Watch-only pointer (no keystore_path) → watch-only true.
         app.identity = Some(IdentityPointer {
+            schema: identity::POINTER_SCHEMA,
             address: "a2x9k4f7q2w8e3r5t6y1u0p9s8d7f6g5h4j3k2l1z0x9c8v7b6n5m4Q".into(),
             pubkey: None,
             keystore_path: None,
@@ -1841,6 +1843,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         assert!(app.reward_is_watch_only());
         // Keystore-backed pointer → watch-only false.
         app.identity = Some(IdentityPointer {
+            schema: identity::POINTER_SCHEMA,
             address: "a2x9k4f7q2w8e3r5t6y1u0p9s8d7f6g5h4j3k2l1z0x9c8v7b6n5m4Q".into(),
             pubkey: Some("0x00".into()),
             keystore_path: Some("/tmp/wallet.json".into()),
@@ -1882,6 +1885,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
 
     fn keystore_identity() -> IdentityPointer {
         IdentityPointer {
+            schema: identity::POINTER_SCHEMA,
             address: "a2x9k4f7q2w8e3r5t6y1u0p9s8d7f6g5h4j3k2l1z0x9c8v7b6n5m4Q".into(),
             pubkey: Some("0x00".into()),
             keystore_path: Some("/tmp/wallet.json".into()),
@@ -1892,6 +1896,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
 
     fn watch_only_identity() -> IdentityPointer {
         IdentityPointer {
+            schema: identity::POINTER_SCHEMA,
             address: "a2x9k4f7q2w8e3r5t6y1u0p9s8d7f6g5h4j3k2l1z0x9c8v7b6n5m4Q".into(),
             pubkey: None,
             keystore_path: None,

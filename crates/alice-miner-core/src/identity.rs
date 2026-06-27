@@ -33,11 +33,27 @@ use zeroize::Zeroizing;
 
 use crate::lane::xmr::validate_alice_address;
 
+/// Current on-disk schema version for [`IdentityPointer`]. Bump only on an
+/// INCOMPATIBLE shape change, alongside a migration that branches on the read value.
+pub const POINTER_SCHEMA: u32 = 1;
+
+/// serde default for [`IdentityPointer::schema`]: a pointer written before the field
+/// existed reads back as schema 1 (its shape at that time), giving a future migration
+/// an explicit version to start from instead of guessing.
+fn default_pointer_schema() -> u32 {
+    1
+}
+
 /// The pointer file written to `~/.alice/identity.json`. Public-only: the
 /// active address, its public key, where the keystore lives (None for a
 /// watch-only paste), an optional label, and a creation timestamp. NO secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityPointer {
+    /// On-disk schema version of THIS pointer (see [`POINTER_SCHEMA`]). Defaults to 1
+    /// for pre-field pointers (serde), so an incompatible future change has a version
+    /// to migrate from. Written going forward.
+    #[serde(default = "default_pointer_schema")]
+    pub schema: u32,
     /// The active Alice reward address (SS58-300).
     pub address: String,
     /// The sr25519 public key hex (`0x…`), or `None` for a watch-only paste
@@ -158,6 +174,7 @@ pub fn create(label: Option<String>, password: &str) -> Result<(Identity, Zeroiz
         watch_only: false,
     };
     write_pointer(&IdentityPointer {
+        schema: POINTER_SCHEMA,
         address,
         pubkey: Some(payload.public_key),
         keystore_path: Some(keystore_path.to_string_lossy().to_string()),
@@ -204,6 +221,7 @@ fn import_payload(
         watch_only: false,
     };
     write_pointer(&IdentityPointer {
+        schema: POINTER_SCHEMA,
         address,
         pubkey: Some(payload.public_key),
         keystore_path: Some(keystore_path.to_string_lossy().to_string()),
@@ -226,6 +244,7 @@ pub fn paste(address: &str, label: Option<String>) -> Result<Identity, String> {
         watch_only: true,
     };
     write_pointer(&IdentityPointer {
+        schema: POINTER_SCHEMA,
         address: canonical,
         pubkey: None,
         keystore_path: None,
@@ -632,5 +651,27 @@ mod tests {
             assert_eq!(identity.keystore_path.as_deref(), Some(miner_ks.as_path()));
             assert_eq!(load_pointer().unwrap().keystore_path.as_deref(), miner_ks.to_str());
         });
+    }
+
+    /// Forward-compat: a pointer written BEFORE the `schema` field existed reads back
+    /// as schema 1 (serde default), and a current pointer serializes WITH the field —
+    /// so a future incompatible shape change has an explicit version to migrate from.
+    #[test]
+    fn pointer_schema_defaults_for_legacy_and_is_written_now() {
+        let legacy = r#"{"address":"a2abc","created":0}"#;
+        let p: IdentityPointer = serde_json::from_str(legacy).expect("legacy pointer parses");
+        assert_eq!(p.schema, 1, "a pre-field pointer reads as schema 1");
+        assert_eq!(p.address, "a2abc");
+
+        let cur = IdentityPointer {
+            schema: POINTER_SCHEMA,
+            address: "a2abc".into(),
+            pubkey: None,
+            keystore_path: None,
+            label: None,
+            created: 0,
+        };
+        let json = serde_json::to_string(&cur).unwrap();
+        assert!(json.contains("\"schema\":1"), "schema is written going forward: {json}");
     }
 }

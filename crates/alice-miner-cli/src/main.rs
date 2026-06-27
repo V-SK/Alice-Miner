@@ -661,6 +661,12 @@ fn cmd_start(args: StartArgs) -> i32 {
         }
     }
 
+    // Background agent: cap the launchd log so a long-uptime or crash-looping agent
+    // can't grow it without bound (best-effort, before we spawn the child).
+    if args.from_service {
+        alice_miner_core::service::rotate_background_log_if_oversized();
+    }
+
     if !cap.support(lane).is_runnable() {
         eprintln!(
             "error: the {} lane is {} on this device ({}). Recommended lane: {}.",
