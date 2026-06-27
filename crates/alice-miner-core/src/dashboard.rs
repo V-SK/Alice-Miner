@@ -43,6 +43,7 @@
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
+use std::io::Read as _;
 
 use serde::{Deserialize, Serialize};
 
@@ -200,6 +201,61 @@ impl CreditScore {
     }
 }
 
+/// A per-lane cumulative accepted-share **COUNT** row (Source B), parsed from the
+/// `miner-lookup` `lanes[]` breakdown. Credit-only by construction: it carries an
+/// integer COUNT of accepted shares the SERVER has confirmed on this lane — never a
+/// fiat / payout / `$` value (the `pending_alice`/`paid_alice` lane fields are NOT
+/// read into this type). `label` is the server's display name (e.g. `"GPU · Alpha"`
+/// / `"GPU · PRL"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneCredit {
+    /// The server lane key (e.g. `"main_pool_gpu_alpha"`). Stable id for matching.
+    pub key: String,
+    /// The server display label (e.g. `"GPU · Alpha"`). Falls back to `key` if absent.
+    pub label: String,
+    /// Cumulative accepted-share COUNT on this lane (credit-only; never fiat).
+    pub accepted: u64,
+}
+
+/// **Source B cumulative totals** — the server-confirmed accepted-share COUNTS for
+/// this address, across all lanes plus the 24h window plus the per-lane breakdown.
+///
+/// **CREDIT-ONLY BY CONSTRUCTION:** every field is a non-negative integer COUNT of
+/// accepted shares (or a per-lane breakdown of the same). There is deliberately NO
+/// fiat / payout / `$` field here — the `pending_alice` / `paid_alice` summary
+/// fields are intentionally NOT read into this type (they are guarded separately by
+/// the envelope's `paid_acu`-zero check, and the credit-only `pending_alice` magnitude
+/// is carried opaquely by [`CreditScore`], never rendered as a number). The UI renders
+/// these counts directly ("N shares · GPU·Alpha M / GPU·PRL K"), which is honest:
+/// they are SHARE COUNTS, not money.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CreditTotals {
+    /// Cumulative accepted-share COUNT across all lanes (server-confirmed).
+    pub accepted_total: u64,
+    /// Accepted-share COUNT in the last 24h (server-confirmed).
+    pub accepted_24h: u64,
+    /// Per-lane cumulative accepted-share COUNT breakdown (display order from server).
+    pub lanes: Vec<LaneCredit>,
+}
+
+impl CreditTotals {
+    /// The cumulative accepted-share COUNT for a given server lane `key` (0 if the
+    /// address has no confirmed shares on that lane). Used to surface the
+    /// GPU·Alpha / GPU·PRL split.
+    pub fn accepted_for_lane(&self, key: &str) -> u64 {
+        self.lanes
+            .iter()
+            .find(|l| l.key == key)
+            .map(|l| l.accepted)
+            .unwrap_or(0)
+    }
+
+    /// Whether the server has confirmed any accepted shares at all for this address.
+    pub fn has_any(&self) -> bool {
+        self.accepted_total > 0 || self.lanes.iter().any(|l| l.accepted > 0)
+    }
+}
+
 /// Why a [`CreditState::Error`] occurred (kept qualitative + honest; never leaks
 /// a server number).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,10 +298,16 @@ pub enum CreditState {
     NotExposed,
     /// We have an active Source-B poll in flight / no confirmation yet.
     Confirming,
-    /// The server confirmed a credit score for this address (Option 1, fast-follow
-    /// when a public endpoint exists). The score is credit-only ([`CreditScore`]
-    /// has no fiat Display) and the envelope's `paid_acu` was verified `"0"`.
-    Confirmed { score: CreditScore },
+    /// The server confirmed credit for this address (Option 1 — the live path now
+    /// that a public per-address endpoint exists). The `score` is the credit-only
+    /// `pending_alice` magnitude ([`CreditScore`] has no fiat Display); `totals`
+    /// carries the server-confirmed cumulative accepted-share COUNTS (across lanes +
+    /// 24h + per-lane breakdown). Reached only after the envelope's `paid_acu` was
+    /// verified `"0"` and the payout/live-reward gates read off.
+    Confirmed {
+        score: CreditScore,
+        totals: CreditTotals,
+    },
     /// A poll failed (unreachable / unparseable / **paid_acu != "0"** → value
     /// dropped). The UI shows a calm, non-numeric note and keeps Source A as the
     /// live UX.
@@ -253,9 +315,25 @@ pub enum CreditState {
 }
 
 impl CreditState {
-    /// Whether this state carries a confirmed, non-zero credit score.
+    /// Whether this state carries a confirmed, non-zero credit score OR any
+    /// server-confirmed accepted shares (the cumulative COUNT view). True whenever
+    /// the server has confirmed *something* for this address.
     pub fn has_confirmed_credit(&self) -> bool {
-        matches!(self, CreditState::Confirmed { score } if score.is_some_credit())
+        matches!(
+            self,
+            CreditState::Confirmed { score, totals }
+                if score.is_some_credit() || totals.has_any()
+        )
+    }
+
+    /// The server-confirmed cumulative accepted-share COUNTS, when in the `Confirmed`
+    /// state (credit-only — counts, never fiat). `None` for every other state so the
+    /// UI shows an honest "—"/"syncing" rather than a fabricated 0.
+    pub fn totals(&self) -> Option<&CreditTotals> {
+        match self {
+            CreditState::Confirmed { totals, .. } => Some(totals),
+            _ => None,
+        }
     }
 }
 
@@ -270,10 +348,19 @@ impl CreditState {
 // `paid_acu != "0"` DROP today (the milestone's "parse test on a sample response").
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Server lane key for the GPU · PRL (pearlhash) pool. Mirrors the acp read_api's
+/// `MAIN_POOL_GPU_PRL` so the client can pull the per-lane share split.
+pub const LANE_KEY_GPU_PRL: &str = "main_pool_gpu_prl";
+/// Server lane key for the GPU · Alpha (AlphaPool pearlhash) pool — the NEW lane the
+/// read_api exposes alongside GPU · PRL. Mirrors `MAIN_POOL_GPU_ALPHA`.
+pub const LANE_KEY_GPU_ALPHA: &str = "main_pool_gpu_alpha";
+
 /// The credit-bearing part of an `alice-read-model-v2` `miner-lookup` response.
 /// Only the fields Source B needs: the credit-only envelope guards + the
-/// confirmed score (read from `summary.pending_alice`, the credit-side total).
-/// Unknown fields are ignored (the live payload carries much more).
+/// confirmed score (`summary.pending_alice`, carried opaquely) + the cumulative
+/// accepted-share COUNTS (`summary.accepted_shares_total` / `_24h` + the per-lane
+/// `lanes[]` breakdown). Unknown fields are ignored (the live payload carries much
+/// more — timeseries, workers, payout_history, etc.).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreditEnvelope {
     /// `paid_acu` MUST be the string `"0"`; anything else is a credit-only
@@ -290,18 +377,43 @@ pub struct CreditEnvelope {
     /// Whether the address was found at all.
     #[serde(default)]
     pub found: bool,
-    /// The credit-side summary (pending credit total). Optional / fail-closed.
+    /// The credit-side summary (pending credit total + cumulative COUNTS). Optional.
     #[serde(default)]
     pub summary: Option<CreditSummary>,
+    /// The per-lane cumulative accepted-share COUNT breakdown. Optional / fail-closed
+    /// (absent => no lane split, just the summary totals).
+    #[serde(default)]
+    pub lanes: Vec<LaneEnvelope>,
 }
 
 /// The credit-side summary fields of the read-model. `pending_alice` is the
-/// credit accrued-but-not-paid total (phase-J keeps it as pending credit).
+/// credit accrued-but-not-paid total (phase-J keeps it as pending credit); the
+/// `accepted_shares_*` are the cumulative server-confirmed COUNTS (credit-only).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreditSummary {
     /// Credit accrued and pending (NOT cash; never rendered as a number/`$`).
     #[serde(default)]
     pub pending_alice: Option<f64>,
+    /// Cumulative accepted-share COUNT across all lanes (server-confirmed).
+    #[serde(default)]
+    pub accepted_shares_total: Option<u64>,
+    /// Accepted-share COUNT in the last 24h (server-confirmed).
+    #[serde(default)]
+    pub accepted_shares_24h: Option<u64>,
+}
+
+/// One element of the read-model's `lanes[]` array — the credit-only fields the
+/// client surfaces: the lane `key`, its display `label`, and the cumulative
+/// `accepted` COUNT. The `pending_alice` / `paid_alice` lane fields are intentionally
+/// NOT deserialized (credit-only: we surface COUNTS, never per-lane fiat).
+#[derive(Debug, Clone, Deserialize)]
+pub struct LaneEnvelope {
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub accepted: Option<u64>,
 }
 
 /// Parse a read-model `miner-lookup` JSON body into a [`CreditState`],
@@ -334,14 +446,41 @@ pub fn parse_credit_envelope(body: &str) -> CreditState {
     if !paid_acu_ok || env.payout_executor_enabled || env.live_reward_enabled {
         return CreditState::Error { reason: CreditError::PaidAcuNotZero };
     }
-    // (3) Not found yet → just "confirming" (no error, no number).
+    // (3) Not found yet → just "confirming" (no error, no number). A MISSING/absent
+    // address is "confirming", NOT a fabricated zero — the UI shows "syncing", never 0.
     if !env.found {
         return CreditState::Confirming;
     }
-    // (4) The confirmed, credit-only score (pending credit). Absent → 0 (which is
-    // a perfectly valid confirmed-but-zero state pre-credit).
-    let raw = env.summary.and_then(|s| s.pending_alice).unwrap_or(0.0);
-    CreditState::Confirmed { score: CreditScore::new(raw) }
+    // (4) The confirmed state. The credit-only score (pending credit magnitude) is
+    // carried opaquely via CreditScore (no fiat Display); the cumulative accepted-share
+    // COUNTS (total / 24h / per-lane) are surfaced directly as COUNTS. Absent summary
+    // → 0 counts (a perfectly valid confirmed-but-zero state — a REAL server 0).
+    let summary = env.summary;
+    let raw = summary.as_ref().and_then(|s| s.pending_alice).unwrap_or(0.0);
+    let accepted_total = summary
+        .as_ref()
+        .and_then(|s| s.accepted_shares_total)
+        .unwrap_or(0);
+    let accepted_24h = summary
+        .as_ref()
+        .and_then(|s| s.accepted_shares_24h)
+        .unwrap_or(0);
+    let lanes: Vec<LaneCredit> = env
+        .lanes
+        .into_iter()
+        .filter_map(|l| {
+            // Require a key (the stable id) and an accepted count; a lane row with no
+            // key/accepted is dropped (we never fabricate a lane).
+            let key = l.key?;
+            let accepted = l.accepted.unwrap_or(0);
+            let label = l.label.unwrap_or_else(|| key.clone());
+            Some(LaneCredit { key, label, accepted })
+        })
+        .collect();
+    CreditState::Confirmed {
+        score: CreditScore::new(raw),
+        totals: CreditTotals { accepted_total, accepted_24h, lanes },
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -351,6 +490,27 @@ pub fn parse_credit_envelope(body: &str) -> CreditState {
 // dependency). The discipline + parser are wired so the fast-follow to a live
 // endpoint (Option 1) is a config flip, not a rewrite.
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The DEFAULT public read-API base for Source B. The acp central `read_api` serves
+/// `GET {base}/read/miner-lookup?address=<alice>` (PUBLIC, read-only, no-auth,
+/// credit-only — every payload asserts `paid_acu == "0"`). This is a clearly-marked
+/// CONFIGURABLE DEFAULT: the EXACT production host is confirmed by the human at
+/// deploy and is trivially overridden by [`ENV_READ_API_URL`] without a rebuild.
+//
+// NOTE(deploy): leave this as the public apex; the human confirms/wires the real
+// production read-API URL at deploy time (env override or a one-line change here).
+pub const READ_API_BASE_DEFAULT: &str = "https://api.aliceprotocol.org";
+
+/// Env override for the read-API base (test/ops/deploy). When set & non-empty it
+/// REPLACES [`READ_API_BASE_DEFAULT`]; still required to be `https://`.
+pub const ENV_READ_API_URL: &str = "ALICE_READ_API_URL";
+
+/// Connect + read timeout for the Source-B credit GET (~10 s, mirrors `pop.rs`).
+const CREDIT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Upper bound on the read-API response body. A `miner-lookup` payload is a few KiB;
+/// 256 KiB is generous (it carries timeseries/workers) yet caps a hostile response.
+const CREDIT_MAX_RESPONSE_BYTES: u64 = 256 * 1024;
 
 /// The base poll interval for Source B (PLAN §5 M5: "read-only poll, 30–60s").
 pub const CREDIT_POLL_BASE_SECS: u64 = 30;
@@ -404,8 +564,9 @@ impl PoolStatsClient {
         }
     }
 
-    /// A client pointed at a live public read-model base (fast-follow). Until such
-    /// a base is deployed + reachable this is unused in production.
+    /// A client pointed at a live public read-model base (the live path). The `base`
+    /// is the API apex (e.g. `https://api.aliceprotocol.org`); the client GETs
+    /// `{base}/read/miner-lookup?address=<addr>`.
     pub fn public_read_model(base: impl Into<String>) -> Self {
         Self {
             source: CreditSource::PublicReadModel { base: base.into() },
@@ -415,14 +576,30 @@ impl PoolStatsClient {
         }
     }
 
-    /// The URL this client would GET for `address` (fast-follow transport). Returns
-    /// `None` in the `NotExposed` configuration (there is nothing to fetch).
+    /// The production client: the read-API base from [`ENV_READ_API_URL`] (if set &
+    /// non-empty) else [`READ_API_BASE_DEFAULT`]. This is what the front-ends use so
+    /// the cumulative credit view is live; the exact host is a CONFIGURABLE DEFAULT
+    /// the human confirms at deploy (env override needs no rebuild).
+    pub fn public_default() -> Self {
+        let base = std::env::var(ENV_READ_API_URL)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| READ_API_BASE_DEFAULT.to_string());
+        Self::public_read_model(base)
+    }
+
+    /// The URL this client GETs for `address`. Returns `None` in the `NotExposed`
+    /// configuration (nothing to fetch). The path is the read-API contract path
+    /// `/read/miner-lookup?address=` (percent-encoded address).
     pub fn lookup_url(&self, address: &str) -> Option<String> {
         match &self.source {
             CreditSource::NotExposed => None,
             CreditSource::PublicReadModel { base } => {
                 let base = base.trim_end_matches('/');
-                Some(format!("{base}/miner-lookup?address={}", urlencode(address)))
+                Some(format!(
+                    "{base}/read/miner-lookup?address={}",
+                    urlencode(address)
+                ))
             }
         }
     }
@@ -485,6 +662,32 @@ impl PoolStatsClient {
         state
     }
 
+    /// Perform ONE real, best-effort, read-only credit poll for `address` (the live
+    /// Source-B transport). Single-flight (returns the current state without a fetch
+    /// if a poll is already in flight or the source never polls); off the mining hot
+    /// path; ~10 s timeout; small read cap. A reachable, clean envelope is parsed via
+    /// [`parse_credit_envelope`] (so the `paid_acu != "0"` DROP guard applies); a
+    /// transport failure surfaces `Error(Unreachable)`. NEVER panics, never blocks
+    /// the engine, never fabricates a value.
+    ///
+    /// Returns the resolved [`CreditState`] (also stored as `last_state`). A
+    /// watch-only / pasted address is fine here: the read API only needs the public
+    /// address to look up confirmed credit (no signing key required).
+    pub fn poll(&mut self, address: &str) -> CreditState {
+        if !self.begin_poll() {
+            // Already in flight, or NotExposed — surface the current best-known view.
+            return self.state();
+        }
+        let Some(url) = self.lookup_url(address) else {
+            // Shouldn't happen (begin_poll gated on polls_network), but fail-closed.
+            return self.fail();
+        };
+        match http_get_credit(&url) {
+            Ok(body) => self.complete(&body),
+            Err(_) => self.fail(),
+        }
+    }
+
     /// The current best-known credit state (for the UI between polls).
     pub fn state(&self) -> CreditState {
         self.last_state.clone()
@@ -518,6 +721,35 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Read-only HTTPS GET of the public read-API `miner-lookup` URL, returning the
+/// (capped) response body. Mirrors `pop.rs`'s ureq discipline: an https-only guard,
+/// a ~10 s connect+read timeout, and a small read cap on the body. NO auth header,
+/// NO secret, NO body — a plain public read. Any non-https URL, transport error, or
+/// non-2xx status is an `Err` (the caller surfaces `Error(Unreachable)`); we never
+/// panic and never block the mining hot path (the caller runs this off-thread).
+fn http_get_credit(url: &str) -> Result<String, String> {
+    // Fail closed on a non-https url (a credit lookup must never cross the wire in
+    // the clear). A misconfigured ALICE_READ_API_URL can otherwise sneak http in.
+    if !url.starts_with("https://") {
+        return Err(format!("refusing non-https read-api url: {url}"));
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(CREDIT_HTTP_TIMEOUT)
+        .timeout_read(CREDIT_HTTP_TIMEOUT)
+        .user_agent(concat!("alice-miner-credit/", env!("CARGO_PKG_VERSION")))
+        .build();
+    let resp = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(CREDIT_MAX_RESPONSE_BYTES)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read {url}: {e}"))?;
+    String::from_utf8(buf).map_err(|e| format!("utf8 {url}: {e}"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -554,11 +786,15 @@ impl Reconciliation {
     pub fn derive(activity: &LocalActivity, credit: &CreditState) -> Self {
         let active = activity.is_active();
         match (active, credit) {
-            (false, CreditState::Confirmed { score }) if score.is_some_credit() => {
+            (false, CreditState::Confirmed { score, totals })
+                if score.is_some_credit() || totals.has_any() =>
+            {
                 Reconciliation::ConfirmedIdle
             }
             (false, _) => Reconciliation::Idle,
-            (true, CreditState::Confirmed { score }) if score.is_some_credit() => {
+            (true, CreditState::Confirmed { score, totals })
+                if score.is_some_credit() || totals.has_any() =>
+            {
                 Reconciliation::InSync
             }
             (true, CreditState::Confirming) => Reconciliation::Confirming,
@@ -780,11 +1016,13 @@ mod tests {
             "summary": { "pending_alice": 0.0, "accepted_shares_total": 1284902 }
         }"#;
         match parse_credit_envelope(body) {
-            CreditState::Confirmed { score } => {
+            CreditState::Confirmed { score, totals } => {
                 // pending_alice was 0.0 (phase-J normal empty state) → a valid
                 // confirmed-but-zero score.
                 assert_eq!(score.raw(), 0.0);
                 assert!(!score.is_some_credit());
+                // The cumulative accepted-share COUNT is parsed from the summary.
+                assert_eq!(totals.accepted_total, 1_284_902);
             }
             other => panic!("expected Confirmed, got {other:?}"),
         }
@@ -796,11 +1034,129 @@ mod tests {
     fn source_b_confirms_positive_credit_score() {
         let body = r#"{"found":true,"paid_acu":"0","summary":{"pending_alice":12.56}}"#;
         match parse_credit_envelope(body) {
-            CreditState::Confirmed { score } => {
+            CreditState::Confirmed { score, .. } => {
                 assert!(score.is_some_credit());
                 assert!((score.raw() - 12.56).abs() < 1e-9);
             }
             other => panic!("expected Confirmed, got {other:?}"),
+        }
+    }
+
+    /// A CAPTURED full `/read/miner-lookup` envelope (the EXACT shape the acp
+    /// `read_api._build_miner_lookup` emits: `summary.accepted_shares_{total,24h}` +
+    /// the per-lane `lanes[]` breakdown incl. the NEW `main_pool_gpu_alpha` lane
+    /// alongside `main_pool_gpu_prl`) parses into the cumulative COUNT model. This is
+    /// the milestone's "parse a captured JSON into the credit model" proof.
+    #[test]
+    fn source_b_parses_cumulative_counts_and_lane_split() {
+        // Trimmed but field-faithful to read_api.py's miner-lookup payload.
+        let body = r#"{
+            "ok": true,
+            "query_address": "a2x7Kf3mNqLpV9wBcD4hJ8sR2tY6uE1nG5kM0aZ7RtY2qWp",
+            "normalized_address": "a2x7Kf3mNqLpV9wBcD4hJ8sR2tY6uE1nG5kM0aZ7RtY2qWp",
+            "found": true,
+            "contract_version": "alice-read-model-v2",
+            "read_only": true,
+            "paid_acu": "0",
+            "live_reward_enabled": false,
+            "payout_executor_enabled": false,
+            "chain_writes_enabled": false,
+            "summary": {
+                "hashrate_eq": "unavailable",
+                "accepted_shares_total": 873,
+                "accepted_shares_24h": 142,
+                "pending_alice": 0.0,
+                "paid_alice": 0.0,
+                "workers_online": 1,
+                "workers_total": 2,
+                "network_share_pct": 0.42
+            },
+            "lanes": [
+                {"key": "main_pool_gpu_alpha", "label": "GPU · Alpha", "algo": "pearlhash",
+                 "hashrate": "unavailable", "accepted": 500, "rejected": 0,
+                 "pending_alice": 0.0, "paid_alice": 0.0, "evidence_status": "ok"},
+                {"key": "main_pool_gpu_prl", "label": "GPU · PRL", "algo": "pearlhash",
+                 "hashrate": "unavailable", "accepted": 373, "rejected": 0,
+                 "pending_alice": 0.0, "paid_alice": 0.0, "evidence_status": "ok"}
+            ],
+            "payout_history": []
+        }"#;
+        match parse_credit_envelope(body) {
+            CreditState::Confirmed { score, totals } => {
+                // phase-J: pending_alice is 0 (a real server 0, not fabricated).
+                assert_eq!(score.raw(), 0.0);
+                // The cumulative + 24h COUNTS are parsed verbatim.
+                assert_eq!(totals.accepted_total, 873);
+                assert_eq!(totals.accepted_24h, 142);
+                // The per-lane breakdown carries BOTH GPU lanes with their labels.
+                assert_eq!(totals.lanes.len(), 2);
+                assert_eq!(totals.accepted_for_lane(LANE_KEY_GPU_ALPHA), 500);
+                assert_eq!(totals.accepted_for_lane(LANE_KEY_GPU_PRL), 373);
+                // 500 + 373 == 873 (the split reconciles with the total).
+                assert_eq!(
+                    totals.accepted_for_lane(LANE_KEY_GPU_ALPHA)
+                        + totals.accepted_for_lane(LANE_KEY_GPU_PRL),
+                    totals.accepted_total
+                );
+                // The GPU·Alpha lane keeps its display label for the UI.
+                let alpha = totals
+                    .lanes
+                    .iter()
+                    .find(|l| l.key == LANE_KEY_GPU_ALPHA)
+                    .unwrap();
+                assert_eq!(alpha.label, "GPU · Alpha");
+                assert!(totals.has_any());
+            }
+            other => panic!("expected Confirmed with totals, got {other:?}"),
+        }
+    }
+
+    /// A confirmed-but-zero pending score with a NON-zero accepted-share COUNT is
+    /// still "credit confirmed" (the COUNT view is what the cumulative display reads).
+    #[test]
+    fn source_b_zero_pending_but_nonzero_count_is_confirmed_credit() {
+        let body = r#"{"found":true,"paid_acu":"0",
+            "summary":{"pending_alice":0.0,"accepted_shares_total":42,"accepted_shares_24h":7}}"#;
+        let state = parse_credit_envelope(body);
+        assert!(state.has_confirmed_credit(), "nonzero count counts as confirmed");
+        let totals = state.totals().expect("Confirmed carries totals");
+        assert_eq!(totals.accepted_total, 42);
+        assert_eq!(totals.accepted_24h, 7);
+    }
+
+    /// THE #18 GUARD over the FULL count model: a `paid_acu != "0"` envelope that ALSO
+    /// carries cumulative counts + a lane split is dropped to `Error` — the COUNTS are
+    /// NOT surfaced either (the whole confirmed value, counts included, is dropped).
+    #[test]
+    fn source_b_paid_acu_violation_drops_counts_too() {
+        let body = r#"{"found":true,"paid_acu":"3.5",
+            "summary":{"pending_alice":9.0,"accepted_shares_total":1000,"accepted_shares_24h":50},
+            "lanes":[{"key":"main_pool_gpu_alpha","label":"GPU · Alpha","accepted":1000}]}"#;
+        let state = parse_credit_envelope(body);
+        assert_eq!(state, CreditState::Error { reason: CreditError::PaidAcuNotZero });
+        // The dropped counts are NOT reachable from the state (no totals on Error).
+        assert!(state.totals().is_none());
+        assert!(!state.has_confirmed_credit());
+    }
+
+    /// The live-default client points at the read-API `/read/miner-lookup` path and is
+    /// a real network poller (not the inert NotExposed stub). The env override swaps
+    /// the base with no rebuild.
+    #[test]
+    fn public_default_client_targets_read_miner_lookup_path() {
+        // Force a known base via the env override so the test is host-independent.
+        let prev = std::env::var(ENV_READ_API_URL).ok();
+        std::env::set_var(ENV_READ_API_URL, "https://read.example.test");
+        let c = PoolStatsClient::public_default();
+        assert!(c.polls_network(), "the live default is a real poller");
+        let url = c.lookup_url("a2x7Kf3mNqLpV9wBcD4hJ8sR2tY6uE1nG5kM0aZ7RtY2qWp").unwrap();
+        assert_eq!(
+            url,
+            "https://read.example.test/read/miner-lookup?address=a2x7Kf3mNqLpV9wBcD4hJ8sR2tY6uE1nG5kM0aZ7RtY2qWp"
+        );
+        match prev {
+            Some(v) => std::env::set_var(ENV_READ_API_URL, v),
+            None => std::env::remove_var(ENV_READ_API_URL),
         }
     }
 
@@ -878,7 +1234,10 @@ mod tests {
         assert_eq!(
             Reconciliation::derive(
                 &active,
-                &CreditState::Confirmed { score: CreditScore::new(5.0) }
+                &CreditState::Confirmed {
+                    score: CreditScore::new(5.0),
+                    totals: CreditTotals::default(),
+                }
             ),
             Reconciliation::InSync
         );
@@ -892,7 +1251,10 @@ mod tests {
         // Idle + Confirmed(nonzero) → confirmed-idle (positive, persists).
         let r = Reconciliation::derive(
             &idle,
-            &CreditState::Confirmed { score: CreditScore::new(5.0) },
+            &CreditState::Confirmed {
+                score: CreditScore::new(5.0),
+                totals: CreditTotals::default(),
+            },
         );
         assert_eq!(r, Reconciliation::ConfirmedIdle);
         assert!(r.is_positive());
@@ -954,7 +1316,8 @@ mod tests {
 
     #[test]
     fn public_read_model_client_builds_lookup_url_and_single_flights() {
-        let mut c = PoolStatsClient::public_read_model("https://api.aliceprotocol.org/read/");
+        // The base is the API APEX; the client appends the `/read/miner-lookup` path.
+        let mut c = PoolStatsClient::public_read_model("https://api.aliceprotocol.org/");
         assert!(c.polls_network());
         let url = c.lookup_url("a2x7Kf3+Lp/V9").unwrap();
         // The address is percent-encoded (the `+` and `/` must NOT pass through).

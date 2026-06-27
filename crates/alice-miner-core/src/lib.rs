@@ -63,8 +63,9 @@ pub(crate) static IDENTITY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::ne
 
 // Convenient top-level re-exports for the front-ends.
 pub use dashboard::{
-    CreditError, CreditScore, CreditSource, CreditState, DashboardModel, LaneActivity,
-    LocalActivity, PoolStatsClient, Reconciliation,
+    CreditError, CreditScore, CreditSource, CreditState, CreditTotals, DashboardModel, LaneActivity,
+    LaneCredit, LocalActivity, PoolStatsClient, Reconciliation, LANE_KEY_GPU_ALPHA,
+    LANE_KEY_GPU_PRL,
 };
 pub use detect::capability::{CapabilityProfile, LaneSupport, LaneViability};
 pub use detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};

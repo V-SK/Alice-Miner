@@ -345,7 +345,7 @@ fn fetch_pending_text(alice_address: &str) -> Option<String> {
 fn pending_text_from_envelope(body: &str) -> Option<String> {
     use crate::dashboard::{CreditState, parse_credit_envelope};
     match parse_credit_envelope(body) {
-        CreditState::Confirmed { score } => {
+        CreditState::Confirmed { score, .. } => {
             // Word-only: confirm there IS pending credit, without minting a fiat
             // figure. `CreditScore` deliberately has NO `Display` (so a careless
             // `{score}` can't leak a number); use its honest pending label.
