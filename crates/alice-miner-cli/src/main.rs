@@ -42,6 +42,7 @@ use alice_miner_core::engine::{Command as EngineCommand, Event, IdentitySpec};
 use alice_miner_core::{EngineHandle, EngineState, GpuSelection, Lane, Snapshot};
 
 mod dashboard;
+mod fleet;
 mod pidfile;
 
 // ── Exit codes ──────────────────────────────────────────────────────────────
@@ -135,6 +136,22 @@ enum Command {
         --lane xmr    the lane to background (xmr only today; GPU needs a follow-up)\n\
         --at-login    also start mining automatically at login/boot")]
     Service(ServiceArgs),
+
+    /// Aggregate several miners (same Alice address) into one local roster.
+    #[command(long_about = "Watch several miner instances reporting to the same Alice address as\n\
+        one LOCAL roster — no server. Each miner emits its `--json` Snapshot stream to\n\
+        stdout; redirect each to a file, then pass those files here:\n\
+        \n\
+            alice-miner start --lane prl --json > rig-a.jsonl   (on box A)\n\
+            alice-miner start --lane xmr --json > rig-b.jsonl   (on box B, synced/NFS)\n\
+            alice-miner fleet rig-a.jsonl rig-b.jsonl\n\
+        \n\
+        Reads the LAST complete Snapshot line from each file and prints a roster keyed\n\
+        by worker id (lane, hashrate, shares A/R, accepted %, state, failovers,\n\
+        last-seen). Refreshes on an interval until Ctrl-C; --once prints one frame.\n\
+        A missing / partial / garbage source is shown as a dim `no data` row (never a\n\
+        panic). Activity only — credit-only, like the live dashboard.")]
+    Fleet(FleetArgs),
 }
 
 #[derive(clap::Args)]
@@ -278,6 +295,19 @@ struct ServiceArgs {
     json: bool,
 }
 
+#[derive(clap::Args)]
+struct FleetArgs {
+    /// One or more `--json` stream files (each fed by a miner's `start --json`).
+    #[arg(value_name = "PATH", required = true)]
+    paths: Vec<std::path::PathBuf>,
+    /// Print one roster frame and exit (no live refresh loop).
+    #[arg(long)]
+    once: bool,
+    /// Refresh interval in seconds for the live loop (ignored with --once).
+    #[arg(long, default_value_t = 2, value_name = "SECONDS")]
+    interval_s: u64,
+}
+
 fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
@@ -287,6 +317,11 @@ fn main() {
         Command::Start(args) => cmd_start(args),
         Command::Stop(args) => cmd_stop(args),
         Command::Service(args) => cmd_service(args),
+        Command::Fleet(args) => fleet::run(
+            &args.paths,
+            args.once,
+            std::time::Duration::from_secs(args.interval_s.max(1)),
+        ),
     };
     std::process::exit(code);
 }
