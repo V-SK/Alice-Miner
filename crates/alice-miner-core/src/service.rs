@@ -57,22 +57,37 @@ pub enum ServiceState {
     NotInstalled,
 }
 
-/// The CLI `--lane` token for a lane that can run in the background WITHOUT a
-/// stored secret, or an error for one that can't yet. XMR is the secret-free
-/// background lane; a GPU lane needs the (not-yet-shipped) Keychain keyring.
+/// The CLI `--lane` token a background unit runs (the SAME token the CLI accepts).
+/// The unit NEVER carries a secret: a GPU pearlhash lane's unlock password lives in the
+/// OS keyring ([`crate::keyring`]) and is read by the `--from-service` start. The
+/// keyring-availability gate is [`require_backgroundable`], enforced at install time.
 fn background_lane_arg(lane: Lane) -> Result<&'static str, String> {
-    match lane {
-        Lane::Xmr => Ok("xmr"),
-        // Every GPU lane (incl. GPU-Alpha, which needs the wallet unlock for its
-        // out-of-band PoP) is NOT secret-free, so it cannot background via launchd —
-        // use the one-click terminal launcher for GPU persistence instead.
-        Lane::GpuPrl | Lane::GpuAlpha | Lane::GpuRvn => Err(
-            "background mining for a GPU lane needs the keystore unlock stored in the OS \
-             keychain (a follow-up). The CPU-XMR lane runs in the background today with no \
-             stored secret — switch to XMR for background mining, or keep the window open."
+    Ok(lane.cli_lane_arg())
+}
+
+/// Gate a background INSTALL for `lane`: a GPU **pearlhash** lane (`GpuPrl`/`GpuAlpha`)
+/// needs the OS keyring to hold its wallet-unlock password, since the unit carries no
+/// secret. Refuse with an honest message when no keyring is available — e.g. a headless
+/// Linux rig with no Secret Service — so we never write an unusable unit (CPU-XMR is
+/// secret-free and always passes). The caller stores the password via
+/// [`crate::keyring::store_unlock_password`] AFTER this returns Ok.
+pub fn require_backgroundable(lane: Lane) -> Result<(), String> {
+    require_backgroundable_with(lane, crate::keyring::is_available())
+}
+
+/// Testable core of [`require_backgroundable`] with the keyring-availability decision
+/// injected (so the gate can be exercised without a real keyring on the box).
+fn require_backgroundable_with(lane: Lane, keyring_available: bool) -> Result<(), String> {
+    if lane.is_prl_lane() && !keyring_available {
+        return Err(
+            "background mining for a GPU lane needs an OS keyring (macOS Keychain / Windows \
+             Credential Manager / Linux Secret Service) to hold your wallet unlock — none is \
+             available on this box (a headless Linux rig has no desktop keyring). Use CPU-XMR \
+             for background mining, or keep the miner window open for the GPU lane."
                 .to_string(),
-        ),
+        );
     }
+    Ok(())
 }
 
 /// Minimal XML text escape for the few values we interpolate into the plist (the
@@ -544,14 +559,21 @@ mod tests {
         assert!(xml.contains("<key>RunAtLoad</key>\n    <false/>"));
     }
 
-    /// A GPU lane is refused (no secret store yet) with an honest message — so we
-    /// can never accidentally try to background a lane that needs the keystore.
+    /// A GPU pearlhash lane now renders a unit (its unlock lives in the OS keyring, not
+    /// the unit) — and that unit STILL carries no secret. The `--lane` token matches the
+    /// CLI's, and the secret stays out of the world-readable definition.
     #[test]
-    fn gpu_lane_background_is_refused_until_keyring() {
-        for lane in [Lane::GpuPrl, Lane::GpuRvn] {
+    fn gpu_lane_units_render_with_lane_token_and_no_secret() {
+        for lane in [Lane::GpuPrl, Lane::GpuAlpha] {
             let spec = ServiceSpec { lane, cli_path: PathBuf::from("/x/alice-miner-cli"), run_at_login: true };
-            let err = launchd_plist_xml(&spec).expect_err("GPU background refused");
-            assert!(err.contains("keychain") || err.contains("keystore"), "got: {err}");
+            let plist = launchd_plist_xml(&spec).expect("GPU plist renders");
+            assert!(
+                plist.contains(&format!("<string>{}</string>", lane.cli_lane_arg())),
+                "carries the lane token: {plist}"
+            );
+            assert_no_secret(&plist, "gpu plist");
+            assert_no_secret(&systemd_unit(&spec).unwrap(), "gpu systemd unit");
+            assert_no_secret(&windows_task_xml(&spec).unwrap(), "gpu windows task");
         }
     }
 
@@ -637,20 +659,19 @@ mod tests {
         let _ = std::fs::remove_file(&small);
     }
 
-    /// Every backend's definition refuses a GPU lane (needs the keyring) — so no
-    /// platform can accidentally background a lane that needs the keystore secret.
+    /// The install GATE: a GPU pearlhash lane is refused when no OS keyring is available
+    /// (e.g. a headless Linux rig), and allowed when one is; CPU-XMR never needs it.
     #[test]
-    fn all_backends_refuse_gpu_lane_until_keyring() {
-        for lane in [Lane::GpuPrl, Lane::GpuRvn] {
-            let spec = ServiceSpec { lane, cli_path: PathBuf::from("/x/alice-miner-cli"), run_at_login: true };
-            for (name, res) in [
-                ("launchd", launchd_plist_xml(&spec)),
-                ("systemd", systemd_unit(&spec)),
-                ("schtasks", windows_task_xml(&spec)),
-            ] {
-                let err = res.expect_err(&format!("{name} must refuse a GPU lane"));
-                assert!(err.contains("keychain") || err.contains("keystore"), "{name}: {err}");
-            }
+    fn require_backgroundable_gates_gpu_on_keyring() {
+        // No keyring → both pearlhash lanes refused with the honest message.
+        for lane in [Lane::GpuPrl, Lane::GpuAlpha] {
+            let err = require_backgroundable_with(lane, false).expect_err("refused without keyring");
+            assert!(err.contains("keyring") || err.contains("Keychain"), "{lane:?}: {err}");
         }
+        // Keyring available → allowed.
+        assert!(require_backgroundable_with(Lane::GpuPrl, true).is_ok());
+        assert!(require_backgroundable_with(Lane::GpuAlpha, true).is_ok());
+        // CPU-XMR is secret-free → always allowed, keyring or not.
+        assert!(require_backgroundable_with(Lane::Xmr, false).is_ok());
     }
 }

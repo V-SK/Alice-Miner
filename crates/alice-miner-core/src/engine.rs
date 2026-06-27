@@ -610,7 +610,7 @@ fn run_identity(spec: IdentitySpec) -> Result<(Identity, Option<String>), String
 ///
 /// The returned `WalletSecrets` zeroizes its seed on the last clone's drop; the
 /// caller hands ONE clone to the lane (+ its refresh task) and drops the rest.
-fn resolve_prl_secrets(password: Option<&str>) -> Result<alice_crypto::WalletSecrets, String> {
+pub fn resolve_prl_secrets(password: Option<&str>) -> Result<alice_crypto::WalletSecrets, String> {
     let pointer = identity::load_pointer().ok_or(
         "no reward identity: create/import an identity (the GPU-PRL lane needs a \
          wallet key to prove possession)",

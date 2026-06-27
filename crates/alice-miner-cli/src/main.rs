@@ -258,12 +258,21 @@ struct ServiceArgs {
     /// Print whether the agent is installed / running (the default action).
     #[arg(long, conflicts_with_all = ["install", "uninstall"])]
     status: bool,
-    /// Which lane to background (xmr only today — a GPU lane needs the keychain).
+    /// Which lane to background: `xmr` (secret-free), or a GPU pearlhash lane
+    /// (`prl`/`alpha`/`gpu`/`auto`) whose wallet unlock is stored in the OS keyring.
     #[arg(long, default_value = "xmr", value_name = "LANE")]
     lane: String,
     /// Also start mining automatically at login / boot (launchd RunAtLoad).
     #[arg(long)]
     at_login: bool,
+    /// Keystore passphrase for a GPU lane (validated, then stored in the OS keyring so
+    /// the background agent can unlock without a prompt). Omit to be prompted; INSECURE
+    /// on the command line (visible in `ps`) — prefer the prompt or `--password-stdin`.
+    #[arg(long, value_name = "PASS")]
+    password: Option<String>,
+    /// Read the GPU keystore passphrase from the first line of STDIN.
+    #[arg(long)]
+    password_stdin: bool,
     /// Machine-readable status output.
     #[arg(long)]
     json: bool,
@@ -308,6 +317,11 @@ fn cmd_service(args: ServiceArgs) -> i32 {
     }
 
     if args.uninstall {
+        // Best-effort: drop any background-unlock password stored for the current
+        // identity (idempotent; a no-op if XMR-only / nothing was stored).
+        if let Some(addr) = alice_miner_core::identity::load_pointer().map(|p| p.address) {
+            let _ = alice_miner_core::keyring::delete_unlock_password(&addr);
+        }
         return match service::uninstall() {
             Ok(()) => {
                 println!("Background mining removed.");
@@ -338,6 +352,42 @@ fn cmd_service(args: ServiceArgs) -> i32 {
     if let Some(pid) = pidfile::read_pid() {
         if pidfile::is_alive(pid) {
             let _ = pidfile::stop_pid(pid, std::time::Duration::from_secs(8));
+        }
+    }
+    // A GPU pearlhash lane needs an OS keyring to hold its unlock (the unit carries no
+    // secret). Refuse early on a box without one (e.g. a headless Linux rig).
+    if let Err(e) = service::require_backgroundable(lane) {
+        eprintln!("error: {e}");
+        return EXIT_USAGE;
+    }
+    // For a pearlhash lane, resolve + VALIDATE the keystore passphrase against the
+    // active identity, then stash it in the OS keyring (keyed to that address) so the
+    // `--from-service` start can unlock without a prompt and without a secret in the
+    // unit. Validation reuses the exact unlock the background start will perform, so a
+    // wrong password (or a watch-only identity) is caught HERE, not after install.
+    if lane.is_prl_lane() {
+        let Some(addr) = alice_miner_core::identity::load_pointer().map(|p| p.address) else {
+            eprintln!(
+                "error: no identity yet — create or import one (`identity --create`) before \
+                 backgrounding a GPU lane."
+            );
+            return EXIT_USAGE;
+        };
+        let pw = match resolve_password(args.password.clone(), args.password_stdin) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return EXIT_USAGE;
+            }
+        };
+        // Unlock to validate (the returned secrets zeroize on drop — we keep nothing).
+        if let Err(e) = alice_miner_core::engine::resolve_prl_secrets(Some(&pw)) {
+            eprintln!("error: {e}");
+            return EXIT_USAGE;
+        }
+        if let Err(e) = alice_miner_core::keyring::store_unlock_password(&addr, &pw) {
+            eprintln!("error: {e}");
+            return EXIT_RUNTIME;
         }
     }
     let spec = ServiceSpec { lane, cli_path, run_at_login: args.at_login };
@@ -731,7 +781,31 @@ fn cmd_start(args: StartArgs) -> i32 {
     // `Lane::start_needs_unlock` rule the GUI modal + engine `prl_in_play` use, so the
     // three can never drift (the GpuAlpha-can't-start bug). XMR / RVN pass None.
     let prl_in_play = lane.start_needs_unlock(args.dual);
-    let unlock_password = if prl_in_play {
+    let unlock_password = if !prl_in_play {
+        None
+    } else if args.from_service {
+        // The background agent has no TTY to prompt: read the unlock from the OS keyring
+        // (stored at `service --install` time), keyed to the active identity.
+        let Some(addr) = alice_miner_core::identity::load_pointer().map(|p| p.address) else {
+            eprintln!("error: background GPU start found no identity to unlock");
+            return EXIT_RUNTIME;
+        };
+        match alice_miner_core::keyring::get_unlock_password(&addr) {
+            Ok(Some(pw)) => Some(pw.as_str().to_string()),
+            Ok(None) => {
+                eprintln!(
+                    "error: no background unlock is stored in the OS keyring for this identity \
+                     — re-run `alice-miner-cli service --install --lane {}`.",
+                    lane.cli_lane_arg()
+                );
+                return EXIT_RUNTIME;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return EXIT_RUNTIME;
+            }
+        }
+    } else {
         match resolve_password(args.password.clone(), args.password_stdin) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -739,8 +813,6 @@ fn cmd_start(args: StartArgs) -> i32 {
                 return EXIT_USAGE;
             }
         }
-    } else {
-        None
     };
 
     if let Err(e) = engine.send(EngineCommand::Start {
