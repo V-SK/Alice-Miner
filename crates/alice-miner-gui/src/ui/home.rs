@@ -416,12 +416,16 @@ fn error_banner(ui: &mut egui::Ui, app: &MinerApp) {
         });
 }
 
-/// The lane row beneath the device line: the SELECTED lane as a filled chip,
-/// plus the *other* lane as either a selectable chip (when runnable on this
-/// device) or a muted "coming soon" / "Apple → XMR" chip (when not). The GPU
-/// chip is **PRL** — the GPU mainline (V: "GPU 主线 = PRL,展示不隐藏"). On a
-/// non-NVIDIA/AMD Mac the PRL chip reads "PRL · needs NVIDIA/AMD GPU" and is
-/// inert, while XMR stays selected — the honest viability behaviour.
+/// The lane row beneath the device line: the CPU-XMR chip plus a selectable chip
+/// for each runnable GPU **engine** on this device. The two pearlhash lanes —
+/// **PRL** (SRBMiner → herominers relay) and **Alpha** (AlphaMiner → AlphaPool
+/// relay) — earn the SAME reward and are a genuine ENGINE CHOICE on a Turing+
+/// NVIDIA box where BOTH run: both render as live, selectable chips, with the
+/// device's RECOMMENDED engine pre-selected so one-click still "just works" and the
+/// miner can switch. On Volta/V100 only Alpha is runnable (SRBMiner can't run there),
+/// so only that GPU chip shows — cleanly, not as "coming soon". On a non-GPU Mac no
+/// GPU chip is runnable, so a single muted PRL chip shows the honest "needs
+/// NVIDIA/AMD GPU" reason and XMR stays selected (the prior CPU-only behaviour).
 fn lane_selector(ui: &mut egui::Ui, app: &mut MinerApp) {
     let selected = app.active_lane();
     // While a run is in flight, the lane is locked (can't switch under a child).
@@ -429,12 +433,22 @@ fn lane_selector(ui: &mut egui::Ui, app: &mut MinerApp) {
         app.state(),
         EngineState::Running | EngineState::Starting | EngineState::Stopping
     );
-    // Deterministic order: XMR then PRL (the GPU mainline).
-    let lanes = [Lane::Xmr, Lane::GpuPrl];
+    // The runnable GPU engines to OFFER (recommended-first). Empty on a non-GPU /
+    // undetected box. When BOTH pearlhash engines run this is the PRL-vs-Alpha pick.
+    let offered = app.offered_gpu_lanes();
+    // XMR always leads; then each offered GPU engine. When no GPU engine is runnable
+    // we still show a single muted PRL chip so the "needs NVIDIA/AMD GPU" reason is
+    // honest (the prior behaviour on a CPU-only / Apple box).
+    let mut lanes: Vec<Lane> = vec![Lane::Xmr];
+    if offered.is_empty() {
+        lanes.push(Lane::GpuPrl);
+    } else {
+        lanes.extend(offered);
+    }
     let pick = std::cell::Cell::new(None);
     centered(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 7.0;
-        for lane in lanes {
+        for &lane in &lanes {
             let support = app.lane_support(lane);
             let is_sel = lane == selected;
             let resp = lane_chip(ui, lane, support, is_sel, locked);

@@ -574,7 +574,10 @@ impl MinerApp {
     /// is unchanged for those cases — the no-regression contract).
     pub fn show_gpu_selector(&self) -> bool {
         self.gpu_devices().len() >= 2
-            && matches!(self.selected_lane, Lane::GpuPrl | Lane::GpuRvn)
+            && matches!(
+                self.selected_lane,
+                Lane::GpuPrl | Lane::GpuAlpha | Lane::GpuRvn
+            )
     }
 
     /// Toggle the checkbox for the card at position `idx` (a no-op when out of
@@ -634,6 +637,33 @@ impl MinerApp {
                 }
             }
         }
+    }
+
+    /// The ordered list of GPU lanes to OFFER in the Home lane selector, given the
+    /// detected device. The two pearlhash lanes — [`Lane::GpuPrl`] (SRBMiner →
+    /// herominers relay, CC≥7.5) and [`Lane::GpuAlpha`] (AlphaMiner → AlphaPool
+    /// relay, Volta+) — earn the SAME reward and are a genuine ENGINE CHOICE on a
+    /// Turing+ NVIDIA box where BOTH run; on Volta/V100 only Alpha runs, on AMD only
+    /// PRL runs. We surface every GPU lane the matrix marks **runnable** (so the
+    /// choice is visible + selectable), ordered with the device's RECOMMENDED lane
+    /// first — that's the one [`set_device`] pre-selects, so one-click still "just
+    /// works" and the miner can switch to the other engine. The legacy GPU-RVN lane
+    /// is intentionally NOT offered here (kept exactly as before — it's reachable via
+    /// the CLI / env only, never auto-recommended).
+    ///
+    /// Returns an empty list on a non-GPU / undetected box (XMR-only) — the selector
+    /// then shows just the CPU lane, unchanged.
+    pub fn offered_gpu_lanes(&self) -> Vec<Lane> {
+        // The pearlhash engine pair, in a stable base order (PRL, then Alpha).
+        const GPU_PEARLHASH: [Lane; 2] = [Lane::GpuPrl, Lane::GpuAlpha];
+        let recommended = self.viability.as_ref().map(|v| v.recommended);
+        let mut lanes: Vec<Lane> = GPU_PEARLHASH
+            .into_iter()
+            .filter(|&l| self.lane_support(l).is_runnable())
+            .collect();
+        // Recommended GPU lane first (so the pre-selected/one-click engine leads).
+        lanes.sort_by_key(|&l| if Some(l) == recommended { 0 } else { 1 });
+        lanes
     }
 
     /// Select `lane` to mine (only honoured if the lane is runnable). Marks the
@@ -1489,6 +1519,146 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             warnings: vec![],
         });
         assert!(app.dual_viable(), "NVIDIA box → dual enabled (two viable lanes)");
+    }
+
+    // ── GPU-engine CHOICE in the Home lane selector (A3) ──────────────────────
+
+    /// A simulated Volta/V100 NVIDIA box (CC 7.0): SRBMiner can't run, so GPU-PRL is
+    /// Unavailable and GPU-Alpha is the runnable GPU engine.
+    fn volta_device() -> alice_miner_core::detect::DeviceProfile {
+        use alice_miner_core::detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
+        DeviceProfile {
+            os: OsFamily::Linux,
+            arch: "x86_64".into(),
+            apple_silicon: false,
+            logical_cores: 16,
+            cpu_model: "Intel Xeon".into(),
+            gpu: GpuInfo {
+                vendor: GpuVendor::Nvidia,
+                model: "Tesla V100-PCIE-16GB".into(),
+                vram_gb: 16,
+                gpus: Vec::new(),
+                max_compute_cap_x10: Some(70),
+            },
+            memory_gb: 64,
+            display: "Intel Xeon · 16 cores".into(),
+            warnings: vec![],
+        }
+    }
+
+    /// An AMD box: SRBMiner supports AMD (GPU-PRL runnable) but alpha-miner is
+    /// NVIDIA-CUDA only (GPU-Alpha Unavailable).
+    fn amd_device() -> alice_miner_core::detect::DeviceProfile {
+        use alice_miner_core::detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
+        DeviceProfile {
+            os: OsFamily::Linux,
+            arch: "x86_64".into(),
+            apple_silicon: false,
+            logical_cores: 16,
+            cpu_model: "AMD Ryzen".into(),
+            gpu: GpuInfo {
+                vendor: GpuVendor::Amd,
+                model: "AMD Radeon RX 7900 XTX".into(),
+                vram_gb: 24,
+                gpus: Vec::new(),
+                max_compute_cap_x10: None,
+            },
+            memory_gb: 64,
+            display: "AMD Ryzen · 16 cores".into(),
+            warnings: vec![],
+        }
+    }
+
+    fn apple_device() -> alice_miner_core::detect::DeviceProfile {
+        use alice_miner_core::detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
+        DeviceProfile {
+            os: OsFamily::Macos,
+            arch: "aarch64".into(),
+            apple_silicon: true,
+            logical_cores: 12,
+            cpu_model: "Apple M2 Max".into(),
+            gpu: GpuInfo { vendor: GpuVendor::Apple, model: "Apple M2 Max".into(), vram_gb: 0, gpus: Vec::new(), max_compute_cap_x10: None },
+            memory_gb: 32,
+            display: "Apple M2 Max · 12 cores".into(),
+            warnings: vec![],
+        }
+    }
+
+    /// THE GPU-ENGINE-CHOICE GATE (A3): on a Turing+ NVIDIA box BOTH pearlhash
+    /// engines are OFFERED as a selectable choice, with the device's RECOMMENDED
+    /// engine (GPU-PRL) first + pre-selected (one-click "just works"); the miner can
+    /// switch to the other engine (GPU-Alpha). On Volta only Alpha is offered; on AMD
+    /// only PRL; on a non-GPU box none. The recommended one is always defaulted, and
+    /// switching to the override engine sticks across a re-detect.
+    #[test]
+    fn gpu_engine_choice_offered_and_recommended_defaulted() {
+        let mut app = MinerApp::new().expect("engine spawns");
+
+        // Turing+ NVIDIA (CC 8.6): BOTH engines runnable → both offered, PRL first.
+        app.set_device(nvidia_device());
+        assert_eq!(
+            app.offered_gpu_lanes(),
+            vec![Lane::GpuPrl, Lane::GpuAlpha],
+            "Turing+ NVIDIA offers BOTH pearlhash engines, recommended (PRL) first"
+        );
+        // The recommended engine is the pre-selected default (one-click just works).
+        assert_eq!(app.selected_lane, Lane::GpuPrl, "PRL is the auto-default");
+        assert!(!app.lane_user_picked, "auto-default is not a manual pick");
+
+        // The miner can SWITCH to the other engine (Alpha) — both are runnable.
+        app.select_lane(Lane::GpuAlpha);
+        assert_eq!(app.selected_lane, Lane::GpuAlpha, "switched to the Alpha engine");
+        assert!(app.lane_user_picked, "switching marks a manual pick");
+        // A re-detect of the same box must NOT override the user's chosen engine.
+        app.set_device(nvidia_device());
+        assert_eq!(
+            app.selected_lane,
+            Lane::GpuAlpha,
+            "a manual engine pick survives re-detect"
+        );
+
+        // Volta/V100 (CC 7.0): SRBMiner can't run → only Alpha offered, Alpha
+        // recommended/defaulted (a fresh app so lane_user_picked is false).
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(volta_device());
+        assert_eq!(
+            app.offered_gpu_lanes(),
+            vec![Lane::GpuAlpha],
+            "Volta offers only the Alpha engine (SRBMiner can't run there)"
+        );
+        assert_eq!(app.selected_lane, Lane::GpuAlpha, "Alpha is the Volta default");
+
+        // AMD: SRBMiner supports AMD, alpha-miner does not → only PRL offered.
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(amd_device());
+        assert_eq!(
+            app.offered_gpu_lanes(),
+            vec![Lane::GpuPrl],
+            "AMD offers only the PRL engine (alpha-miner is NVIDIA-only)"
+        );
+        assert_eq!(app.selected_lane, Lane::GpuPrl, "PRL is the AMD default");
+
+        // Apple/CPU-only: no runnable GPU engine → none offered, XMR defaulted.
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(apple_device());
+        assert!(
+            app.offered_gpu_lanes().is_empty(),
+            "no runnable GPU engine on Apple → none offered"
+        );
+        assert_eq!(app.selected_lane, Lane::Xmr, "Apple defaults to CPU-XMR");
+    }
+
+    /// The multi-GPU picker must show for ALL three GPU lanes (PRL, Alpha, RVN), so
+    /// an Alpha-engine miner on a ≥2-card box can still scope which cards mine.
+    #[test]
+    fn gpu_selector_shows_for_the_alpha_engine_too() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(multigpu_device(2));
+        app.select_lane(Lane::GpuAlpha);
+        assert!(
+            app.show_gpu_selector(),
+            "≥2 GPUs + the Alpha engine → the multi-GPU picker shows"
+        );
     }
 
     // ── Change reward address (post-onboarding) ───────────────────────────────

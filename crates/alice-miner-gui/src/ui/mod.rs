@@ -24,8 +24,13 @@ use eframe::egui::Color32;
 pub fn lane_chip_label(lane: Lane) -> &'static str {
     match lane {
         Lane::Xmr => "XMR · RandomX",
+        // The two pearlhash GPU lanes are a CHOICE on a Turing+ NVIDIA box — they
+        // earn the SAME reward, differing only by engine + relay. PRL = SRBMiner →
+        // herominers relay; Alpha = AlphaMiner → AlphaPool relay (and the only GPU
+        // option on Volta/V100, where SRBMiner can't run). The Alpha label no longer
+        // reads "(V100)" since it's now a general engine pick, not Volta-only.
         Lane::GpuPrl => "PRL · pearlhash",
-        Lane::GpuAlpha => "Alpha · pearlhash (V100)",
+        Lane::GpuAlpha => "Alpha · pearlhash (AlphaPool)",
         Lane::GpuRvn => "RVN · KawPoW",
     }
 }
