@@ -955,21 +955,26 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
         });
 }
 
-/// The Settings → Background mining panel. A single "keep mining when the window
-/// is closed" toggle that installs/removes the launchd LaunchAgent for the CPU-XMR
-/// lane via the (tested) `core::service` API. The reward address is read from the
-/// keystore at runtime and never written into the service definition. Rendered on
-/// every platform (so the field/method references aren't dead code off macOS); the
-/// toggle is enabled only where a backend exists (macOS today) and otherwise shows
-/// an honest "coming soon".
+/// The Settings → Background mining panel. A "keep mining when the window is closed"
+/// toggle that installs/removes the per-OS background agent (launchd / systemd `--user`
+/// / Task Scheduler) via the (tested) `core::service` API. The reward address is read
+/// from the keystore at runtime and never written into the service definition.
+///
+/// The background lane mirrors the SELECTED lane: a chosen GPU **pearlhash** lane is
+/// backgrounded when the box has an OS keyring (to hold its wallet unlock for the
+/// secret-free `--from-service` start); otherwise the secret-free CPU-XMR lane runs.
+/// When a GPU lane is selected on a box WITHOUT a keyring, the toggle stays disabled
+/// with the honest "needs an OS keyring" explainer (never a silent XMR fallback).
+/// Enabling a GPU lane opens the background-unlock modal to capture + store the
+/// password; XMR enables with no prompt.
 fn render_background_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
     use alice_miner_core::service::ServiceState;
-    // macOS is the only platform with a background backend today; on Windows/Linux
-    // the toggle is shown disabled with a "coming soon" note (service::install
-    // would return a clear "not supported yet" error anyway).
-    let supported = cfg!(target_os = "macos");
-    // Lazily query the state once (spawns launchctl on macOS; a cheap stub
-    // elsewhere) and cache it.
+    // Every platform now has a real background backend (launchd / systemd / Task
+    // Scheduler) — the toggle is enabled wherever the SELECTED lane is backgroundable.
+    let bg_lane = app.background_target_lane();
+    let toggle_enabled = app.background_toggle_enabled();
+    let disabled_reason = app.background_disabled_reason();
+    // Lazily query the state once (spawns launchctl/systemctl/schtasks) and cache it.
     if app.bg_service.is_none() {
         app.refresh_bg_service();
     }
@@ -982,14 +987,10 @@ fn render_background_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
         srow(
             ui,
             "Keep mining when closed",
-            "Runs the CPU (XMR) lane in the background so mining continues after you close the \
+            "Runs your selected lane in the background so mining continues after you close the \
              window, and restarts at login. Your reward address stays in the keystore — it is \
              never written into the background service.",
             |ui| {
-                if !supported {
-                    ui.label(RichText::new("macOS only for now").size(12.0).color(THEME.text3));
-                    return;
-                }
                 let (label, fill, ink, stroke) = if on {
                     ("Turn off", THEME.well, THEME.text2, THEME.line_strong)
                 } else {
@@ -1000,7 +1001,10 @@ fn render_background_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                     .stroke(egui::Stroke::new(1.0, stroke))
                     .corner_radius(9)
                     .min_size(egui::vec2(0.0, 32.0));
-                if ui.add(btn).clicked() {
+                // Disable the "Turn on" affordance when the selected lane can't be
+                // backgrounded here (GPU lane, no keyring); "Turn off" is always live.
+                let clickable = on || toggle_enabled;
+                if ui.add_enabled(clickable, btn).clicked() {
                     if on {
                         do_disable = true;
                     } else {
@@ -1009,15 +1013,32 @@ fn render_background_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                 }
             },
         );
-        let (word, tone) = match (supported, state) {
-            (false, _) => ("Windows/Linux background mining is on the way", THEME.text3),
-            (true, ServiceState::Running) => ("On — mining in the background", THEME.live),
-            (true, ServiceState::Loaded) => ("On — installed (the miner will keep retrying)", THEME.warn),
-            (true, ServiceState::NotInstalled) => ("Off", THEME.text3),
+        // The lane the background service will run, so the user knows what backgrounds.
+        srow(
+            ui,
+            "Lane",
+            "The lane the background service will mine (mirrors your selection).",
+            |ui| {
+                ui.label(RichText::new(bg_lane.label()).size(12.5).color(THEME.text2));
+            },
+        );
+        let (word, tone) = match state {
+            ServiceState::Running => ("On — mining in the background", THEME.live),
+            ServiceState::Loaded => ("On — installed (the miner will keep retrying)", THEME.warn),
+            ServiceState::NotInstalled => ("Off", THEME.text3),
         };
         srow(ui, "Status", "Background agent state.", |ui| {
             ui.label(RichText::new(word).size(12.5).color(tone));
         });
+        // Honest explainer when a GPU lane is selected but no keyring is available —
+        // we refuse rather than silently background XMR. Only shown while OFF.
+        if !on {
+            if let Some(reason) = &disabled_reason {
+                srow(ui, "Why disabled", "This GPU lane needs an OS keyring.", |ui| {
+                    ui.label(RichText::new(reason).size(11.5).color(THEME.text3));
+                });
+            }
+        }
         if let Some(err) = app.bg_service_error.clone() {
             srow(ui, "Last error", "The toggle action reported this.", |ui| {
                 ui.label(RichText::new(err).size(11.5).color(THEME.err));

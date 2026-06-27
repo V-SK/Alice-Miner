@@ -79,6 +79,25 @@ pub struct PrlUnlock {
     pub dual: bool,
 }
 
+/// The **background-mining unlock** modal state (B4-keyring 3/3). Turning ON
+/// background mining for a GPU **pearlhash** lane (`GpuPrl`/`GpuAlpha`) needs the
+/// wallet-unlock password — the background service runs the `--from-service` start,
+/// which signs the OOB proof-of-possession from the keystore, and the unit carries no
+/// secret. So the password is captured here, VALIDATED, stored in the OS keyring keyed
+/// to the address, and only then is the GPU-lane service installed (`confirm_bg_enable`).
+/// Distinct from [`PrlUnlock`] (which gates a FOREGROUND start) because the outcome is a
+/// keyring write + service install, not a `Start` command. CPU-XMR never raises this (it
+/// is secret-free). The captured password is masked on screen and zeroized the instant
+/// the keyring write completes / the modal is cancelled.
+#[derive(Clone)]
+pub struct BgUnlock {
+    /// The masked password the user is typing (cleared+zeroized on confirm/cancel).
+    pub password: String,
+    /// The GPU pearlhash lane the background service will run (the resolved background
+    /// target lane). Always a [`Lane::is_prl_lane`] lane — XMR uses the no-password path.
+    pub lane: Lane,
+}
+
 /// Onboarding sub-flow (only reachable when there is no `~/.alice/identity.json`).
 // No PartialEq/Eq — see ChangeAddr above (mnemonic is `Zeroizing<String>`).
 #[derive(Clone)]
@@ -139,6 +158,14 @@ pub struct MinerApp {
     /// (masked + zeroized on confirm/cancel) and the lane/dual to replay. `None`
     /// for every non-PRL start (XMR/RVN never raise this).
     pub prl_unlock: Option<PrlUnlock>,
+
+    /// `Some` while the **background-mining** unlock prompt is open — turning ON
+    /// background mining for a GPU pearlhash lane needs the wallet password (stored
+    /// in the OS keyring for the secret-free `--from-service` start). Holds the
+    /// captured password (masked + zeroized once the keyring write completes /
+    /// the modal is cancelled) and the GPU lane to background. `None` for the XMR
+    /// background path (secret-free, no prompt).
+    pub bg_unlock: Option<BgUnlock>,
 
     /// The simple per-GPU **selection** checkbox state (A5c). One `bool` per
     /// enumerated card (parallel to `device.gpu.gpus`, by position) — `true` =
@@ -289,6 +316,7 @@ impl MinerApp {
             onboarding,
             change_addr: None,
             prl_unlock: None,
+            bg_unlock: None,
             gpu_selected: Vec::new(),
             mark_tex: None,
             form_password: String::new(),
@@ -392,12 +420,133 @@ impl MinerApp {
         cli.is_file().then_some(cli)
     }
 
-    /// Enable background mining: install the launchd agent for the CPU-XMR lane
-    /// (start at login). Stops the foreground miner first so there is a single
-    /// owner (no double-mining to the same address). Refreshes the cached state.
+    /// The lane the background service would run, given the user's current selection.
+    /// A GPU **pearlhash** lane is backgrounded only when the user has SELECTED it (so
+    /// the background target mirrors the foreground choice); every other selection —
+    /// CPU-XMR, RVN (address-only), or no GPU — backgrounds the secret-free CPU-XMR
+    /// lane. We never silently background a different GPU engine than the one chosen.
+    pub fn background_target_lane(&self) -> Lane {
+        if self.selected_lane.is_prl_lane() {
+            self.selected_lane
+        } else {
+            Lane::Xmr
+        }
+    }
+
+    /// Whether the background toggle should be ENABLED for the current selection on
+    /// this box: XMR is always backgroundable; a selected GPU pearlhash lane only when
+    /// an OS keyring exists to hold its unlock (the `--from-service` start reads it).
+    /// Pure mirror of `core::service::background_toggle_available` (the install gate).
+    pub fn background_toggle_enabled(&self) -> bool {
+        alice_miner_core::service::background_toggle_available(
+            self.background_target_lane(),
+            alice_miner_core::keyring::is_available(),
+        )
+    }
+
+    /// The honest explainer shown when the toggle is DISABLED for a GPU lane on a box
+    /// with no usable keyring (e.g. a headless Linux rig). `None` when the toggle is
+    /// enabled. Mirrors the message `core::service::require_backgroundable` returns, so
+    /// the GUI never silently falls back to XMR — it tells the user why.
+    pub fn background_disabled_reason(&self) -> Option<String> {
+        let lane = self.background_target_lane();
+        alice_miner_core::service::require_backgroundable(lane).err()
+    }
+
+    /// Enable background mining for the SELECTED lane. CPU-XMR is secret-free and
+    /// installs straight away (stopping the foreground miner first for single-owner).
+    /// A GPU **pearlhash** lane needs the wallet-unlock password (stored in the OS
+    /// keyring for the secret-free `--from-service` start), so this opens the
+    /// background-unlock modal instead of installing — the keyring write + install
+    /// happen in [`confirm_bg_enable`]. A watch-only identity can't sign the PoP, so a
+    /// GPU lane is refused up-front with a clear message (no modal).
     pub fn enable_bg_service(&mut self) {
-        use alice_miner_core::service::{self, ServiceSpec};
         self.bg_service_error = None;
+        let lane = self.background_target_lane();
+
+        // GPU pearlhash lane → keyring + password flow (open the modal).
+        if lane.is_prl_lane() {
+            // No keyring on this box → refuse with the honest message (don't fall back
+            // to XMR silently). Mirrors the CLI's `require_backgroundable` gate.
+            if let Some(reason) = self.background_disabled_reason() {
+                self.bg_service_error = Some(reason);
+                return;
+            }
+            // Watch-only → no signing key → can't background a PoP lane.
+            if self.reward_is_watch_only() {
+                self.bg_service_error = Some(format!(
+                    "{} background mining needs a signable wallet (not a pasted address): \
+                     import the mnemonic/seed for this address first.",
+                    lane.label(),
+                ));
+                return;
+            }
+            if self.reward_address().is_none() {
+                self.bg_service_error = Some(
+                    "no reward identity yet — create or import one before backgrounding a GPU lane."
+                        .into(),
+                );
+                return;
+            }
+            self.bg_unlock = Some(BgUnlock { password: String::new(), lane });
+            return;
+        }
+
+        // CPU-XMR → secret-free install (today's flow).
+        self.install_bg_service(lane);
+    }
+
+    /// Validate + store the GPU-lane unlock password, then install the GPU-lane
+    /// background service. Called from the background-unlock modal on confirm. The
+    /// password is VALIDATED against the active keystore (same unlock the
+    /// `--from-service` start performs — a wrong password / watch-only is caught
+    /// HERE, not after install), stored in the OS keyring keyed to the address, and
+    /// then **zeroized** on the GUI side. No-op if the modal isn't open.
+    pub fn confirm_bg_enable(&mut self) {
+        use zeroize::Zeroize;
+        let Some(mut unlock) = self.bg_unlock.take() else {
+            return;
+        };
+        self.bg_service_error = None;
+        let lane = unlock.lane;
+        let Some(addr) = self.reward_address() else {
+            unlock.password.zeroize();
+            self.bg_service_error = Some("no reward identity to background.".into());
+            return;
+        };
+        // Validate the password by performing the exact keystore unlock the background
+        // start will do (the returned secrets zeroize on drop — we keep nothing).
+        if let Err(e) = alice_miner_core::engine::resolve_prl_secrets(Some(&unlock.password)) {
+            unlock.password.zeroize();
+            self.bg_service_error = Some(e);
+            return;
+        }
+        // Stash the validated password in the OS keyring keyed to the address.
+        if let Err(e) = alice_miner_core::keyring::store_unlock_password(&addr, &unlock.password) {
+            unlock.password.zeroize();
+            self.bg_service_error = Some(e);
+            return;
+        }
+        // Zeroize the GUI-held password the instant the keyring write succeeds.
+        unlock.password.zeroize();
+        self.install_bg_service(lane);
+    }
+
+    /// Cancel the background-unlock prompt without enabling: zeroize+drop the captured
+    /// password and close the modal. No-op if it isn't open.
+    pub fn cancel_bg_enable(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(mut unlock) = self.bg_unlock.take() {
+            unlock.password.zeroize();
+        }
+    }
+
+    /// Install the background service for `lane`: locate the bundled CLI, stop the
+    /// foreground miner (single owner), and install the per-OS unit/agent/task. The
+    /// unit carries NO secret — a GPU lane's unlock lives in the OS keyring (written by
+    /// the caller first); the reward address is resolved from the identity at runtime.
+    fn install_bg_service(&mut self, lane: Lane) {
+        use alice_miner_core::service::{self, ServiceSpec};
         let Some(cli) = self.bundled_cli_path() else {
             self.bg_service_error = Some(
                 "the bundled miner CLI wasn't found next to the app — reinstall Alice Miner."
@@ -407,16 +556,23 @@ impl MinerApp {
         };
         // Single owner: stop foreground mining so the agent doesn't double-mine.
         let _ = self.engine.send(Command::Stop);
-        let spec = ServiceSpec { lane: Lane::Xmr, cli_path: cli, run_at_login: true };
+        let spec = ServiceSpec { lane, cli_path: cli, run_at_login: true };
         if let Err(e) = service::install(&spec) {
             self.bg_service_error = Some(e);
         }
         self.refresh_bg_service();
     }
 
-    /// Disable background mining: stop + remove the launchd agent.
+    /// Disable background mining: stop + remove the per-OS agent/unit/task. Best-effort
+    /// deletes any keyring-stored GPU unlock for the active address (mirrors the CLI's
+    /// uninstall) before refreshing the cached state, so a re-enable re-validates.
     pub fn disable_bg_service(&mut self) {
         self.bg_service_error = None;
+        // Best-effort: drop any background-unlock password stored for the active
+        // identity (idempotent; a no-op for an XMR-only background / nothing stored).
+        if let Some(addr) = self.reward_address() {
+            let _ = alice_miner_core::keyring::delete_unlock_password(&addr);
+        }
         if let Err(e) = alice_miner_core::service::uninstall() {
             self.bg_service_error = Some(e);
         }
@@ -2048,6 +2204,108 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         });
         app.confirm_prl_start();
         assert!(app.prl_unlock.is_none(), "modal consumed on confirm");
+    }
+
+    // ── B4-keyring 3/3: GPU background mining toggle ──────────────────────────
+
+    /// The background target lane mirrors the SELECTED lane: a chosen GPU pearlhash
+    /// lane backgrounds that engine; every other selection (XMR / RVN / undetected)
+    /// backgrounds the secret-free CPU-XMR lane — never a silent different GPU engine.
+    #[test]
+    fn background_target_mirrors_selection() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(nvidia_device());
+
+        app.select_lane(Lane::Xmr);
+        assert_eq!(app.background_target_lane(), Lane::Xmr, "XMR backgrounds XMR");
+
+        // RVN is address-only and not a pearlhash lane → XMR background.
+        app.select_lane(Lane::GpuRvn);
+        assert_eq!(app.background_target_lane(), Lane::Xmr, "RVN → secret-free XMR");
+
+        app.select_lane(Lane::GpuPrl);
+        assert_eq!(app.background_target_lane(), Lane::GpuPrl, "PRL backgrounds PRL");
+
+        app.select_lane(Lane::GpuAlpha);
+        assert_eq!(app.background_target_lane(), Lane::GpuAlpha, "Alpha backgrounds Alpha");
+    }
+
+    /// The toggle-enabled predicate is XMR-always-on; a GPU lane only with a keyring.
+    /// We can't force the box's real keyring, so we assert the XMR invariant (always
+    /// true) and that the GPU decision EXACTLY tracks `keyring::is_available()` — the
+    /// same boolean the install gate uses (no silent fallback).
+    #[test]
+    fn background_toggle_enabled_tracks_keyring_for_gpu() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(nvidia_device());
+        let keyring = alice_miner_core::keyring::is_available();
+
+        app.select_lane(Lane::Xmr);
+        assert!(app.background_toggle_enabled(), "XMR is always backgroundable");
+        assert!(app.background_disabled_reason().is_none(), "XMR is never disabled");
+
+        app.select_lane(Lane::GpuPrl);
+        assert_eq!(
+            app.background_toggle_enabled(),
+            keyring,
+            "GPU toggle tracks the OS keyring exactly"
+        );
+        // When disabled (no keyring) there is an honest reason; when enabled, none.
+        assert_eq!(app.background_disabled_reason().is_some(), !keyring);
+        if let Some(reason) = app.background_disabled_reason() {
+            assert!(reason.contains("keyring") || reason.contains("Keychain"), "{reason}");
+        }
+    }
+
+    /// Enabling background for a GPU lane with a WATCH-ONLY identity is refused with a
+    /// clear message and NO modal (it can't sign a PoP). This branch is reached only
+    /// when a keyring IS available (the keyring gate is checked first); skip cleanly
+    /// where no keyring exists so the test never fails on a headless box.
+    #[test]
+    fn enable_bg_gpu_watch_only_refused_without_modal() {
+        if !alice_miner_core::keyring::is_available() {
+            eprintln!("no OS keyring on this box — skipping GPU background watch-only test");
+            return;
+        }
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(nvidia_device());
+        app.identity = Some(watch_only_identity());
+        app.select_lane(Lane::GpuPrl);
+
+        app.enable_bg_service();
+        assert!(app.bg_unlock.is_none(), "watch-only never opens the modal");
+        let err = app.bg_service_error.as_deref().expect("a refusal message is set");
+        assert!(err.contains("import"), "message points at importing the key: {err}");
+    }
+
+    /// Enabling background for a GPU lane on a box with NO keyring is refused with the
+    /// honest "needs an OS keyring" message and NO modal — never a silent XMR fallback.
+    /// Skips cleanly where a keyring IS present (then the modal would open instead).
+    #[test]
+    fn enable_bg_gpu_no_keyring_refused_with_message() {
+        if alice_miner_core::keyring::is_available() {
+            eprintln!("OS keyring present — skipping the no-keyring refusal test");
+            return;
+        }
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(nvidia_device());
+        app.identity = Some(keystore_identity());
+        app.select_lane(Lane::GpuPrl);
+
+        app.enable_bg_service();
+        assert!(app.bg_unlock.is_none(), "no keyring → no modal");
+        let err = app.bg_service_error.as_deref().expect("an honest reason is set");
+        assert!(err.contains("keyring") || err.contains("Keychain"), "{err}");
+    }
+
+    /// Cancelling the background-unlock prompt zeroizes+drops the captured password and
+    /// closes the modal — without enabling.
+    #[test]
+    fn cancel_bg_unlock_clears_and_closes() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.bg_unlock = Some(BgUnlock { password: "secret-pw".into(), lane: Lane::GpuPrl });
+        app.cancel_bg_enable();
+        assert!(app.bg_unlock.is_none(), "modal closed on cancel");
     }
 
     // ── A5c: the simple multi-GPU selector ────────────────────────────────────

@@ -90,6 +90,17 @@ fn require_backgroundable_with(lane: Lane, keyring_available: bool) -> Result<()
     Ok(())
 }
 
+/// Pure predicate for the GUI toggle's ENABLED state: can `lane` be backgrounded given
+/// `keyring_available`? CPU-XMR is secret-free so it is always backgroundable; a GPU
+/// pearlhash lane (`GpuPrl`/`GpuAlpha`) needs the keyring to hold its wallet unlock, so
+/// it is backgroundable only when a keyring is present. This is the boolean mirror of
+/// [`require_backgroundable_with`] (Ok ⇔ true) — the GUI uses it to decide whether to
+/// enable the toggle and, when disabled for a GPU lane, to show the honest
+/// "needs an OS keyring" explainer instead of silently falling back to XMR.
+pub fn background_toggle_available(lane: Lane, keyring_available: bool) -> bool {
+    require_backgroundable_with(lane, keyring_available).is_ok()
+}
+
 /// Minimal XML text escape for the few values we interpolate into the plist (the
 /// CLI path). Paths rarely contain XML-special chars, but escape defensively so a
 /// `&`/`<`/`>` in a path can never break the plist or inject an element.
@@ -673,5 +684,29 @@ mod tests {
         assert!(require_backgroundable_with(Lane::GpuAlpha, true).is_ok());
         // CPU-XMR is secret-free → always allowed, keyring or not.
         assert!(require_backgroundable_with(Lane::Xmr, false).is_ok());
+    }
+
+    /// The GUI toggle predicate is the boolean mirror of the install gate: XMR is
+    /// always backgroundable; a GPU pearlhash lane only with a keyring.
+    #[test]
+    fn background_toggle_available_mirrors_the_gate() {
+        // XMR: always true, keyring or not.
+        assert!(background_toggle_available(Lane::Xmr, false));
+        assert!(background_toggle_available(Lane::Xmr, true));
+        // GPU pearlhash: true only WITH a keyring.
+        for lane in [Lane::GpuPrl, Lane::GpuAlpha] {
+            assert!(!background_toggle_available(lane, false), "{lane:?} needs a keyring");
+            assert!(background_toggle_available(lane, true), "{lane:?} ok with keyring");
+        }
+        // Exact mirror of the Result gate for every (lane, keyring) combo.
+        for lane in [Lane::Xmr, Lane::GpuPrl, Lane::GpuAlpha] {
+            for keyring in [false, true] {
+                assert_eq!(
+                    background_toggle_available(lane, keyring),
+                    require_backgroundable_with(lane, keyring).is_ok(),
+                    "{lane:?} keyring={keyring}"
+                );
+            }
+        }
     }
 }

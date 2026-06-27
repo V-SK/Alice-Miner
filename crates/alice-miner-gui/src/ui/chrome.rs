@@ -74,6 +74,23 @@ pub fn render(ui_root: &mut egui::Ui, app: &mut MinerApp) {
                             super::prl_unlock::render(ui, app);
                         });
                 }
+
+                // The background-mining unlock-password modal — same overlay
+                // treatment. Opened by `enable_bg_service` when the SELECTED lane is a
+                // GPU pearlhash lane and the box has an OS keyring (the password is
+                // stored there for the secret-free `--from-service` background start).
+                if app.bg_unlock.is_some() {
+                    let panel = ui.max_rect();
+                    egui::Area::new(egui::Id::new("bg-unlock-modal"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(panel.min)
+                        .default_size(panel.size())
+                        .show(ui.ctx(), |ui| {
+                            ui.set_min_size(panel.size());
+                            ui.set_max_size(panel.size());
+                            super::bg_unlock::render(ui, app);
+                        });
+                }
             }
         });
 }

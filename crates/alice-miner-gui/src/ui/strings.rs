@@ -153,6 +153,24 @@ pub const PRL_UNLOCK_CONFIRM: &str = "Unlock & start";
 pub const PRL_UNLOCK_NOTE: &str =
     "Your password unlocks the local signing key and is wiped right after.";
 
+// ── Background-mining unlock (B4-keyring 3/3) ─────────────────────────────────
+/// Turning ON background mining for a GPU pearlhash lane needs the wallet password,
+/// which is stored in the OS keyring (macOS Keychain / Windows Credential Manager /
+/// Linux Secret Service) so the secret-free background service can sign the
+/// proof-of-possession. These label the modal that captures it (masked + zeroized the
+/// instant the keyring write completes). NO reward vocabulary — purely a key-unlock.
+pub const BG_UNLOCK_EYEBROW: &str = "Background mining";
+pub const BG_UNLOCK_TITLE: &str = "Unlock to mine in the background";
+pub const BG_UNLOCK_SUB: &str =
+    "Background GPU mining proves you hold this address (a signature). Enter your wallet \
+     password — it is stored in your OS keyring (Keychain / Credential Manager / Secret \
+     Service) so the background service can sign locally. It never leaves this device.";
+/// The confirm (enable) button.
+pub const BG_UNLOCK_CONFIRM: &str = "Unlock & enable";
+/// A small reassurance under the field.
+pub const BG_UNLOCK_NOTE: &str =
+    "Your password is saved in the OS keyring (not on disk) and wiped from the app right after.";
+
 // ── M5 dashboard depth: Source A (activity) / Source B (server-confirmed) ─────
 /// Source-A section eyebrow + caption — this is LOCAL ACTIVITY, explicitly NOT
 /// earnings (the brief's hard separation).
