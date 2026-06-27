@@ -458,14 +458,11 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
                 // password surfaces a clear error and the lane never starts (no
                 // earning without PoP). The secrets/password drop at the end of
                 // the start (the lane + refresh task own their own clone).
-                // PRL needs the signing key. It is in play for a single PRL start,
-                // and for dual-mine whose GPU partner is the PRL mainline (anything
-                // but an explicit RVN selection — see `start_run`'s `gpu_lane`).
-                let prl_in_play = if dual {
-                    lane != Lane::GpuRvn
-                } else {
-                    lane.is_prl_lane() // GpuPrl OR GpuAlpha — both sign the OOB M4 PoP
-                };
+                // PRL needs the signing key. It is in play for a single pearlhash start
+                // (GpuPrl OR GpuAlpha), and for a dual-mine whose GPU partner is a
+                // pearlhash lane (anything but an explicit RVN selection). One shared
+                // rule with the GUI modal + CLI prompt so the three can never drift.
+                let prl_in_play = lane.start_needs_unlock(dual);
                 let secrets = if prl_in_play {
                     match resolve_prl_secrets(unlock_password.as_deref()) {
                         Ok(s) => Some(s),
@@ -680,9 +677,11 @@ fn start_run(
 
     if dual {
         // Both lanes together. XMR gets `cores-2` headroom; the GPU lane runs full.
-        // The GPU partner is the PRL **mainline** (PoP-gated → `secrets` are threaded
-        // into its start) unless RVN was explicitly selected (legacy, address-only).
-        let gpu_lane = if lane == Lane::GpuRvn { Lane::GpuRvn } else { Lane::GpuPrl };
+        // The GPU partner is the user's explicitly-selected GPU lane (so a Volta/V100
+        // box dual-mines via AlphaMiner, and an RVN selection stays RVN), defaulting to
+        // the PRL **mainline** for a CPU-XMR selection. Pearlhash partners are PoP-gated
+        // → `secrets` are threaded into the start; RVN is address-only.
+        let gpu_lane = lane.dual_gpu_partner();
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let xmr_threads = dual_xmr_threads(cores);
         // CPU-XMR ignores GPU selection (pass All); the GPU partner (PRL mainline,
@@ -730,6 +729,25 @@ fn start_one_lane(
     secrets: Option<alice_crypto::WalletSecrets>,
     gpus: &GpuSelection,
 ) -> Result<(LaneSupervisor, Option<Arc<AtomicU8>>), String> {
+    // A4 defensive CC guard: SRBMiner pearlhash needs CUDA compute capability ≥ 7.5
+    // (Turing+). The CLI/GUI gate this advisorily, but a direct Start — the in-window
+    // engine, a dual partner, or a misuse path — must NOT spawn SRBMiner on a Volta card
+    // it physically cannot run on. `detect()` already folds in the operator override +
+    // force (`ALICE_MINER_LANES[_FORCE]`), so a *forced* GpuPrl stays runnable and is NOT
+    // refused here; we refuse only when the resolved viability says it can't run, and
+    // redirect to the Alpha lane (which covers Volta/V100). Refuse BEFORE RTT probing.
+    if lane == Lane::GpuPrl {
+        let cap = crate::CapabilityProfile::detect();
+        if !cap.support(Lane::GpuPrl).is_runnable() {
+            return Err(format!(
+                "GPU-PRL (SRBMiner) can't run on this GPU: {}. Use the Alpha lane \
+                 (`--lane alpha`) — AlphaMiner covers Volta/V100.",
+                cap.viability
+                    .reason(Lane::GpuPrl)
+                    .unwrap_or("compute capability below 7.5"),
+            ));
+        }
+    }
     // GPU-PRL targets the region relays ordered by lowest RTT (operator override /
     // probe / US-first fallback); every other lane uses its compiled plan.
     let plan = if lane == Lane::GpuPrl {
@@ -901,11 +919,20 @@ fn start_one_lane(
             // state (credit-only — a status, never a value).
             let status = Arc::new(AtomicU8::new(enroll_status::PENDING));
             spawn_prl_enroll_task(sup.clone(), address.clone(), secrets.clone(), status.clone());
-            // The OOB-allowlist refresh currently targets the GPU-PRL (herominers)
-            // relay; the GPU-Alpha relay's refresh ships with its alpha PoP gate (a
-            // follow-up), so spawn it only for GPU-PRL today. `secrets` is moved here
-            // for GPU-PRL, or dropped for GPU-Alpha.
-            if lane == Lane::GpuPrl {
+            // OOB-allowlist refresh: re-OOB-verify the (address, device) before the
+            // relay's TTL (~1800s) lapses, or the lane silently stops being credited
+            // after ~25min. The task is lane-agnostic (it targets the lane's CURRENT
+            // region host via the same port-free `establish_pop` control plane), so it
+            // serves BOTH the GPU-PRL (herominers :3340) and GPU-Alpha (AlphaPool :3341)
+            // relays — the alpha PoP gate has shipped. Skip it only when the alpha lane
+            // runs with PoP disabled (the lab escape hatch: no allowlist entry exists to
+            // refresh). `secrets` is moved here, or dropped when skipped.
+            let refresh_pop = match lane {
+                Lane::GpuPrl => true,
+                Lane::GpuAlpha => !alpha_pop_disabled(),
+                _ => false,
+            };
+            if refresh_pop {
                 spawn_pop_refresh_task(sup.clone(), address.clone(), secrets);
             }
             prl_enroll = Some(status);

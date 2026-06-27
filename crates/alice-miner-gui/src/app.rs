@@ -867,12 +867,15 @@ impl MinerApp {
         }
     }
 
-    /// Whether a Start of the resolved lane needs the wallet UNLOCK password (a
-    /// proof-of-possession signature). True iff the resolved lane is GPU-PRL — the
-    /// only lane the engine gates on `resolve_prl_secrets` (XMR/RVN are
-    /// address-only). Pure + testable; mirrors `engine.rs` `prl_in_play`.
+    /// Whether a Start of the resolved lane needs the wallet UNLOCK password (the OOB
+    /// M4 proof-of-possession signature). True iff the EFFECTIVE pearlhash lane runs —
+    /// either pearlhash lane single (`GpuPrl` OR `GpuAlpha`), or a dual-mine whose GPU
+    /// partner is pearlhash. Delegates to [`Lane::start_needs_unlock`] — the SAME rule
+    /// the engine's `prl_in_play` and the CLI prompt use, so they can never drift (the
+    /// GpuAlpha-can't-start bug). XMR/RVN are address-only.
     pub fn start_needs_prl_password(&self) -> bool {
-        self.resolved_start_lane() == Lane::GpuPrl
+        let dual = self.dual_requested && self.dual_viable();
+        self.resolved_start_lane().start_needs_unlock(dual)
     }
 
     /// True when the engine reports Running but no hashrate has materialised yet
@@ -924,11 +927,11 @@ impl MinerApp {
         // Non-PRL lanes send Start{unlock_password: None} straight away (unchanged).
         if self.start_needs_prl_password() {
             if self.reward_is_watch_only() {
-                self.error = Some(
-                    "GPU · PRL needs a signable wallet (not a pasted address): import \
-                     the mnemonic/seed for this address, then start PRL."
-                        .into(),
-                );
+                self.error = Some(format!(
+                    "{} needs a signable wallet (not a pasted address): import the \
+                     mnemonic/seed for this address, then start mining.",
+                    lane.label(),
+                ));
                 return;
             }
             // Keystore-backed → prompt for the unlock password.
@@ -1829,9 +1832,10 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         }
     }
 
-    /// The PoP-needed predicate: only the GPU-PRL lane raises the unlock prompt;
-    /// XMR/RVN are address-only. Computed from the RESOLVED lane (what Start would
-    /// actually launch), so it mirrors the engine's `prl_in_play`.
+    /// The PoP-needed predicate: BOTH pearlhash lanes (GPU-PRL SRBMiner AND GPU-Alpha
+    /// AlphaMiner) raise the unlock prompt; XMR/RVN are address-only. Computed from the
+    /// RESOLVED lane (what Start would actually launch), so it mirrors the engine's
+    /// `prl_in_play`. The GpuAlpha case is the V100-can't-start regression guard.
     #[test]
     fn start_needs_prl_password_only_for_resolved_prl_lane() {
         let mut app = MinerApp::new().expect("engine spawns");
@@ -1845,6 +1849,12 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
 
         app.select_lane(Lane::GpuPrl);
         assert!(app.start_needs_prl_password(), "PRL signs a PoP → needs the key");
+
+        app.select_lane(Lane::GpuAlpha);
+        assert!(
+            app.start_needs_prl_password(),
+            "Alpha (V100) signs the OOB PoP → needs the key (the can't-start bug)"
+        );
     }
 
     /// Starting PRL with a KEYSTORE-backed identity opens the unlock-password modal

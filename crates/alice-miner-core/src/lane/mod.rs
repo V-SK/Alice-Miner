@@ -58,6 +58,33 @@ impl Lane {
         matches!(self, Lane::GpuPrl | Lane::GpuAlpha)
     }
 
+    /// The GPU lane to pair with CPU-XMR in a **dual-mine** run, given the user's
+    /// SELECTED lane. An explicitly chosen GPU lane (`GpuPrl`/`GpuAlpha`/`GpuRvn`) is
+    /// honoured verbatim — so a **Volta/V100 box dual-mines via AlphaMiner**, not the
+    /// SRBMiner mainline it can't run — while a CPU-XMR selection defaults to the
+    /// `GpuPrl` mainline. (The engine still viability-gates the partner at start, so
+    /// an unrunnable default surfaces an honest error, never a silent half-run.)
+    pub fn dual_gpu_partner(self) -> Lane {
+        match self {
+            Lane::Xmr => Lane::GpuPrl,
+            gpu => gpu,
+        }
+    }
+
+    /// Whether a Start needs the wallet UNLOCK password (the OOB M4 proof-of-possession
+    /// signature): true iff the EFFECTIVE pearlhash lane will run — the selected lane,
+    /// or (under dual-mine) the GPU partner XMR is paired with. This is the SINGLE
+    /// source of truth shared by the GUI unlock modal, the CLI password prompt, and the
+    /// engine's `prl_in_play`, so the three can never drift (the GpuAlpha-can't-start
+    /// class of bug). XMR / RVN (incl. an RVN dual partner) need no unlock.
+    pub fn start_needs_unlock(self, dual: bool) -> bool {
+        if dual {
+            self.dual_gpu_partner().is_prl_lane()
+        } else {
+            self.is_prl_lane()
+        }
+    }
+
     /// The exact `--lane` token the headless CLI (`alice-miner-cli start --lane …`)
     /// accepts for this lane. Distinct from [`Lane::id`] because the CLI's `gpu`
     /// alias means the PRL **mainline**, so `GpuRvn` must spell `rvn` (its `id()` of
@@ -183,6 +210,32 @@ mod gpu_selection_tests {
         // Guard the RVN footgun explicitly: id() collides with the CLI's PRL alias.
         assert_eq!(Lane::GpuRvn.id(), "gpu");
         assert_ne!(Lane::GpuRvn.cli_lane_arg(), Lane::GpuRvn.id());
+    }
+
+    #[test]
+    fn dual_gpu_partner_honours_explicit_gpu_lane() {
+        // CPU-XMR selection → the GPU-PRL mainline (unchanged default).
+        assert_eq!(Lane::Xmr.dual_gpu_partner(), Lane::GpuPrl);
+        // An explicitly chosen GPU lane is honoured verbatim — Volta dual-mines Alpha.
+        assert_eq!(Lane::GpuAlpha.dual_gpu_partner(), Lane::GpuAlpha);
+        assert_eq!(Lane::GpuPrl.dual_gpu_partner(), Lane::GpuPrl);
+        assert_eq!(Lane::GpuRvn.dual_gpu_partner(), Lane::GpuRvn);
+    }
+
+    #[test]
+    fn start_needs_unlock_covers_both_pearlhash_lanes_single_and_dual() {
+        // Single-lane: BOTH pearlhash lanes need the unlock (the GpuAlpha-start bug).
+        assert!(Lane::GpuPrl.start_needs_unlock(false));
+        assert!(Lane::GpuAlpha.start_needs_unlock(false));
+        assert!(!Lane::Xmr.start_needs_unlock(false));
+        assert!(!Lane::GpuRvn.start_needs_unlock(false));
+        // Dual: keyed on the GPU PARTNER, so a CPU-XMR selection still unlocks (its
+        // partner is the PRL mainline), and an Alpha selection unlocks; only an
+        // explicit RVN partner needs no unlock.
+        assert!(Lane::Xmr.start_needs_unlock(true));
+        assert!(Lane::GpuAlpha.start_needs_unlock(true));
+        assert!(Lane::GpuPrl.start_needs_unlock(true));
+        assert!(!Lane::GpuRvn.start_needs_unlock(true));
     }
 
     #[test]

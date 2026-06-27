@@ -677,7 +677,9 @@ fn cmd_start(args: StartArgs) -> i32 {
     if args.dual {
         let runnable = cap.viability.runnable_lanes();
         if runnable.len() < 2 {
-            let gpu = Lane::GpuPrl; // dual's GPU partner is the PRL mainline
+            // Report the GPU partner this selection would actually pair (Alpha on a
+            // Volta box), not a hardcoded PRL, so the honest reason matches the device.
+            let gpu = lane.dual_gpu_partner();
             eprintln!(
                 "error: dual-mine needs 2 viable lanes; this device has {} ({} is {}: {}). \
                  Run a single lane instead, e.g. `alice-miner start --lane {}`.",
@@ -716,11 +718,13 @@ fn cmd_start(args: StartArgs) -> i32 {
     // to find us, and Ctrl-C still works.
     let pid_guard = pidfile::PidGuard::acquire();
 
-    // GPU-PRL needs the wallet password to unlock the signing key for PoP. Resolve
-    // it (stdin / flag / interactive prompt) when PRL is in play: a single PRL start,
-    // or a dual-mine whose GPU partner is the PRL mainline (anything but an explicit
-    // RVN selection). Mirrors `engine.rs` `prl_in_play`. XMR / RVN pass None.
-    let prl_in_play = if args.dual { lane != Lane::GpuRvn } else { lane == Lane::GpuPrl };
+    // A pearlhash lane needs the wallet password to unlock the signing key for the OOB
+    // M4 PoP. Resolve it (stdin / flag / interactive prompt) when a pearlhash lane is in
+    // play: a single GpuPrl OR GpuAlpha start, or a dual-mine whose GPU partner is
+    // pearlhash (anything but an explicit RVN selection). Delegates to the SAME
+    // `Lane::start_needs_unlock` rule the GUI modal + engine `prl_in_play` use, so the
+    // three can never drift (the GpuAlpha-can't-start bug). XMR / RVN pass None.
+    let prl_in_play = lane.start_needs_unlock(args.dual);
     let unlock_password = if prl_in_play {
         match resolve_password(args.password.clone(), args.password_stdin) {
             Ok(p) => Some(p),

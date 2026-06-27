@@ -51,11 +51,17 @@ pub const ENV_ALPHA_PLACEHOLDER: &str = "ALICE_ALPHA_PLACEHOLDER_ADDRESS";
 
 /// The default placeholder `prl1` (overridable via [`ENV_ALPHA_PLACEHOLDER`]). It is
 /// a PUBLIC, relay-rewritten stand-in — NOT the foundation collection address (which
-/// never lives in the client). **V supplies the canonical checksum-valid published
-/// placeholder before the alpha lane mines live** (decision: the published
-/// placeholder the relay rewrites).
+/// never lives in the client, per the honesty invariant above).
+///
+/// This is a **deterministic burn address**: a Taproot (witness v1) output over an
+/// all-zeros 32-byte program, bech32m-encoded for the `prl` HRP. It is a
+/// syntactically valid `prl1` (so alpha-miner's bech32 checksum check passes) yet is
+/// provably NOT a real collection target (no known key, the relay rewrites it server
+/// side before any share counts). V may swap in a branded published placeholder at
+/// any time via this const or [`ENV_ALPHA_PLACEHOLDER`] — the value is immaterial to
+/// crediting. (Codec verified by round-tripping the live transit address, 2026-06-27.)
 pub const DEFAULT_ALPHA_PLACEHOLDER: &str =
-    "prl1pplaceholderaddressrewrittenbytherelayreplaceme0000";
+    "prl1pqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqen4g90";
 
 /// Resolve the placeholder `prl1` for `--address`: env override, else the default.
 pub fn alpha_placeholder_address() -> String {
@@ -297,6 +303,42 @@ mod tests {
         // The only stratum authority is *.aliceprotocol.org:3341.
         let pool = plan.args.iter().position(|x| x == "--pool").unwrap();
         assert!(plan.args[pool + 1].contains("aliceprotocol.org:3341"));
+    }
+
+    /// The default placeholder MUST be a checksum-valid bech32m `prl1` — alpha-miner
+    /// bech32-validates `--address` and REJECTS a bad checksum, so an invalid default
+    /// silently bricks the V100 lane out-of-box. Self-contained BIP-350 verify (no dep)
+    /// so this invariant can never regress (it would have caught the old placeholder).
+    #[test]
+    fn default_placeholder_is_valid_bech32m() {
+        const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        const BECH32M_CONST: u32 = 0x2bc8_30a3;
+        fn polymod(values: &[u8]) -> u32 {
+            const GEN: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
+            let mut chk: u32 = 1;
+            for &v in values {
+                let b = chk >> 25;
+                chk = ((chk & 0x1ff_ffff) << 5) ^ v as u32;
+                for (i, g) in GEN.iter().enumerate() {
+                    if (b >> i) & 1 == 1 {
+                        chk ^= g;
+                    }
+                }
+            }
+            chk
+        }
+        let addr = DEFAULT_ALPHA_PLACEHOLDER;
+        let pos = addr.rfind('1').expect("has a separator");
+        let (hrp, data_part) = (&addr[..pos], &addr[pos + 1..]);
+        assert_eq!(hrp, "prl", "HRP must be prl");
+        let mut values: Vec<u8> = hrp.bytes().map(|b| b >> 5).collect();
+        values.push(0);
+        values.extend(hrp.bytes().map(|b| b & 31));
+        for c in data_part.bytes() {
+            let idx = CHARSET.iter().position(|&x| x == c).expect("valid bech32 char");
+            values.push(idx as u8);
+        }
+        assert_eq!(polymod(&values), BECH32M_CONST, "default placeholder bech32m checksum invalid");
     }
 
     #[test]
