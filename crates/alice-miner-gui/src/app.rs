@@ -296,6 +296,14 @@ pub struct MinerApp {
     /// job-feed otherwise reads as a confident green "Mining"). Re-baselined each run.
     pub last_acc_count: u64,
     pub last_acc_change: Option<Instant>,
+    /// SHOULD-FIX A: per-lane stall clocks for dual-mine. The top-level
+    /// `last_acc_count`/`last_acc_change` track the SUMMED accepted count, so in
+    /// dual-mine CPU-XMR's steady RandomX shares keep the sum advancing and mask a
+    /// stalled GPU-PRL/GpuAlpha lane (the 15% earner, prone to the ~25min OOB-allowlist
+    /// credit stall). This map keeps an independent change-clock per lane (keyed by
+    /// `Lane`), so the stall banner can read the GPU lane's OWN cadence even while XMR
+    /// is healthy. Single-lane runs read the top-level clock (sum == lane) unchanged.
+    pub lane_acc_clocks: std::collections::HashMap<Lane, (u64, Instant)>,
     pub copied_at: Option<Instant>,
     /// Language toggle (display-only; copy is bilingual already).
     pub lang_zh: bool,
@@ -425,6 +433,7 @@ impl MinerApp {
             last_spark_push: None,
             last_acc_count: 0,
             last_acc_change: None,
+            lane_acc_clocks: std::collections::HashMap::new(),
             copied_at: None,
             lang_zh: false,
             reduce_motion: false,
@@ -1033,6 +1042,27 @@ impl MinerApp {
         } else if self.last_acc_change.is_none() {
             self.last_acc_change = Some(Instant::now());
         }
+        // SHOULD-FIX A: maintain an independent change-clock per lane from the snapshot's
+        // per-lane rows, so a dual-mine GPU lane's stall isn't masked by XMR's steady sum.
+        // Same arm/re-baseline logic as the top-level clock, applied per `LaneSnapshot`.
+        // A lane no longer in the snapshot (run ended / single-lane) is dropped so its
+        // clock can't go stale across runs.
+        let now = Instant::now();
+        let present: std::collections::HashSet<Lane> = s.lanes.iter().map(|l| l.lane).collect();
+        self.lane_acc_clocks.retain(|lane, _| present.contains(lane));
+        for l in &s.lanes {
+            if l.state != EngineState::Running {
+                self.lane_acc_clocks.remove(&l.lane);
+                continue;
+            }
+            match self.lane_acc_clocks.get_mut(&l.lane) {
+                Some((count, _)) if *count == l.shares_accepted => {} // steady — keep the clock
+                Some(entry) => *entry = (l.shares_accepted, now), // advanced — re-arm
+                None => {
+                    self.lane_acc_clocks.insert(l.lane, (l.shares_accepted, now));
+                }
+            }
+        }
         self.snapshot = Some(s);
     }
 
@@ -1042,9 +1072,34 @@ impl MinerApp {
     /// `acc == 0`). `None` otherwise. The status line shows a gentle banner past a
     /// threshold so a stalled-but-connected pool feed is visible before the ~600s
     /// watchdog rotates endpoints.
+    ///
+    /// SHOULD-FIX A: in dual-mine the top-level counters are the SUM of both lanes, so
+    /// CPU-XMR's steady RandomX shares keep the sum advancing and would hide a stalled
+    /// GPU-PRL/GpuAlpha lane (the 15% earner). So in dual mode this reads each lane's OWN
+    /// per-lane clock (`lane_acc_clocks`) and returns the WORST (most-stalled) producing
+    /// lane — a quiet GPU lane is flagged even while XMR is healthy. Single-lane runs read
+    /// the top-level clock (sum == lane), so behaviour there is identical.
     pub fn share_stall_secs(&self) -> Option<u64> {
         if self.state() != EngineState::Running {
             return None;
+        }
+        let dual = self.snapshot.as_ref().map(|s| s.dual).unwrap_or(false);
+        if dual {
+            // Per-lane: the worst stall among lanes that ARE producing (Running, live
+            // hashrate, has landed ≥1 share) — so a stalled GPU lane surfaces even while
+            // the XMR lane keeps the summed count clean.
+            return self
+                .snapshot
+                .as_ref()?
+                .lanes
+                .iter()
+                .filter(|l| {
+                    l.state == EngineState::Running
+                        && l.hashrate_hs.unwrap_or(0.0) > 0.0
+                        && l.shares_accepted > 0
+                })
+                .filter_map(|l| self.lane_acc_clocks.get(&l.lane).map(|(_, t)| t.elapsed().as_secs()))
+                .max();
         }
         let hr = self.snapshot.as_ref().and_then(|s| s.hashrate_hs).unwrap_or(0.0);
         let acc = self.snapshot.as_ref().map(|s| s.shares_accepted).unwrap_or(0);
@@ -2078,6 +2133,58 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         warming.hashrate_hs = Some(0.0);
         app.snapshot = Some(warming);
         assert_eq!(app.share_stall_secs(), None, "warming up is not a stall");
+    }
+
+    /// SHOULD-FIX A: in dual-mine a stalled GPU-PRL lane is flagged even while the XMR
+    /// lane's steady RandomX shares keep the SUMMED accepted count advancing — i.e. the
+    /// stall banner reads the GPU lane's OWN per-lane clock, not the XMR-dominated sum.
+    #[test]
+    fn dual_share_stall_reads_gpu_lane_not_summed() {
+        use alice_miner_core::engine::LaneSnapshot;
+        use std::time::Duration;
+        let mut app = MinerApp::new().expect("engine spawns");
+        // Dual-mine: XMR healthy + just advanced; GPU-PRL Running, hashing, has shares
+        // but has gone quiet for ~400s. The top-level (summed) clock is FRESH because
+        // XMR keeps advancing — only the per-lane GPU clock is stale.
+        let mut s = running_snapshot();
+        s.dual = true;
+        s.lanes = vec![
+            LaneSnapshot {
+                lane: Lane::Xmr,
+                state: EngineState::Running,
+                hashrate_hs: Some(8_400.0),
+                shares_accepted: 200,
+                shares_rejected: 0,
+                endpoint: None,
+                failovers: 0,
+            },
+            LaneSnapshot {
+                lane: Lane::GpuPrl,
+                state: EngineState::Running,
+                hashrate_hs: Some(870_000_000_000.0),
+                shares_accepted: 7,
+                shares_rejected: 0,
+                endpoint: None,
+                failovers: 0,
+            },
+        ];
+        app.snapshot = Some(s);
+        // Top-level clock is fresh (XMR keeps the sum advancing) …
+        app.last_acc_change = Some(Instant::now());
+        // … but the GPU lane's own clock is ~400s stale, XMR's fresh.
+        app.lane_acc_clocks.insert(Lane::Xmr, (200, Instant::now()));
+        app.lane_acc_clocks
+            .insert(Lane::GpuPrl, (7, Instant::now() - Duration::from_secs(400)));
+        let secs = app.share_stall_secs().expect("stalled GPU lane is flagged");
+        assert!(secs >= 300, "the GPU lane's ~400s stall surfaces (got {secs}s)");
+
+        // Both lanes fresh → no stall.
+        app.lane_acc_clocks.insert(Lane::GpuPrl, (7, Instant::now()));
+        assert_eq!(
+            app.share_stall_secs(),
+            Some(0),
+            "both lanes fresh → ~0s, below the banner threshold"
+        );
     }
 
     /// `open_change_addr` opens the modal at its launcher and wipes any stale

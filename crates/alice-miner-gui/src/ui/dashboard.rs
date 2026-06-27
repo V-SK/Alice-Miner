@@ -163,20 +163,14 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     // unconditional "rolling · healthy" (which read healthy at ANY reject ratio).
     // GPU-Alpha doesn't track rejects (parse_alpha → None, so r stays 0), so show an
     // honest "rejects n/a" there rather than a false 100%/healthy.
-    let (accepted_sub, accepted_sub_color): (String, egui::Color32) = if a + r == 0 {
-        ("no shares yet".to_string(), THEME.text3)
-    } else if app.active_lane() == Lane::GpuAlpha {
-        ("rejects n/a".to_string(), THEME.text3)
-    } else {
-        let reject_pct = r as f64 / (a + r) as f64 * 100.0;
-        if reject_pct <= 5.0 {
-            ("rolling · healthy".to_string(), THEME.live)
-        } else if reject_pct <= 20.0 {
-            (format!("{reject_pct:.0}% rejects · elevated"), THEME.warn)
-        } else {
-            (format!("{reject_pct:.0}% rejects · high"), THEME.err)
-        }
-    };
+    //
+    // SHOULD-FIX A: in dual-mine the summed `(a, r)` is XMR-dominated, so a high-reject
+    // GPU lane is diluted to "healthy". `reject_health_sub` reads each lane's OWN
+    // counters from the snapshot in dual mode and reports the WORST (highest-reject) GPU
+    // lane. Single-lane reads the summed counters (sum == active lane), unchanged.
+    let (rh_label, rh_tone) = reject_health_sub(snap.as_ref(), app.active_lane(), a, r);
+    let (accepted_sub, accepted_sub_color): (String, egui::Color32) =
+        (rh_label, rh_tone.color());
     let cards: Vec<CardFn> = vec![
         // Hashrate (accent, with sparkline).
         Box::new({
@@ -359,6 +353,96 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     widgets::section_label(ui, "Log");
     ui.add_space(10.0);
     log_panel(ui, app);
+}
+
+/// The tone of the reject-health sub-label (mapped to a THEME colour at render).
+/// A small enum (not a raw `Color32`) so [`reject_health_sub`] stays a pure,
+/// testable function that doesn't depend on the egui theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectTone {
+    Neutral,
+    Healthy,
+    Elevated,
+    High,
+}
+
+impl RejectTone {
+    fn color(self) -> egui::Color32 {
+        match self {
+            RejectTone::Neutral => THEME.text3,
+            RejectTone::Healthy => THEME.live,
+            RejectTone::Elevated => THEME.warn,
+            RejectTone::High => THEME.err,
+        }
+    }
+}
+
+/// The reject-health sub-label + tone for the "Accepted" card. Pure + testable.
+///
+/// SHOULD-FIX A: in **dual-mine** the summed `(sum_a, sum_r)` is XMR-dominated, so a
+/// high-reject GPU lane would dilute to "healthy". So in dual mode this reads each
+/// lane's OWN counters from the snapshot and reports the WORST (highest reject-rate)
+/// GPU/PRL-earning lane — a degrading GPU lane is flagged even while XMR is clean. A
+/// GpuAlpha lane reports "rejects n/a" (the client never sees a pool reject; the relay
+/// owns acceptance). In **single-lane** mode the summed counters equal the active lane,
+/// so it falls back to the prior summed behaviour (identical output).
+fn reject_health_sub(
+    snap: Option<&alice_miner_core::engine::Snapshot>,
+    active_lane: Lane,
+    sum_a: u64,
+    sum_r: u64,
+) -> (String, RejectTone) {
+    let dual = snap.map(|s| s.dual).unwrap_or(false);
+    if dual {
+        // The PRL-earning GPU lanes that are actually producing (have shares). Pick the
+        // worst reject-rate among them; if the only producing GPU lane is GpuAlpha (no
+        // reject signal), say so honestly.
+        let gpu_lanes: Vec<&alice_miner_core::engine::LaneSnapshot> = snap
+            .map(|s| {
+                s.lanes
+                    .iter()
+                    .filter(|l| l.lane.is_prl_lane() && l.shares_accepted + l.shares_rejected > 0)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if gpu_lanes.is_empty() {
+            return ("no shares yet".to_string(), RejectTone::Neutral);
+        }
+        // If EVERY producing GPU lane is GpuAlpha (rejects untracked), the reject signal
+        // is genuinely n/a.
+        if gpu_lanes.iter().all(|l| l.lane == Lane::GpuAlpha) {
+            return ("rejects n/a".to_string(), RejectTone::Neutral);
+        }
+        // Worst reject-rate among the reject-tracking GPU lanes.
+        let worst = gpu_lanes
+            .iter()
+            .filter(|l| l.lane != Lane::GpuAlpha)
+            .map(|l| {
+                let total = l.shares_accepted + l.shares_rejected;
+                l.shares_rejected as f64 / total as f64 * 100.0
+            })
+            .fold(0.0_f64, f64::max);
+        return classify_reject_pct(worst);
+    }
+    // Single-lane: the summed counters ARE the active lane's.
+    if sum_a + sum_r == 0 {
+        return ("no shares yet".to_string(), RejectTone::Neutral);
+    }
+    if active_lane == Lane::GpuAlpha {
+        return ("rejects n/a".to_string(), RejectTone::Neutral);
+    }
+    classify_reject_pct(sum_r as f64 / (sum_a + sum_r) as f64 * 100.0)
+}
+
+/// Map a reject percentage to the (label, tone) the "Accepted" card shows.
+fn classify_reject_pct(reject_pct: f64) -> (String, RejectTone) {
+    if reject_pct <= 5.0 {
+        ("rolling · healthy".to_string(), RejectTone::Healthy)
+    } else if reject_pct <= 20.0 {
+        (format!("{reject_pct:.0}% rejects · elevated"), RejectTone::Elevated)
+    } else {
+        (format!("{reject_pct:.0}% rejects · high"), RejectTone::High)
+    }
 }
 
 /// The (hashrate kH/s, shares) to show for a lane row. In dual-mine each lane
@@ -1427,4 +1511,106 @@ fn srow(ui: &mut egui::Ui, title: &str, hint: &str, rhs: impl FnOnce(&mut egui::
         ui.cursor().top(),
         egui::Stroke::new(1.0, THEME.line),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alice_miner_core::engine::{LaneSnapshot, Snapshot};
+    use alice_miner_core::EngineState;
+
+    fn lane(lane: Lane, accepted: u64, rejected: u64) -> LaneSnapshot {
+        LaneSnapshot {
+            lane,
+            state: EngineState::Running,
+            hashrate_hs: Some(1.0e6),
+            shares_accepted: accepted,
+            shares_rejected: rejected,
+            endpoint: None,
+            failovers: 0,
+        }
+    }
+
+    /// Build a minimal Snapshot carrying just the fields `reject_health_sub` reads
+    /// (`dual` + `lanes`); the rest are honest zero/None defaults.
+    fn snap(dual: bool, lanes: Vec<LaneSnapshot>) -> Snapshot {
+        Snapshot {
+            state: EngineState::Running,
+            device: None,
+            lane: None,
+            hashrate_hs: None,
+            shares_accepted: 0,
+            shares_rejected: 0,
+            endpoint: None,
+            worker_id: None,
+            uptime_s: 0,
+            failovers: 0,
+            dual,
+            lanes,
+            last_line: None,
+            message: None,
+            prl_payout: None,
+        }
+    }
+
+    // ── SHOULD-FIX A: reject-health is PER-LANE in dual-mine ───────────────────
+
+    /// The core bug: in dual-mine a clean, high-volume XMR lane keeps the SUMMED reject
+    /// denominator clean, so a high-reject GPU-PRL lane reads false-"healthy". Reading
+    /// per-lane must flag the GPU lane's OWN reject rate even while XMR is healthy.
+    #[test]
+    fn dual_reject_health_flags_gpu_lane_not_summed() {
+        // XMR: 10000 accepted / 1 rejected (~0% — healthy). GPU-PRL: 10 accepted / 10
+        // rejected (50% — HIGH). Summed = 10010A / 11R ≈ 0.1% → would read "healthy".
+        let s = snap(
+            true,
+            vec![lane(Lane::Xmr, 10_000, 1), lane(Lane::GpuPrl, 10, 10)],
+        );
+        let sum_a = 10_010;
+        let sum_r = 11;
+        // Summed view (the OLD behaviour) would be healthy …
+        assert_eq!(
+            classify_reject_pct(sum_r as f64 / (sum_a + sum_r) as f64 * 100.0).1,
+            RejectTone::Healthy
+        );
+        // … the per-lane fix flags the GPU lane as HIGH.
+        let (label, tone) = reject_health_sub(Some(&s), Lane::Xmr, sum_a, sum_r);
+        assert_eq!(tone, RejectTone::High, "GPU lane's 50% reject must surface: {label}");
+        assert!(label.contains("high"), "label: {label}");
+    }
+
+    /// A healthy GPU lane in dual-mine still reads healthy (no false alarm).
+    #[test]
+    fn dual_reject_health_healthy_gpu_stays_healthy() {
+        let s = snap(true, vec![lane(Lane::Xmr, 5_000, 2), lane(Lane::GpuPrl, 100, 1)]);
+        let (_, tone) = reject_health_sub(Some(&s), Lane::Xmr, 5_100, 3);
+        assert_eq!(tone, RejectTone::Healthy);
+    }
+
+    /// A dual-mine GPU-Alpha partner (no pool-reject signal) reads "rejects n/a", not a
+    /// fabricated 100%/healthy — even if XMR is producing.
+    #[test]
+    fn dual_gpu_alpha_reads_rejects_na() {
+        let s = snap(true, vec![lane(Lane::Xmr, 5_000, 2), lane(Lane::GpuAlpha, 50, 0)]);
+        let (label, tone) = reject_health_sub(Some(&s), Lane::Xmr, 5_050, 2);
+        assert_eq!(tone, RejectTone::Neutral);
+        assert_eq!(label, "rejects n/a");
+    }
+
+    /// Single-lane behaviour is unchanged: the summed counters ARE the active lane, so
+    /// the output matches the prior summed logic exactly.
+    #[test]
+    fn single_lane_reject_health_unchanged() {
+        // Single XMR, 5% rejects → healthy boundary.
+        let s = snap(false, vec![lane(Lane::Xmr, 95, 5)]);
+        assert_eq!(reject_health_sub(Some(&s), Lane::Xmr, 95, 5).1, RejectTone::Healthy);
+        // Single XMR, 30% rejects → high.
+        let s = snap(false, vec![lane(Lane::Xmr, 70, 30)]);
+        assert_eq!(reject_health_sub(Some(&s), Lane::Xmr, 70, 30).1, RejectTone::High);
+        // Single GpuAlpha → rejects n/a.
+        let s = snap(false, vec![lane(Lane::GpuAlpha, 40, 0)]);
+        assert_eq!(reject_health_sub(Some(&s), Lane::GpuAlpha, 40, 0).0, "rejects n/a");
+        // No shares yet.
+        assert_eq!(reject_health_sub(Some(&s), Lane::Xmr, 0, 0).0, "no shares yet");
+    }
 }
