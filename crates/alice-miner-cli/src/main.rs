@@ -878,6 +878,50 @@ fn cmd_start(args: StartArgs) -> i32 {
         print!("{}", dashboard::render_start_banner(lane, args.dual));
     }
 
+    // ── Source B: cumulative server-confirmed credit poller ──────────────────
+    // A best-effort, READ-ONLY background poll of the public read-API for THIS
+    // address's cumulative accepted-share COUNTS (credit-only). It runs on its OWN
+    // thread on a slow cadence (off the 500ms render hot path) and publishes the
+    // latest CreditState into a shared cell the render loop reads. Watch-only
+    // addresses resolve fine (a read needs only the public address). In `--json`
+    // mode we skip it entirely (the JSON stream is unchanged + machine-only).
+    let credit_cell = std::sync::Arc::new(std::sync::Mutex::new(
+        alice_miner_core::CreditState::NotExposed,
+    ));
+    let effective_address = args
+        .address
+        .clone()
+        .or_else(|| alice_miner_core::identity::load_pointer().map(|p| p.address));
+    if !args.json {
+        if let Some(addr) = effective_address {
+            let cell = std::sync::Arc::clone(&credit_cell);
+            let stop = std::sync::Arc::clone(&stop_flag);
+            std::thread::spawn(move || {
+                let mut client = alice_miner_core::PoolStatsClient::public_default();
+                // A tiny deterministic jitter from the address so a fleet doesn't poll
+                // in lockstep (no rng dep needed).
+                let jitter = (addr.bytes().map(|b| b as u64).sum::<u64>() % 30) as f64 / 30.0;
+                loop {
+                    // poll() is single-flight + https-only + ~10s-timeout + capped;
+                    // it never panics and never blocks the engine.
+                    let state = client.poll(&addr);
+                    if let Ok(mut c) = cell.lock() {
+                        *c = state;
+                    }
+                    // Sleep the poll cadence in short slices so a Ctrl-C tears the
+                    // thread down promptly instead of after a full interval.
+                    let secs = client.next_poll_in_secs(jitter).unwrap_or(45);
+                    for _ in 0..(secs * 2) {
+                        if stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+            });
+        }
+    }
+
     let start = std::time::Instant::now();
     let deadline = (args.duration_s > 0).then(|| Duration::from_secs(args.duration_s));
 
@@ -892,15 +936,19 @@ fn cmd_start(args: StartArgs) -> i32 {
     loop {
         match engine.recv_timeout(Duration::from_millis(500)) {
             Ok(Event::Snapshot(snap)) => {
+                let credit = credit_cell
+                    .lock()
+                    .map(|c| c.clone())
+                    .unwrap_or(alice_miner_core::CreditState::NotExposed);
                 if let Some(t) = tui.as_mut() {
                     // In-place panel; a draw failure (terminal lost) falls back to the
                     // line renderer for the rest of the run rather than aborting.
                     if t.draw(&snap).is_err() {
                         tui = None;
-                        emit_snapshot(&snap, args.json);
+                        emit_snapshot(&snap, args.json, &credit);
                     }
                 } else {
-                    emit_snapshot(&snap, args.json);
+                    emit_snapshot(&snap, args.json, &credit);
                 }
                 if matches!(snap.state, EngineState::Running) {
                     saw_running = true;
@@ -975,8 +1023,11 @@ fn cmd_start(args: StartArgs) -> i32 {
 }
 
 /// Emit one snapshot, either as a JSON line (`--json`) or rendered into the
-/// human dashboard block.
-fn emit_snapshot(snap: &Snapshot, json: bool) {
+/// human dashboard block. `credit` is the latest Source-B server-confirmed credit
+/// state (cumulative accepted-share COUNTS); its honest line is appended to the
+/// human block only (the `--json` stream is byte-for-byte unchanged — credit-only,
+/// and a parser-facing schema we don't perturb).
+fn emit_snapshot(snap: &Snapshot, json: bool, credit: &alice_miner_core::CreditState) {
     if json {
         // One compact JSON object per tick — credit-only by construction (the
         // Snapshot type has no payout field; a core test asserts the JSON shape).
@@ -986,6 +1037,11 @@ fn emit_snapshot(snap: &Snapshot, json: bool) {
         }
     } else {
         print!("{}", dashboard::render_snapshot(snap));
+        // The cumulative server-confirmed credit line (Source B), when there is one
+        // to show (NotExposed yields None — no fabricated line).
+        if let Some(line) = dashboard::render_credit_line(credit) {
+            print!("{line}");
+        }
     }
 }
 

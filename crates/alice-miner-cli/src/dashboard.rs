@@ -10,7 +10,10 @@
 
 use alice_miner_core::detect::capability::ALL_LANES;
 use alice_miner_core::detect::GpuDevice;
-use alice_miner_core::{CapabilityProfile, GpuInfo, GpuVendor, Lane, Snapshot};
+use alice_miner_core::{
+    CapabilityProfile, CreditState, GpuInfo, GpuVendor, Lane, Snapshot, LANE_KEY_GPU_ALPHA,
+    LANE_KEY_GPU_PRL,
+};
 
 /// The ONLY way the CLI ever renders rewards: pending, bilingual, never a
 /// number / `$`. Mirrors the GUI's `strings::REWARD_PENDING`.
@@ -303,6 +306,50 @@ pub fn render_snapshot(snap: &Snapshot) -> String {
         }
     }
     out
+}
+
+/// Render the **cumulative server-confirmed credit** line (Source B) for the human
+/// dashboard. CREDIT-ONLY by construction: it surfaces only accepted-share COUNTS
+/// (cumulative total, 24h, and the GPU·Alpha / GPU·PRL split) — never a `$`, a fiat
+/// figure, or a "paid"/"earned" claim. The credit-only `pending_alice` magnitude on
+/// `Confirmed` is deliberately NOT rendered (it stays "pending · 待发放").
+///
+/// Honest states (mirrors the read_api's fail-closed philosophy):
+///   * `None` (no line at all) for `NotExposed` — the poller hasn't been wired to a
+///     live endpoint, so there is nothing to claim.
+///   * `Confirming` → "credited (cumulative): syncing…" (a MISSING fetch must NOT
+///     show a fabricated 0).
+///   * `Error` → "credited (cumulative): —" + a calm reason (network unreachable /
+///     withheld); never a number, never the dropped value.
+///   * `Confirmed` → the real COUNTS (a server 0 IS shown as 0 — a real measured
+///     zero, distinct from "syncing"/"—").
+pub fn render_credit_line(credit: &CreditState) -> Option<String> {
+    match credit {
+        // No live endpoint wired → no cumulative line (don't invent one).
+        CreditState::NotExposed => None,
+        CreditState::Confirming => {
+            Some("    credited (cumulative): syncing… · 同步中 (credit-only)\n".to_string())
+        }
+        CreditState::Error { reason } => Some(format!(
+            "    credited (cumulative): — · {} (credit-only)\n",
+            reason.message()
+        )),
+        CreditState::Confirmed { totals, .. } => {
+            let alpha = totals.accepted_for_lane(LANE_KEY_GPU_ALPHA);
+            let prl = totals.accepted_for_lane(LANE_KEY_GPU_PRL);
+            // The GPU·Alpha / GPU·PRL split is shown only when the server reports
+            // those lanes (else just the headline count + 24h).
+            let split = if alpha > 0 || prl > 0 {
+                format!(" · GPU·Alpha {alpha} / GPU·PRL {prl}")
+            } else {
+                String::new()
+            };
+            Some(format!(
+                "    credited (cumulative): {} shares (24h {}){} · {REWARD_PENDING} (credit-only)\n",
+                totals.accepted_total, totals.accepted_24h, split,
+            ))
+        }
+    }
 }
 
 /// Render the GPU **15% PRL 返还 (credit-only)** line for the human dashboard. Shows
@@ -628,6 +675,95 @@ mod tests {
         }
         // The only host that may appear is the public relay.
         assert!(all.contains("hk.aliceprotocol.org"));
+    }
+
+    // ── Source B: the cumulative server-confirmed credit line ──────────────────
+
+    use alice_miner_core::{CreditError, CreditScore, CreditState, CreditTotals, LaneCredit};
+
+    fn confirmed_totals() -> CreditState {
+        CreditState::Confirmed {
+            score: CreditScore::new(0.0),
+            totals: CreditTotals {
+                accepted_total: 873,
+                accepted_24h: 142,
+                lanes: vec![
+                    LaneCredit {
+                        key: alice_miner_core::LANE_KEY_GPU_ALPHA.into(),
+                        label: "GPU · Alpha".into(),
+                        accepted: 500,
+                    },
+                    LaneCredit {
+                        key: alice_miner_core::LANE_KEY_GPU_PRL.into(),
+                        label: "GPU · PRL".into(),
+                        accepted: 373,
+                    },
+                ],
+            },
+        }
+    }
+
+    /// A `Confirmed` state renders the cumulative COUNTS + the GPU·Alpha / GPU·PRL
+    /// split — and NOTHING else (no number that is a fiat figure).
+    #[test]
+    fn credit_line_renders_cumulative_counts_only() {
+        let line = render_credit_line(&confirmed_totals()).expect("a confirmed state renders");
+        assert!(line.contains("credited (cumulative): 873 shares"), "headline count: {line}");
+        assert!(line.contains("24h 142"), "24h count: {line}");
+        assert!(line.contains("GPU·Alpha 500"), "alpha split: {line}");
+        assert!(line.contains("GPU·PRL 373"), "prl split: {line}");
+        // Credit-only honesty: only counts + "pending · 待发放", never fiat/paid/earned.
+        let lower = line.to_lowercase();
+        for forbidden in ["$", "usd", "fiat", "paid", "earned", "已发放"] {
+            assert!(!lower.contains(forbidden), "credit line leaked `{forbidden}`: {line}");
+        }
+        assert!(line.contains(REWARD_PENDING));
+    }
+
+    /// A real server ZERO is shown as 0 (a measured zero) — distinct from "syncing".
+    #[test]
+    fn credit_line_shows_a_real_server_zero() {
+        let zero = CreditState::Confirmed {
+            score: CreditScore::new(0.0),
+            totals: CreditTotals::default(),
+        };
+        let line = render_credit_line(&zero).expect("confirmed-zero renders");
+        assert!(line.contains("credited (cumulative): 0 shares"), "real 0: {line}");
+        // No lane split when there are no lanes (don't fabricate one).
+        assert!(!line.contains("GPU·Alpha"), "no split for an empty breakdown: {line}");
+    }
+
+    /// Honest non-confirmed states: NotExposed → no line at all; Confirming →
+    /// "syncing" (NOT a fabricated 0); Error → "—" + a calm reason (no number).
+    #[test]
+    fn credit_line_honest_states() {
+        // NotExposed: nothing to claim → no line.
+        assert!(render_credit_line(&CreditState::NotExposed).is_none());
+        // Confirming: an honest "syncing", never a 0.
+        let confirming = render_credit_line(&CreditState::Confirming).unwrap();
+        assert!(confirming.contains("syncing"), "confirming syncs: {confirming}");
+        assert!(!confirming.contains(" 0 shares"), "no fabricated 0 while syncing: {confirming}");
+        // Error (unreachable): an em-dash placeholder + a calm reason, never a 0/number.
+        let err = render_credit_line(&CreditState::Error { reason: CreditError::Unreachable }).unwrap();
+        assert!(err.contains("credited (cumulative): —"), "error shows —: {err}");
+        assert!(!err.contains("shares"), "no count on an errored fetch: {err}");
+    }
+
+    /// The dropped-value guard at the RENDER layer: a `paid_acu != "0"` envelope
+    /// parsed through the client lands as `Error` and the render shows NO number.
+    #[test]
+    fn credit_line_drops_paid_acu_violation() {
+        let state = alice_miner_core::dashboard::parse_credit_envelope(
+            r#"{"found":true,"paid_acu":"9.9","summary":{"pending_alice":5.0,"accepted_shares_total":1000}}"#,
+        );
+        let line = render_credit_line(&state).unwrap();
+        // The withheld value is never rendered — no count, no magnitude.
+        assert!(!line.contains("1000"), "dropped count must not render: {line}");
+        assert!(!line.contains("shares"), "no count on a withheld response: {line}");
+        let lower = line.to_lowercase();
+        for forbidden in ["$", "paid", "earned", "9.9", "5.0"] {
+            assert!(!lower.contains(forbidden), "withheld value leaked `{forbidden}`: {line}");
+        }
     }
 
     // ── Piece 3: the 15% PRL 返还 (credit-only) dashboard line ──────────────────

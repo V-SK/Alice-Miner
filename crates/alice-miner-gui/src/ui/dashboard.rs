@@ -14,7 +14,10 @@ use super::widgets::{self, Tone};
 use super::{lane_accent, lane_chip_label};
 use crate::app::MinerApp;
 use crate::update::UpdateUi;
-use alice_miner_core::{CreditState, Lane, LaneSupport, Reconciliation};
+use alice_miner_core::{
+    CreditState, CreditTotals, Lane, LaneSupport, Reconciliation, LANE_KEY_GPU_ALPHA,
+    LANE_KEY_GPU_PRL,
+};
 
 /// One boxed stat-card painter, so the grid can lay the four cards out in either
 /// one row of four or two rows of two without duplicating their bodies.
@@ -627,18 +630,14 @@ fn credit_panel(ui: &mut egui::Ui, app: &MinerApp) {
                     ui.add_space(10.0);
                     explorer_link(ui);
                 }
-                CreditState::Confirmed { score } => {
-                    // CREDIT-ONLY: render the confirmed score ONLY as its pending
-                    // label — never the magnitude. The presence of confirmed credit
-                    // is shown with a live dot; the amount stays "pending".
-                    let _ = score; // intentionally NOT rendered as a number ($-trap)
-                    credit_status_row(
-                        ui,
-                        Tone::Live,
-                        "Confirmed by the network",
-                        strings::CREDIT_PENDING_VALUE,
-                        app.motion_enabled(),
-                    );
+                CreditState::Confirmed { score, totals } => {
+                    // CREDIT-ONLY: the `pending_alice` MAGNITUDE (`score`) is never
+                    // rendered as a number ($-trap) — it stays "pending · 待发放". What
+                    // we DO surface is the cumulative accepted-share COUNTS (counts are
+                    // SHARE COUNTS, not money): the headline total, the 24h count, and
+                    // the GPU·Alpha / GPU·PRL split.
+                    let _ = score; // deliberately NOT rendered as a number
+                    credit_cumulative_panel(ui, totals, app.motion_enabled());
                     ui.add_space(10.0);
                     explorer_link(ui);
                 }
@@ -756,6 +755,61 @@ fn credit_status_row(ui: &mut egui::Ui, tone: Tone, title: &str, status: &str, b
         ui.label(RichText::new(title).size(13.0).strong().color(THEME.text));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(RichText::new(status).size(12.0).color(tone.fg()));
+        });
+    });
+}
+
+/// The cumulative server-confirmed credit panel (Source B, `Confirmed`). Renders
+/// the accepted-share COUNTS — credit-only by construction (these are SHARE COUNTS,
+/// not money): the headline total, the 24h count, and the GPU·Alpha / GPU·PRL split.
+/// A real server 0 is shown as 0 (a measured zero); the `pending_alice` magnitude is
+/// NEVER rendered (it stays "pending · 待发放" via the pending chip).
+fn credit_cumulative_panel(ui: &mut egui::Ui, totals: &CreditTotals, motion: bool) {
+    // Header: a live dot + the title + the pending chip (the ONLY "value" framing).
+    ui.horizontal(|ui| {
+        widgets::status_dot(ui, Tone::Live.fg(), 8.0, motion);
+        ui.add_space(9.0);
+        ui.label(
+            RichText::new(strings::CREDIT_CUMULATIVE_TITLE)
+                .size(13.0)
+                .strong()
+                .color(THEME.text),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            pending_chip(ui);
+        });
+    });
+    ui.add_space(10.0);
+    // The cumulative accepted-share COUNT (the headline number — a count, not money).
+    credit_count_row(ui, strings::CREDIT_CUMULATIVE_TOTAL_LABEL, totals.accepted_total);
+    ui.add_space(4.0);
+    credit_count_row(ui, strings::CREDIT_CUMULATIVE_24H_LABEL, totals.accepted_24h);
+
+    // The per-lane split (GPU·Alpha / GPU·PRL) — only when the server reports those
+    // lanes (else just the headline; never fabricate a lane row).
+    let alpha = totals.accepted_for_lane(LANE_KEY_GPU_ALPHA);
+    let prl = totals.accepted_for_lane(LANE_KEY_GPU_PRL);
+    if alpha > 0 || prl > 0 {
+        ui.add_space(9.0);
+        ui.label(
+            RichText::new(strings::CREDIT_CUMULATIVE_LANES_LABEL)
+                .size(10.5)
+                .color(THEME.text3),
+        );
+        ui.add_space(4.0);
+        credit_count_row(ui, "GPU · Alpha", alpha);
+        ui.add_space(3.0);
+        credit_count_row(ui, "GPU · PRL", prl);
+    }
+}
+
+/// A single "label … N" count row (mono number, right-aligned). The number is an
+/// accepted-share COUNT — never a fiat figure. Used by the cumulative-credit panel.
+fn credit_count_row(ui: &mut egui::Ui, label: &str, count: u64) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(12.0).color(THEME.text2));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(widgets::mono(count.to_string(), 13.0, THEME.text));
         });
     });
 }

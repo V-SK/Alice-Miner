@@ -829,11 +829,12 @@ fn pose_settings_prl_endpoint(app: &mut MinerApp) {
     app.select_lane(Lane::GpuPrl); // → :3340 (the region relay)
 }
 
-/// M5: the Source-B fast-follow path rendered honestly — a CONFIRMED credit state
-/// (as if a live public read-model endpoint had confirmed credit for this
-/// address). The panel shows ONLY "pending" (NEVER the magnitude) + the
-/// reconciliation badge reads "in sync". Proves the credit-only rendering holds
-/// even on the confirmed path. (Posed only; the live client ships NotExposed.)
+/// M5: the Source-B LIVE path rendered honestly — a CONFIRMED credit state (as if
+/// the public read-API had confirmed credit for this address). The panel shows the
+/// cumulative accepted-share COUNTS (total + 24h + the GPU·Alpha / GPU·PRL split) +
+/// a "pending · 待发放" chip; the `pending_alice` magnitude is NEVER rendered. The
+/// reconciliation badge reads "in sync". Proves the credit-only count rendering
+/// holds. (Posed only; a live run drives the real poller.)
 fn pose_dashboard_m5_confirmed(app: &mut MinerApp) {
     app.onboarding = None;
     app.screen = Screen::Dashboard;
@@ -843,9 +844,26 @@ fn pose_dashboard_m5_confirmed(app: &mut MinerApp) {
     app.snapshot = Some(demo_mining_snapshot());
     pin_mining_anim(app, 8.4);
     seed_log(app);
-    // A confirmed (non-zero) credit score — but the UI renders only "pending".
+    // A confirmed state with cumulative COUNTS — the UI renders the counts + a
+    // "pending" chip, never the pending_alice magnitude.
     app.credit_state = alice_miner_core::CreditState::Confirmed {
         score: alice_miner_core::CreditScore::new(12.56),
+        totals: alice_miner_core::CreditTotals {
+            accepted_total: 873,
+            accepted_24h: 142,
+            lanes: vec![
+                alice_miner_core::LaneCredit {
+                    key: alice_miner_core::LANE_KEY_GPU_ALPHA.into(),
+                    label: "GPU · Alpha".into(),
+                    accepted: 500,
+                },
+                alice_miner_core::LaneCredit {
+                    key: alice_miner_core::LANE_KEY_GPU_PRL.into(),
+                    label: "GPU · PRL".into(),
+                    accepted: 373,
+                },
+            ],
+        },
     };
 }
 

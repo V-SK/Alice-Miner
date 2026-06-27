@@ -7,7 +7,9 @@
 //! gauge + readout animate. Start sends `Start{Xmr}`; Stop sends `Stop`.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use alice_miner_core::engine::{Command, EngineHandle, Event, IdentitySpec, Snapshot};
 use alice_miner_core::identity::{self, IdentityPointer};
@@ -114,6 +116,91 @@ pub enum Onboarding {
     Import,
     /// Paste an address (watch-only).
     Paste,
+}
+
+/// The Source-B credit poll background worker (M5). Owns a long-lived thread that
+/// drives a real, READ-ONLY [`PoolStatsClient`] poll of the public read-API on a
+/// slow cadence (off the egui paint loop), publishing the latest server-confirmed
+/// [`CreditState`] (cumulative accepted-share COUNTS, credit-only) into a shared
+/// cell the UI reads each frame. The address it polls is held in a shared cell the
+/// app updates (so a change-address takes effect without restarting the thread).
+///
+/// All transport rules live in `PoolStatsClient::poll` (https-only, ~10 s timeout,
+/// small read cap, single-flight, the `paid_acu != "0"` DROP guard). The UI never
+/// blocks on the network — it only reads the published state.
+pub struct CreditPoll {
+    /// The latest resolved credit state (worker writes, UI reads).
+    state: Arc<Mutex<CreditState>>,
+    /// The address the worker should poll (`None` = nothing yet; worker idles).
+    address: Arc<Mutex<Option<String>>>,
+    /// Set on drop to tear the worker thread down promptly.
+    stop: Arc<AtomicBool>,
+}
+
+impl CreditPoll {
+    /// Start the background poll worker. Spawns ONE thread that owns its own
+    /// `PoolStatsClient::public_default()` (the live read-API base + env override),
+    /// polling whatever address is currently set on a slow cadence. Best-effort —
+    /// a transport failure surfaces `Error(Unreachable)` (never a panic).
+    fn start() -> Self {
+        let state = Arc::new(Mutex::new(CreditState::NotExposed));
+        let address: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (st, ad, sp) = (Arc::clone(&state), Arc::clone(&address), Arc::clone(&stop));
+        std::thread::Builder::new()
+            .name("alice-credit-poll".into())
+            .spawn(move || {
+                let mut client = PoolStatsClient::public_default();
+                let mut jitter = 0.37_f64;
+                while !sp.load(Ordering::SeqCst) {
+                    let addr = ad.lock().ok().and_then(|a| a.clone());
+                    match addr {
+                        Some(addr) if !addr.is_empty() => {
+                            // Deterministic per-address jitter so a fleet doesn't poll
+                            // in lockstep (no rng dep).
+                            jitter = (addr.bytes().map(|b| b as u64).sum::<u64>() % 30) as f64 / 30.0;
+                            let resolved = client.poll(&addr);
+                            if let Ok(mut s) = st.lock() {
+                                *s = resolved;
+                            }
+                        }
+                        // No address yet → keep the honest NotExposed default.
+                        _ => {}
+                    }
+                    let secs = client.next_poll_in_secs(jitter).unwrap_or(45);
+                    // Sleep the cadence in short slices so stop is honored promptly.
+                    for _ in 0..(secs * 2).max(2) {
+                        if sp.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+            })
+            .expect("spawn credit-poll thread");
+        Self { state, address, stop }
+    }
+
+    /// Point the worker at `address` (the user's OWN public address). A watch-only
+    /// address is fine — a read needs only the public address. Idempotent.
+    fn set_address(&self, address: Option<String>) {
+        if let Ok(mut a) = self.address.lock() {
+            if *a != address {
+                *a = address;
+            }
+        }
+    }
+
+    /// The latest published credit state (cheap clone; the worker owns the network).
+    fn state(&self) -> CreditState {
+        self.state.lock().map(|s| s.clone()).unwrap_or(CreditState::NotExposed)
+    }
+}
+
+impl Drop for CreditPoll {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
 }
 
 /// The application.
@@ -233,10 +320,15 @@ pub struct MinerApp {
     /// — see [`alice_miner_core::dashboard`]), so it never touches the network; it
     /// just yields the honest `NotExposed` panel. The fast-follow to a live
     /// public read-model endpoint is a one-line config flip here.
-    pub credit_client: PoolStatsClient,
     /// The latest server-confirmed credit state (Source B), kept separate from the
-    /// live local activity (Source A) so the UI never blurs the two.
+    /// live local activity (Source A) so the UI never blurs the two. Published by the
+    /// background [`CreditPoll`] worker each frame via [`Self::tick_credit`].
     pub credit_state: CreditState,
+    /// The background Source-B poll worker (lazily started on the first non-shot
+    /// `tick_credit` once an identity exists). `None` until then — so screenshot /
+    /// posed runs never spawn a network thread and their posed `credit_state`
+    /// survives. Drives the LIVE cumulative-credit view.
+    pub credit_poll: Option<CreditPoll>,
 
     /// Headless screenshot-mode driver. `None` on every normal run; `Some` only
     /// when `ALICE_MINER_SHOT_DIR` is set (see [`crate::shot`]). When set, the
@@ -342,8 +434,10 @@ impl MinerApp {
             // Source B v1: the investigated reality is that no reachable public
             // per-address credit endpoint exists, so the poller is `NotExposed`
             // (no network, honest panel). See `alice_miner_core::dashboard`.
-            credit_client: PoolStatsClient::not_exposed(),
             credit_state: CreditState::NotExposed,
+            // Lazily started on the first non-shot tick_credit (so posed/screenshot
+            // runs never spawn a network thread).
+            credit_poll: None,
             shot,
             updater: crate::update::UpdateManager::default(),
             update_committed_note,
@@ -579,26 +673,34 @@ impl MinerApp {
         self.refresh_bg_service();
     }
 
-    /// Source-B credit tick (called each frame). The credit state is sourced from
-    /// the [`PoolStatsClient`], which in the v1 `NotExposed` configuration performs
-    /// **no network I/O** (it just yields `NotExposed`). When the fast-follow flips
-    /// `credit_client` to a live public read-model endpoint, this is where the
-    /// poll-due / single-flight / backoff logic would drive an actual GET; the
-    /// `polls_network()` guard keeps v1 a pure, server-independent no-op.
+    /// Source-B credit tick (called each frame, OFF the screenshot path so posed
+    /// states survive). Drives the LIVE cumulative server-confirmed credit view:
     ///
-    /// Crucially this NEVER computes an estimated/projected reward (the #18
-    /// red-team trap) — it only reflects what the server has CONFIRMED.
+    ///   * lazily starts the background [`CreditPoll`] worker on the first call once
+    ///     an identity exists (so posed/screenshot runs never spawn a network thread);
+    ///   * keeps the worker pointed at the current reward address (a change-address
+    ///     re-points it without a restart) — watch-only addresses resolve fine, a
+    ///     read needs only the public address;
+    ///   * pulls the worker's latest published [`CreditState`] into `credit_state`.
+    ///
+    /// The actual GET (https-only, ~10 s timeout, capped, single-flight, the
+    /// `paid_acu != "0"` DROP guard) happens on the worker thread — the paint loop
+    /// only reads the published state, never blocks. Crucially this NEVER computes an
+    /// estimated/projected reward (the #18 red-team trap) — only what the server has
+    /// CONFIRMED (cumulative accepted-share COUNTS, credit-only).
     pub fn tick_credit(&mut self) {
-        if !self.credit_client.polls_network() {
-            // v1: no reachable public per-address endpoint → the honest panel.
-            self.credit_state = self.credit_client.state();
+        // Resolve the address we want polled (the user's OWN public address).
+        let address = self.reward_address();
+        // No identity yet → nothing to poll; keep the honest NotExposed default and
+        // do NOT spawn a worker (avoids a network thread on a fresh, identity-less run).
+        if address.is_none() && self.credit_poll.is_none() {
+            self.credit_state = CreditState::NotExposed;
             return;
         }
-        // (Fast-follow path — inert in v1.) A real implementation would check
-        // `next_poll_in_secs` against a timer, `begin_poll()` (single-flight), fire
-        // the GET on the worker, and feed the body to `complete()` / `fail()`. Here
-        // we simply surface the client's last-known state so the UI stays in sync.
-        self.credit_state = self.credit_client.state();
+        // Lazily start the worker on the first call that has (or could get) an address.
+        let poll = self.credit_poll.get_or_insert_with(CreditPoll::start);
+        poll.set_address(address);
+        self.credit_state = poll.state();
     }
 
     /// Build the M5 [`DashboardModel`] for the current frame: Source A (live local
@@ -1629,6 +1731,71 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             app.confirm_place(words[p - 1]);
         }
         assert!(app.confirm_is_correct(PHRASE));
+    }
+
+    /// Source B: with NO identity, `tick_credit` keeps the honest `NotExposed`
+    /// default and does NOT spawn a background poll worker (a fresh, identity-less
+    /// run must never touch the network).
+    #[test]
+    fn tick_credit_without_identity_is_not_exposed_and_spawns_no_worker() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.identity = None;
+        app.tick_credit();
+        assert_eq!(app.credit_state, CreditState::NotExposed);
+        assert!(app.credit_poll.is_none(), "no worker spawned without an identity");
+    }
+
+    /// Source B: a posed `Confirmed` state carrying cumulative COUNTS surfaces those
+    /// counts (credit-only) through the dashboard model + reconciles to "in sync"
+    /// while mining — and the pending_alice magnitude stays opaque (no Display).
+    #[test]
+    fn confirmed_credit_totals_are_count_only_and_reconcile_in_sync() {
+        use alice_miner_core::{CreditScore, CreditTotals, LaneCredit};
+        let mut app = MinerApp::new().expect("engine spawns");
+        // Simulate a live mining snapshot (Source A active).
+        app.snapshot = Some(Snapshot {
+            state: EngineState::Running,
+            device: None,
+            lane: Some(Lane::GpuPrl),
+            hashrate_hs: Some(8_400.0),
+            shares_accepted: 70,
+            shares_rejected: 0,
+            endpoint: Some("us.aliceprotocol.org:3340".into()),
+            worker_id: Some("rig".into()),
+            uptime_s: 60,
+            failovers: 0,
+            dual: false,
+            lanes: vec![],
+            last_line: None,
+            message: None,
+            prl_payout: None,
+        });
+        app.credit_state = CreditState::Confirmed {
+            score: CreditScore::new(12.56),
+            totals: CreditTotals {
+                accepted_total: 873,
+                accepted_24h: 142,
+                lanes: vec![
+                    LaneCredit {
+                        key: alice_miner_core::LANE_KEY_GPU_ALPHA.into(),
+                        label: "GPU · Alpha".into(),
+                        accepted: 500,
+                    },
+                    LaneCredit {
+                        key: alice_miner_core::LANE_KEY_GPU_PRL.into(),
+                        label: "GPU · PRL".into(),
+                        accepted: 373,
+                    },
+                ],
+            },
+        };
+        // The cumulative COUNTS are reachable (credit-only) and reconcile in-sync.
+        let model = app.dashboard_model();
+        let totals = model.credit.totals().expect("confirmed carries totals");
+        assert_eq!(totals.accepted_total, 873);
+        assert_eq!(totals.accepted_for_lane(alice_miner_core::LANE_KEY_GPU_ALPHA), 500);
+        assert_eq!(totals.accepted_for_lane(alice_miner_core::LANE_KEY_GPU_PRL), 373);
+        assert_eq!(app.reconciliation(), Reconciliation::InSync);
     }
 
     /// THE M3 FOLLOW-UP FIX: when idle / not yet connected, the displayed endpoint

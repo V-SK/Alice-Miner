@@ -196,6 +196,21 @@ pub const CREDIT_EXPLORER_URL: &str = "https://aliceprotocol.org/explorer.html";
 /// The Source-B states' short value labels (no number, ever).
 pub const CREDIT_CONFIRMING: &str = "confirming… · 确认中";
 pub const CREDIT_PENDING_VALUE: &str = "pending · 待发放";
+
+/// The cumulative server-confirmed credit panel (Confirmed state). These surface
+/// accepted-share COUNTS (cumulative + 24h + the GPU·Alpha / GPU·PRL split) — which
+/// are SHARE COUNTS, not money, so they are credit-only. The number is rendered by
+/// the panel from the count fields; these are the static labels around it.
+pub const CREDIT_CUMULATIVE_TITLE: &str = "Confirmed by the network";
+/// Row label for the cumulative accepted-share count (the headline number).
+pub const CREDIT_CUMULATIVE_TOTAL_LABEL: &str = "Accepted shares · 累计接受";
+/// Row label for the 24h accepted-share count.
+pub const CREDIT_CUMULATIVE_24H_LABEL: &str = "Last 24h · 近 24 小时";
+/// Section label for the per-lane (GPU·Alpha / GPU·PRL) split.
+pub const CREDIT_CUMULATIVE_LANES_LABEL: &str = "By pool · 按池";
+/// The honest "still syncing" caption shown under the cumulative title before the
+/// first successful fetch (so a not-yet-fetched view never shows a fabricated 0).
+pub const CREDIT_SYNCING: &str = "syncing… · 同步中";
 /// When a Source-B poll fault occurs (unreachable / withheld): a calm, neutral,
 /// NON-numeric note. We never hint at any dropped value.
 pub const CREDIT_UNCONFIRMED: &str = "unconfirmed · 待确认";
