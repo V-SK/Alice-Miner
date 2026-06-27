@@ -254,6 +254,17 @@ pub fn render_snapshot(snap: &Snapshot) -> String {
         out.push_str(&format!("    ! {note}\n"));
     }
 
+    // Crediting health for a pearlhash lane: it earns ONLY while the out-of-band PoP is
+    // live, so a full-hashrate lane can otherwise be counting nothing. Positive
+    // confirmation when healthy; the PAUSE case is already surfaced by the `message`
+    // line above (so we suppress this line then to avoid a contradictory pair).
+    if snap.lane.map(|l| l.is_prl_lane()).unwrap_or(false)
+        && snap.state == alice_miner_core::EngineState::Running
+        && snap.message.as_deref().map(str::is_empty).unwrap_or(true)
+    {
+        out.push_str("    rewards: counting (PoP active · credit-only)\n");
+    }
+
     // In dual mode, print each lane's own row so both lanes are visible.
     if snap.dual {
         for l in &snap.lanes {
@@ -680,6 +691,30 @@ mod tests {
         assert!(s.contains("15% PRL 返还 (credit-only)"));
         assert!(s.contains("待绑定 · pending"), "unbound → pending state");
         assert!(!s.contains('$'));
+    }
+
+    /// Crediting health: a pearlhash lane Running with no PoP warning shows the positive
+    /// "rewards: counting" confirmation; a PoP-pause message suppresses it (the message
+    /// line carries the detail, so the two never contradict); an XMR lane never shows it
+    /// (XMR credits by address, no OOB PoP).
+    #[test]
+    fn crediting_line_counts_when_healthy_suppressed_when_paused() {
+        // Healthy pearlhash → positive confirmation.
+        let disp = alice_miner_core::PrlPayoutDisplay::new(true, Some(PAYOUT_OK));
+        let s = render_snapshot(&prl_snapshot(disp));
+        assert!(s.contains("rewards: counting"), "healthy pearlhash shows counting: {s}");
+
+        // Paused → counting suppressed, the pause message surfaces.
+        let disp2 = alice_miner_core::PrlPayoutDisplay::new(true, Some(PAYOUT_OK));
+        let mut paused = prl_snapshot(disp2);
+        paused.message = Some("PoP re-verify failing — crediting may pause; retrying".into());
+        let s = render_snapshot(&paused);
+        assert!(!s.contains("rewards: counting"), "paused suppresses the counting line: {s}");
+        assert!(s.contains("crediting may pause"), "the pause message is surfaced: {s}");
+
+        // XMR (address-only) never shows the crediting line.
+        let s = render_snapshot(&running_snapshot());
+        assert!(!s.contains("rewards: counting"), "XMR has no OOB-PoP crediting row: {s}");
     }
 
     /// Non-PRL snapshots carry NO display block → the line is absent (no regression
