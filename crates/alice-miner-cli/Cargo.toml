@@ -24,6 +24,12 @@ rpassword = "7.3"
 # `--json` machine-readable output (detect/start). serde_json is already in the
 # engine's tree (a core dep), so this pulls in NO new transitive crates.
 serde_json = "1.0"
+# In-place live dashboard for an INTERACTIVE TTY (the `start` loop). A non-TTY
+# (piped / CI) and `--json` keep the plain line renderer untouched — the TUI is a
+# render-layer swap only. `crossterm` is ratatui's default backend; we use
+# ratatui's re-export (`ratatui::crossterm`) so the versions can never drift.
+ratatui = "0.30"
+crossterm = "0.29"
 
 [dev-dependencies]
 # Drive the built CLI binary end-to-end in integration tests (subcommand parsing,

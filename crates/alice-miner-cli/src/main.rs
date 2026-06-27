@@ -44,6 +44,7 @@ use alice_miner_core::{EngineHandle, EngineState, GpuSelection, Lane, Snapshot};
 mod dashboard;
 mod fleet;
 mod pidfile;
+mod tui;
 
 // ── Exit codes ──────────────────────────────────────────────────────────────
 /// Success.
@@ -861,7 +862,19 @@ fn cmd_start(args: StartArgs) -> i32 {
         return EXIT_RUNTIME;
     }
 
-    if !args.json {
+    // Choose the live-output mode ONCE (the three honest paths):
+    //   * --json          → machine JSON lines (TUI/line renderer never touch it).
+    //   * non-TTY, !json   → the plain scrolling line renderer (piped / CI).
+    //   * interactive TTY  → the in-place ratatui panel (falls back to the line
+    //                        renderer if the terminal can't enter raw mode).
+    // The `--json` output is byte-for-byte unchanged in every case.
+    use std::io::IsTerminal;
+    let interactive = !args.json && std::io::stdout().is_terminal();
+    let mut tui = if interactive { tui::Tui::new().ok() } else { None };
+
+    // Banners only make sense for the scrolling line renderer (the TUI shows state
+    // in its status bar; --json is machine-only).
+    if !args.json && tui.is_none() {
         print!("{}", dashboard::render_start_banner(lane, args.dual));
     }
 
@@ -871,11 +884,24 @@ fn cmd_start(args: StartArgs) -> i32 {
     let mut exit_code = EXIT_OK;
     let mut requested_stop = false;
     let mut saw_running = false;
+    // A fatal engine error message, deferred until AFTER the TUI is torn down so it
+    // prints to the restored terminal (not the alternate screen). `None` in line mode
+    // (it's printed inline there immediately, as before).
+    let mut deferred_error: Option<String> = None;
 
     loop {
         match engine.recv_timeout(Duration::from_millis(500)) {
             Ok(Event::Snapshot(snap)) => {
-                emit_snapshot(&snap, args.json);
+                if let Some(t) = tui.as_mut() {
+                    // In-place panel; a draw failure (terminal lost) falls back to the
+                    // line renderer for the rest of the run rather than aborting.
+                    if t.draw(&snap).is_err() {
+                        tui = None;
+                        emit_snapshot(&snap, args.json);
+                    }
+                } else {
+                    emit_snapshot(&snap, args.json);
+                }
                 if matches!(snap.state, EngineState::Running) {
                     saw_running = true;
                 }
@@ -888,6 +914,9 @@ fn cmd_start(args: StartArgs) -> i32 {
             Ok(Event::Error(e)) => {
                 if args.json {
                     println!("{}", serde_json::json!({ "error": e }));
+                } else if tui.is_some() {
+                    // Defer: print after the alt screen is gone.
+                    deferred_error = Some(e);
                 } else {
                     eprintln!("engine error: {e}");
                 }
@@ -902,15 +931,29 @@ fn cmd_start(args: StartArgs) -> i32 {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        // Ctrl-C / SIGTERM or duration elapsed → request Stop once.
+        // In the TUI, the process-wide ctrlc handler may not fire while the terminal
+        // is in raw mode, so also poll the panel for a quit key (q / Esc / Ctrl-C).
+        let tui_quit = match tui.as_ref() {
+            Some(t) => t.poll_quit(0).unwrap_or(false),
+            None => false,
+        };
+
+        // Ctrl-C / SIGTERM, a TUI quit key, or the duration elapsed → request Stop once.
         let timed_out = deadline.map(|d| start.elapsed() >= d).unwrap_or(false);
-        if !requested_stop && (stop_flag.load(Ordering::SeqCst) || timed_out) {
-            if !args.json {
+        if !requested_stop && (stop_flag.load(Ordering::SeqCst) || tui_quit || timed_out) {
+            if !args.json && tui.is_none() {
                 print!("{}", dashboard::render_stopping_banner());
             }
             let _ = engine.send(EngineCommand::Stop);
             requested_stop = true;
         }
+    }
+
+    // Tear the TUI down (restore the terminal) BEFORE any post-loop printing so the
+    // notes/errors land on the user's real shell, not the alternate screen.
+    drop(tui);
+    if let Some(e) = deferred_error {
+        eprintln!("engine error: {e}");
     }
 
     // Best-effort: ensure the child is torn down on the way out (kill_on_drop is
