@@ -1,6 +1,6 @@
 [package]
 name = "alice-miner-cli"
-version = "0.3.2"
+version = "0.3.4"
 edition = "2021"
 
 # Headless Alice Miner client (PLAN §2.2, C2). Drives the SAME `alice-miner-core`
