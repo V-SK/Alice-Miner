@@ -201,14 +201,37 @@ pub fn text_input(ui: &mut Ui, value: &mut String, hint: &str, mono: bool) -> Re
 /// — used for the wallet-unlock password prompt so the passphrase is never shown
 /// on screen. Same recessed styling as [`text_input`]; always non-mono.
 pub fn password_input(ui: &mut Ui, value: &mut String, hint: &str) -> Response {
-    ui.add(
-        egui::TextEdit::singleline(value)
-            .desired_width(f32::INFINITY)
-            .hint_text(hint)
-            .password(true)
-            .margin(egui::vec2(12.0, 10.0))
-            .background_color(THEME.well),
-    )
+    ui.add(password_edit(value, hint))
+}
+
+/// Like [`password_input`] but with an EXPLICIT widget [`egui::Id`], so the
+/// caller can later wipe the field's persisted `TextEdit` state (cursor + the
+/// **undo history**, which otherwise retains typed-then-deleted text — including
+/// a password the owned `String` already zeroized). Pair with
+/// [`clear_text_edit_state`] on modal close.
+pub fn password_input_with_id(ui: &mut Ui, id: egui::Id, value: &mut String, hint: &str) -> Response {
+    ui.add(password_edit(value, hint).id(id))
+}
+
+/// Build the shared masked single-line `TextEdit` (so the id'd and non-id'd
+/// variants can never style differently).
+fn password_edit<'t>(value: &'t mut String, hint: &str) -> egui::TextEdit<'t> {
+    egui::TextEdit::singleline(value)
+        .desired_width(f32::INFINITY)
+        .hint_text(hint)
+        .password(true)
+        .margin(egui::vec2(12.0, 10.0))
+        .background_color(THEME.well)
+}
+
+/// Dispose a `TextEdit` widget's persisted state (cursor + undo history) for an
+/// explicit `id`. Used to scrub a password field's in-process egui residue when a
+/// modal closes: the owned `String` is zeroized separately, but egui's `Undoer`
+/// keeps a few past snapshots of the buffer (the typed password) until evicted —
+/// removing the whole `TextEditState` drops them immediately. The cursor lives
+/// inside that same state, so one removal covers it. No-op if nothing was stored.
+pub fn clear_text_edit_state(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|d| d.remove::<egui::widgets::text_edit::TextEditState>(id));
 }
 
 /// A recessed multi-line text input (mnemonic paste).
