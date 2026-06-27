@@ -1467,9 +1467,14 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         app.select_lane(Lane::Xmr);
         assert_eq!(app.display_endpoint(), "hk.aliceprotocol.org:3333");
 
-        // RVN selected → :8888 (was hardcoded to :3333 before the fix).
-        app.select_lane(Lane::GpuRvn);
-        assert_eq!(app.display_endpoint(), "hk.aliceprotocol.org:8888");
+        // A GPU lane (Alpha → its own relay port :3341) reflects through, NOT the
+        // hardcoded :3333. (RVN is ComingSoon/not-selectable now, so use Alpha.)
+        app.select_lane(Lane::GpuAlpha);
+        assert!(
+            app.display_endpoint().ends_with(":3341"),
+            "idle endpoint should reflect the selected lane's port, got {}",
+            app.display_endpoint()
+        );
     }
 
     /// Reduced motion flips `motion_enabled`.
@@ -2019,7 +2024,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
 
         // Single-GPU NVIDIA (the summary GPU but no enumeration) → picker hidden.
         app.set_device(nvidia_device()); // gpus: [] (no enumeration)
-        app.select_lane(Lane::GpuRvn);
+        app.select_lane(Lane::GpuPrl); // a runnable GPU lane (RVN is ComingSoon now)
         assert!(!app.show_gpu_selector(), "no enumerated list → no picker");
         assert_eq!(app.resolved_gpu_selection(), GpuSelection::All);
 
@@ -2034,7 +2039,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
 
         // With a GPU lane the picker shows; all-checked still resolves to All
         // (byte-identical every-card argv — the no-regression contract).
-        app.select_lane(Lane::GpuRvn);
+        app.select_lane(Lane::GpuPrl); // a runnable GPU lane (RVN is ComingSoon now)
         assert!(app.show_gpu_selector(), "≥2 GPUs + GPU lane → picker shows");
         assert_eq!(
             app.resolved_gpu_selection(),

@@ -151,7 +151,19 @@ pub fn derive_lane_viability(profile: &DeviceProfile) -> LaneViability {
 
     // ── RVN: depends on the GPU vendor ──────────────────────────────────────
     let (rvn_support, rvn_reason) = match profile.gpu.vendor {
-        GpuVendor::Nvidia => (LaneSupport::Viable, "nvidia_present"),
+        GpuVendor::Nvidia => {
+            // RVN (KawPoW) needs a pinned kawpowminer engine, which is NOT yet bundled
+            // or fetchable (the miners.json entry is an all-zero placeholder, refused by
+            // binaries.rs). Advertising it Viable made the UI offer a lane that always
+            // failed with "GPU miner not installed"; ComingSoon is the honest state
+            // until the engine is pinned (PRL/Alpha are the live NVIDIA pearlhash lanes).
+            notes.push(
+                "NVIDIA GPU detected — the RVN (KawPoW) lane is coming soon; mine the \
+                 PRL or Alpha pearlhash lane today."
+                    .to_string(),
+            );
+            (LaneSupport::ComingSoon, "rvn_nvidia_coming_soon_engine_unpinned")
+        }
         GpuVendor::Amd => {
             notes.push(
                 "AMD GPU detected — the RVN (KawPoW) lane for AMD is coming soon."
@@ -494,22 +506,23 @@ mod tests {
         assert_eq!(v.recommended, Lane::Xmr);
         assert_eq!(v.reason(Lane::GpuRvn), Some("rvn_requires_nvidia_apple_excluded"));
 
-        // Simulated NVIDIA: RVN + PRL + Alpha viable; XMR still viable.
+        // Simulated NVIDIA: PRL + Alpha viable; RVN is ComingSoon (engine unpinned,
+        // honest — not runnable); XMR still viable.
         let v = derive_lane_viability(&nvidia());
         assert_eq!(v.support(Lane::Xmr), LaneSupport::Viable);
-        assert_eq!(v.support(Lane::GpuRvn), LaneSupport::Viable);
+        assert_eq!(v.support(Lane::GpuRvn), LaneSupport::ComingSoon);
         assert_eq!(v.support(Lane::GpuPrl), LaneSupport::Viable);
         assert_eq!(v.support(Lane::GpuAlpha), LaneSupport::Viable); // V100/Volta path, selectable
-        assert!(v.is_runnable(Lane::GpuRvn));
+        assert!(!v.is_runnable(Lane::GpuRvn)); // coming-soon is NOT runnable
         assert!(v.is_runnable(Lane::GpuPrl));
         assert!(v.is_runnable(Lane::GpuAlpha));
         // GPU-PRL is the mainline default (V: "GPU 主线 = PRL") — a GPU box
         // one-click-defaults to PRL. runnable set = recommended-first, then
-        // ALL_LANES order ([Xmr, GpuPrl, GpuAlpha, GpuRvn]).
+        // ALL_LANES order; RVN is excluded (ComingSoon, not runnable).
         assert_eq!(v.recommended, Lane::GpuPrl);
         assert_eq!(
             v.runnable_lanes(),
-            vec![Lane::GpuPrl, Lane::Xmr, Lane::GpuAlpha, Lane::GpuRvn]
+            vec![Lane::GpuPrl, Lane::Xmr, Lane::GpuAlpha]
         );
     }
 
@@ -527,8 +540,9 @@ mod tests {
         assert!(v.is_runnable(Lane::GpuAlpha));
         assert_eq!(v.recommended, Lane::GpuAlpha);
         assert!(v.notes.iter().any(|n| n.contains("Volta")));
-        // RVN still viable (NVIDIA) but Alpha leads the runnable set.
-        assert_eq!(v.runnable_lanes(), vec![Lane::GpuAlpha, Lane::Xmr, Lane::GpuRvn]);
+        // RVN is ComingSoon on NVIDIA (engine unpinned, not runnable) → excluded; the
+        // runnable set is Alpha-led then XMR.
+        assert_eq!(v.runnable_lanes(), vec![Lane::GpuAlpha, Lane::Xmr]);
     }
 
     /// AMD → RVN "coming soon" (NOT runnable), but PRL viable (SRBMiner supports
@@ -583,7 +597,8 @@ mod tests {
     }
 
     /// Restrict override: on an NVIDIA box, `ALICE_MINER_LANES=xmr` demotes the
-    /// runnable RVN lane and re-points the recommendation to XMR.
+    /// runnable GPU lanes (PRL/Alpha) and re-points the recommendation to XMR. (RVN is
+    /// already ComingSoon/not-runnable, so it keeps its own reason, not override_excluded.)
     #[test]
     fn restrict_override_demotes_unrequested_runnable_lane() {
         let base = derive_lane_viability(&nvidia());
@@ -593,7 +608,8 @@ mod tests {
         assert!(!v.is_runnable(Lane::GpuRvn));
         assert!(!v.is_runnable(Lane::GpuPrl));
         assert_eq!(v.recommended, Lane::Xmr);
-        assert_eq!(v.reason(Lane::GpuRvn), Some("override_excluded"));
+        // GPU-PRL was runnable and the operator excluded it → override_excluded.
+        assert_eq!(v.reason(Lane::GpuPrl), Some("override_excluded"));
     }
 
     /// Restrict override CANNOT conjure hardware: forcing `gpu` on an Apple box

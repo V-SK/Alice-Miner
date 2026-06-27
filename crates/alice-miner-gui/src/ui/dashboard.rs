@@ -156,6 +156,24 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     } else {
         "—".to_string()
     };
+    // Reject-rate health for the "Accepted" card sub-label. Replaces the old
+    // unconditional "rolling · healthy" (which read healthy at ANY reject ratio).
+    // GPU-Alpha doesn't track rejects (parse_alpha → None, so r stays 0), so show an
+    // honest "rejects n/a" there rather than a false 100%/healthy.
+    let (accepted_sub, accepted_sub_color): (String, egui::Color32) = if a + r == 0 {
+        ("no shares yet".to_string(), THEME.text3)
+    } else if app.active_lane() == Lane::GpuAlpha {
+        ("rejects n/a".to_string(), THEME.text3)
+    } else {
+        let reject_pct = r as f64 / (a + r) as f64 * 100.0;
+        if reject_pct <= 5.0 {
+            ("rolling · healthy".to_string(), THEME.live)
+        } else if reject_pct <= 20.0 {
+            (format!("{reject_pct:.0}% rejects · elevated"), THEME.warn)
+        } else {
+            (format!("{reject_pct:.0}% rejects · high"), THEME.err)
+        }
+    };
     let cards: Vec<CardFn> = vec![
         // Hashrate (accent, with sparkline).
         Box::new({
@@ -197,6 +215,8 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
         // Accepted %.
         Box::new({
             let pct = pct.clone();
+            let sub = accepted_sub.clone();
+            let sub_color = accepted_sub_color;
             move |ui: &mut egui::Ui| {
                 widgets::stat_card(
                     ui,
@@ -204,7 +224,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
                     CARD_MIN_CONTENT_H,
                     "Accepted",
                     widgets::mono(format!("{pct}%"), 25.0, THEME.text).strong(),
-                    Some(RichText::new(if a + r > 0 { "rolling · healthy" } else { "no shares yet" }).size(11.0).color(if a + r > 0 { THEME.live } else { THEME.text3 })),
+                    Some(RichText::new(sub.clone()).size(11.0).color(sub_color)),
                     None,
                     None,
                 );

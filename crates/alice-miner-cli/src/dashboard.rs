@@ -239,6 +239,21 @@ pub fn render_snapshot(snap: &Snapshot) -> String {
         REWARD_PENDING,
     ));
 
+    // Surface the engine's short reason whenever it set one: an Error/Stopping reason,
+    // or a transient warning pushed while STILL running (e.g. the PoP-refresh "crediting
+    // may pause" note — a full-hashrate lane can be earning nothing). The most actionable
+    // field the engine computes every tick; previously dropped on the floor.
+    if let Some(msg) = snap.message.as_deref() {
+        if !msg.is_empty() {
+            out.push_str(&format!("    ! {msg}\n"));
+        }
+    }
+    // Reject-rate health note when elevated (rejected shares are wasted power that earns
+    // nothing). Quiet under a noise floor; GPU-Alpha doesn't track rejects so it never trips.
+    if let Some(note) = reject_health_note(snap.shares_accepted, snap.shares_rejected) {
+        out.push_str(&format!("    ! {note}\n"));
+    }
+
     // In dual mode, print each lane's own row so both lanes are visible.
     if snap.dual {
         for l in &snap.lanes {
@@ -350,6 +365,28 @@ pub fn fmt_hashrate_human(h: f64) -> String {
         format!("{:.2} kH/s", h / K)
     } else {
         format!("{h:.0} H/s")
+    }
+}
+
+/// A reject-rate health note when the rejected fraction is elevated — `None` under a
+/// noise floor (don't alarm on a tiny sample) or when rejects are healthy. Rejected
+/// shares are wasted power that earns nothing, so an elevated rate is a real earn-
+/// correctness signal a miner should see. GPU-Alpha never tracks rejects (always 0), so
+/// it never trips.
+fn reject_health_note(accepted: u64, rejected: u64) -> Option<String> {
+    let total = accepted + rejected;
+    if total < 20 {
+        return None; // noise floor: a few early rejects are normal vardiff churn
+    }
+    let pct = rejected as f64 / total as f64 * 100.0;
+    if pct > 20.0 {
+        Some(format!(
+            "HIGH reject rate {pct:.0}% — wasted work; check GPU stability / overclock / pool"
+        ))
+    } else if pct > 5.0 {
+        Some(format!("elevated reject rate {pct:.0}%"))
+    } else {
+        None
     }
 }
 
@@ -513,6 +550,22 @@ mod tests {
         assert!(s.contains("01:01:01"));
         assert!(s.contains("hk.aliceprotocol.org:3333"));
         assert!(s.contains("net accepted (142/1)"));
+    }
+
+    #[test]
+    fn reject_health_note_thresholds() {
+        // Under the noise floor → no note regardless of ratio.
+        assert_eq!(reject_health_note(5, 5), None);
+        // Healthy (<=5%) → no note.
+        assert_eq!(reject_health_note(1000, 30), None);
+        // Elevated (>5%, <=20%).
+        let n = reject_health_note(900, 100).expect("elevated");
+        assert!(n.contains("elevated"), "{n}");
+        // High (>20%) → loud note.
+        let n = reject_health_note(700, 300).expect("high");
+        assert!(n.contains("HIGH"), "{n}");
+        // GPU-Alpha never tracks rejects (rejected stays 0) → never trips.
+        assert_eq!(reject_health_note(10_000, 0), None);
     }
 
     #[test]

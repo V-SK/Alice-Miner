@@ -358,9 +358,17 @@ fn status_line(ui: &mut egui::Ui, app: &MinerApp) {
             (Tone::Warn, strings::STATUS_CONNECTING.to_string())
         }
         EngineState::Running => {
-            let a = app.snapshot.as_ref().map(|s| s.shares_accepted).unwrap_or(0);
-            let r = app.snapshot.as_ref().map(|s| s.shares_rejected).unwrap_or(0);
-            (Tone::Live, format!("Mining · {a}/{r} shares"))
+            // A transient warning pushed while STILL mining (e.g. the PoP-refresh
+            // "crediting may pause" note) must be visible — a full-hashrate lane can be
+            // earning nothing. Show it in a Warn tone rather than a confident green
+            // "Mining"; otherwise the calm share line.
+            if let Some(msg) = app.snapshot.as_ref().and_then(|s| s.message.clone()) {
+                (Tone::Warn, msg)
+            } else {
+                let a = app.snapshot.as_ref().map(|s| s.shares_accepted).unwrap_or(0);
+                let r = app.snapshot.as_ref().map(|s| s.shares_rejected).unwrap_or(0);
+                (Tone::Live, format!("Mining · {a}/{r} shares"))
+            }
         }
         EngineState::Starting => (Tone::Warn, strings::STATUS_CONNECTING.to_string()),
         EngineState::Stopping => (Tone::Warn, strings::STATUS_STOPPING.to_string()),
@@ -410,7 +418,10 @@ fn error_banner(ui: &mut egui::Ui, app: &MinerApp) {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.horizontal(|ui| {
                 ui.add_space(0.0);
-                ui.label(RichText::new("⚠  ").size(13.0).color(fg).strong());
+                // Vector icon, NOT an emoji (the no-emoji/SVG brand rule; emoji also
+                // renders inconsistently across OS/fonts on this safety-critical surface).
+                super::icons::show(ui, super::icons::Icon::Alert, 14.0, fg);
+                ui.add_space(7.0);
                 ui.label(RichText::new(err).size(12.5).color(THEME.text));
             });
         });
