@@ -1364,7 +1364,62 @@ pub fn migrate_keystore_in_place(path: &Path, migrated: &[u8]) -> Result<Option<
         .map_err(|e| UpdateError::Io(format!("write migrated keystore: {e}")))?;
     std::fs::rename(&tmp, path)
         .map_err(|e| UpdateError::Io(format!("commit migrated keystore: {e}")))?;
+
+    // Prune old backups so repeated migrations can't accumulate `.bak-<ts>`
+    // siblings unbounded (mirrors the bound on alice-crypto's identity backups).
+    // Best-effort: a prune failure must never fail a migration that already
+    // committed, so every step swallows its error.
+    if backup.is_some() {
+        prune_old_migration_backups(path, KEYSTORE_MIGRATION_BACKUP_RETENTION);
+    }
     Ok(backup)
+}
+
+/// How many timestamped migration backups (`<name>.bak-<ts>`) to keep. The newest
+/// `N` are retained (the most recent pre-migration states); older ones are pruned.
+const KEYSTORE_MIGRATION_BACKUP_RETENTION: usize = 5;
+
+/// Delete all but the `keep` newest `<keystore-name>.bak-<ts>` siblings of `path`.
+/// Strict-prefix matched so the live keystore and unrelated files are never
+/// touched; sorted newest-first by the numeric `<ts>` suffix (lexical fallback).
+/// Fully fail-soft — any IO error short-circuits without surfacing, because this
+/// only ever runs *after* a backup + migration have already committed.
+fn prune_old_migration_backups(path: &Path, keep: usize) {
+    let Some(dir) = path.parent() else { return };
+    let Some(live_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let prefix = format!("{live_name}.bak-");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    let mut backups: Vec<(u128, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(ts_str) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        // Numeric suffix sorts chronologically; non-numeric (shouldn't occur)
+        // sinks to 0 so it is pruned first rather than wrongly kept.
+        let ts = ts_str.parse::<u128>().unwrap_or(0);
+        backups.push((ts, entry.path()));
+    }
+
+    if backups.len() <= keep {
+        return;
+    }
+    backups.sort_by_key(|b| std::cmp::Reverse(b.0)); // newest first
+    for (_, old) in backups.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(old);
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1777,6 +1832,58 @@ mod tests {
         let backup2 = migrate_keystore_in_place(&fresh, new_bytes).unwrap();
         assert!(backup2.is_none());
         assert_eq!(std::fs::read(&fresh).unwrap(), new_bytes);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn keystore_migration_prunes_old_backups_to_n_and_never_touches_live_or_unrelated() {
+        // Repeated migrations must not let `<name>.bak-<ts>` siblings accumulate
+        // unbounded; only the newest N are kept, and the live keystore + unrelated
+        // files are never matched/deleted.
+        let base = std::env::temp_dir().join(format!(
+            "alice-wallet-migrate-prune-{}-{}",
+            std::process::id(),
+            nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let keystore = base.join("profiles.json");
+        std::fs::write(&keystore, br#"{"version":1}"#).unwrap();
+
+        // Seed more than N old backups with distinct ascending timestamps, plus a
+        // decoy that shares no `.bak-` prefix and must be left untouched.
+        let seeded = KEYSTORE_MIGRATION_BACKUP_RETENTION + 4; // 9 with N=5
+        for i in 1..=seeded as u128 {
+            std::fs::write(base.join(format!("profiles.json.bak-{i}")), b"old").unwrap();
+        }
+        let decoy = base.join("unrelated.txt");
+        std::fs::write(&decoy, b"keep me").unwrap();
+
+        // One migration adds a fresh (large-nanos) backup, then prunes.
+        migrate_keystore_in_place(&keystore, br#"{"version":2}"#)
+            .expect("migration ok")
+            .expect("pre-existing file backed up");
+
+        let remaining: Vec<String> = std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("profiles.json.bak-"))
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            KEYSTORE_MIGRATION_BACKUP_RETENTION,
+            "exactly N backups must remain after prune, got {remaining:?}"
+        );
+        // Oldest seeded backup is pruned; the newest seeded one survives.
+        assert!(!base.join("profiles.json.bak-1").exists(), "oldest backup pruned");
+        assert!(
+            base.join(format!("profiles.json.bak-{seeded}")).exists(),
+            "newest seeded backup retained"
+        );
+        // Live keystore migrated + intact; unrelated decoy untouched.
+        assert_eq!(std::fs::read(&keystore).unwrap(), br#"{"version":2}"#);
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"keep me");
 
         let _ = std::fs::remove_dir_all(&base);
     }
