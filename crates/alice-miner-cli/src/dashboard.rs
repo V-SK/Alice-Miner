@@ -40,8 +40,13 @@ const REWARD_CREDIT: &str = "credit · 积分 (credit-only)";
 pub enum LaneHealth {
     /// Running with a nonzero hashrate — the lane is doing real work.
     Green,
-    /// Running but 0 H/s (a STALL — the loud "this lane is wedged" signal, e.g. Mac
-    /// App-Nap), or a transitional Starting/Stopping (reconnecting).
+    /// Running but no hashrate reported YET, within the warm-up grace. The engines
+    /// (xmrig/SRBMiner) emit a rate only on a periodic cumulative summary (~60-90s), so
+    /// a freshly-started lane legitimately reads 0 for up to ~90s — that is NOT a stall,
+    /// so it gets its own quieter chip instead of the loud STALL.
+    Warmup,
+    /// Running but 0 H/s PAST the warm-up grace (a real STALL — the loud "this lane is
+    /// wedged" signal, e.g. Mac App-Nap), or a transitional Starting/Stopping.
     Amber,
     /// The lane errored / its child exited.
     Red,
@@ -49,16 +54,25 @@ pub enum LaneHealth {
     Idle,
 }
 
+/// How long after start a Running lane may report 0 H/s before it counts as a STALL
+/// rather than warm-up: the engines emit a rate only on a periodic cumulative summary
+/// (xmrig/SRBMiner ~60-90s), so a fresh lane is legitimately 0 until the first one. This
+/// stops the loud STALL chip from false-alarming in the first ~90s of a healthy lane.
+pub const WARMUP_GRACE_S: u64 = 90;
+
 impl LaneHealth {
-    /// Classify a lane from its lifecycle state + live hashrate. A `Running` lane
-    /// with a positive, finite hashrate is GREEN; a `Running` lane at 0 / no speed
-    /// line yet is AMBER (the stall tell); `Starting`/`Stopping` are AMBER
-    /// (reconnecting); `Error` is RED; `Idle` is IDLE.
-    pub fn classify(state: EngineState, hashrate_hs: Option<f64>) -> Self {
+    /// Classify a lane from its lifecycle state, live hashrate, and uptime. A `Running`
+    /// lane with a positive, finite hashrate is GREEN. A `Running` lane at 0 / no speed
+    /// line yet is WARMUP while `uptime_s < WARMUP_GRACE_S` (the engine just hasn't
+    /// emitted its first periodic summary), then AMBER (a genuine STALL) past the grace.
+    /// `Starting`/`Stopping` are AMBER (reconnecting); `Error` is RED; `Idle` is IDLE.
+    pub fn classify(state: EngineState, hashrate_hs: Option<f64>, uptime_s: u64) -> Self {
         match state {
             EngineState::Running => match hashrate_hs {
                 Some(h) if h.is_finite() && h > 0.0 => LaneHealth::Green,
-                _ => LaneHealth::Amber, // running but 0 H/s = stalled (LOUD)
+                // 0 / none: warm-up until the engine's first summary lands, then STALL.
+                _ if uptime_s < WARMUP_GRACE_S => LaneHealth::Warmup,
+                _ => LaneHealth::Amber, // running but 0 H/s past warm-up = stalled (LOUD)
             },
             EngineState::Starting | EngineState::Stopping => LaneHealth::Amber,
             EngineState::Error => LaneHealth::Red,
@@ -72,6 +86,7 @@ impl LaneHealth {
     pub fn chip(self) -> &'static str {
         match self {
             LaneHealth::Green => "OK",
+            LaneHealth::Warmup => "WARM",
             LaneHealth::Amber => "STALL",
             LaneHealth::Red => "ERR",
             LaneHealth::Idle => "—",
@@ -94,12 +109,12 @@ pub struct LaneRow {
 }
 
 impl LaneRow {
-    fn from_lane_snapshot(l: &LaneSnapshot) -> Self {
+    fn from_lane_snapshot(l: &LaneSnapshot, uptime_s: u64) -> Self {
         LaneRow {
             lane: l.lane,
-            health: LaneHealth::classify(l.state, l.hashrate_hs),
+            health: LaneHealth::classify(l.state, l.hashrate_hs, uptime_s),
             state: fmt_state(l.state).to_string(),
-            speed: fmt_hashrate(l.hashrate_hs),
+            speed: fmt_hashrate_compact(l.hashrate_hs),
             shares: fmt_lane_shares(l.lane, l.shares_accepted, l.shares_rejected),
             endpoint: l.endpoint.clone().unwrap_or_else(|| "—".into()),
             failovers: l.failovers,
@@ -125,15 +140,19 @@ fn fmt_lane_shares(lane: Lane, accepted: u64, rejected: u64) -> String {
 /// pre-start idle snapshot with no `lane`).
 pub fn lane_table_rows(snap: &Snapshot) -> Vec<LaneRow> {
     if !snap.lanes.is_empty() {
-        return snap.lanes.iter().map(LaneRow::from_lane_snapshot).collect();
+        return snap
+            .lanes
+            .iter()
+            .map(|l| LaneRow::from_lane_snapshot(l, snap.uptime_s))
+            .collect();
     }
     // Synthesize a single row from the top-level fields (single-lane / older stream).
     match snap.lane {
         Some(lane) => vec![LaneRow {
             lane,
-            health: LaneHealth::classify(snap.state, snap.hashrate_hs),
+            health: LaneHealth::classify(snap.state, snap.hashrate_hs, snap.uptime_s),
             state: fmt_state(snap.state).to_string(),
-            speed: fmt_hashrate(snap.hashrate_hs),
+            speed: fmt_hashrate_compact(snap.hashrate_hs),
             shares: fmt_lane_shares(lane, snap.shares_accepted, snap.shares_rejected),
             endpoint: snap.endpoint.clone().unwrap_or_else(|| "—".into()),
             failovers: snap.failovers,
@@ -184,7 +203,7 @@ fn paint_line(line: &str, health: LaneHealth, color: bool) -> String {
     }
     let code = match health {
         LaneHealth::Green => "\x1b[32m",
-        LaneHealth::Amber => "\x1b[33m",
+        LaneHealth::Warmup | LaneHealth::Amber => "\x1b[33m",
         LaneHealth::Red => "\x1b[31m",
         LaneHealth::Idle => return line.to_string(),
     };
@@ -702,6 +721,18 @@ pub fn fmt_hashrate(hs: Option<f64>) -> String {
     }
 }
 
+/// A COMPACT hashrate for fixed-width table cells: the human-scaled value ONLY (no raw
+/// `"{h} H/s (…)"` prefix). The full [`fmt_hashrate`] is too long for the lane-table
+/// SPEED column, so a huge pearlhash magnitude (e.g. 109790000000000 H/s) used to
+/// truncate to its USELESS raw digits and drop the readable `109.79 TH/s`. This keeps
+/// only the scaled form so the headline number a miner reads always fits. `—` for None.
+pub fn fmt_hashrate_compact(hs: Option<f64>) -> String {
+    match hs {
+        Some(h) if h.is_finite() && h >= 0.0 => fmt_hashrate_human(h),
+        _ => "—".to_string(),
+    }
+}
+
 /// The xmrig-grade triple-window speed line `speed 10s/60s/15m <a>/<b>/<c>` — but
 /// ONLY when the snapshot's lane actually measures the windows (i.e. at least one of
 /// the 60s/15m figures is present, which is xmrig). `None` for every GPU lane (they
@@ -1003,17 +1034,24 @@ mod tests {
     /// stall tell); Starting/Stopping = amber; Error = red; Idle = idle.
     #[test]
     fn lane_health_classify_amber_on_zero() {
-        assert_eq!(LaneHealth::classify(EngineState::Running, Some(8_432.0)), LaneHealth::Green);
-        // Running but 0 H/s = STALLED → amber (the loud signal).
-        assert_eq!(LaneHealth::classify(EngineState::Running, Some(0.0)), LaneHealth::Amber);
-        assert_eq!(LaneHealth::classify(EngineState::Running, None), LaneHealth::Amber);
+        // Past the warm-up grace, a 0/None/NaN running lane is a genuine STALL (amber).
+        let up = WARMUP_GRACE_S + 30;
+        assert_eq!(LaneHealth::classify(EngineState::Running, Some(8_432.0), up), LaneHealth::Green);
+        assert_eq!(LaneHealth::classify(EngineState::Running, Some(0.0), up), LaneHealth::Amber);
+        assert_eq!(LaneHealth::classify(EngineState::Running, None, up), LaneHealth::Amber);
         // A non-finite reading is treated as no-progress → amber, never green.
-        assert_eq!(LaneHealth::classify(EngineState::Running, Some(f64::NAN)), LaneHealth::Amber);
+        assert_eq!(LaneHealth::classify(EngineState::Running, Some(f64::NAN), up), LaneHealth::Amber);
+        // WITHIN the warm-up grace, a 0/None running lane is WARMUP, not a false STALL
+        // (the engine just hasn't emitted its first periodic summary yet).
+        assert_eq!(LaneHealth::classify(EngineState::Running, None, 5), LaneHealth::Warmup);
+        assert_eq!(LaneHealth::classify(EngineState::Running, Some(0.0), 5), LaneHealth::Warmup);
+        // …but a nonzero rate during warm-up is already green.
+        assert_eq!(LaneHealth::classify(EngineState::Running, Some(1.0), 5), LaneHealth::Green);
         // Transitional = amber (reconnecting); error = red; idle = idle.
-        assert_eq!(LaneHealth::classify(EngineState::Starting, None), LaneHealth::Amber);
-        assert_eq!(LaneHealth::classify(EngineState::Stopping, Some(1.0)), LaneHealth::Amber);
-        assert_eq!(LaneHealth::classify(EngineState::Error, None), LaneHealth::Red);
-        assert_eq!(LaneHealth::classify(EngineState::Idle, None), LaneHealth::Idle);
+        assert_eq!(LaneHealth::classify(EngineState::Starting, None, up), LaneHealth::Amber);
+        assert_eq!(LaneHealth::classify(EngineState::Stopping, Some(1.0), up), LaneHealth::Amber);
+        assert_eq!(LaneHealth::classify(EngineState::Error, None, up), LaneHealth::Red);
+        assert_eq!(LaneHealth::classify(EngineState::Idle, None, up), LaneHealth::Idle);
     }
 
     /// The lane table renders ALWAYS (not just dual): a single-lane snapshot with no
@@ -1030,12 +1068,23 @@ mod tests {
         assert!(table.contains("OK"), "green lane shows OK chip: {table}");
         assert!(table.contains("hk.aliceprotocol.org:3333"));
 
-        // Running but 0 H/s → the STALL chip (silent zero made loud).
+        // Running but 0 H/s PAST the warm-up grace → the STALL chip (silent zero made loud).
         let mut stalled = running_snapshot();
         stalled.hashrate_hs = Some(0.0);
         stalled.lanes[0].hashrate_hs = Some(0.0);
+        stalled.uptime_s = WARMUP_GRACE_S + 30; // past warm-up → a genuine stall
         let t2 = render_lane_table(&stalled, false);
-        assert!(t2.contains("STALL"), "0 H/s while running = STALL chip: {t2}");
+        assert!(t2.contains("STALL"), "0 H/s while running past warm-up = STALL chip: {t2}");
+
+        // …but within the warm-up grace, the same 0 H/s shows WARM — no false STALL alarm
+        // in the first ~90s while the engine hasn't emitted its first summary yet.
+        let mut warming = running_snapshot();
+        warming.hashrate_hs = None;
+        warming.lanes[0].hashrate_hs = None;
+        warming.uptime_s = 10;
+        let t3 = render_lane_table(&warming, false);
+        assert!(t3.contains("WARM"), "0 H/s within warm-up = WARM chip: {t3}");
+        assert!(!t3.contains("STALL"), "warm-up must NOT false-alarm STALL: {t3}");
 
         // An idle snapshot with no lane → no table at all (nothing to show).
         let idle = Snapshot {

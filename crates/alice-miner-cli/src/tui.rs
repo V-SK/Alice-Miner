@@ -168,7 +168,7 @@ fn state_color(state: EngineState) -> Color {
 fn health_color(h: LaneHealth) -> Color {
     match h {
         LaneHealth::Green => Color::Green,
-        LaneHealth::Amber => Color::Yellow,
+        LaneHealth::Warmup | LaneHealth::Amber => Color::Yellow,
         LaneHealth::Red => Color::Red,
         LaneHealth::Idle => Color::DarkGray,
     }
@@ -573,7 +573,14 @@ mod tests {
     fn lane_rows_amber_on_zero_red_on_error() {
         let mut stalled = running();
         stalled.hashrate_hs = Some(0.0);
-        assert_eq!(lane_rows(&stalled)[0].health, LaneHealth::Amber, "0 H/s while running = amber");
+        stalled.uptime_s = 120; // past the warm-up grace → a genuine stall, not warm-up
+        assert_eq!(lane_rows(&stalled)[0].health, LaneHealth::Amber, "0 H/s past warm-up = amber (STALL)");
+
+        // Within the warm-up grace, the same 0 H/s is WARMUP — no false STALL in the first ~90s.
+        let mut warming = running();
+        warming.hashrate_hs = None;
+        warming.uptime_s = 10;
+        assert_eq!(lane_rows(&warming)[0].health, LaneHealth::Warmup, "0 H/s within warm-up = warm");
 
         let mut errored = running();
         errored.state = EngineState::Error;
