@@ -182,8 +182,12 @@ pub fn launchd_plist_xml(spec: &ServiceSpec) -> Result<String, String> {
     <true/>
     <key>ThrottleInterval</key>
     <integer>30</integer>
+    <!-- Standard, NOT Background: a miner must run at FULL LOAD. macOS QoS-throttles
+         `Background` LaunchAgents onto the efficiency cores (~10x slower: ~455 vs ~4175 H/s
+         on an M2 Max), which defeats "keep mining when closed". `nice`d + `--cpu-priority 1`
+         keep it polite under contention, so it still yields when the user is active. -->
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Standard</string>
     <key>StandardOutPath</key>
     <string>{log}</string>
     <key>StandardErrorPath</key>
@@ -543,6 +547,13 @@ mod tests {
         assert!(xml.contains("alice-miner-cli"));
         assert!(xml.contains("<key>KeepAlive</key>\n    <true/>"));
         assert!(xml.contains("<key>RunAtLoad</key>\n    <true/>"), "run_at_login=true → RunAtLoad true");
+        // FULL-LOAD regression: a miner must NOT be QoS-throttled. ProcessType=Standard,
+        // never Background (Background parks xmrig on the efficiency cores → ~10x slower).
+        assert!(
+            xml.contains("<key>ProcessType</key>\n    <string>Standard</string>"),
+            "ProcessType must be Standard (full load), not the efficiency-core throttle"
+        );
+        assert!(!xml.contains("<string>Background</string>"), "no Background QoS throttle");
         assert!(xml.contains(SERVICE_LABEL));
         // The credit-only / no-secret invariant: nothing sensitive in the plist.
         // NB: "key" is intentionally absent — the plist legitimately contains
