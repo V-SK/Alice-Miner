@@ -711,6 +711,13 @@ pub fn fmt_hashrate(hs: Option<f64>) -> String {
 ///
 /// Honest-by-construction: a window we didn't measure stays `—`, not a copied value.
 pub fn fmt_speed_windows(snap: &Snapshot) -> Option<String> {
+    // In dual mode the top-level `hashrate_hs` (the 10s slot) is a cross-lane SUM,
+    // while the 60s/15m windows are the primary (XMR) lane's only — mixing them in
+    // one line would be misleading. The always-on lane table already shows each
+    // lane's own speed, so we show the triple ONLY for a single-lane run.
+    if snap.dual {
+        return None;
+    }
     // Only show the triple when the engine reported a 60s OR 15m window — that's the
     // signal it actually measures them (xmrig). GPU lanes leave both None → no line.
     if snap.hashrate_60s_hs.is_none() && snap.hashrate_15m_hs.is_none() {
@@ -981,6 +988,13 @@ mod tests {
         // The full snapshot render includes the triple line for XMR.
         let rendered = render_snapshot(&xmr);
         assert!(rendered.contains("speed 10s/60s/15m"), "triple in the block: {rendered}");
+
+        // DUAL mode: the top-level hashrate is a cross-lane SUM, so the triple (whose
+        // 60s/15m are XMR-only) would be misleading — it's suppressed. The per-lane
+        // table still shows each lane's own speed.
+        let mut dual = xmr.clone();
+        dual.dual = true;
+        assert!(fmt_speed_windows(&dual).is_none(), "no mixed-unit triple in dual mode");
     }
 
     // ── Always-on lane table + semaphore (make silent zeros LOUD) ───────────────
