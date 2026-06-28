@@ -196,8 +196,20 @@ pub fn detect_wallet_path() -> PathBuf {
     primary
 }
 
+/// How many `<name>.bak-<ts>` backups to keep per keystore. Every
+/// create/import/re-key renames the live keystore to a fresh timestamped
+/// `.bak-…` recovery copy; without a bound these pile up indefinitely (60+ were
+/// observed in `~/.alice/` after a single day of identity churn). We keep the
+/// N most recent and prune the rest. The backup-before-write safety net is
+/// preserved — only the count is bounded.
+const KEYSTORE_BACKUP_RETENTION: usize = 5;
+
 /// Rename any existing wallet file to `wallet.json.bak-<timestamp>` so that an
 /// import/overwrite can never destroy an old wallet silently.
+///
+/// After making the new backup we prune older `<name>.bak-*` siblings down to
+/// [`KEYSTORE_BACKUP_RETENTION`] (best-effort: a prune failure is swallowed and
+/// never fails the backup itself).
 pub fn backup_existing_wallet(path: &Path) -> Result<Option<PathBuf>, String> {
     if !path.exists() {
         return Ok(None);
@@ -212,7 +224,64 @@ pub fn backup_existing_wallet(path: &Path) -> Result<Option<PathBuf>, String> {
         .unwrap_or("wallet.json");
     let backup = path.with_file_name(format!("{}.bak-{}", file_name, ts));
     fs::rename(path, &backup).map_err(|e| format!("Failed to back up existing wallet: {}", e))?;
+
+    // Best-effort, fail-soft: bound the number of retained backups. A pruning
+    // error must NEVER fail the write that just succeeded above.
+    prune_old_backups(path, KEYSTORE_BACKUP_RETENTION);
+
     Ok(Some(backup))
+}
+
+/// Delete the oldest `<name>.bak-*` siblings of `keystore_path`, keeping the
+/// `keep` most recent. Best-effort: any IO error (unreadable dir, undeletable
+/// file) is silently ignored so this can never fail the keystore write.
+///
+/// SAFETY: only files whose name is EXACTLY `<live-name>.bak-<...>` are ever
+/// considered — the live keystore itself and any unrelated file are never
+/// touched. Ordering is by the numeric `<ts>` suffix (falling back to lexical
+/// order for any non-numeric suffix), so the newest backups survive.
+fn prune_old_backups(keystore_path: &Path, keep: usize) {
+    let Some(dir) = keystore_path.parent() else {
+        return;
+    };
+    let Some(live_name) = keystore_path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let prefix = format!("{live_name}.bak-");
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    // Collect (sort_key, path) for every matching backup. We sort by the numeric
+    // timestamp suffix when it parses, else fall back to the raw suffix string so
+    // ordering stays deterministic.
+    let mut backups: Vec<(u64, String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Match ONLY `<live-name>.bak-…` — never the live keystore or other files.
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let ts = suffix.parse::<u64>().unwrap_or(0);
+        backups.push((ts, suffix.to_string(), entry.path()));
+    }
+
+    if backups.len() <= keep {
+        return;
+    }
+
+    // Newest first (higher ts first; tie-break on the raw suffix descending).
+    backups.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+    // Everything past the `keep` newest is pruned (fail-soft per file).
+    for (_, _, stale) in backups.into_iter().skip(keep) {
+        let _ = fs::remove_file(&stale);
+    }
 }
 
 pub fn write_wallet_payload(path: &Path, payload: &WalletPayload) -> Result<(), String> {
@@ -794,5 +863,89 @@ mod tests {
             .unwrap()
             .encrypted_mnemonic
             .is_none());
+    }
+
+    /// Unique scratch dir under the OS temp root (no `tempfile` dep needed). The
+    /// returned guard removes the tree on drop so the test leaves nothing behind.
+    struct ScratchDir(PathBuf);
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let uniq = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!("alice-crypto-{tag}-{uniq}"));
+            fs::create_dir_all(&dir).unwrap();
+            ScratchDir(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn backup_retention_keeps_only_n_newest_and_never_touches_live_keystore() {
+        let scratch = ScratchDir::new("bak-retention");
+        let keystore = scratch.path().join("miner-keystore.json");
+        let live_name = "miner-keystore.json";
+
+        // Seed MORE than the retention bound of pre-existing backups with known,
+        // ordered timestamps. (Lower ts = older.)
+        let total = KEYSTORE_BACKUP_RETENTION + 4;
+        for ts in 1..=total as u64 {
+            fs::write(
+                scratch.path().join(format!("{live_name}.bak-{ts}")),
+                format!("backup-{ts}"),
+            )
+            .unwrap();
+        }
+        // An unrelated sibling that merely starts similarly must SURVIVE — it is
+        // not a `<live>.bak-<...>` file.
+        let decoy = scratch.path().join("miner-keystore.json.notes.txt");
+        fs::write(&decoy, b"keep me").unwrap();
+
+        // The live keystore exists; backing it up renames it to a fresh `.bak-<now>`
+        // and then prunes the tail down to the retention bound.
+        fs::write(&keystore, b"live-keystore-bytes").unwrap();
+        let made = backup_existing_wallet(&keystore).unwrap();
+        assert!(made.is_some(), "an existing keystore must be backed up");
+
+        // Exactly N backups remain.
+        let mut remaining: Vec<String> = fs::read_dir(scratch.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| n.starts_with(&format!("{live_name}.bak-")))
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining.len(),
+            KEYSTORE_BACKUP_RETENTION,
+            "exactly N backups must remain after pruning, got {remaining:?}"
+        );
+
+        // The survivors are the NEWEST: the just-created backup (ts == now, far
+        // larger than our seeded 1..=total) plus the highest-numbered seeds. The
+        // oldest seeds (ts = 1, 2, …) must be gone.
+        assert!(
+            !remaining.iter().any(|n| n == &format!("{live_name}.bak-1")),
+            "the oldest backup must have been pruned"
+        );
+
+        // The live keystore is renamed-then-recreated only by the caller; here the
+        // rename moved it away, so the ORIGINAL path no longer holds the live file
+        // (backup_existing_wallet's contract). The unrelated decoy is untouched.
+        assert!(decoy.exists(), "an unrelated sibling must never be deleted");
+        assert_eq!(fs::read(&decoy).unwrap(), b"keep me");
+
+        // And the backup we just made still contains the live bytes (safety net
+        // preserved — the count is bounded, the recovery copy is intact).
+        let made = made.unwrap();
+        assert_eq!(fs::read(&made).unwrap(), b"live-keystore-bytes");
     }
 }
