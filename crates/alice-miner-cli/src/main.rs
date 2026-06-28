@@ -44,8 +44,10 @@ use alice_miner_core::{EngineHandle, EngineState, GpuSelection, Lane, Snapshot};
 
 mod color;
 mod dashboard;
+mod doctor;
 mod fleet;
 mod pidfile;
+mod setup;
 mod tui;
 
 // ── Exit codes ──────────────────────────────────────────────────────────────
@@ -55,6 +57,15 @@ const EXIT_OK: i32 = 0;
 const EXIT_RUNTIME: i32 = 1;
 /// Usage / argument error (bad lane, no identity flag, dual refused, …).
 const EXIT_USAGE: i32 = 2;
+
+/// ONE crate-wide lock for every test that mutates the process-global
+/// `$ALICE_IDENTITY_DIR` (or other shared env). Rust runs a crate's tests in
+/// parallel, and these live in DIFFERENT modules (`pidfile`, `setup`), so a
+/// module-local lock can't serialize them against each other — they'd race on the
+/// shared env var. Funnel all of them through this single lock (the same discipline
+/// `alice-miner-core` uses with its crate-wide `IDENTITY_ENV_LOCK`).
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Parser)]
 #[command(
@@ -77,8 +88,13 @@ struct Cli {
     #[arg(long, global = true)]
     no_color: bool,
 
+    /// The subcommand to run. OPTIONAL: with no subcommand, the binary auto-runs
+    /// the `setup` wizard on a FIRST launch (no `~/.alice` identity AND an
+    /// interactive TTY), and otherwise prints help — so a non-developer who just
+    /// double-clicks / runs the bare binary is guided, while a script that pipes in
+    /// gets the usual help (never an unexpected interactive prompt).
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -170,6 +186,45 @@ enum Command {
         A missing / partial / garbage source is shown as a dim `no data` row (never a\n\
         panic). Activity only — credit-only, like the live dashboard.")]
     Fleet(FleetArgs),
+
+    /// Self-diagnose: PASS/FAIL per check + the EXACT fix (run this when stuck).
+    #[command(long_about = "Run a preflight / on-stuck self-diagnostic and print, per check, a\n\
+        PASS / WARN / FAIL line plus the EXACT fix when something is wrong. Collapses the\n\
+        recurring issues (no identity, an unrunnable lane, a Volta card that can't run\n\
+        SRBMiner, a missing engine, an unreachable relay, a headless box with no keyring,\n\
+        Windows Defender / macOS App-Nap) into one self-serve screen.\n\
+        \n\
+        --lane <LANE>  scope the engine / relay / GPU checks to a lane (default: auto)\n\
+        --json         emit the report as one JSON object (for scripting)\n\
+        \n\
+        Exits non-zero if any check FAILs, so a script can gate `start` on a clean\n\
+        preflight. Diagnostics only — credit-only, never a secret or a reward amount.")]
+    Doctor(DoctorArgs),
+
+    /// Guided first-run wizard: hardware → address → (15% PRL) → start.
+    #[command(long_about = "A guided setup wizard for the first 60 seconds: detect your hardware and\n\
+        recommend a lane, set your reward address (paste an existing one or generate a new\n\
+        identity, validated inline), optionally set your 15% PRL return address for a GPU\n\
+        lane, confirm, and start mining.\n\
+        \n\
+        Every step has a flag so the WHOLE wizard runs non-interactively from a single\n\
+        copy-paste line (what the website publishes):\n\
+        \n\
+            alice-miner setup --lane auto --address <alice-addr> --yes\n\
+        \n\
+        --lane <LANE>      the lane to use (default: the recommended one)\n\
+        --address <ADDR>   your Alice reward address (skips the paste/generate prompt)\n\
+        --generate         generate a NEW identity for the reward address (prints the\n\
+                           mnemonic to back up; refuses to clobber an existing identity)\n\
+        --prl-payout <P>   your 15% PRL return address (prl1p…) for a GPU lane\n\
+        --yes              accept the confirmation without prompting\n\
+        --no-input         never prompt (fail if a required value is missing) — for scripts\n\
+        --start / --no-start  whether to begin mining at the end (default: ask / --yes = yes)\n\
+        \n\
+        Auto-runs on first launch ONLY when ~/.alice has no identity AND stdin is a TTY;\n\
+        otherwise it does nothing. Re-runnable. Credit-only — never a secret in argv, and\n\
+        the generate path warns + never silently overwrites an existing identity.")]
+    Setup(SetupArgs),
 }
 
 #[derive(clap::Args)]
@@ -338,22 +393,117 @@ struct FleetArgs {
     interval_s: u64,
 }
 
+#[derive(clap::Args)]
+struct DoctorArgs {
+    /// Scope the engine / relay / GPU checks to a lane (default: the recommended one).
+    #[arg(long, default_value = "auto", value_name = "LANE")]
+    lane: String,
+    /// Emit the report as a single JSON object (machine-readable).
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct SetupArgs {
+    /// The lane to use (default: the recommended one for this device).
+    #[arg(long, default_value = "auto", value_name = "LANE")]
+    lane: String,
+    /// Your Alice reward address (skips the paste/generate prompt). Validated as
+    /// an SS58-300 Alice address before anything is written.
+    #[arg(long, value_name = "ADDRESS", conflicts_with = "generate")]
+    address: Option<String>,
+    /// Generate a NEW identity for the reward address (prints the 24-word mnemonic
+    /// to back up). REFUSES to clobber an existing identity (the keystore hazard).
+    #[arg(long)]
+    generate: bool,
+    /// Your 15% PRL return address (`prl1p…`) for a GPU lane. Optional.
+    #[arg(long, value_name = "PRL1")]
+    prl_payout: Option<String>,
+    /// Accept the confirmation summary without prompting.
+    #[arg(long)]
+    yes: bool,
+    /// Never prompt — fail if a required value is missing (for non-interactive use).
+    #[arg(long)]
+    no_input: bool,
+    /// Begin mining at the end of the wizard.
+    #[arg(long, conflicts_with = "no_start")]
+    start: bool,
+    /// Do NOT begin mining at the end (just finish setup).
+    #[arg(long)]
+    no_start: bool,
+    /// Keystore passphrase for `--generate` (INSECURE on the command line; prefer
+    /// the prompt or `--password-stdin`).
+    #[arg(long, value_name = "PASS")]
+    password: Option<String>,
+    /// Read the `--generate` keystore passphrase from the first line of STDIN.
+    #[arg(long, conflicts_with = "password")]
+    password_stdin: bool,
+}
+
 fn main() {
     let cli = Cli::parse();
+    let no_color = cli.no_color;
     let code = match cli.command {
-        Command::Detect(args) => cmd_detect(args),
-        Command::GpuDevices(args) => cmd_gpu_devices(args),
-        Command::Identity(args) => cmd_identity(args),
-        Command::Start(args) => cmd_start(args, cli.no_color),
-        Command::Stop(args) => cmd_stop(args),
-        Command::Service(args) => cmd_service(args),
-        Command::Fleet(args) => fleet::run(
+        Some(Command::Detect(args)) => cmd_detect(args),
+        Some(Command::GpuDevices(args)) => cmd_gpu_devices(args),
+        Some(Command::Identity(args)) => cmd_identity(args),
+        Some(Command::Start(args)) => cmd_start(args, no_color),
+        Some(Command::Stop(args)) => cmd_stop(args),
+        Some(Command::Service(args)) => cmd_service(args),
+        Some(Command::Fleet(args)) => fleet::run(
             &args.paths,
             args.once,
             std::time::Duration::from_secs(args.interval_s.max(1)),
         ),
+        Some(Command::Doctor(args)) => cmd_doctor(args),
+        Some(Command::Setup(args)) => setup::run(args.into(), no_color),
+        // No subcommand: guide a first-launch user (auto-setup when ~/.alice has no
+        // identity AND stdin is a TTY), else print help. Skips silently otherwise.
+        None => cmd_no_subcommand(no_color),
     };
     std::process::exit(code);
+}
+
+/// The bare-binary path (no subcommand). On a FIRST launch — no `~/.alice`
+/// identity AND an interactive stdin TTY — auto-run the guided `setup` wizard.
+/// Otherwise print the top-level help (a script piping in, or an already-set-up
+/// user who just typed the bare command, gets help, never a surprise prompt).
+fn cmd_no_subcommand(no_color: bool) -> i32 {
+    use std::io::IsTerminal;
+    let has_identity = alice_miner_core::identity::load_pointer().is_some();
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !has_identity && interactive {
+        // First launch, interactive → guide them through setup.
+        return setup::run(setup::SetupConfig::first_launch(), no_color);
+    }
+    // Otherwise: print help and exit cleanly (clap renders the long help).
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let _ = cmd.print_help();
+    println!();
+    EXIT_OK
+}
+
+/// `doctor`: run the self-diagnostic battery for the resolved lane and print the
+/// report (human or `--json`). Exits non-zero if any check FAILs so a script can
+/// gate `start` on a clean preflight.
+fn cmd_doctor(args: DoctorArgs) -> i32 {
+    let cap = alice_miner_core::CapabilityProfile::detect();
+    let lane = match resolve_lane(&args.lane, &cap) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    let checks = doctor::run_checks(lane, &cap);
+    if args.json {
+        println!("{}", doctor::render_json(&checks, lane));
+    } else {
+        print!("{}", doctor::render_report(&checks, lane));
+    }
+    if doctor::has_blocking_failure(&checks) {
+        EXIT_USAGE
+    } else {
+        EXIT_OK
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -828,6 +978,14 @@ fn cmd_start(args: StartArgs, no_color: bool) -> i32 {
             );
             return EXIT_USAGE;
         }
+    }
+
+    // Light preflight (a subset of `doctor`): surface the first BLOCKING issue (e.g.
+    // an unreachable relay / missing engine the viability gate doesn't catch) to
+    // stderr before we spawn, with the exact fix + a pointer to `doctor`. Human path
+    // only (the --json stream stays machine-clean); best-effort, never blocks mining.
+    if !args.json {
+        doctor::print_preflight_summary(lane, &cap);
     }
 
     let engine = match EngineHandle::spawn() {
@@ -1354,13 +1512,13 @@ mod tests {
     fn cli_parses_all_subcommands() {
         // detect (+ --json)
         let cli = Cli::try_parse_from(["alice-miner", "detect"]).unwrap();
-        assert!(matches!(cli.command, Command::Detect(DetectArgs { json: false })));
+        assert!(matches!(cli.command, Some(Command::Detect(DetectArgs { json: false }))));
         let cli = Cli::try_parse_from(["alice-miner", "detect", "--json"]).unwrap();
-        assert!(matches!(cli.command, Command::Detect(DetectArgs { json: true })));
+        assert!(matches!(cli.command, Some(Command::Detect(DetectArgs { json: true }))));
 
         // identity variants
         let cli = Cli::try_parse_from(["alice-miner", "identity", "--create"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Identity(a) => {
                 assert!(a.create && a.import.is_none() && !a.show);
             }
@@ -1368,30 +1526,30 @@ mod tests {
         }
         let cli =
             Cli::try_parse_from(["alice-miner", "identity", "--import", "a b c"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Identity(a) => assert_eq!(a.import.as_deref(), Some("a b c")),
             _ => panic!("expected identity"),
         }
         let cli =
             Cli::try_parse_from(["alice-miner", "identity", "--import-seed", "0xdead"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Identity(a) => assert_eq!(a.import_seed.as_deref(), Some("0xdead")),
             _ => panic!("expected identity"),
         }
         let cli = Cli::try_parse_from(["alice-miner", "identity", "--paste", "addr"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Identity(a) => assert_eq!(a.paste.as_deref(), Some("addr")),
             _ => panic!("expected identity"),
         }
         let cli = Cli::try_parse_from(["alice-miner", "identity", "--show"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Identity(a) => assert!(a.show),
             _ => panic!("expected identity"),
         }
 
         // start defaults: lane=auto, no dual, no json.
         let cli = Cli::try_parse_from(["alice-miner", "start"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Start(a) => {
                 assert_eq!(a.lane, "auto");
                 assert!(!a.dual && !a.json);
@@ -1405,7 +1563,7 @@ mod tests {
             "alice-miner", "start", "--lane", "xmr", "--dual", "--json", "--duration-s", "30",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Start(a) => {
                 assert_eq!(a.lane, "xmr");
                 assert!(a.dual && a.json);
@@ -1416,7 +1574,7 @@ mod tests {
 
         // stop (+ default timeout)
         let cli = Cli::try_parse_from(["alice-miner", "stop"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Stop(a) => assert_eq!(a.timeout_s, 8),
             _ => panic!("expected stop"),
         }
@@ -1445,7 +1603,7 @@ mod tests {
     #[test]
     fn start_gpus_flag_parses_and_maps_to_selection() {
         let cli = Cli::try_parse_from(["alice-miner", "start", "--gpus", "0,1,2"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Start(a) => {
                 assert_eq!(a.gpus.as_deref(), Some("0,1,2"));
                 // The CLI maps a present, well-formed value to Ids in order.
@@ -1458,7 +1616,7 @@ mod tests {
         }
         // Absent → None → All.
         let cli = Cli::try_parse_from(["alice-miner", "start"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Start(a) => {
                 assert!(a.gpus.is_none());
                 let sel = match a.gpus.as_deref() {
@@ -1472,7 +1630,7 @@ mod tests {
         // A malformed value still PARSES at the clap layer (it's a free string);
         // the rejection happens in cmd_start via parse_ids (asserted in core).
         let cli = Cli::try_parse_from(["alice-miner", "start", "--gpus", "0,x"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Start(a) => assert!(GpuSelection::parse_ids(a.gpus.as_deref().unwrap()).is_err()),
             _ => panic!("expected start"),
         }
@@ -1519,7 +1677,7 @@ mod tests {
         // --password-stdin parses on its own.
         let cli = Cli::try_parse_from(["alice-miner", "identity", "--create", "--password-stdin"])
             .unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Identity(a) => {
                 assert!(a.create && a.password_stdin && a.password.is_none());
             }
@@ -1529,7 +1687,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["alice-miner", "identity", "--create", "--password", "s3cret"])
                 .unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Identity(a) => {
                 assert_eq!(a.password.as_deref(), Some("s3cret"));
                 assert!(!a.password_stdin);
@@ -1622,18 +1780,18 @@ mod tests {
     #[test]
     fn start_plain_flag_parses_and_defaults_off() {
         let cli = Cli::try_parse_from(["alice-miner", "start"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Start(a) => assert!(!a.plain, "plain defaults off"),
             _ => panic!("expected start"),
         }
         let cli = Cli::try_parse_from(["alice-miner", "start", "--plain"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Start(a) => assert!(a.plain),
             _ => panic!("expected start"),
         }
         // --plain + --json coexist (plain is a no-op under json; parsing is permissive).
         let cli = Cli::try_parse_from(["alice-miner", "start", "--plain", "--json"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Start(a) => assert!(a.plain && a.json),
             _ => panic!("expected start"),
         }

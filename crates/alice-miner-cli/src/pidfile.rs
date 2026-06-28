@@ -201,15 +201,15 @@ extern "C" {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
 
     /// `ALICE_IDENTITY_DIR` is process-global; the tests that mutate it must NOT
-    /// run concurrently (Rust runs a crate's tests in parallel). Serialize them
-    /// through one lock — the same discipline `alice-miner-core` uses for its env
-    /// vars. (`is_alive`/`stop_pid` tests don't touch the env, so they're free.)
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// run concurrently (Rust runs a crate's tests in parallel) — INCLUDING with
+    /// the `setup` module's tests, which also set this var. Serialize them ALL
+    /// through the ONE crate-wide lock (a module-local lock couldn't coordinate
+    /// across modules). (`is_alive`/`stop_pid` tests don't touch the env, so
+    /// they're free.)
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     /// The pid file lives under the identity dir (honoring the override) so tests
     /// never touch the real `~/.alice`.
