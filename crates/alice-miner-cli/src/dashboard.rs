@@ -53,11 +53,20 @@ pub fn render_detect(cap: &CapabilityProfile) -> String {
     // The lane-viability matrix (which lanes this device can run + recommended).
     out.push_str("Lanes:\n");
     let recommended = cap.recommended_lane();
+    // Pad to the WIDEST lane label so the STATE column always aligns. The longest
+    // is "GPU · Alpha (V100)" (18 chars) — a fixed `{:<10}` truncated past it and
+    // broke the column (polish #13). Compute the pad from the labels themselves so
+    // it can never drift if a lane is renamed. `·` counts as one display column.
+    let pad = ALL_LANES
+        .iter()
+        .map(|l| l.label().chars().count())
+        .max()
+        .unwrap_or(10);
     for &lane in ALL_LANES.iter() {
         let support = cap.support(lane);
         let marker = if lane == recommended { "  (recommended)" } else { "" };
         out.push_str(&format!(
-            "  {:<10} {}{}\n",
+            "  {:<pad$} {}{}\n",
             lane.label(),
             support.label(),
             marker
@@ -946,5 +955,37 @@ mod tests {
             let is_emoji = (0x1F300..=0x1FAFF).contains(&c) || (0x2600..=0x27BF).contains(&c);
             assert!(!is_emoji, "detect output contains an emoji: {ch:?}");
         }
+    }
+
+    /// Polish #13: the lane-matrix support column must line up across rows even for
+    /// the longest label "GPU · Alpha (V100)" — a fixed too-narrow pad truncated
+    /// past it and broke the alignment. For each lane row we find the column where
+    /// the support text starts (the char index past the label + its padding) and
+    /// assert it's identical on every row.
+    #[test]
+    fn detect_matrix_columns_align_for_longest_label() {
+        let cap = CapabilityProfile::detect();
+        let s = render_detect(&cap);
+        let mut starts = Vec::new();
+        for line in s.lines() {
+            for &lane in ALL_LANES.iter() {
+                let prefix = format!("  {}", lane.label()); // "  " indent + label
+                if line.starts_with(&prefix) {
+                    // Char index of the first non-space AFTER the label = the column
+                    // the support text starts at (must match across rows).
+                    let chars: Vec<char> = line.chars().collect();
+                    let label_len = prefix.chars().count();
+                    let trailing_spaces =
+                        chars[label_len..].iter().take_while(|c| **c == ' ').count();
+                    starts.push(label_len + trailing_spaces);
+                    break;
+                }
+            }
+        }
+        assert!(starts.len() >= 2, "expected ≥2 lane rows, got {}: {s}", starts.len());
+        assert!(
+            starts.iter().all(|c| *c == starts[0]),
+            "support column must align across all lane rows, got {starts:?}: {s}"
+        );
     }
 }
