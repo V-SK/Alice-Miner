@@ -1091,6 +1091,12 @@ fn emit_snapshot(
         if let Some(line) = dashboard::render_credit_line(credit) {
             print!("{line}");
         }
+        // The credited-vs-raw divergence note: a healthy local hashrate while the
+        // server confirms 0 credited shares = the "hashing but not landing" bug made
+        // visible. Counts/rates only, never fiat; fires only on a confirmed read.
+        if let Some(note) = dashboard::render_credited_vs_raw_note(snap, credit) {
+            print!("{note}");
+        }
     }
 }
 

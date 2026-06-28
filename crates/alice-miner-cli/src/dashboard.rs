@@ -596,6 +596,53 @@ pub fn render_credit_line(credit: &CreditState) -> Option<String> {
     }
 }
 
+/// The warm-up an uptime must pass before a 0-credited / hashing-but-not-landing
+/// divergence is treated as a real signal rather than normal start-up lag (the
+/// server's read API + the first shares both take a moment). 120s ≈ a couple of
+/// share intervals.
+const CREDITED_RAW_WARMUP_S: u64 = 120;
+
+/// The **credited-vs-raw** decision-grade note (Theme 1 #5). The local lane can be
+/// producing a healthy RAW hashrate while the server confirms ZERO accepted shares —
+/// exactly the Win/PRL "hashing but 0-share" field bug (a wedged PoP, a firewalled
+/// stratum, a pool that isn't crediting). This surfaces that divergence at a glance:
+/// the raw local rate next to the server's credited 24h count, with a "credited < raw
+/// — shares may not be landing" note when they diverge.
+///
+/// HONEST + CREDIT-ONLY: counts and rates only, never a fiat figure. It fires ONLY on
+/// a CONFIRMED server read (we never accuse the pool on a `syncing`/`error`/unexposed
+/// state — that would be a false alarm from our own missing fetch) and only after a
+/// warm-up, and only when the lane is genuinely producing raw work (nonzero, finite
+/// hashrate while Running). `None` (no note) otherwise. The credited count being a
+/// real measured 0 is the load-bearing signal — distinct from "syncing".
+pub fn render_credited_vs_raw_note(snap: &Snapshot, credit: &CreditState) -> Option<String> {
+    // Only a CONFIRMED server read can tell us the pool credited nothing; on
+    // syncing/error/not-exposed we don't know, so we stay silent (no false alarm).
+    let CreditState::Confirmed { totals, .. } = credit else {
+        return None;
+    };
+    // The lane must be actually hashing (Running + a positive, finite raw rate) and
+    // past warm-up — otherwise a 0 credited count is just normal start-up, not a bug.
+    let raw = snap.hashrate_hs?;
+    if snap.state != EngineState::Running || !raw.is_finite() || raw <= 0.0 {
+        return None;
+    }
+    if snap.uptime_s < CREDITED_RAW_WARMUP_S {
+        return None;
+    }
+    // Divergence: producing raw work for a while, but the server's recent (24h)
+    // credited accepted-share count is still 0 → the shares aren't landing.
+    if totals.accepted_24h == 0 {
+        Some(format!(
+            "    ! credited 0 < raw {} — shares may not be landing \
+             (check PoP / pool / firewall)\n",
+            fmt_hashrate_human(raw),
+        ))
+    } else {
+        None
+    }
+}
+
 /// Render the GPU **15% PRL 返还 (credit-only)** line for the human dashboard. Shows
 /// the bind state (`已绑定 · bound` / `待绑定 · pending`), the user's MASKED return
 /// wallet (`prl1p…XXXX`, only when one is configured — never the foundation
@@ -1098,6 +1145,74 @@ mod tests {
             assert!(!lower.contains(forbidden), "credit line leaked `{forbidden}`: {line}");
         }
         assert!(line.contains(REWARD_CREDIT));
+    }
+
+    // ── Piece 6: credited-vs-raw divergence note ────────────────────────────────
+
+    /// A confirmed server read showing 0 credited (24h) while the lane is producing a
+    /// healthy raw hashrate past warm-up = the "hashing but not landing" bug. The note
+    /// fires with the raw rate + an actionable hint — counts/rates only, never fiat.
+    #[test]
+    fn credited_vs_raw_flags_hashing_but_zero_credited() {
+        let mut s = running_snapshot();
+        s.lane = Some(Lane::GpuPrl);
+        s.hashrate_hs = Some(1_200_000_000_000.0); // ~1.2 TH/s of real work
+        s.uptime_s = 600; // well past warm-up
+        let zero_credited = CreditState::Confirmed {
+            score: CreditScore::new(0.0),
+            totals: CreditTotals::default(), // accepted_24h = 0
+        };
+        let note = render_credited_vs_raw_note(&s, &zero_credited).expect("divergence note");
+        assert!(note.contains("credited 0 < raw"), "names the divergence: {note}");
+        assert!(note.contains("TH/s"), "shows the raw rate: {note}");
+        assert!(note.contains("shares may not be landing"), "actionable: {note}");
+        // Credit-only: no fiat / paid token.
+        let lower = note.to_lowercase();
+        for forbidden in ["$", "usd", "paid", "earned", "已发放"] {
+            assert!(!lower.contains(forbidden), "note leaked `{forbidden}`: {note}");
+        }
+    }
+
+    /// The note is SILENT on every honest non-confirmed state (we never accuse the
+    /// pool from our OWN missing/syncing fetch), during warm-up, and when the lane
+    /// isn't actually hashing — so it never false-alarms.
+    #[test]
+    fn credited_vs_raw_is_silent_unless_truly_diverging() {
+        let mut hashing = running_snapshot();
+        hashing.hashrate_hs = Some(8_432.0);
+        hashing.uptime_s = 600;
+
+        // Non-confirmed states → silent (we don't know the server's truth).
+        assert!(render_credited_vs_raw_note(&hashing, &CreditState::NotExposed).is_none());
+        assert!(render_credited_vs_raw_note(&hashing, &CreditState::Confirming).is_none());
+        assert!(render_credited_vs_raw_note(
+            &hashing,
+            &CreditState::Error { reason: CreditError::Unreachable }
+        )
+        .is_none());
+
+        // Confirmed but credited > 0 → no divergence, no note.
+        let credited = CreditState::Confirmed {
+            score: CreditScore::new(0.0),
+            totals: CreditTotals { accepted_total: 50, accepted_24h: 12, lanes: vec![] },
+        };
+        assert!(render_credited_vs_raw_note(&hashing, &credited).is_none(), "credited>0 → quiet");
+
+        // Still within warm-up → silent (0 credited is just start-up lag).
+        let mut warming = hashing.clone();
+        warming.uptime_s = 5;
+        let zero = CreditState::Confirmed {
+            score: CreditScore::new(0.0),
+            totals: CreditTotals::default(),
+        };
+        assert!(render_credited_vs_raw_note(&warming, &zero).is_none(), "warm-up → quiet");
+
+        // Not hashing (0 / no raw rate) → silent (nothing to compare against).
+        let mut idle_rate = hashing.clone();
+        idle_rate.hashrate_hs = Some(0.0);
+        assert!(render_credited_vs_raw_note(&idle_rate, &zero).is_none(), "0 raw → quiet");
+        idle_rate.hashrate_hs = None;
+        assert!(render_credited_vs_raw_note(&idle_rate, &zero).is_none(), "no raw line → quiet");
     }
 
     /// A real server ZERO is shown as 0 (a measured zero) — distinct from "syncing".
