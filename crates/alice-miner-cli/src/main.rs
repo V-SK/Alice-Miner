@@ -119,7 +119,9 @@ enum Command {
         --lane rvn   NVIDIA KawPoW/RVN lane (legacy)\n\
         --lane auto  the recommended lane for this device\n\
         --dual       run BOTH lanes (needs >=2 viable lanes; refuses honestly otherwise)\n\
-        --json       emit one Snapshot JSON line per tick (for scripting)\n\
+        --json       emit one Snapshot JSON line per tick (suppresses the credit\n\
+                     poller + all banners; see `start --help` for the full contract)\n\
+        --plain      force the plain greppable line renderer + no color (clean logs)\n\
         \n\
         Ctrl-C (or `alice-miner stop`) stops gracefully. Rewards accrue as credit\n\
         (积分, credit-only); the collection address and upstream pool are never shown.")]
@@ -242,10 +244,22 @@ struct StartArgs {
     /// with `cores-2` XMR headroom. Requires >=2 viable lanes on this device.
     #[arg(long)]
     dual: bool,
-    /// Emit one Snapshot JSON line per tick (for scripting) instead of the
-    /// human dashboard.
+    /// Emit one Snapshot JSON line per tick (for scripting) instead of the human
+    /// dashboard. CONTRACT: `--json` SUPPRESSES the Source-B server-confirmed credit
+    /// poller (the JSON stream is the engine Snapshot only — credit-only, no
+    /// `paid_acu`/payout key) and emits NO human banners or hints. On a clean exit
+    /// that NEVER reached Running, a final Snapshot is emitted with `message` set to
+    /// a machine reason (e.g. "never_reached_running") so a harness gets a signal
+    /// beyond exit 0. `ALICE_READ_API_URL` overrides the read-API endpoint the human
+    /// (non-`--json`) credit poller queries; it is `https://`-only.
     #[arg(long)]
     json: bool,
+    /// Plain greppable line mode: force the scrolling line renderer (never the
+    /// in-place TUI panel) and disable ANSI color, for clean logs / `grep`. Implied
+    /// off a non-TTY; this makes it explicit on a TTY too. Has no effect with
+    /// `--json` (that stream is already machine-only).
+    #[arg(long)]
+    plain: bool,
     /// Stop automatically after this many seconds (0 = run until Ctrl-C / stop).
     /// Used for the live-connect verification.
     #[arg(long, default_value_t = 0, value_name = "SECONDS")]
@@ -901,12 +915,15 @@ fn cmd_start(args: StartArgs, no_color: bool) -> i32 {
     //                        renderer if the terminal can't enter raw mode).
     // The `--json` output is byte-for-byte unchanged in every case. `use_tui()` is
     // FALSE off a TTY (and under TERM=dumb), so a non-TTY never gets screen-paint
-    // escapes — even under FORCE_COLOR (a pipe isn't a screen).
-    let interactive = !args.json && color_env.use_tui();
+    // escapes — even under FORCE_COLOR (a pipe isn't a screen). `--plain` forces the
+    // scrolling line renderer (never the in-place panel) and drops color, for clean
+    // greppable logs even on an interactive TTY.
+    let interactive = !args.json && !args.plain && color_env.use_tui();
     let mut tui = if interactive { tui::Tui::new().ok() } else { None };
     // Whether the plain line renderer emits ANSI color (semaphore + heartbeat). Only
-    // meaningful for the line path; the TUI does its own coloring.
-    let line_color = color_env.color_enabled();
+    // meaningful for the line path; the TUI does its own coloring. `--plain` forces
+    // color OFF regardless of the env decision.
+    let line_color = !args.plain && color_env.color_enabled();
 
     // Banners only make sense for the scrolling line renderer (the TUI shows state
     // in its status bar; --json is machine-only).
@@ -975,6 +992,10 @@ fn cmd_start(args: StartArgs, no_color: bool) -> i32 {
     let mut spinner_frame: u64 = 0;
     let mut last_advance = std::time::Instant::now();
     let mut prev_fingerprint: Option<(u64, u64, u64, u64)> = None;
+    // The most recent Snapshot seen this run. Reused (only `message` is set) to emit
+    // a TERMINAL `--json` Snapshot carrying a machine reason when the lane never
+    // reached Running — so a CI/harness gets a signal beyond exit 0.
+    let mut last_snapshot: Option<Snapshot> = None;
 
     loop {
         match engine.recv_timeout(Duration::from_millis(500)) {
@@ -1019,6 +1040,7 @@ fn cmd_start(args: StartArgs, no_color: bool) -> i32 {
                     }
                     saw_running = true;
                 }
+                last_snapshot = Some(snap.clone());
                 if requested_stop
                     && matches!(snap.state, EngineState::Idle | EngineState::Error)
                 {
@@ -1078,7 +1100,22 @@ fn cmd_start(args: StartArgs, no_color: bool) -> i32 {
     if exit_code == EXIT_OK && !saw_running {
         // We never reached Running — surface that as a soft failure for the
         // harness (e.g. the relay was unreachable from this context).
-        if !args.json {
+        if args.json {
+            // Structured terminal Snapshot: reuse the last one seen (real terminal
+            // state — Idle/Error/Starting), tagging `message` with a MACHINE reason so
+            // a harness gets a signal beyond exit 0. Still credit-only (a Snapshot has
+            // no payout field; we only set the existing `message`). Skipped if no
+            // snapshot was ever seen (nothing to base it on).
+            if let Some(mut snap) = last_snapshot {
+                snap.message = Some(TERMINAL_REASON_NEVER_RUNNING.to_string());
+                emit_snapshot(
+                    &snap,
+                    true,
+                    &alice_miner_core::CreditState::NotExposed,
+                    &dashboard::RenderCtx { spinner_frame: 0, stale_for_s: None, color: false },
+                );
+            }
+        } else {
             eprintln!(
                 "note: the lane never reached the Running state \
                  (the relay may be unreachable from here)."
@@ -1087,6 +1124,12 @@ fn cmd_start(args: StartArgs, no_color: bool) -> i32 {
     }
     exit_code
 }
+
+/// The `message` reason set on the terminal `--json` Snapshot when a run exited
+/// cleanly without ever reaching Running (a CI/harness signal beyond exit 0). A
+/// stable, machine-grep-able token — credit-only (it is a status reason, not a
+/// reward field).
+const TERMINAL_REASON_NEVER_RUNNING: &str = "never_reached_running";
 
 /// Emit one snapshot, either as a JSON line (`--json`) or rendered into the
 /// human dashboard block. `credit` is the latest Source-B server-confirmed credit
@@ -1573,6 +1616,62 @@ mod tests {
 
     /// Serialize the PRL payout-env tests (process env is global).
     static PRL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `--plain` parses on `start` and defaults off; the `--json` contract docs
+    /// don't change its parsing (both can coexist on the args struct).
+    #[test]
+    fn start_plain_flag_parses_and_defaults_off() {
+        let cli = Cli::try_parse_from(["alice-miner", "start"]).unwrap();
+        match cli.command {
+            Command::Start(a) => assert!(!a.plain, "plain defaults off"),
+            _ => panic!("expected start"),
+        }
+        let cli = Cli::try_parse_from(["alice-miner", "start", "--plain"]).unwrap();
+        match cli.command {
+            Command::Start(a) => assert!(a.plain),
+            _ => panic!("expected start"),
+        }
+        // --plain + --json coexist (plain is a no-op under json; parsing is permissive).
+        let cli = Cli::try_parse_from(["alice-miner", "start", "--plain", "--json"]).unwrap();
+        match cli.command {
+            Command::Start(a) => assert!(a.plain && a.json),
+            _ => panic!("expected start"),
+        }
+    }
+
+    /// The terminal `--json` reason is a stable machine token AND is credit-only:
+    /// a Snapshot carrying it in `message` still serializes with NO payout/paid key.
+    #[test]
+    fn terminal_never_running_reason_is_credit_only() {
+        assert_eq!(TERMINAL_REASON_NEVER_RUNNING, "never_reached_running");
+        // Build a minimal terminal-shaped Snapshot via JSON (the struct's fields are
+        // additive + skip-when-None) so we exercise the real serialized wire form.
+        let snap = alice_miner_core::Snapshot {
+            state: EngineState::Idle,
+            device: None,
+            lane: Some(Lane::GpuPrl),
+            hashrate_hs: None,
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
+            shares_accepted: 0,
+            shares_rejected: 0,
+            endpoint: None,
+            worker_id: None,
+            uptime_s: 0,
+            failovers: 0,
+            dual: false,
+            lanes: vec![],
+            last_line: None,
+            message: Some(TERMINAL_REASON_NEVER_RUNNING.to_string()),
+            prl_payout: None,
+        };
+        let wire = serde_json::to_string(&snap).unwrap();
+        assert!(wire.contains("never_reached_running"), "reason present: {wire}");
+        let lower = wire.to_ascii_lowercase();
+        for forbidden in ["paid_acu", "payout", "\"paid\"", "earned", "fiat"] {
+            assert!(!lower.contains(forbidden), "terminal snapshot leaked `{forbidden}`: {wire}");
+        }
+    }
 
     /// A non-empty `--password` flag is honored by `build_identity_spec` (the
     /// warning is printed to stderr; we just confirm the spec carries the pw).
