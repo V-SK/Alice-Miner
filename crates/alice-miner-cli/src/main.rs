@@ -135,14 +135,21 @@ enum Command {
     /// Run mining in the background so it PERSISTS when you close the window.
     #[command(long_about = "Install / remove a background mining service so mining keeps running\n\
         after you close the window (and, with --at-login, restarts at login/boot).\n\
-        macOS only for now (launchd LaunchAgent). The CPU-XMR lane runs with NO\n\
-        stored secret — the reward address is read from your ~/.alice identity at\n\
-        runtime, never written into the service definition.\n\
+        Works on macOS (launchd LaunchAgent), Linux (systemd --user), and Windows\n\
+        (Task Scheduler). The service definition itself carries NO secret and NO\n\
+        reward address — the address is read from your ~/.alice identity at runtime.\n\
+        \n\
+        The CPU-XMR lane is secret-free, so it always backgrounds. A GPU pearlhash\n\
+        lane (prl/alpha) also backgrounds, but needs an OS keyring (macOS Keychain /\n\
+        Windows Credential Manager / Linux Secret Service) to hold the wallet unlock,\n\
+        so it is REFUSED on a box with no keyring (e.g. a headless Linux rig — keep\n\
+        the miner window open there, or background CPU-XMR instead).\n\
         \n\
         --install     install + start the background agent\n\
         --uninstall   stop + remove the background agent\n\
         --status      print whether it is installed / running (the default)\n\
-        --lane xmr    the lane to background (xmr only today; GPU needs a follow-up)\n\
+        --lane xmr    the lane to background: xmr (secret-free) or a GPU pearlhash\n\
+                      lane (prl/alpha/gpu/auto) whose unlock is stored in the keyring\n\
         --at-login    also start mining automatically at login/boot")]
     Service(ServiceArgs),
 
@@ -764,7 +771,7 @@ fn cmd_start(args: StartArgs, no_color: bool) -> i32 {
         ) {
             eprintln!(
                 "error: background mining is already active (one miner per machine). Stop it with \
-                 `alice-miner-cli service --uninstall` first, then run start — or just let the \
+                 `alice-miner service --uninstall` first, then run start — or just let the \
                  background service keep mining."
             );
             return EXIT_USAGE;
@@ -855,7 +862,7 @@ fn cmd_start(args: StartArgs, no_color: bool) -> i32 {
             Ok(None) => {
                 eprintln!(
                     "error: no background unlock is stored in the OS keyring for this identity \
-                     — re-run `alice-miner-cli service --install --lane {}`.",
+                     — re-run `alice-miner service --install --lane {}`.",
                     lane.cli_lane_arg()
                 );
                 return EXIT_RUNTIME;
