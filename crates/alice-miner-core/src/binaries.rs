@@ -632,38 +632,60 @@ pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
         });
     }
 
-    // Graceful, kind-specific "not installed" status (NEVER a panic). The GPU
-    // lane in particular ships no bundled binary on this dev machine, so the lane
-    // must surface a clear, user-facing reason and stay unavailable.
+    // Graceful, kind-specific "not installed" status (NEVER a panic). We reach
+    // here only when the engine is NOT fetchable on this platform (no real pin +
+    // configured download URL) — which, for a kind that DOES ship a packaged
+    // release elsewhere, means this is an unpackaged DEV build (e.g. `target/release`
+    // on macOS with no `.app` sibling). Lead with the actionable fix — install a
+    // packaged release — instead of a bare "not installed" (#14).
     Err(match kind {
         MinerKind::CpuXmr => format!(
-            "CPU miner not installed (expected `{}` beside the executable at {}).",
+            "CPU miner not bundled in this build: `{}` was not found beside the \
+             executable at {} and no verified download is configured for this \
+             platform — this is an unpackaged dev build. Install a packaged release \
+             from {} (which bundles the engine), or set {} to a pinned `{}`.",
             kind.binary_name(),
-            candidate.display()
+            candidate.display(),
+            RELEASES_URL,
+            kind.env_override(),
+            kind.binary_name(),
         ),
         MinerKind::GpuRvn => format!(
-            "GPU miner not installed: the KawPowMiner engine `{}` was not found \
-             (set {} to a kawpowminer/T-Rex binary, or install the bundled engine). \
-             The RVN lane stays unavailable.",
+            "GPU miner not bundled in this build: the KawPowMiner engine `{}` was not \
+             found and no verified download is configured for this platform. Install a \
+             packaged release from {}, or set {} to a kawpowminer/T-Rex binary. The \
+             RVN lane stays unavailable.",
             kind.binary_name(),
+            RELEASES_URL,
             kind.env_override(),
         ),
         MinerKind::GpuPrl => format!(
-            "GPU miner not installed: the SRBMiner-MULTI engine `{}` was not found \
-             (set {} to an SRBMiner-MULTI binary, or install the bundled engine). \
-             The GPU-PRL lane stays unavailable.",
+            "GPU miner not bundled in this build: the SRBMiner-MULTI engine `{}` was not \
+             found and no verified download is configured for this platform (SRBMiner \
+             ships no macOS build). Install a packaged release from {}, or set {} to an \
+             SRBMiner-MULTI binary. The GPU-PRL lane stays unavailable.",
             kind.binary_name(),
+            RELEASES_URL,
             kind.env_override(),
         ),
         MinerKind::GpuAlpha => format!(
-            "GPU miner not installed: the AlphaMiner engine `{}` was not found \
-             (set {} to an alpha-miner binary, or install the bundled engine). \
-             The GPU-Alpha (V100/Volta) lane stays unavailable.",
+            "GPU miner not bundled in this build: the AlphaMiner engine `{}` was not \
+             found and no verified download is configured for this platform (alpha-miner \
+             is NVIDIA-CUDA only). Install a packaged release from {}, or set {} to an \
+             alpha-miner binary. The GPU-Alpha (V100/Volta) lane stays unavailable.",
             kind.binary_name(),
+            RELEASES_URL,
             kind.env_override(),
         ),
     })
 }
+
+/// The canonical packaged-release home for the actionable "engine not bundled"
+/// message (#14). A non-dev gets a one-stop place to download a real packaged
+/// build (which bundles / auto-downloads the verified engine), instead of being
+/// told the engine is merely "not installed". The releases page hosts the signed
+/// per-OS artifacts.
+pub const RELEASES_URL: &str = "https://github.com/V-SK/Alice-Miner/releases/latest";
 
 /// `true` when `ALICE_MINER_ALLOW_UNVERIFIED_BIN` is set to an affirmative value
 /// (`1` / `true` / `yes`, case-insensitive). Off (safe) by default.
@@ -931,6 +953,50 @@ mod tests {
         }
     }
 
+    /// #14 (the surviving HIGH-1 nugget): EVERY non-placeholder engine entry must
+    /// be obtainable — it carries an https `binary_url` or `archive_url` for the
+    /// runtime auto-download. The ONE intentional exception is the macOS arm64 xmrig,
+    /// which is BUNDLED in the `.app` (pin, no URL by design). gpu-rvn entries are
+    /// intentional all-zero placeholders (pinned at packaging) → excluded. This guards
+    /// the "onboarding dead-end" regression: a real-user entry with a pin but no way
+    /// to fetch it.
+    #[test]
+    fn every_non_placeholder_entry_is_fetchable_or_bundled() {
+        let v: serde_json::Value = serde_json::from_str(MINERS_MANIFEST).unwrap();
+        let engines = v["engines"].as_array().expect("engines array");
+        let mut checked = 0;
+        for e in engines {
+            let kind = e["kind"].as_str().unwrap_or("");
+            let target = e["target"].as_str().unwrap_or("");
+            // Exclude intentional placeholders (gpu-rvn: pinned at packaging M7).
+            if e.get("_placeholder").and_then(|p| p.as_bool()) == Some(true) {
+                assert_eq!(kind, "gpu-rvn", "only gpu-rvn is a placeholder, not {kind}");
+                continue;
+            }
+            // The bundled exception: macOS arm64 xmrig ships in the `.app` (no URL).
+            let bundled_macos_xmrig = kind == "cpu-xmr" && target == "aarch64-apple-darwin";
+            let has_binary_url =
+                e["binary_url"].as_str().map(|u| u.starts_with("https://")).unwrap_or(false);
+            let has_archive_url =
+                e["archive_url"].as_str().map(|u| u.starts_with("https://")).unwrap_or(false);
+            if bundled_macos_xmrig {
+                assert!(
+                    !has_binary_url && !has_archive_url,
+                    "macOS arm64 xmrig is bundled — it must NOT carry a download URL"
+                );
+            } else {
+                assert!(
+                    has_binary_url || has_archive_url,
+                    "non-placeholder {kind}/{target} must have an https binary_url or \
+                     archive_url (onboarding dead-end guard)"
+                );
+            }
+            checked += 1;
+        }
+        // Sanity: we actually exercised real entries (not an empty/garbled manifest).
+        assert!(checked >= 5, "expected to check several real entries, got {checked}");
+    }
+
     #[test]
     fn gpu_kind_has_distinct_binary_name_and_override() {
         // kawpowminer (not xmrig) + its own env override.
@@ -948,10 +1014,12 @@ mod tests {
         clear_env(MinerKind::GpuRvn);
         let err = resolve_miner_binary(MinerKind::GpuRvn).expect_err("no GPU binary on this box");
         assert!(
-            err.contains("GPU miner not installed"),
-            "expected a clear GPU-not-installed status, got: {err}"
+            err.contains("not bundled in this build"),
+            "expected a clear not-bundled status, got: {err}"
         );
-        // The message tells the user the override knob + that the lane stays off.
+        // #14: the message is ACTIONABLE — it points at a packaged release, names the
+        // override knob, and says the lane stays off (never a bare "not installed").
+        assert!(err.contains(RELEASES_URL), "must point at a packaged release: {err}");
         assert!(err.contains("ALICE_MINER_GPU_BIN"));
         assert!(err.contains("unavailable"));
     }
