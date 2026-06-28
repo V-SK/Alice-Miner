@@ -967,18 +967,22 @@ pub fn parse_hashrate_windows(line: &str) -> Option<(Option<f64>, Option<f64>, O
 /// Returns `None` for non-share lines. **Ported VERBATIM** from
 /// `miner_supervisor.rs` (~L299).
 //
-// HONESTY-DRIVEN DEFERRAL — the a/s/i (accepted / STALE / INVALID) share split.
-// xmrig's stdout `accepted (A/R)` line gives only TWO buckets: accepted + a single
-// rejected count. It does NOT distinguish a STALE (network/late) reject from an
-// INVALID (bad-result/verify) reject in that count. The GPU engines are the same or
-// coarser: kawpow gives A/R, SRBMiner gives acc./rej., and AlphaMiner reports only
-// SUBMITTED (the relay owns acceptance — no client-side reject at all). So NO lane's
-// captured output measures a stale-vs-invalid split. Per the credit-only honesty
-// rule we DO NOT fabricate one: `rejected` stays a single bucket and no a/s/i field
-// is added. Surfacing a split would require either a richer engine log mode we don't
-// currently parse (e.g. xmrig's `--print-time` verbose / API JSON) or a server-side
-// reject-reason feed — a deliberate future change with its own measurement, not an
-// invented client-side guess.
+// HONESTY-DRIVEN DEFERRAL — the a/s/i (accepted / STALE / INVALID) share split, i.e.
+// a per-reject CAUSE breakdown. xmrig's stdout `accepted (A/R)` line gives only TWO
+// buckets: accepted + a single rejected count, and does NOT split that rejected count
+// into a STALE (network/late) vs an INVALID (bad-result/verify) cause. The other GPU
+// engines are the same or coarser for the *rejected* count: kawpow gives A/R, and
+// AlphaMiner reports only SUBMITTED (the relay owns acceptance — no client-side reject
+// at all). SRBMiner is the one partial exception: its per-GPU bracket is
+// `[accepted|rejected|stale|eff]`, so it exposes a coarse CUMULATIVE *stale* counter
+// (the third field) ALONGSIDE rejected — but `parse_srbminer` reads only the first two
+// fields (`accepted|rejected`) and DISCARDS that stale column. So no lane currently
+// surfaces a stale signal, and even SRBMiner's stale is a separate parallel counter,
+// not a cause-split of `rejected`. Per the credit-only honesty rule we DO NOT fabricate
+// a split: `rejected` stays a single bucket and no a/s/i field is added. Surfacing one
+// would mean either capturing SRBMiner's stale column (a coarse start, SRBMiner-only)
+// or a richer log mode / server-side reject-reason feed for a true per-engine cause
+// split — a deliberate future change with its own measurement, not an invented guess.
 pub fn parse_share_counts(line: &str) -> Option<(u64, u64)> {
     if !line.contains("accepted") && !line.contains("rejected") {
         return None;
