@@ -42,6 +42,7 @@ use zeroize::Zeroizing;
 use alice_miner_core::engine::{Command as EngineCommand, Event, IdentitySpec};
 use alice_miner_core::{EngineHandle, EngineState, GpuSelection, Lane, Snapshot};
 
+mod color;
 mod dashboard;
 mod fleet;
 mod pidfile;
@@ -70,6 +71,12 @@ const EXIT_USAGE: i32 = 2;
     propagate_version = true
 )]
 struct Cli {
+    /// Disable ANSI color in the live dashboard (also honored: the `NO_COLOR` env
+    /// var, `TERM=dumb`, and a non-TTY stdout). A global flag so it applies to any
+    /// subcommand. `FORCE_COLOR` overrides all of these and forces color on.
+    #[arg(long, global = true)]
+    no_color: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -316,7 +323,7 @@ fn main() {
         Command::Detect(args) => cmd_detect(args),
         Command::GpuDevices(args) => cmd_gpu_devices(args),
         Command::Identity(args) => cmd_identity(args),
-        Command::Start(args) => cmd_start(args),
+        Command::Start(args) => cmd_start(args, cli.no_color),
         Command::Stop(args) => cmd_stop(args),
         Command::Service(args) => cmd_service(args),
         Command::Fleet(args) => fleet::run(
@@ -711,7 +718,11 @@ fn build_identity_spec(
 // start
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn cmd_start(args: StartArgs) -> i32 {
+fn cmd_start(args: StartArgs, no_color: bool) -> i32 {
+    // Resolve the color / TUI decision ONCE (NO_COLOR / --no-color / TERM=dumb /
+    // FORCE_COLOR + the TTY check). Drives both whether the in-place panel is used
+    // and whether the line renderer emits ANSI — so a journal / pipe stays clean.
+    let color_env = color::ColorEnv::detect(no_color);
     // Resolve the lane (auto = recommended for this device), then pre-flight the
     // viability gates so we refuse HONESTLY before spawning a child.
     let cap = alice_miner_core::CapabilityProfile::detect();
@@ -870,13 +881,18 @@ fn cmd_start(args: StartArgs) -> i32 {
 
     // Choose the live-output mode ONCE (the three honest paths):
     //   * --json          → machine JSON lines (TUI/line renderer never touch it).
-    //   * non-TTY, !json   → the plain scrolling line renderer (piped / CI).
+    //   * non-TTY, !json   → the plain scrolling line renderer (piped / CI / a
+    //                        launchd|systemd journal — kept clean + greppable).
     //   * interactive TTY  → the in-place ratatui panel (falls back to the line
     //                        renderer if the terminal can't enter raw mode).
-    // The `--json` output is byte-for-byte unchanged in every case.
-    use std::io::IsTerminal;
-    let interactive = !args.json && std::io::stdout().is_terminal();
+    // The `--json` output is byte-for-byte unchanged in every case. `use_tui()` is
+    // FALSE off a TTY (and under TERM=dumb), so a non-TTY never gets screen-paint
+    // escapes — even under FORCE_COLOR (a pipe isn't a screen).
+    let interactive = !args.json && color_env.use_tui();
     let mut tui = if interactive { tui::Tui::new().ok() } else { None };
+    // Whether the plain line renderer emits ANSI color (semaphore + heartbeat). Only
+    // meaningful for the line path; the TUI does its own coloring.
+    let line_color = color_env.color_enabled();
 
     // Banners only make sense for the scrolling line renderer (the TUI shows state
     // in its status bar; --json is machine-only).
@@ -938,6 +954,13 @@ fn cmd_start(args: StartArgs) -> i32 {
     // prints to the restored terminal (not the alternate screen). `None` in line mode
     // (it's printed inline there immediately, as before).
     let mut deferred_error: Option<String> = None;
+    // Heartbeat + staleness state for the line renderer: a spinner frame that advances
+    // every emitted tick, and the instant the stream last ADVANCED (a real activity
+    // change). When the stream stops advancing, the rendered "no update Ns" chip grows
+    // — the App-Nap "process alive but wedged" tell. (The TUI tracks its own.)
+    let mut spinner_frame: u64 = 0;
+    let mut last_advance = std::time::Instant::now();
+    let mut prev_fingerprint: Option<(u64, u64, u64, u64)> = None;
 
     loop {
         match engine.recv_timeout(Duration::from_millis(500)) {
@@ -946,15 +969,29 @@ fn cmd_start(args: StartArgs) -> i32 {
                     .lock()
                     .map(|c| c.clone())
                     .unwrap_or(alice_miner_core::CreditState::NotExposed);
+                // Advance detection: a coarse fingerprint of the live activity. When it
+                // changes, the stream advanced (reset the staleness clock); when it
+                // doesn't, `stale_for_s` keeps growing and the chip lights up.
+                let fp = snapshot_fingerprint(&snap);
+                if prev_fingerprint != Some(fp) {
+                    prev_fingerprint = Some(fp);
+                    last_advance = std::time::Instant::now();
+                }
+                let ctx = dashboard::RenderCtx {
+                    spinner_frame,
+                    stale_for_s: Some(last_advance.elapsed().as_secs()),
+                    color: line_color,
+                };
+                spinner_frame = spinner_frame.wrapping_add(1);
                 if let Some(t) = tui.as_mut() {
                     // In-place panel; a draw failure (terminal lost) falls back to the
                     // line renderer for the rest of the run rather than aborting.
                     if t.draw(&snap).is_err() {
                         tui = None;
-                        emit_snapshot(&snap, args.json, &credit);
+                        emit_snapshot(&snap, args.json, &credit, &ctx);
                     }
                 } else {
-                    emit_snapshot(&snap, args.json, &credit);
+                    emit_snapshot(&snap, args.json, &credit, &ctx);
                 }
                 if matches!(snap.state, EngineState::Running) {
                     saw_running = true;
@@ -1032,8 +1069,14 @@ fn cmd_start(args: StartArgs) -> i32 {
 /// human dashboard block. `credit` is the latest Source-B server-confirmed credit
 /// state (cumulative accepted-share COUNTS); its honest line is appended to the
 /// human block only (the `--json` stream is byte-for-byte unchanged — credit-only,
-/// and a parser-facing schema we don't perturb).
-fn emit_snapshot(snap: &Snapshot, json: bool, credit: &alice_miner_core::CreditState) {
+/// and a parser-facing schema we don't perturb). `ctx` carries the per-tick heartbeat
+/// frame + staleness + color decision for the human block (ignored for `--json`).
+fn emit_snapshot(
+    snap: &Snapshot,
+    json: bool,
+    credit: &alice_miner_core::CreditState,
+    ctx: &dashboard::RenderCtx,
+) {
     if json {
         // One compact JSON object per tick — credit-only by construction (the
         // Snapshot type has no payout field; a core test asserts the JSON shape).
@@ -1042,13 +1085,23 @@ fn emit_snapshot(snap: &Snapshot, json: bool, credit: &alice_miner_core::CreditS
             Err(e) => eprintln!("error: failed to serialize snapshot: {e}"),
         }
     } else {
-        print!("{}", dashboard::render_snapshot(snap));
+        print!("{}", dashboard::render_snapshot_ctx(snap, ctx));
         // The cumulative server-confirmed credit line (Source B), when there is one
         // to show (NotExposed yields None — no fabricated line).
         if let Some(line) = dashboard::render_credit_line(credit) {
             print!("{line}");
         }
     }
+}
+
+/// A coarse activity fingerprint of a snapshot used to detect whether the stream
+/// ADVANCED between ticks (drives the line dashboard's "no update Ns" staleness
+/// chip). Folds the fields that move on a live, healthy stream — uptime, the share
+/// counts, and a quantized hashrate — so a wedged miner (process alive, stream
+/// frozen) reads as "not advancing". Credit-only (counts only, never a reward).
+fn snapshot_fingerprint(snap: &Snapshot) -> (u64, u64, u64, u64) {
+    let hr_q = snap.hashrate_hs.map(|h| h as u64).unwrap_or(0);
+    (snap.uptime_s, snap.shares_accepted, snap.shares_rejected, hr_q)
 }
 
 /// Resolve the `--lane` string to a [`Lane`]. `auto` → the device's recommended

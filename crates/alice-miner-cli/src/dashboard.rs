@@ -12,9 +12,10 @@
 
 use alice_miner_core::detect::capability::ALL_LANES;
 use alice_miner_core::detect::GpuDevice;
+use alice_miner_core::engine::LaneSnapshot;
 use alice_miner_core::{
-    CapabilityProfile, CreditState, GpuInfo, GpuVendor, Lane, Snapshot, LANE_KEY_GPU_ALPHA,
-    LANE_KEY_GPU_PRL,
+    CapabilityProfile, CreditState, EngineState, GpuInfo, GpuVendor, Lane, Snapshot,
+    LANE_KEY_GPU_ALPHA, LANE_KEY_GPU_PRL,
 };
 
 /// The ONLY way the CLI ever renders rewards: it is CREDIT (accruing now,
@@ -23,6 +24,188 @@ use alice_miner_core::{
 /// accruing, whereas "待发放" wrongly implied a queued payout. (The GUI's
 /// `strings::REWARD_PENDING` is the older wording, intentionally not aligned yet.)
 const REWARD_CREDIT: &str = "credit · 积分 (credit-only)";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lane semaphore + always-on lane table (the "make silent zeros LOUD" core).
+//
+// A strict green/amber/red per-lane health so the open field bugs (Win/PRL
+// 0-share, V100/i9 0-hashrate, Mac App-Nap stall) become VISIBLE instead of
+// silent zeros. SHARED by the line renderer (here) and the ratatui TUI so the two
+// can never drift. Credit-only: it reads only activity (state + hashrate), never a
+// reward number.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A lane's at-a-glance health, the dashboard semaphore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneHealth {
+    /// Running with a nonzero hashrate — the lane is doing real work.
+    Green,
+    /// Running but 0 H/s (a STALL — the loud "this lane is wedged" signal, e.g. Mac
+    /// App-Nap), or a transitional Starting/Stopping (reconnecting).
+    Amber,
+    /// The lane errored / its child exited.
+    Red,
+    /// Not started / fully stopped.
+    Idle,
+}
+
+impl LaneHealth {
+    /// Classify a lane from its lifecycle state + live hashrate. A `Running` lane
+    /// with a positive, finite hashrate is GREEN; a `Running` lane at 0 / no speed
+    /// line yet is AMBER (the stall tell); `Starting`/`Stopping` are AMBER
+    /// (reconnecting); `Error` is RED; `Idle` is IDLE.
+    pub fn classify(state: EngineState, hashrate_hs: Option<f64>) -> Self {
+        match state {
+            EngineState::Running => match hashrate_hs {
+                Some(h) if h.is_finite() && h > 0.0 => LaneHealth::Green,
+                _ => LaneHealth::Amber, // running but 0 H/s = stalled (LOUD)
+            },
+            EngineState::Starting | EngineState::Stopping => LaneHealth::Amber,
+            EngineState::Error => LaneHealth::Red,
+            EngineState::Idle => LaneHealth::Idle,
+        }
+    }
+
+    /// A short, color-independent chip so the semaphore survives NO_COLOR / a pipe /
+    /// a journal (the green/amber/red is ALSO applied as a terminal color when color
+    /// is enabled, but the word carries the signal on its own). ASCII-only.
+    pub fn chip(self) -> &'static str {
+        match self {
+            LaneHealth::Green => "OK",
+            LaneHealth::Amber => "STALL",
+            LaneHealth::Red => "ERR",
+            LaneHealth::Idle => "—",
+        }
+    }
+}
+
+/// One always-on lane row (LANE / STATE / SPEED / SHARES / ENDPOINT / FAILOVERS),
+/// plus the computed [`LaneHealth`] semaphore. Pure presentation — built from the
+/// snapshot, no engine handle. Credit-only (counts only).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaneRow {
+    pub lane: Lane,
+    pub health: LaneHealth,
+    pub state: String,
+    pub speed: String,
+    pub shares: String,
+    pub endpoint: String,
+    pub failovers: u64,
+}
+
+impl LaneRow {
+    fn from_lane_snapshot(l: &LaneSnapshot) -> Self {
+        LaneRow {
+            lane: l.lane,
+            health: LaneHealth::classify(l.state, l.hashrate_hs),
+            state: fmt_state(l.state).to_string(),
+            speed: fmt_hashrate(l.hashrate_hs),
+            shares: fmt_lane_shares(l.lane, l.shares_accepted, l.shares_rejected),
+            endpoint: l.endpoint.clone().unwrap_or_else(|| "—".into()),
+            failovers: l.failovers,
+        }
+    }
+}
+
+/// Honest per-lane share text: a GpuAlpha lane reports SUBMITTED shares (the relay
+/// owns acceptance — AlphaMiner never logs a pool accept), so it reads "N sub"; every
+/// other lane shows "A/R". Used by the lane table (both renderers).
+fn fmt_lane_shares(lane: Lane, accepted: u64, rejected: u64) -> String {
+    if lane == Lane::GpuAlpha {
+        format!("{accepted} sub")
+    } else {
+        format!("{accepted}A/{rejected}R")
+    }
+}
+
+/// The always-on lane table rows for a snapshot. When the engine populated `lanes`
+/// (single OR dual run), use them; otherwise SYNTHESIZE one row from the top-level
+/// mirror fields so the table renders even for an older single-lane stream that
+/// predates the per-lane breakdown. Empty only when there is genuinely no lane (a
+/// pre-start idle snapshot with no `lane`).
+pub fn lane_table_rows(snap: &Snapshot) -> Vec<LaneRow> {
+    if !snap.lanes.is_empty() {
+        return snap.lanes.iter().map(LaneRow::from_lane_snapshot).collect();
+    }
+    // Synthesize a single row from the top-level fields (single-lane / older stream).
+    match snap.lane {
+        Some(lane) => vec![LaneRow {
+            lane,
+            health: LaneHealth::classify(snap.state, snap.hashrate_hs),
+            state: fmt_state(snap.state).to_string(),
+            speed: fmt_hashrate(snap.hashrate_hs),
+            shares: fmt_lane_shares(lane, snap.shares_accepted, snap.shares_rejected),
+            endpoint: snap.endpoint.clone().unwrap_or_else(|| "—".into()),
+            failovers: snap.failovers,
+        }],
+        None => Vec::new(),
+    }
+}
+
+/// Render the always-on lane table as a fixed-width text block (the line renderer's
+/// table; the TUI builds a ratatui `Table` from the same [`lane_table_rows`]). The
+/// per-row health chip is the LOUD signal — `STALL` for a running-but-0 lane, `ERR`
+/// for a crashed one — visible even with color stripped. Returns `""` when there is
+/// no lane to show.
+pub fn render_lane_table(snap: &Snapshot, color: bool) -> String {
+    let rows = lane_table_rows(snap);
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    // Header. Columns: a 1-char health gutter, LANE / STATE / SPEED / SHARES /
+    // ENDPOINT / FAILOVERS.
+    out.push_str(&format!(
+        "    {:<5} {:<18} {:<9} {:<22} {:<10} {:<26} {:>3}\n",
+        "", "LANE", "STATE", "SPEED", "SHARES", "ENDPOINT", "F/O",
+    ));
+    for r in &rows {
+        let line = format!(
+            "    {:<5} {:<18} {:<9} {:<22} {:<10} {:<26} {:>3}\n",
+            r.health.chip(),
+            r.lane.label(),
+            r.state,
+            truncate_col(&r.speed, 22),
+            truncate_col(&r.shares, 10),
+            truncate_col(&r.endpoint, 26),
+            r.failovers,
+        );
+        out.push_str(&paint_line(&line, r.health, color));
+    }
+    out
+}
+
+/// Apply the semaphore color to a whole row (green/amber/red) when color is enabled.
+/// A no-op (returns the line unchanged) when `color` is false — so a pipe / journal /
+/// NO_COLOR stays clean and greppable. Idle rows are left uncolored.
+fn paint_line(line: &str, health: LaneHealth, color: bool) -> String {
+    if !color {
+        return line.to_string();
+    }
+    let code = match health {
+        LaneHealth::Green => "\x1b[32m",
+        LaneHealth::Amber => "\x1b[33m",
+        LaneHealth::Red => "\x1b[31m",
+        LaneHealth::Idle => return line.to_string(),
+    };
+    // Keep the trailing newline OUTSIDE the reset so the color spans exactly the row.
+    let trimmed = line.strip_suffix('\n').unwrap_or(line);
+    format!("{code}{trimmed}\x1b[0m\n")
+}
+
+/// Truncate a cell to `max` chars with a trailing `…` (char-counted, so the `·`
+/// middot never splits) — keeps the lane table columns aligned.
+fn truncate_col(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_string()
+    } else if max == 0 {
+        String::new()
+    } else {
+        let kept: String = chars.into_iter().take(max.saturating_sub(1)).collect();
+        format!("{kept}…")
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // detect
@@ -224,14 +407,51 @@ pub fn render_stopping_banner() -> String {
     "Stopping…\n".to_string()
 }
 
-/// Render ONE live dashboard tick from a [`Snapshot`]. A compact, honest block:
-/// state · hashrate (H/s + human) · shares A/R (+accepted%) · uptime · endpoint
-/// · failovers · rewards pending. In dual-mine it appends a per-lane row each.
+/// Per-tick render context: an advancing heartbeat spinner frame + how stale the
+/// stream is (seconds since the snapshot last ADVANCED). Lets the line renderer show
+/// a visible, advancing heartbeat — so a wedged (App-Nap) miner whose process is
+/// alive but stalled is obvious — and a "no update Ns" chip when the stream stops
+/// advancing. The render-loop owns the state and passes it in each tick.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RenderCtx {
+    /// A monotonically-increasing tick counter; `% SPINNER.len()` picks the frame.
+    pub spinner_frame: u64,
+    /// Seconds since the snapshot last advanced (a real tick changed). `None` =
+    /// unknown / first tick; `Some(n)` drives the "no update Ns" amber chip when n is
+    /// past [`STALE_AFTER_S`].
+    pub stale_for_s: Option<u64>,
+    /// Whether to emit terminal color (semaphore + chips). False under NO_COLOR /
+    /// a pipe / a journal, so the output stays clean + greppable.
+    pub color: bool,
+}
+
+/// The heartbeat spinner frames (ASCII-only so a journal / NO_COLOR stays clean and
+/// no glyph trips the no-emoji gate). Advances on every real Snapshot tick.
+pub const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+
+/// After this many seconds without the stream advancing, the heartbeat dims to an
+/// amber "no update Ns" — the loud "process alive but stalled" tell (App-Nap).
+pub const STALE_AFTER_S: u64 = 5;
+
+/// Render ONE live dashboard tick from a [`Snapshot`] with the default (no-context)
+/// presentation — no spinner-staleness chip, no color. Kept for tests and any caller
+/// that doesn't track per-tick state; the live loop uses [`render_snapshot_ctx`] with
+/// a real [`RenderCtx`].
+#[allow(dead_code)] // back-compat / test entry point; the live path uses *_ctx
+pub fn render_snapshot(snap: &Snapshot) -> String {
+    render_snapshot_ctx(snap, &RenderCtx::default())
+}
+
+/// Render ONE live dashboard tick from a [`Snapshot`] + a [`RenderCtx`]. A compact,
+/// honest block: an advancing heartbeat · state · hashrate (H/s + human) · shares
+/// A/R (+accepted%) · uptime · endpoint · failovers · rewards credit, followed by the
+/// ALWAYS-ON per-lane table (LANE / STATE / SPEED / SHARES / ENDPOINT / FAILOVERS
+/// with a green/amber/red semaphore per row).
 ///
 /// Honest by construction: rewards are only ["credit · 积分 (credit-only)"](REWARD_CREDIT);
 /// the endpoint shown is the PUBLIC relay carried in the snapshot — never the
 /// collection address / upstream pool / core IP (those never reach the client).
-pub fn render_snapshot(snap: &Snapshot) -> String {
+pub fn render_snapshot_ctx(snap: &Snapshot, ctx: &RenderCtx) -> String {
     let mut out = String::new();
 
     let hr = fmt_hashrate(snap.hashrate_hs);
@@ -242,6 +462,20 @@ pub fn render_snapshot(snap: &Snapshot) -> String {
         String::new()
     };
     let dual_tag = if snap.dual { " [dual]" } else { "" };
+
+    // Heartbeat: an advancing spinner glyph (so an App-Nap stall — process alive but
+    // the stream wedged — is visible), dimming to an amber "no update Ns" chip when
+    // the stream stops advancing past STALE_AFTER_S.
+    let beat = SPINNER[(ctx.spinner_frame as usize) % SPINNER.len()];
+    let heartbeat = match ctx.stale_for_s {
+        Some(n) if n >= STALE_AFTER_S => {
+            let chip = format!("{beat} no update {n}s");
+            // Amber when stale (color-gated; the word carries the signal regardless).
+            if ctx.color { format!("\x1b[33m{chip}\x1b[0m ") } else { format!("{chip} ") }
+        }
+        _ => format!("{beat} "),
+    };
+    out.push_str(&heartbeat);
 
     // SHOULD-FIX B: AlphaMiner reports `hits` = SUBMITTED shares (it async-submits and
     // never logs a pool accept; acceptance is the relay's truth — see `parse_alpha`). So
@@ -294,31 +528,10 @@ pub fn render_snapshot(snap: &Snapshot) -> String {
         out.push_str("    rewards: counting (PoP active · credit-only)\n");
     }
 
-    // In dual mode, print each lane's own row so both lanes are visible.
-    if snap.dual {
-        for l in &snap.lanes {
-            let lhr = fmt_hashrate(l.hashrate_hs);
-            let lfo = if l.failovers > 0 {
-                format!(" · failed-over×{}", l.failovers)
-            } else {
-                String::new()
-            };
-            // SHOULD-FIX B: a GpuAlpha row's count is SUBMITTED (not accepted) — the
-            // relay owns acceptance — so label it honestly; other lanes show A/R.
-            let lshares = if l.lane == Lane::GpuAlpha {
-                format!("{} submitted", l.shares_accepted)
-            } else {
-                format!("{}A/{}R", l.shares_accepted, l.shares_rejected)
-            };
-            out.push_str(&format!(
-                "    └ {:<9} [{}] {lhr} · {lshares} · {}{}\n",
-                l.lane.label(),
-                fmt_state(l.state),
-                l.endpoint.as_deref().unwrap_or("—"),
-                lfo,
-            ));
-        }
-    }
+    // The ALWAYS-ON per-lane table (was dual-only): one row per running lane (or a
+    // single synthesized row for a single-lane / older stream), each with a strict
+    // green/amber/red semaphore chip. One glance finds the dead / stalled lane.
+    out.push_str(&render_lane_table(snap, ctx.color));
 
     // The GPU "15% PRL 返还 (credit-only)" line — present only on a PRL-earning lane
     // (the engine attaches the display block for `is_prl_lane()`). Credit-only by
@@ -639,6 +852,118 @@ mod tests {
         assert!(s.contains("01:01:01"));
         assert!(s.contains("hk.aliceprotocol.org:3333"));
         assert!(s.contains("net accepted (142/1)"));
+    }
+
+    // ── Always-on lane table + semaphore (make silent zeros LOUD) ───────────────
+
+    /// The lane semaphore: Running + nonzero = green; Running + 0/None = AMBER (the
+    /// stall tell); Starting/Stopping = amber; Error = red; Idle = idle.
+    #[test]
+    fn lane_health_classify_amber_on_zero() {
+        assert_eq!(LaneHealth::classify(EngineState::Running, Some(8_432.0)), LaneHealth::Green);
+        // Running but 0 H/s = STALLED → amber (the loud signal).
+        assert_eq!(LaneHealth::classify(EngineState::Running, Some(0.0)), LaneHealth::Amber);
+        assert_eq!(LaneHealth::classify(EngineState::Running, None), LaneHealth::Amber);
+        // A non-finite reading is treated as no-progress → amber, never green.
+        assert_eq!(LaneHealth::classify(EngineState::Running, Some(f64::NAN)), LaneHealth::Amber);
+        // Transitional = amber (reconnecting); error = red; idle = idle.
+        assert_eq!(LaneHealth::classify(EngineState::Starting, None), LaneHealth::Amber);
+        assert_eq!(LaneHealth::classify(EngineState::Stopping, Some(1.0)), LaneHealth::Amber);
+        assert_eq!(LaneHealth::classify(EngineState::Error, None), LaneHealth::Red);
+        assert_eq!(LaneHealth::classify(EngineState::Idle, None), LaneHealth::Idle);
+    }
+
+    /// The lane table renders ALWAYS (not just dual): a single-lane snapshot with no
+    /// `lanes` breakdown still gets one synthesized row with the header + a semaphore
+    /// chip. A running-but-0 row shows the loud "STALL" chip.
+    #[test]
+    fn lane_table_is_always_on_and_shows_stall() {
+        // Single lane, no `lanes` breakdown → one synthesized row.
+        let mut s = running_snapshot();
+        s.lanes = vec![];
+        let table = render_lane_table(&s, false);
+        assert!(table.contains("LANE"), "header present: {table}");
+        assert!(table.contains("CPU · XMR"), "synthesized row: {table}");
+        assert!(table.contains("OK"), "green lane shows OK chip: {table}");
+        assert!(table.contains("hk.aliceprotocol.org:3333"));
+
+        // Running but 0 H/s → the STALL chip (silent zero made loud).
+        let mut stalled = running_snapshot();
+        stalled.hashrate_hs = Some(0.0);
+        stalled.lanes[0].hashrate_hs = Some(0.0);
+        let t2 = render_lane_table(&stalled, false);
+        assert!(t2.contains("STALL"), "0 H/s while running = STALL chip: {t2}");
+
+        // An idle snapshot with no lane → no table at all (nothing to show).
+        let idle = Snapshot {
+            state: EngineState::Idle,
+            device: None,
+            lane: None,
+            hashrate_hs: None,
+            shares_accepted: 0,
+            shares_rejected: 0,
+            endpoint: None,
+            worker_id: None,
+            uptime_s: 0,
+            failovers: 0,
+            dual: false,
+            lanes: vec![],
+            last_line: None,
+            message: None,
+            prl_payout: None,
+        };
+        assert_eq!(render_lane_table(&idle, false), "");
+    }
+
+    /// The lane table's GpuAlpha row is honest: SUBMITTED ("N sub"), never an A/R or
+    /// a fabricated accept rate (the relay owns acceptance).
+    #[test]
+    fn lane_table_gpu_alpha_row_is_submitted() {
+        let mut s = running_snapshot();
+        s.lane = Some(Lane::GpuAlpha);
+        s.lanes = vec![LaneSnapshot {
+            lane: Lane::GpuAlpha,
+            state: EngineState::Running,
+            hashrate_hs: Some(9.58e12),
+            shares_accepted: 42,
+            shares_rejected: 0,
+            endpoint: Some("us.aliceprotocol.org:3341".into()),
+            failovers: 0,
+        }];
+        let t = render_lane_table(&s, false);
+        assert!(t.contains("42 sub"), "submitted label: {t}");
+        assert!(!t.contains("42A/0R"), "no A/R framing for alpha: {t}");
+    }
+
+    /// Color gating: with `color=false` the table carries no ANSI escape; with
+    /// `color=true` a row is wrapped in a color code + reset (so a pipe / NO_COLOR
+    /// journal stays clean, but a TTY gets the semaphore).
+    #[test]
+    fn lane_table_color_is_gated() {
+        let s = running_snapshot();
+        let plain = render_lane_table(&s, false);
+        assert!(!plain.contains('\x1b'), "no ANSI when color off: {plain:?}");
+        let colored = render_lane_table(&s, true);
+        assert!(colored.contains('\x1b'), "ANSI present when color on");
+        assert!(colored.contains("\x1b[0m"), "reset present");
+    }
+
+    /// The heartbeat advances with the spinner frame and, once the stream goes stale,
+    /// dims to an amber "no update Ns" chip — the App-Nap "alive but wedged" tell.
+    #[test]
+    fn heartbeat_advances_and_goes_stale() {
+        let s = running_snapshot();
+        let fresh = render_snapshot_ctx(&s, &RenderCtx { spinner_frame: 0, stale_for_s: Some(1), color: false });
+        // Fresh (under the stale threshold) → spinner glyph, no "no update".
+        assert!(fresh.starts_with(SPINNER[0]), "leads with the heartbeat glyph: {fresh:?}");
+        assert!(!fresh.contains("no update"), "fresh stream is not stale");
+        // The frame advances.
+        let f1 = render_snapshot_ctx(&s, &RenderCtx { spinner_frame: 1, stale_for_s: Some(0), color: false });
+        assert!(f1.starts_with(SPINNER[1]), "spinner frame advanced: {f1:?}");
+        // Past STALE_AFTER_S → the loud "no update Ns" chip.
+        let stale = render_snapshot_ctx(&s, &RenderCtx { spinner_frame: 2, stale_for_s: Some(STALE_AFTER_S + 3), color: false });
+        assert!(stale.contains("no update"), "stale shows the chip: {stale}");
+        assert!(stale.contains(&format!("{}s", STALE_AFTER_S + 3)), "with the age: {stale}");
     }
 
     /// SHOULD-FIX B: a single GpuAlpha lane's count is SUBMITTED (the client never sees a
