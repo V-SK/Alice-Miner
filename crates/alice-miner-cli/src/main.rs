@@ -444,6 +444,9 @@ fn cmd_service(args: ServiceArgs) -> i32 {
         Ok(()) => {
             let tail = if args.at_login { " It will also start at login." } else { "" };
             println!("Background mining installed and started.{tail}");
+            if !args.json {
+                print!("{}", next_steps_after_service_install());
+            }
             EXIT_OK
         }
         Err(e) => {
@@ -572,6 +575,10 @@ fn cmd_identity(args: IdentityArgs) -> i32 {
                 }
             } else {
                 print!("{}", dashboard::render_identity(&identity, mnemonic.as_deref()));
+                // Next-step hint (onboarding): the user now has a reward identity,
+                // so point them straight at mining. Human path only (the --json
+                // stream stays machine-clean). Credit-only — no payout wording.
+                print!("{}", next_steps_after_identity(&identity));
             }
             engine.shutdown();
             EXIT_OK
@@ -994,6 +1001,15 @@ fn cmd_start(args: StartArgs, no_color: bool) -> i32 {
                     emit_snapshot(&snap, args.json, &credit, &ctx);
                 }
                 if matches!(snap.state, EngineState::Running) {
+                    // First transition into Running: print the background-service tip
+                    // + the 15%-PRL nudge (human path only — never on --json, never in
+                    // the in-place TUI, which has no scrollback for one-shot hints).
+                    if !saw_running && !args.json && tui.is_none() {
+                        print!("{}", next_steps_after_running(lane));
+                        if let Some(nudge) = prl_payout_nudge(lane) {
+                            print!("{nudge}");
+                        }
+                    }
                     saw_running = true;
                 }
                 if requested_stop
@@ -1219,6 +1235,63 @@ fn resolve_password(flag: Option<String>, from_stdin: bool) -> Result<String, St
         })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Onboarding hints (Theme 2 #8) — the first-60-seconds guidance the website now
+// funnels a non-developer audience into. Every hint is plain activity guidance:
+// CREDIT-ONLY (no $/paid/earned/payout-amount), and it never prints a secret or a
+// server address. Returned as Strings (printed by the human path only) so they are
+// unit-testable without capturing stdout.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// After an identity is established (`identity --create`/`--import`/`--paste`):
+/// the user now has a reward address, so point them straight at mining. A
+/// watch-only (pasted) identity can still mine to its own address.
+fn next_steps_after_identity(_identity: &alice_miner_core::Identity) -> String {
+    "\nNext: start mining to this address\n  alice-miner start\n".to_string()
+}
+
+/// After `start` reaches the Running state: tell the user how to keep mining in
+/// the background after they close the window. The lane token is the SAME one
+/// `service --install --lane <lane>` accepts, so the line is copy-paste ready.
+fn next_steps_after_running(lane: Lane) -> String {
+    format!(
+        "\nTip: to keep mining after you close this window, install the background service:\n  \
+         alice-miner service --install --lane {}\n",
+        lane.cli_lane_arg()
+    )
+}
+
+/// On a GPU (pearlhash) lane with NO 15%-PRL return address configured: surface
+/// the 15% PRL return (advertised on the website but otherwise buried as an
+/// `identity` sub-flag). Returns `None` when the lane doesn't earn the return, or
+/// when a return address is already set / can't be read. Credit-only: it offers
+/// to set an ADDRESS to enroll, never implies a paid amount.
+fn prl_payout_nudge(lane: Lane) -> Option<String> {
+    if !lane.is_prl_lane() {
+        return None;
+    }
+    // Already set (or unreadable) → no nudge. `load_payout_address` returns
+    // Ok(Some) when set, Ok(None) when unset; an Err (typo on disk) we treat as
+    // "don't nag" since the existing show/set path surfaces that.
+    match alice_miner_core::prl_payout::load_payout_address() {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(
+            "\nThis GPU lane earns the 15% PRL return. To claim it, set your PRL return address:\n  \
+             alice-miner identity --set-prl-payout <prl1p…>\n"
+                .to_string(),
+        ),
+        Err(_) => None,
+    }
+}
+
+/// After `service --install` succeeds: how to check status / uninstall, so the
+/// user isn't left guessing whether the background agent took.
+fn next_steps_after_service_install() -> String {
+    "\nCheck it any time:   alice-miner service --status\n\
+     Stop background mining: alice-miner service --uninstall\n"
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -1424,6 +1497,75 @@ mod tests {
         ])
         .is_err());
     }
+
+    /// The onboarding hints carry the RIGHT next command and the right lane token,
+    /// and stay credit-only (no $/paid/earned/payout-amount wording, no secret).
+    #[test]
+    fn onboarding_hints_are_actionable_and_credit_only() {
+        let id = alice_miner_core::Identity {
+            address: "a2test".into(),
+            pubkey: None,
+            keystore_path: None,
+            watch_only: false,
+        };
+        let after_id = next_steps_after_identity(&id);
+        assert!(after_id.contains("alice-miner start"), "points at start: {after_id}");
+
+        // The background tip uses the SAME --lane token `service --install` accepts.
+        for lane in [Lane::Xmr, Lane::GpuPrl, Lane::GpuAlpha, Lane::GpuRvn] {
+            let tip = next_steps_after_running(lane);
+            assert!(
+                tip.contains(&format!("service --install --lane {}", lane.cli_lane_arg())),
+                "{lane:?} tip must use its cli lane token: {tip}"
+            );
+        }
+
+        let svc = next_steps_after_service_install();
+        assert!(svc.contains("service --status"));
+        assert!(svc.contains("service --uninstall"));
+
+        // Credit-only honesty across every hint string + the PRL nudge text. The
+        // nudge offers an ADDRESS to enroll — never a paid figure.
+        let nudge = "\nThis GPU lane earns the 15% PRL return. To claim it, set your PRL return address:\n  \
+             alice-miner identity --set-prl-payout <prl1p…>\n"
+            .to_string();
+        let all = format!("{after_id}{}{svc}{nudge}", next_steps_after_running(Lane::GpuPrl));
+        let lower = all.to_ascii_lowercase();
+        for forbidden in ["$", "usd", "fiat", "paid", "earned", "待发放", "已发放"] {
+            assert!(!lower.contains(forbidden), "hint leaked forbidden token `{forbidden}`: {all}");
+        }
+    }
+
+    /// The 15%-PRL nudge fires only on a pearlhash lane AND only when no return
+    /// address is configured. Drive the "set" branch via the env override so the
+    /// test never touches the real `~/.alice` file.
+    #[test]
+    fn prl_nudge_only_for_unset_gpu_lane() {
+        // XMR / RVN never nudge (they don't earn the 15% return).
+        assert!(prl_payout_nudge(Lane::Xmr).is_none());
+        assert!(prl_payout_nudge(Lane::GpuRvn).is_none());
+
+        // A pearlhash lane with a configured return address → no nudge.
+        let _g = PRL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(alice_miner_core::prl_payout::ENV_PAYOUT_ADDRESS).ok();
+        std::env::set_var(
+            alice_miner_core::prl_payout::ENV_PAYOUT_ADDRESS,
+            format!("prl1p{}", "q".repeat(30)),
+        );
+        assert!(prl_payout_nudge(Lane::GpuPrl).is_none(), "set address → no nudge");
+        // Cleared → the nudge appears for a pearlhash lane.
+        std::env::remove_var(alice_miner_core::prl_payout::ENV_PAYOUT_ADDRESS);
+        let nudge = prl_payout_nudge(Lane::GpuPrl).expect("unset GPU lane nudges");
+        assert!(nudge.contains("--set-prl-payout"), "nudge gives the exact flag: {nudge}");
+        assert!(nudge.contains("15% PRL"), "nudge names the 15% return: {nudge}");
+        match prev {
+            Some(v) => std::env::set_var(alice_miner_core::prl_payout::ENV_PAYOUT_ADDRESS, v),
+            None => std::env::remove_var(alice_miner_core::prl_payout::ENV_PAYOUT_ADDRESS),
+        }
+    }
+
+    /// Serialize the PRL payout-env tests (process env is global).
+    static PRL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A non-empty `--password` flag is honored by `build_identity_spec` (the
     /// warning is printed to stderr; we just confirm the spec carries the pw).
