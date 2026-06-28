@@ -46,6 +46,10 @@ zip = { version = "2.2", default-features = false, features = ["deflate"] }
 # keystore stays encrypted on disk — only the password is stored, protected by the OS
 # account. Native backends per platform; a headless Linux box without a running Secret
 # Service probes as unavailable so GPU background is refused honestly (no plaintext path).
+# BUILD PREREQ (Linux from source): `sync-secret-service` pulls in `libdbus-sys`, so a clean
+# Debian/Ubuntu box must `apt-get install -y libdbus-1-dev pkg-config` (+ a C toolchain) or
+# `cargo build` fails resolving dbus. The CI images + the packaged release already include
+# it; this only bites a from-source build on a bare box (e.g. a fresh rented GPU instance).
 keyring = { version = "3", default-features = false, features = [
     "apple-native",
     "windows-native",
