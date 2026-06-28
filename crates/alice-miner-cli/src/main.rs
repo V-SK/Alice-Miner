@@ -897,6 +897,21 @@ fn build_identity_spec(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn cmd_start(args: StartArgs, no_color: bool) -> i32 {
+    cmd_start_with_unlock(args, no_color, None)
+}
+
+/// `cmd_start` with an OPTIONAL pre-resolved keystore passphrase for a pearlhash
+/// lane's unlock. `prefetched_unlock` is `Some` only from the setup wizard's
+/// generate-then-start handoff (NIT B): the passphrase that just created the keystore
+/// is reused to unlock it, so the user is not prompted a SECOND time for the same
+/// secret. It is `Zeroizing` (scrubbed on drop), arrives ONLY through this in-process
+/// argument (NEVER via argv / `StartArgs.password`), and is never logged. `None` (every
+/// other start) preserves the existing prompt/stdin/keyring resolution exactly.
+fn cmd_start_with_unlock(
+    args: StartArgs,
+    no_color: bool,
+    prefetched_unlock: Option<Zeroizing<String>>,
+) -> i32 {
     // Resolve the color / TUI decision ONCE (NO_COLOR / --no-color / TERM=dumb /
     // FORCE_COLOR + the TTY check). Drives both whether the in-place panel is used
     // and whether the line renderer emits ANSI — so a journal / pipe stays clean.
@@ -1044,6 +1059,11 @@ fn cmd_start(args: StartArgs, no_color: bool) -> i32 {
                 return EXIT_RUNTIME;
             }
         }
+    } else if let Some(pw) = prefetched_unlock {
+        // NIT B: the setup wizard just created this keystore and handed us its
+        // passphrase — unlock with it instead of prompting a SECOND time for the same
+        // secret. Consumed here (zeroized on drop); it never reached argv or a log.
+        Some(pw.as_str().to_string())
     } else {
         match resolve_password(args.password.clone(), args.password_stdin) {
             Ok(p) => Some(p),

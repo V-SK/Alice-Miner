@@ -30,6 +30,7 @@
 use std::io::{IsTerminal, Write};
 
 use alice_miner_core::{CapabilityProfile, Lane};
+use zeroize::Zeroizing;
 
 use crate::{EXIT_OK, EXIT_RUNTIME, EXIT_USAGE};
 
@@ -169,9 +170,12 @@ pub fn run(cfg: SetupConfig, no_color: bool) -> i32 {
         return EXIT_USAGE;
     }
 
-    // (2) Reward address: paste (validate SS58-300 inline) or generate inline.
-    let address = match resolve_reward_address(&cfg) {
-        Ok(addr) => addr,
+    // (2) Reward address: paste (validate SS58-300 inline) or generate inline. The
+    // generate path also hands back the keystore passphrase it just resolved, so a
+    // pearlhash `start` below can unlock with the SAME secret instead of re-prompting
+    // (NIT B). It stays zeroized and never reaches argv.
+    let (address, generated_passphrase) = match resolve_reward_address(&cfg) {
+        Ok(pair) => pair,
         Err(code) => return code,
     };
     println!("Address: {address}");
@@ -197,6 +201,8 @@ pub fn run(cfg: SetupConfig, no_color: bool) -> i32 {
         _ => {
             println!("\nStarting the miner — a live dashboard follows (Ctrl-C to stop).");
             // Reuse the EXACT `start` path so setup can't drift from real mining.
+            // `password` stays None — the generated passphrase is NEVER put on argv;
+            // it rides the separate in-process `prefetched_unlock` channel below.
             let start_args = crate::StartArgs {
                 lane: lane.cli_lane_arg().to_string(),
                 address: Some(address),
@@ -209,28 +215,40 @@ pub fn run(cfg: SetupConfig, no_color: bool) -> i32 {
                 gpus: None,
                 from_service: false,
             };
-            crate::cmd_start(start_args, no_color)
+            // NIT B: if we just generated the keystore, hand its passphrase straight to
+            // start so a pearlhash lane unlocks without a SECOND prompt for the same
+            // secret. `None` for paste/reuse (start prompts to unlock the existing key).
+            crate::cmd_start_with_unlock(start_args, no_color, generated_passphrase)
         }
     }
 }
 
 /// Resolve the reward address per the configured [`AddressMode`], validating an
 /// SS58-300 Alice address inline and offering to generate one interactively.
-fn resolve_reward_address(cfg: &SetupConfig) -> Result<String, i32> {
+///
+/// Returns `(address, Option<keystore passphrase>)`. The passphrase is `Some` ONLY on
+/// the GENERATE path (where we just created the keystore and so already hold its
+/// passphrase) — every paste / reuse path returns `None`, since no keystore was created
+/// and a pearlhash `start` must still prompt to unlock the existing key. The `Some`
+/// passphrase is threaded into the start handoff so a "generate then start a GPU lane"
+/// first run prompts for the SAME secret only ONCE (NIT B).
+fn resolve_reward_address(
+    cfg: &SetupConfig,
+) -> Result<(String, Option<Zeroizing<String>>), i32> {
     match &cfg.address {
-        AddressMode::Paste(addr) => validate_or_reject(addr),
-        AddressMode::Generate => generate_identity_address(cfg),
+        AddressMode::Paste(addr) => validate_or_reject(addr).map(|a| (a, None)),
+        AddressMode::Generate => generate_identity_address(cfg).map(|(a, pw)| (a, Some(pw))),
         AddressMode::Ask => {
             // An existing identity? Offer to reuse it (the common re-run case).
             if let Some(p) = alice_miner_core::identity::load_pointer() {
                 if alice_miner_core::lane::xmr::validate_alice_address(&p.address).is_some() {
                     println!("Found an existing reward address: {}", p.address);
                     if !can_prompt(cfg) {
-                        return Ok(p.address);
+                        return Ok((p.address, None));
                     }
                     let ans = prompt_line("Use it? [Y/n] ").unwrap_or_default();
                     if ans.is_empty() || ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes") {
-                        return Ok(p.address);
+                        return Ok((p.address, None));
                     }
                 }
             }
@@ -247,10 +265,10 @@ fn resolve_reward_address(cfg: &SetupConfig) -> Result<String, i32> {
             println!("  2) generate a new identity (you'll back up a 24-word phrase)");
             let choice = prompt_line("Choose [1/2]: ").unwrap_or_default();
             if choice == "2" {
-                generate_identity_address(cfg)
+                generate_identity_address(cfg).map(|(a, pw)| (a, Some(pw)))
             } else {
                 let pasted = prompt_line("Alice address: ").unwrap_or_default();
-                validate_or_reject(&pasted)
+                validate_or_reject(&pasted).map(|a| (a, None))
             }
         }
     }
@@ -284,7 +302,13 @@ fn validate_or_reject(addr: &str) -> Result<String, i32> {
 /// existing identity (the `$ALICE_IDENTITY_DIR` keystore hazard): if a pointer
 /// already exists we warn and stop. The mnemonic is printed via the SAME forced-
 /// backup block `identity --create` uses; no secret reaches argv.
-fn generate_identity_address(cfg: &SetupConfig) -> Result<String, i32> {
+///
+/// Returns the reward address AND the resolved keystore passphrase (zeroized): the
+/// passphrase that just CREATED the keystore is the SAME one a pearlhash `start` needs
+/// to unlock it for the PoP, so the caller threads it straight into the start handoff
+/// (NIT B) — no second prompt for the same secret. It NEVER reaches argv, is never
+/// logged, and is dropped/zeroized the moment the start command consumes it.
+fn generate_identity_address(cfg: &SetupConfig) -> Result<(String, Zeroizing<String>), i32> {
     // HAZARD GUARD: never silently overwrite an existing identity.
     if let Some(p) = alice_miner_core::identity::load_pointer() {
         eprintln!(
@@ -298,8 +322,10 @@ fn generate_identity_address(cfg: &SetupConfig) -> Result<String, i32> {
     }
     // Resolve the keystore passphrase (stdin / flag / interactive prompt) via the
     // SAME shared resolver `identity --create` uses — it warns on the insecure flag.
+    // Wrap in `Zeroizing` so it is scrubbed on EVERY exit path (success threads it on,
+    // an error drops it here) and never lingers in plaintext.
     let password = match crate::resolve_password(cfg.password.clone(), cfg.password_stdin) {
-        Ok(p) => p,
+        Ok(p) => Zeroizing::new(p),
         Err(e) => {
             eprintln!("error: {e}");
             return Err(EXIT_USAGE);
@@ -313,7 +339,7 @@ fn generate_identity_address(cfg: &SetupConfig) -> Result<String, i32> {
             eprintln!("  ── BACK UP THIS RECOVERY PHRASE (24 words) ──");
             eprintln!("  {}", mnemonic.as_str());
             eprintln!("  ─────────────────────────────────────────────");
-            Ok(identity.address)
+            Ok((identity.address, password))
         }
         Err(e) => {
             eprintln!("error: failed to create identity: {e}");
@@ -512,6 +538,47 @@ mod tests {
         assert_eq!(r, Err(EXIT_USAGE), "must refuse to clobber");
         // The original pointer is intact (unchanged).
         assert_eq!(alice_miner_core::identity::load_pointer().unwrap().address, addr);
+
+        match prev {
+            Some(v) => std::env::set_var("ALICE_IDENTITY_DIR", v),
+            None => std::env::remove_var("ALICE_IDENTITY_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NIT B: the generate path hands back the SAME passphrase it used to create the
+    /// keystore, so the start handoff can unlock without a second prompt. The
+    /// passphrase rides the function's return value (an in-process channel) — never
+    /// argv — and is `Zeroizing` (scrubbed on drop).
+    #[test]
+    fn generate_returns_the_passphrase_for_the_start_handoff() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("alice-setup-genpw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("ALICE_IDENTITY_DIR").ok();
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+        // Clean slate — no pre-existing identity (else the clobber guard fires).
+        let _ = std::fs::remove_file(alice_miner_core::identity::identity_path());
+
+        // Drive the passphrase in via the flag path (no interactive prompt in a test);
+        // the wizard resolves it through the SAME shared resolver `start` would use.
+        let known = "known-handoff-passphrase";
+        let mut cfg = SetupConfig::first_launch();
+        cfg.password = Some(known.to_string());
+
+        let (address, passphrase) =
+            generate_identity_address(&cfg).expect("generate succeeds on a clean slate");
+        assert!(!address.is_empty(), "an address was produced");
+        // The returned passphrase is exactly what start needs to unlock the new keystore
+        // — proving the handoff carries the right secret (no second prompt).
+        assert_eq!(passphrase.as_str(), known, "the created-keystore passphrase is returned");
+        // And a keystore was actually written for it (the pointer names one).
+        assert!(
+            alice_miner_core::identity::load_pointer()
+                .and_then(|p| p.keystore_path)
+                .is_some(),
+            "a signing keystore exists to unlock"
+        );
 
         match prev {
             Some(v) => std::env::set_var("ALICE_IDENTITY_DIR", v),
