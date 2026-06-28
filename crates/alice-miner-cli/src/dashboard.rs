@@ -109,10 +109,14 @@ pub struct LaneRow {
 }
 
 impl LaneRow {
-    fn from_lane_snapshot(l: &LaneSnapshot, uptime_s: u64) -> Self {
+    fn from_lane_snapshot(l: &LaneSnapshot) -> Self {
         LaneRow {
             lane: l.lane,
-            health: LaneHealth::classify(l.state, l.hashrate_hs, uptime_s),
+            // Per-lane uptime (NIT A): the WARMUP grace is measured against THIS lane's
+            // own uptime, not the whole-process `snap.uptime_s` — so a late-restarting /
+            // failed-over lane that's only been up a few seconds reads WARM, not a false
+            // STALL, even when the process has been running a long time.
+            health: LaneHealth::classify(l.state, l.hashrate_hs, l.uptime_s),
             state: fmt_state(l.state).to_string(),
             speed: fmt_hashrate_compact(l.hashrate_hs),
             shares: fmt_lane_shares(l.lane, l.shares_accepted, l.shares_rejected),
@@ -143,7 +147,7 @@ pub fn lane_table_rows(snap: &Snapshot) -> Vec<LaneRow> {
         return snap
             .lanes
             .iter()
-            .map(|l| LaneRow::from_lane_snapshot(l, snap.uptime_s))
+            .map(LaneRow::from_lane_snapshot)
             .collect();
     }
     // Synthesize a single row from the top-level fields (single-lane / older stream).
@@ -882,6 +886,7 @@ mod tests {
                 hashrate_15m_hs: None,
                 shares_accepted: 142,
                 shares_rejected: 1,
+                uptime_s: 3_661,
                 endpoint: Some("hk.aliceprotocol.org:3333".into()),
                 failovers: 0,
             }],
@@ -915,6 +920,7 @@ mod tests {
                     hashrate_15m_hs: None,
                     shares_accepted: 142,
                     shares_rejected: 1,
+                    uptime_s: 65,
                     endpoint: Some("hk.aliceprotocol.org:3333".into()),
                     failovers: 1,
                 },
@@ -926,6 +932,7 @@ mod tests {
                     hashrate_15m_hs: None,
                     shares_accepted: 3,
                     shares_rejected: 0,
+                    uptime_s: 65,
                     endpoint: Some("hk.aliceprotocol.org:8888".into()),
                     failovers: 0,
                 },
@@ -1069,10 +1076,12 @@ mod tests {
         assert!(table.contains("hk.aliceprotocol.org:3333"));
 
         // Running but 0 H/s PAST the warm-up grace → the STALL chip (silent zero made loud).
+        // The grace is measured against the LANE's own uptime (NIT A), so set both.
         let mut stalled = running_snapshot();
         stalled.hashrate_hs = Some(0.0);
         stalled.lanes[0].hashrate_hs = Some(0.0);
-        stalled.uptime_s = WARMUP_GRACE_S + 30; // past warm-up → a genuine stall
+        stalled.lanes[0].uptime_s = WARMUP_GRACE_S + 30; // past warm-up → a genuine stall
+        stalled.uptime_s = WARMUP_GRACE_S + 30;
         let t2 = render_lane_table(&stalled, false);
         assert!(t2.contains("STALL"), "0 H/s while running past warm-up = STALL chip: {t2}");
 
@@ -1081,6 +1090,7 @@ mod tests {
         let mut warming = running_snapshot();
         warming.hashrate_hs = None;
         warming.lanes[0].hashrate_hs = None;
+        warming.lanes[0].uptime_s = 10; // the LANE is only 10s old → WARM
         warming.uptime_s = 10;
         let t3 = render_lane_table(&warming, false);
         assert!(t3.contains("WARM"), "0 H/s within warm-up = WARM chip: {t3}");
@@ -1109,6 +1119,46 @@ mod tests {
         assert_eq!(render_lane_table(&idle, false), "");
     }
 
+    /// NIT A: the WARMUP grace is measured against each lane's OWN uptime, not the
+    /// whole-process uptime. A dual run where the process has been up a long time but
+    /// ONE lane just restarted (small per-lane uptime + 0 H/s) must show WARM for the
+    /// young lane while the long-lived 0-H/s lane shows STALL — proving the row uses
+    /// `l.uptime_s`, not `snap.uptime_s`. (Previously both rows shared the large
+    /// process uptime, so the freshly-restarted lane false-alarmed STALL.)
+    #[test]
+    fn lane_warmup_grace_is_per_lane_not_process_uptime() {
+        let mut s = dual_snapshot();
+        // The whole process has been up well past the grace…
+        s.uptime_s = WARMUP_GRACE_S + 600;
+        // …lane 0 is long-lived but wedged at 0 H/s → a genuine STALL.
+        s.lanes[0].hashrate_hs = Some(0.0);
+        s.lanes[0].uptime_s = WARMUP_GRACE_S + 600;
+        // …lane 1 just restarted/failed-over: only a few seconds old + no speed line
+        // yet → WARM, NOT a false STALL despite the large process uptime.
+        s.lanes[1].hashrate_hs = None;
+        s.lanes[1].uptime_s = 5;
+
+        let rows = lane_table_rows(&s);
+        assert_eq!(rows.len(), 2, "both lanes present");
+        assert_eq!(
+            rows[0].health,
+            LaneHealth::Amber,
+            "long-lived 0-H/s lane = STALL (amber): {:?}",
+            rows[0]
+        );
+        assert_eq!(
+            rows[1].health,
+            LaneHealth::Warmup,
+            "freshly-restarted 0-H/s lane = WARM (per-lane uptime), not a false STALL: {:?}",
+            rows[1]
+        );
+
+        // And the rendered chips reflect it.
+        let t = render_lane_table(&s, false);
+        assert!(t.contains("STALL"), "stalled lane chip present: {t}");
+        assert!(t.contains("WARM"), "warming lane chip present: {t}");
+    }
+
     /// The lane table's GpuAlpha row is honest: SUBMITTED ("N sub"), never an A/R or
     /// a fabricated accept rate (the relay owns acceptance).
     #[test]
@@ -1123,6 +1173,7 @@ mod tests {
             hashrate_15m_hs: None,
             shares_accepted: 42,
             shares_rejected: 0,
+            uptime_s: 3_661,
             endpoint: Some("us.aliceprotocol.org:3341".into()),
             failovers: 0,
         }];
@@ -1179,6 +1230,7 @@ mod tests {
             hashrate_15m_hs: None,
             shares_accepted: 42,
             shares_rejected: 0,
+            uptime_s: 3_661,
             endpoint: s.endpoint.clone(),
             failovers: 0,
         }];
@@ -1443,6 +1495,7 @@ mod tests {
                 hashrate_15m_hs: None,
                 shares_accepted: 70,
                 shares_rejected: 0,
+                uptime_s: 120,
                 endpoint: Some("us.aliceprotocol.org:3340".into()),
                 failovers: 0,
             }],

@@ -932,6 +932,7 @@ mod tests {
                 hashrate_15m_hs: None,
                 shares_accepted: 142,
                 shares_rejected: 1,
+                uptime_s: 1234,
                 endpoint: Some("hk.aliceprotocol.org:3333".into()),
                 failovers: 0,
             }],

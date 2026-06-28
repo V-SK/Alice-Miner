@@ -229,6 +229,14 @@ pub struct LaneSnapshot {
     pub shares_accepted: u64,
     /// This lane's cumulative rejected shares.
     pub shares_rejected: u64,
+    /// Seconds since THIS lane's run started (its OWN uptime, not the process's). The
+    /// dashboard's per-lane WARMUP grace is measured against this so a lane that
+    /// restarts / fails over late (briefly 0 H/s while only a few seconds old) reads
+    /// WARM, not a false STALL — even when the whole-process uptime is already large.
+    /// `#[serde(default)]` so an older stream that predates this field deserializes to
+    /// 0 (the synthesized single-lane row falls back to the process uptime instead).
+    #[serde(default)]
+    pub uptime_s: u64,
     /// This lane's ACTIVE (post-failover) endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -1172,6 +1180,9 @@ fn build_snapshot(
             hashrate_15m_hs: st.hashrate_15m_hs,
             shares_accepted: st.accepted,
             shares_rejected: st.rejected,
+            // This lane's OWN uptime (not the process's) — feeds the per-lane WARMUP
+            // grace so a late-restarting lane isn't mis-flagged STALL (NIT A).
+            uptime_s: st.uptime_s,
             endpoint: st.endpoint.clone(),
             failovers: st.failovers,
         });
@@ -1287,6 +1298,7 @@ mod tests {
                     hashrate_15m_hs: Some(1180.0),
                     shares_accepted: 7,
                     shares_rejected: 1,
+                    uptime_s: 42,
                     endpoint: Some("hk.aliceprotocol.org:3333".into()),
                     failovers: 1,
                 },
@@ -1299,6 +1311,7 @@ mod tests {
                     hashrate_15m_hs: None,
                     shares_accepted: 3,
                     shares_rejected: 0,
+                    uptime_s: 42,
                     endpoint: Some("hk.aliceprotocol.org:8888".into()),
                     failovers: 0,
                 },

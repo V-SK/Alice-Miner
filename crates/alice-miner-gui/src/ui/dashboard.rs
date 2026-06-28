@@ -1552,6 +1552,7 @@ mod tests {
             hashrate_15m_hs: None,
             shares_accepted: accepted,
             shares_rejected: rejected,
+            uptime_s: 0,
             endpoint: None,
             failovers: 0,
         }
