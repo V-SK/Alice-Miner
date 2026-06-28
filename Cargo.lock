@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "alice-crypto"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "alice-miner-cli"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "alice-miner-core",
  "assert_cmd",
@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "alice-miner-core"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "alice-crypto",
  "alice-release",
@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "alice-miner-gui"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "alice-miner-core",
  "eframe",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "alice-release"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "alice-supervise"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "tokio",
 ]
