@@ -502,6 +502,15 @@ pub fn render_snapshot_ctx(snap: &Snapshot, ctx: &RenderCtx) -> String {
         REWARD_CREDIT,
     ));
 
+    // Triple-window speed line (xmrig-grade): `speed 10s/60s/15m <a>/<b>/<c>`, shown
+    // ONLY when the engine actually measures the windows (xmrig). A 0 in the 10s
+    // column while Running is the instant stalled-lane tell; the 15m is the earnings
+    // number. A window the engine reports as `n/a` (warm-up) renders `—`, never a
+    // fabricated figure.
+    if let Some(line) = fmt_speed_windows(snap) {
+        out.push_str(&format!("    {line}\n"));
+    }
+
     // Surface the engine's short reason whenever it set one: an Error/Stopping reason,
     // or a transient warning pushed while STILL running (e.g. the PoP-refresh "crediting
     // may pause" note — a full-hashrate lane can be earning nothing). The most actionable
@@ -693,6 +702,32 @@ pub fn fmt_hashrate(hs: Option<f64>) -> String {
     }
 }
 
+/// The xmrig-grade triple-window speed line `speed 10s/60s/15m <a>/<b>/<c>` — but
+/// ONLY when the snapshot's lane actually measures the windows (i.e. at least one of
+/// the 60s/15m figures is present, which is xmrig). `None` for every GPU lane (they
+/// report a single instantaneous rate — no honest triple to show). The 10s figure is
+/// the snapshot's primary `hashrate_hs`; each window renders `—` when not measured yet
+/// (a `n/a` warm-up slot), and is NEVER backfilled from another window.
+///
+/// Honest-by-construction: a window we didn't measure stays `—`, not a copied value.
+pub fn fmt_speed_windows(snap: &Snapshot) -> Option<String> {
+    // Only show the triple when the engine reported a 60s OR 15m window — that's the
+    // signal it actually measures them (xmrig). GPU lanes leave both None → no line.
+    if snap.hashrate_60s_hs.is_none() && snap.hashrate_15m_hs.is_none() {
+        return None;
+    }
+    let w = |h: Option<f64>| match h {
+        Some(v) if v.is_finite() && v >= 0.0 => fmt_hashrate_human(v),
+        _ => "—".to_string(),
+    };
+    Some(format!(
+        "speed 10s/60s/15m {} / {} / {}",
+        w(snap.hashrate_hs),
+        w(snap.hashrate_60s_hs),
+        w(snap.hashrate_15m_hs),
+    ))
+}
+
 /// The human-scaled hashrate unit alone (kH/s, MH/s, GH/s) — no raw H/s. Used in
 /// the combined form above; exposed for tests.
 pub fn fmt_hashrate_human(h: f64) -> String {
@@ -792,6 +827,8 @@ mod tests {
             device: None,
             lane: Some(Lane::Xmr),
             hashrate_hs: Some(8_432.0),
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
             shares_accepted: 142,
             shares_rejected: 1,
             endpoint: Some("hk.aliceprotocol.org:3333".into()),
@@ -803,6 +840,8 @@ mod tests {
                 lane: Lane::Xmr,
                 state: EngineState::Running,
                 hashrate_hs: Some(8_432.0),
+                hashrate_60s_hs: None,
+                hashrate_15m_hs: None,
                 shares_accepted: 142,
                 shares_rejected: 1,
                 endpoint: Some("hk.aliceprotocol.org:3333".into()),
@@ -820,6 +859,8 @@ mod tests {
             device: None,
             lane: Some(Lane::Xmr),
             hashrate_hs: Some(8_432.0 + 25_000_000.0),
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
             shares_accepted: 145,
             shares_rejected: 1,
             endpoint: Some("hk.aliceprotocol.org:3333".into()),
@@ -832,6 +873,8 @@ mod tests {
                     lane: Lane::Xmr,
                     state: EngineState::Running,
                     hashrate_hs: Some(8_432.0),
+                    hashrate_60s_hs: None,
+                    hashrate_15m_hs: None,
                     shares_accepted: 142,
                     shares_rejected: 1,
                     endpoint: Some("hk.aliceprotocol.org:3333".into()),
@@ -841,6 +884,8 @@ mod tests {
                     lane: Lane::GpuRvn,
                     state: EngineState::Running,
                     hashrate_hs: Some(25_000_000.0),
+                    hashrate_60s_hs: None,
+                    hashrate_15m_hs: None,
                     shares_accepted: 3,
                     shares_rejected: 0,
                     endpoint: Some("hk.aliceprotocol.org:8888".into()),
@@ -901,6 +946,43 @@ mod tests {
         assert!(s.contains("net accepted (142/1)"));
     }
 
+    // ── Triple-window speed line (xmrig-grade; STRETCH) ─────────────────────────
+
+    /// XMR (the one engine that measures the windows) renders a `speed 10s/60s/15m`
+    /// triple; a `n/a` window shows `—` (never a backfilled figure). A GPU lane (both
+    /// windows None) shows NO triple line at all.
+    #[test]
+    fn triple_window_speed_only_when_measured() {
+        // XMR with all three windows → the full triple.
+        let mut xmr = running_snapshot();
+        xmr.hashrate_hs = Some(8_432.0);
+        xmr.hashrate_60s_hs = Some(8_100.0);
+        xmr.hashrate_15m_hs = Some(7_900.0);
+        let line = fmt_speed_windows(&xmr).expect("xmr measures windows");
+        assert!(line.contains("speed 10s/60s/15m"), "{line}");
+        assert!(line.contains("8.43 kH/s"), "10s: {line}");
+        assert!(line.contains("8.10 kH/s"), "60s: {line}");
+        assert!(line.contains("7.90 kH/s"), "15m: {line}");
+
+        // A still-n/a 15m window → `—` for that slot, the rest measured.
+        let mut warming = xmr.clone();
+        warming.hashrate_15m_hs = None;
+        let l2 = fmt_speed_windows(&warming).expect("60s present → triple shown");
+        assert!(l2.contains("—"), "n/a window renders an em dash: {l2}");
+
+        // A GPU lane (both windows None) → no triple line (honesty: nothing measured).
+        let mut gpu = running_snapshot();
+        gpu.lane = Some(Lane::GpuPrl);
+        gpu.hashrate_hs = Some(870_000_000_000.0);
+        gpu.hashrate_60s_hs = None;
+        gpu.hashrate_15m_hs = None;
+        assert!(fmt_speed_windows(&gpu).is_none(), "GPU lane has no honest triple");
+
+        // The full snapshot render includes the triple line for XMR.
+        let rendered = render_snapshot(&xmr);
+        assert!(rendered.contains("speed 10s/60s/15m"), "triple in the block: {rendered}");
+    }
+
     // ── Always-on lane table + semaphore (make silent zeros LOUD) ───────────────
 
     /// The lane semaphore: Running + nonzero = green; Running + 0/None = AMBER (the
@@ -947,6 +1029,8 @@ mod tests {
             device: None,
             lane: None,
             hashrate_hs: None,
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
             shares_accepted: 0,
             shares_rejected: 0,
             endpoint: None,
@@ -972,6 +1056,8 @@ mod tests {
             lane: Lane::GpuAlpha,
             state: EngineState::Running,
             hashrate_hs: Some(9.58e12),
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
             shares_accepted: 42,
             shares_rejected: 0,
             endpoint: Some("us.aliceprotocol.org:3341".into()),
@@ -1026,6 +1112,8 @@ mod tests {
             lane: Lane::GpuAlpha,
             state: EngineState::Running,
             hashrate_hs: Some(9.58e12),
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
             shares_accepted: 42,
             shares_rejected: 0,
             endpoint: s.endpoint.clone(),
@@ -1275,6 +1363,8 @@ mod tests {
             device: None,
             lane: Some(Lane::GpuPrl),
             hashrate_hs: Some(870_000_000_000.0), // ~0.87 TH/s pearlhash
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
             shares_accepted: 70,
             shares_rejected: 0,
             endpoint: Some("us.aliceprotocol.org:3340".into()),
@@ -1286,6 +1376,8 @@ mod tests {
                 lane: Lane::GpuPrl,
                 state: EngineState::Running,
                 hashrate_hs: Some(870_000_000_000.0),
+                hashrate_60s_hs: None,
+                hashrate_15m_hs: None,
                 shares_accepted: 70,
                 shares_rejected: 0,
                 endpoint: Some("us.aliceprotocol.org:3340".into()),

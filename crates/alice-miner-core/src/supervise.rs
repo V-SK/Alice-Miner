@@ -89,6 +89,11 @@ pub struct LaneStats {
     /// Most recent hashrate in H/s (10s, else 60s figure). `None` until the
     /// first speed line arrives.
     pub hashrate_hs: Option<f64>,
+    /// The 60s + 15m hashrate windows (H/s) — populated ONLY for xmrig (its
+    /// `speed 10s/60s/15m` line is the one engine that reports them); `None` for
+    /// every GPU lane and for an xmrig window still printing `n/a`. Never fabricated.
+    pub hashrate_60s_hs: Option<f64>,
+    pub hashrate_15m_hs: Option<f64>,
     /// Running count of accepted shares (latest `(A/R)` figure).
     pub accepted: u64,
     /// Running count of rejected shares (latest `(A/R)` figure).
@@ -116,6 +121,8 @@ impl LaneStats {
             running: false,
             state: ProcState::Stopped,
             hashrate_hs: None,
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
             accepted: 0,
             rejected: 0,
             last_exit_code: None,
@@ -142,6 +149,13 @@ struct Inner {
     last_exit_code: Option<i32>,
     message: Option<String>,
     hashrate_hs: Option<f64>,
+    /// The 60s + 15m hashrate windows (H/s), populated ONLY for an engine that
+    /// actually reports them — xmrig's `speed 10s/60s/15m` line. `None` for every
+    /// GPU lane (SRBMiner / kawpow / alpha report a single instantaneous rate), and
+    /// `None` while xmrig still prints `n/a` for that window during warm-up. NEVER
+    /// fabricated from the 10s figure — a window we didn't measure stays `None`.
+    hashrate_60s_hs: Option<f64>,
+    hashrate_15m_hs: Option<f64>,
     accepted: u64,
     rejected: u64,
     last_line: String,
@@ -204,6 +218,8 @@ impl LaneSupervisor {
                 last_exit_code: None,
                 message: None,
                 hashrate_hs: None,
+                hashrate_60s_hs: None,
+                hashrate_15m_hs: None,
                 accepted: 0,
                 rejected: 0,
                 last_line: String::new(),
@@ -271,6 +287,8 @@ impl LaneSupervisor {
             running: g.state.is_active(),
             state: g.state,
             hashrate_hs: g.hashrate_hs,
+            hashrate_60s_hs: g.hashrate_60s_hs,
+            hashrate_15m_hs: g.hashrate_15m_hs,
             accepted: g.accepted,
             rejected: g.rejected,
             last_exit_code: g.last_exit_code,
@@ -363,6 +381,8 @@ impl LaneSupervisor {
             g.stop_requested = false;
             g.forced_error = false;
             g.hashrate_hs = None;
+            g.hashrate_60s_hs = None;
+            g.hashrate_15m_hs = None;
             // On a fresh start, zero the share counters; on a failover relaunch,
             // KEEP the cumulative accepted/rejected (the user's session totals
             // shouldn't reset just because we rotated endpoints) but re-arm the
@@ -455,6 +475,8 @@ impl LaneSupervisor {
                     g.last_exit_code = Some(code);
                     g.pid = None;
                     g.hashrate_hs = None;
+                    g.hashrate_60s_hs = None;
+                    g.hashrate_15m_hs = None;
                     g.started_at = None;
                     g.state = if g.stop_requested {
                         ProcState::Stopped
@@ -478,6 +500,8 @@ impl LaneSupervisor {
                 if g.generation == gen {
                     g.pid = None;
                     g.hashrate_hs = None;
+                    g.hashrate_60s_hs = None;
+                    g.hashrate_15m_hs = None;
                     g.started_at = None;
                     g.last_exit_code = code;
                     if g.forced_error {
@@ -689,6 +713,16 @@ fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
                 g.hashrate_hs = Some(hr);
                 note_hashrate_progress(g, hr);
             }
+            // Triple-window (10s/60s/15m): xmrig is the ONE engine that reports them.
+            // Each window is set independently; a `n/a` slot leaves that window None
+            // (we never backfill it from another window).
+            if let Some((w10, w60, w15)) = parse_hashrate_windows(&line) {
+                // The primary `hashrate_hs` already prefers 10s (else 60s) above; keep
+                // the 60s/15m windows for the triple-window display only.
+                let _ = w10;
+                g.hashrate_60s_hs = w60;
+                g.hashrate_15m_hs = w15;
+            }
             if let Some((accepted, rejected)) = parse_share_counts(&line) {
                 g.accepted = accepted;
                 g.rejected = rejected;
@@ -887,10 +921,64 @@ pub fn parse_hashrate_hs(line: &str) -> Option<f64> {
     None
 }
 
+/// Parse ALL THREE hashrate windows (10s / 60s / 15m, each in H/s) from an XMRig
+/// `speed 10s/60s/15m <a> <b> <c> H/s` line. Returns `(10s, 60s, 15m)`, each `None`
+/// when that slot is `n/a` (warm-up) or absent. `None` (the whole tuple) only when
+/// the line isn't an XMRig speed line. Positional: the three figures map 1:1 to the
+/// three windows, so a window we didn't measure stays `None` — NEVER filled from
+/// another window. Only XMRig prints this triple; the GPU engines have no such line,
+/// so they never call this (the per-lane `apply_log_line` only invokes it for XMR).
+pub fn parse_hashrate_windows(line: &str) -> Option<(Option<f64>, Option<f64>, Option<f64>)> {
+    if !line.contains("speed") || !line.contains("10s/60s/15m") {
+        return None;
+    }
+    let after = line.split("10s/60s/15m").nth(1)?;
+    let mut windows: [Option<f64>; 3] = [None, None, None];
+    let mut idx = 0usize;
+    for tok in after.split_whitespace() {
+        // Stop at the unit (the three figures all precede it; a trailing
+        // `max <x> H/s` is past the unit and ignored).
+        if tok.eq_ignore_ascii_case("h/s")
+            || tok.eq_ignore_ascii_case("kh/s")
+            || tok.eq_ignore_ascii_case("mh/s")
+        {
+            break;
+        }
+        if idx >= windows.len() {
+            break;
+        }
+        if tok.eq_ignore_ascii_case("n/a") {
+            windows[idx] = None; // this window genuinely not measured yet
+            idx += 1;
+            continue;
+        }
+        if let Ok(v) = tok.parse::<f64>() {
+            windows[idx] = Some(v);
+            idx += 1;
+        }
+        // A non-numeric, non-n/a, non-unit token (shouldn't happen) is skipped
+        // without advancing — defensive against an unexpected log shape.
+    }
+    Some((windows[0], windows[1], windows[2]))
+}
+
 /// Parse cumulative `(accepted/rejected)` counts from an XMRig share line, e.g.
 /// `net      accepted (12/0) diff 1234 (45 ms)` or `... rejected (12/1) ...`.
 /// Returns `None` for non-share lines. **Ported VERBATIM** from
 /// `miner_supervisor.rs` (~L299).
+//
+// HONESTY-DRIVEN DEFERRAL — the a/s/i (accepted / STALE / INVALID) share split.
+// xmrig's stdout `accepted (A/R)` line gives only TWO buckets: accepted + a single
+// rejected count. It does NOT distinguish a STALE (network/late) reject from an
+// INVALID (bad-result/verify) reject in that count. The GPU engines are the same or
+// coarser: kawpow gives A/R, SRBMiner gives acc./rej., and AlphaMiner reports only
+// SUBMITTED (the relay owns acceptance — no client-side reject at all). So NO lane's
+// captured output measures a stale-vs-invalid split. Per the credit-only honesty
+// rule we DO NOT fabricate one: `rejected` stays a single bucket and no a/s/i field
+// is added. Surfacing a split would require either a richer engine log mode we don't
+// currently parse (e.g. xmrig's `--print-time` verbose / API JSON) or a server-side
+// reject-reason feed — a deliberate future change with its own measurement, not an
+// invented client-side guess.
 pub fn parse_share_counts(line: &str) -> Option<(u64, u64)> {
     if !line.contains("accepted") && !line.contains("rejected") {
         return None;
@@ -1027,6 +1115,38 @@ mod tests {
         assert_eq!(parse_hashrate_hs("net      new job from pool"), None);
     }
 
+    /// The triple-window parser maps the three figures 1:1 to (10s, 60s, 15m); a
+    /// `n/a` slot is `None` for THAT window only (never backfilled from another); a
+    /// trailing `max <x>` is ignored; a non-speed line yields `None` for the tuple.
+    #[test]
+    fn parses_all_three_hashrate_windows() {
+        // Full line: 10s + 60s present, 15m still n/a; the `max 1300.0` is ignored.
+        assert_eq!(
+            parse_hashrate_windows(
+                "miner    speed 10s/60s/15m 1234.5 1200.0 n/a H/s max 1300.0 H/s"
+            ),
+            Some((Some(1234.5), Some(1200.0), None))
+        );
+        // 10s n/a but 60s + 15m present → only the 10s window is None.
+        assert_eq!(
+            parse_hashrate_windows("miner    speed 10s/60s/15m n/a 980.0 950.0 H/s"),
+            Some((None, Some(980.0), Some(950.0)))
+        );
+        // All three measured.
+        assert_eq!(
+            parse_hashrate_windows("miner    speed 10s/60s/15m 100.0 90.0 80.0 H/s"),
+            Some((Some(100.0), Some(90.0), Some(80.0)))
+        );
+        // All n/a (warm-up) → the tuple is present but every window is None (never
+        // a fabricated figure).
+        assert_eq!(
+            parse_hashrate_windows("miner    speed 10s/60s/15m n/a n/a n/a H/s"),
+            Some((None, None, None))
+        );
+        // Not a speed line → the whole tuple is None (nothing measured).
+        assert_eq!(parse_hashrate_windows("net      new job from pool"), None);
+    }
+
     #[test]
     fn parses_accepted_and_rejected_share_counts() {
         assert_eq!(
@@ -1056,7 +1176,27 @@ mod tests {
         assert_eq!(st.accepted, 7);
         assert_eq!(st.rejected, 1);
         assert_eq!(st.hashrate_hs, Some(555.5));
+        // The triple-window is captured for XMR: 10s+60s measured, 15m still n/a.
+        assert_eq!(st.hashrate_60s_hs, Some(540.0));
+        assert_eq!(st.hashrate_15m_hs, None, "n/a window stays None, never backfilled");
         assert!(!st.last_line.contains('\u{1b}'));
+    }
+
+    /// A GPU lane (no `speed 10s/60s/15m` line) never gets the 60s/15m windows — they
+    /// stay `None`, so the dashboard never shows a triple-window for a lane that
+    /// didn't measure one (honesty rule).
+    #[test]
+    fn gpu_lane_has_no_triple_window() {
+        let s = LaneSupervisor::new(Lane::GpuRvn);
+        {
+            let mut g = s.inner.lock().unwrap();
+            // A kawpow speed line carries ONE instantaneous rate, no window triple.
+            apply_log_line(&mut g, Lane::GpuRvn, "m kawpowminer Speed 25.00 Mh/s gpu0 [A5+0:R0+0:F0]");
+        }
+        let st = s.stats();
+        assert!(st.hashrate_hs.is_some(), "the single rate is still parsed");
+        assert_eq!(st.hashrate_60s_hs, None, "no 60s window for a GPU lane");
+        assert_eq!(st.hashrate_15m_hs, None, "no 15m window for a GPU lane");
     }
 
     #[test]

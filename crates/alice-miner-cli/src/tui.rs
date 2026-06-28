@@ -307,9 +307,13 @@ pub fn ticker_text(snap: &Snapshot) -> String {
 /// `stale_s` the seconds since the stream last advanced (the staleness chip).
 fn render(frame: &mut Frame, snap: &Snapshot, beat: char, stale_s: u64) {
     let rows = lane_rows(snap);
+    // The xmrig triple-window speed line (only when the engine measures it). Adds a
+    // row to the Activity panel when present.
+    let triple = crate::dashboard::fmt_speed_windows(snap);
     // Vertical layout: status bar, stats, ALWAYS-ON lane table (when there's a lane),
     // ticker, and the persistent footer keybinding bar.
-    let mut constraints = vec![Constraint::Length(3), Constraint::Length(4)];
+    let stats_h = if triple.is_some() { 5 } else { 4 };
+    let mut constraints = vec![Constraint::Length(3), Constraint::Length(stats_h)];
     let has_table = !rows.is_empty();
     if has_table {
         // 1 header + N lane rows + top/bottom border.
@@ -332,8 +336,11 @@ fn render(frame: &mut Frame, snap: &Snapshot, beat: char, stale_s: u64) {
     );
     frame.render_widget(status, chunks[0]);
 
-    // 2) Stats + (optional) crediting line.
+    // 2) Stats + (optional) triple-window speed + (optional) crediting line.
     let mut stats_lines = vec![Line::from(stats_line(snap))];
+    if let Some(t) = triple {
+        stats_lines.push(Line::from(Span::styled(t, Style::default().fg(Color::DarkGray))));
+    }
     if let Some(c) = crediting_line(snap) {
         stats_lines.push(Line::from(Span::styled(c, Style::default().fg(Color::Green))));
     }
@@ -418,6 +425,8 @@ mod tests {
             device: None,
             lane: Some(Lane::Xmr),
             hashrate_hs: Some(8_432.0),
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
             shares_accepted: 142,
             shares_rejected: 1,
             endpoint: Some("hk.aliceprotocol.org:3333".into()),
@@ -438,6 +447,8 @@ mod tests {
             device: None,
             lane: Some(Lane::Xmr),
             hashrate_hs: Some(25_008_432.0),
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
             shares_accepted: 145,
             shares_rejected: 1,
             endpoint: Some("hk.aliceprotocol.org:3333".into()),
@@ -450,6 +461,8 @@ mod tests {
                     lane: Lane::Xmr,
                     state: EngineState::Running,
                     hashrate_hs: Some(8_432.0),
+                    hashrate_60s_hs: None,
+                    hashrate_15m_hs: None,
                     shares_accepted: 142,
                     shares_rejected: 1,
                     endpoint: Some("hk.aliceprotocol.org:3333".into()),
@@ -459,6 +472,8 @@ mod tests {
                     lane: Lane::GpuRvn,
                     state: EngineState::Running,
                     hashrate_hs: Some(25_000_000.0),
+                    hashrate_60s_hs: None,
+                    hashrate_15m_hs: None,
                     shares_accepted: 3,
                     shares_rejected: 0,
                     endpoint: Some("hk.aliceprotocol.org:8888".into()),

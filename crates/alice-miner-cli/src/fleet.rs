@@ -294,6 +294,8 @@ mod tests {
             device: None,
             lane: Some(lane),
             hashrate_hs: Some(8_432.0),
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
             shares_accepted: acc,
             shares_rejected: rej,
             endpoint: Some("hk.aliceprotocol.org:3333".into()),
@@ -305,6 +307,8 @@ mod tests {
                 lane,
                 state: EngineState::Running,
                 hashrate_hs: Some(8_432.0),
+                hashrate_60s_hs: None,
+                hashrate_15m_hs: None,
                 shares_accepted: acc,
                 shares_rejected: rej,
                 endpoint: Some("hk.aliceprotocol.org:3333".into()),
@@ -330,6 +334,21 @@ mod tests {
         let stream = format!("{a}\n{b}\n{{\"state\":\"Runn");
         let got = parse_last_snapshot_line(&stream).expect("parses the last COMPLETE line");
         assert_eq!(got.worker_id.as_deref(), Some("rig-b"), "the most recent complete tick");
+    }
+
+    /// The triple-window fields are ADDITIVE: a Snapshot JSON line emitted by an
+    /// OLDER miner (no `hashrate_60s_hs` / `hashrate_15m_hs` keys) still parses — the
+    /// missing Option fields default to None. Guards the fleet roster against a
+    /// schema-version skew across a mixed fleet.
+    #[test]
+    fn parse_tolerates_a_snapshot_without_window_fields() {
+        let old = r#"{"state":"running","lane":"xmr","hashrate_hs":8432.0,"shares_accepted":10,"shares_rejected":0,"endpoint":"hk.aliceprotocol.org:3333","worker_id":"rig-old","uptime_s":60,"failovers":0,"dual":false}"#;
+        let snap = parse_last_snapshot_line(old).expect("older stream still parses");
+        assert_eq!(snap.worker_id.as_deref(), Some("rig-old"));
+        assert_eq!(snap.hashrate_60s_hs, None, "absent window field → None");
+        assert_eq!(snap.hashrate_15m_hs, None);
+        let row = RowData::from_snapshot(&snap);
+        assert_eq!(row.shares_accepted, 10);
     }
 
     /// Empty / whitespace / pure-garbage content yields no snapshot (never panics).

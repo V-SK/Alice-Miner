@@ -145,9 +145,19 @@ pub struct Snapshot {
     /// The active mining lane (once a `Start` has been issued).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lane: Option<Lane>,
-    /// Live hashrate in H/s (`None` until the first speed line).
+    /// Live hashrate in H/s (`None` until the first speed line). For the triple-window
+    /// engines this is the 10s (else 60s) figure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hashrate_hs: Option<f64>,
+    /// The 60s + 15m hashrate windows (H/s) — populated ONLY for the engine that
+    /// actually reports them (xmrig's `speed 10s/60s/15m`), and `None` for every GPU
+    /// lane and for an xmrig window still printing `n/a`. A window we didn't measure
+    /// is NEVER fabricated from another window. Additive + `skip`-when-`None`, so the
+    /// JSON shape is unchanged for any lane that doesn't measure them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hashrate_60s_hs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hashrate_15m_hs: Option<f64>,
     /// Cumulative accepted shares this run.
     pub shares_accepted: u64,
     /// Cumulative rejected shares this run.
@@ -205,9 +215,16 @@ pub struct LaneSnapshot {
     pub lane: Lane,
     /// This lane's lifecycle state.
     pub state: EngineState,
-    /// This lane's live hashrate in H/s (`None` until the first speed line).
+    /// This lane's live hashrate in H/s (`None` until the first speed line). For the
+    /// triple-window engines this is the 10s (else 60s) figure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hashrate_hs: Option<f64>,
+    /// This lane's 60s + 15m hashrate windows (H/s) — populated ONLY for xmrig (the
+    /// one engine that reports them); `None` for every GPU lane. Never fabricated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hashrate_60s_hs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hashrate_15m_hs: Option<f64>,
     /// This lane's cumulative accepted shares.
     pub shares_accepted: u64,
     /// This lane's cumulative rejected shares.
@@ -226,6 +243,8 @@ impl Snapshot {
             device: None,
             lane: None,
             hashrate_hs: None,
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
             shares_accepted: 0,
             shares_rejected: 0,
             endpoint: None,
@@ -1149,6 +1168,8 @@ fn build_snapshot(
             lane: st.lane,
             state: st.state.into(),
             hashrate_hs: st.hashrate_hs,
+            hashrate_60s_hs: st.hashrate_60s_hs,
+            hashrate_15m_hs: st.hashrate_15m_hs,
             shares_accepted: st.accepted,
             shares_rejected: st.rejected,
             endpoint: st.endpoint.clone(),
@@ -1163,6 +1184,8 @@ fn build_snapshot(
         let st = p.stats();
         snap.lane = Some(st.lane);
         snap.hashrate_hs = st.hashrate_hs;
+        snap.hashrate_60s_hs = st.hashrate_60s_hs;
+        snap.hashrate_15m_hs = st.hashrate_15m_hs;
         snap.shares_accepted = st.accepted;
         snap.shares_rejected = st.rejected;
         snap.endpoint = st.endpoint.clone();
@@ -1244,6 +1267,10 @@ mod tests {
             device: Some(DeviceProfile::detect()),
             lane: Some(Lane::Xmr),
             hashrate_hs: Some(1234.5),
+            // XMR measures the triple window — populate them so the JSON-honesty
+            // assertion below also exercises the new fields' serialization.
+            hashrate_60s_hs: Some(1200.0),
+            hashrate_15m_hs: Some(1180.0),
             shares_accepted: 7,
             shares_rejected: 1,
             endpoint: Some("hk.aliceprotocol.org:3333".into()),
@@ -1256,6 +1283,8 @@ mod tests {
                     lane: Lane::Xmr,
                     state: EngineState::Running,
                     hashrate_hs: Some(1234.5),
+                    hashrate_60s_hs: Some(1200.0),
+                    hashrate_15m_hs: Some(1180.0),
                     shares_accepted: 7,
                     shares_rejected: 1,
                     endpoint: Some("hk.aliceprotocol.org:3333".into()),
@@ -1265,6 +1294,9 @@ mod tests {
                     lane: Lane::GpuRvn,
                     state: EngineState::Running,
                     hashrate_hs: Some(25_000_000.0),
+                    // GPU lane does NOT measure the windows → honestly None.
+                    hashrate_60s_hs: None,
+                    hashrate_15m_hs: None,
                     shares_accepted: 3,
                     shares_rejected: 0,
                     endpoint: Some("hk.aliceprotocol.org:8888".into()),
