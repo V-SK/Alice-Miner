@@ -5,8 +5,10 @@
 //!
 //! Parity with the GUI dashboard (PLAN §5 M6): the SAME fields — state, per-lane
 //! hashrate (H/s + a human kH/MH), accepted/rejected shares, accepted %,
-//! endpoint, failovers, uptime — and the SAME honest reward wording ("pending ·
-//! 待发放"). Every string here is presentation only; no mining logic.
+//! endpoint, failovers, uptime. The reward wording leads with credit
+//! ("credit · 积分 (credit-only)") — the GUI (Beta) still shows the older
+//! "pending · 待发放" and is intentionally not aligned yet. Every string here is
+//! presentation only; no mining logic.
 
 use alice_miner_core::detect::capability::ALL_LANES;
 use alice_miner_core::detect::GpuDevice;
@@ -15,9 +17,12 @@ use alice_miner_core::{
     LANE_KEY_GPU_PRL,
 };
 
-/// The ONLY way the CLI ever renders rewards: pending, bilingual, never a
-/// number / `$`. Mirrors the GUI's `strings::REWARD_PENDING`.
-const REWARD_PENDING: &str = "pending · 待发放";
+/// The ONLY way the CLI ever renders rewards: it is CREDIT (accruing now,
+/// server-confirmable), credit-only (payout gated, phase-J), bilingual, never a
+/// number / `$`. Leads with "credit" not "pending" — the credit is real and
+/// accruing, whereas "待发放" wrongly implied a queued payout. (The GUI's
+/// `strings::REWARD_PENDING` is the older wording, intentionally not aligned yet.)
+const REWARD_CREDIT: &str = "credit · 积分 (credit-only)";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // detect
@@ -214,7 +219,7 @@ pub fn render_stopping_banner() -> String {
 /// state · hashrate (H/s + human) · shares A/R (+accepted%) · uptime · endpoint
 /// · failovers · rewards pending. In dual-mine it appends a per-lane row each.
 ///
-/// Honest by construction: rewards are only ["pending · 待发放"](REWARD_PENDING);
+/// Honest by construction: rewards are only ["credit · 积分 (credit-only)"](REWARD_CREDIT);
 /// the endpoint shown is the PUBLIC relay carried in the snapshot — never the
 /// collection address / upstream pool / core IP (those never reach the client).
 pub fn render_snapshot(snap: &Snapshot) -> String {
@@ -251,7 +256,7 @@ pub fn render_snapshot(snap: &Snapshot) -> String {
         fmt_uptime(snap.uptime_s),
         endpoint,
         failover,
-        REWARD_PENDING,
+        REWARD_CREDIT,
     ));
 
     // Surface the engine's short reason whenever it set one: an Error/Stopping reason,
@@ -329,7 +334,7 @@ pub fn render_snapshot(snap: &Snapshot) -> String {
 /// dashboard. CREDIT-ONLY by construction: it surfaces only accepted-share COUNTS
 /// (cumulative total, 24h, and the GPU·Alpha / GPU·PRL split) — never a `$`, a fiat
 /// figure, or a "paid"/"earned" claim. The credit-only `pending_alice` magnitude on
-/// `Confirmed` is deliberately NOT rendered (it stays "pending · 待发放").
+/// `Confirmed` is deliberately NOT rendered (it stays "credit · 积分 (credit-only)").
 ///
 /// Honest states (mirrors the read_api's fail-closed philosophy):
 ///   * `None` (no line at all) for `NotExposed` — the poller hasn't been wired to a
@@ -362,7 +367,7 @@ pub fn render_credit_line(credit: &CreditState) -> Option<String> {
                 String::new()
             };
             Some(format!(
-                "    credited (cumulative): {} shares (24h {}){} · {REWARD_PENDING} (credit-only)\n",
+                "    credited (cumulative): {} shares (24h {}){} · {REWARD_CREDIT}\n",
                 totals.accepted_total, totals.accepted_24h, split,
             ))
         }
@@ -682,7 +687,7 @@ mod tests {
 
     // ── THE HONESTY GATE (credit-only): the rendered dashboard must never carry
     // a fiat/payout token, and must never carry the collection address / upstream
-    // pool / core IP. Rewards appear ONLY as "pending · 待发放". ──────────────────
+    // pool / core IP. Rewards appear ONLY as "credit · 积分 (credit-only)". ────────
 
     #[test]
     fn rendered_output_is_credit_only_and_leaks_no_secrets() {
@@ -695,7 +700,7 @@ mod tests {
         all.push_str(&render_stopping_banner());
 
         // The reward line is present and is the ONLY reward wording.
-        assert!(all.contains(REWARD_PENDING));
+        assert!(all.contains(REWARD_CREDIT));
 
         let lower = all.to_lowercase();
         // Fiat / positive-earnings claims can never appear.
@@ -753,12 +758,12 @@ mod tests {
         assert!(line.contains("24h 142"), "24h count: {line}");
         assert!(line.contains("GPU·Alpha 500"), "alpha split: {line}");
         assert!(line.contains("GPU·PRL 373"), "prl split: {line}");
-        // Credit-only honesty: only counts + "pending · 待发放", never fiat/paid/earned.
+        // Credit-only honesty: only counts + "credit · 积分 (credit-only)", never fiat/paid/earned.
         let lower = line.to_lowercase();
         for forbidden in ["$", "usd", "fiat", "paid", "earned", "已发放"] {
             assert!(!lower.contains(forbidden), "credit line leaked `{forbidden}`: {line}");
         }
-        assert!(line.contains(REWARD_PENDING));
+        assert!(line.contains(REWARD_CREDIT));
     }
 
     /// A real server ZERO is shown as 0 (a measured zero) — distinct from "syncing".

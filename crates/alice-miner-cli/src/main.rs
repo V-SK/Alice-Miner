@@ -25,7 +25,7 @@
 //! - **NO egui/eframe** in this binary (verified by `cargo tree -p
 //!   alice-miner-cli`, `otool -L`, AND a `no_egui_in_dep_tree` unit test).
 //! - **Credit-only honesty** — the dashboard shows rewards only as
-//!   "pending · 待发放"; it NEVER prints `$`/fiat/`paid`/`earned`, and never the
+//!   "credit · 积分 (credit-only)"; it NEVER prints `$`/fiat/`paid`/`earned`, and never the
 //!   collection address / upstream pool / core IP (those never reach the client
 //!   — the engine bakes only the PUBLIC relay). A strings honesty test scans
 //!   this file's user-facing copy.
@@ -65,7 +65,7 @@ const EXIT_USAGE: i32 = 2;
         \n\
         Detects your device, manages your Alice reward identity, and mines ALICE\n\
         credit to your OWN address against the public relay. Drives the same engine\n\
-        as the desktop app. Rewards accrue as pending (待发放); payout, settlement,\n\
+        as the desktop app. Rewards accrue as credit (积分, credit-only); payout, settlement,\n\
         and on-chain transfer stay gated (phase-J).",
     propagate_version = true
 )]
@@ -114,8 +114,8 @@ enum Command {
         --dual       run BOTH lanes (needs >=2 viable lanes; refuses honestly otherwise)\n\
         --json       emit one Snapshot JSON line per tick (for scripting)\n\
         \n\
-        Ctrl-C (or `alice-miner stop`) stops gracefully. Rewards accrue as pending\n\
-        (待发放); the collection address and upstream pool are never shown.")]
+        Ctrl-C (or `alice-miner stop`) stops gracefully. Rewards accrue as credit\n\
+        (积分, credit-only); the collection address and upstream pool are never shown.")]
     Start(StartArgs),
 
     /// Gracefully stop a running `start` (SIGTERM→SIGKILL, no orphan).

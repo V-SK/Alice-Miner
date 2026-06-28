@@ -20,7 +20,7 @@
 //! unit-tested without a terminal.
 //!
 //! HONEST / CREDIT-ONLY: the panel renders the SAME activity the line dashboard
-//! does (rewards only ever "pending · 待发放"; the crediting line is the engine's
+//! does (rewards only ever "credit · 积分 (credit-only)"; the crediting line is the engine's
 //! own confirmation), and shows only the PUBLIC relay endpoint the snapshot carries.
 
 use std::io::{self, Stdout};
@@ -42,8 +42,8 @@ use alice_miner_core::{EngineState, Snapshot};
 use crate::dashboard::{fmt_hashrate, fmt_uptime};
 
 /// The reward wording — the ONLY way rewards are shown (mirrors the line
-/// dashboard's `REWARD_PENDING`). Never a number / `$`.
-const REWARD_PENDING: &str = "pending · 待发放";
+/// dashboard's `REWARD_CREDIT`). Never a number / `$`.
+const REWARD_CREDIT: &str = "credit · 积分 (credit-only)";
 
 /// The live-TUI terminal guard. Owns the alternate-screen + raw-mode lifecycle so
 /// the terminal is always restored — on normal exit (`Drop`) and on panic (a hook
@@ -184,7 +184,7 @@ pub fn stats_line(snap: &Snapshot) -> String {
         snap.shares_accepted,
         snap.shares_rejected,
         pct,
-        REWARD_PENDING,
+        REWARD_CREDIT,
     )
 }
 
@@ -396,7 +396,7 @@ mod tests {
         assert!(s.contains("8.43 kH/s"), "{s}");
         assert!(s.contains("142A/1R"));
         assert!(s.contains("(99%)"));
-        assert!(s.contains(REWARD_PENDING));
+        assert!(s.contains(REWARD_CREDIT));
         let lower = s.to_lowercase();
         for forbidden in ["$", "usd", "paid", "earned", "已发放"] {
             assert!(!lower.contains(forbidden), "stats leaked `{forbidden}`: {s}");
