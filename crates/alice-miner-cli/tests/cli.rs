@@ -349,3 +349,148 @@ fn start_xmr_streams_live() {
     // We should have seen the running state + some H/s in the stream.
     assert!(stdout.contains("running"), "expected a running tick: {stdout}");
 }
+
+// ── ai (shard-stage inference worker) ──────────────────────────────────────────
+
+/// The top-level help lists the new `ai` subcommand, and `ai --help` documents its
+/// flag surface (the credit-only, honest UX).
+#[test]
+fn ai_is_listed_and_documented() {
+    bin()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ai"));
+
+    bin().args(["ai", "--help"]).assert().success().stdout(
+        predicate::str::contains("--endpoint")
+            .and(predicate::str::contains("--engine-dir"))
+            .and(predicate::str::contains("--center-url"))
+            .and(predicate::str::contains("--allow-cpu"))
+            .and(predicate::str::contains("SHARD_PSK"))
+            .and(predicate::str::contains("Credit-only").or(predicate::str::contains("credit-only"))),
+    );
+}
+
+/// With NO identity, `ai` fails closed with a clear "create/import an identity"
+/// message (it never creates one implicitly — the keystore-clobber hazard).
+#[test]
+fn ai_without_identity_fails_closed() {
+    let env = TempEnv::new("ai-noid");
+    let mut cmd = bin();
+    env.apply(&mut cmd);
+    // Provide flags so the failure is specifically the missing identity, not a
+    // missing-flag usage error.
+    cmd.args([
+        "ai",
+        "--center-url",
+        "https://api.aliceprotocol.org",
+        "--endpoint",
+        "203.0.113.7:29501",
+        "--engine-dir",
+        "/nonexistent",
+        "--allow-cpu",
+    ])
+    .env("SHARD_PSK", "test-psk")
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("no reward identity"));
+}
+
+/// `ai` refuses a WATCH-ONLY (pasted-address) identity: it has no signing key, so
+/// it can never PoP-register a stage. The message is explicit + honest.
+#[test]
+fn ai_watch_only_identity_cannot_register() {
+    let env = TempEnv::new("ai-watch");
+    // A real Alice address to paste (watch-only — no keystore).
+    let addr = alice_miner_core::alice_crypto::create_wallet_payload(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "x",
+    )
+    .unwrap()
+    .address;
+    let mut cmd = bin();
+    env.apply(&mut cmd);
+    cmd.args(["identity", "--paste", &addr]).assert().success();
+
+    // A temp engine dir with a stub pipeline.py so we get past the engine-dir check
+    // and reach the watch-only key failure.
+    let engine = env.id_dir().join("engine");
+    std::fs::create_dir_all(engine.join("phase0")).unwrap();
+    std::fs::write(engine.join("phase0/pipeline.py"), b"# stub").unwrap();
+
+    let mut cmd = bin();
+    env.apply(&mut cmd);
+    cmd.args([
+        "ai",
+        "--endpoint",
+        "203.0.113.7:29501",
+        "--engine-dir",
+        engine.to_str().unwrap(),
+        "--allow-cpu",
+    ])
+    .env("SHARD_PSK", "test-psk")
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("watch-only"));
+}
+
+/// `ai` fails closed with a clear message when SHARD_PSK is not set (the engine
+/// needs it; never spawn one that would immediately die).
+#[test]
+fn ai_without_shard_psk_fails_closed() {
+    let env = TempEnv::new("ai-nopsk");
+    // A keystore-backed identity via import (so the key check would pass).
+    let mut cmd = bin();
+    env.apply(&mut cmd);
+    cmd.args([
+        "identity",
+        "--import",
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "--password",
+        "pw-123456",
+    ])
+    .assert()
+    .success();
+
+    let engine = env.id_dir().join("engine");
+    std::fs::create_dir_all(engine.join("phase0")).unwrap();
+    std::fs::write(engine.join("phase0/pipeline.py"), b"# stub").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("alice-miner-cli").unwrap();
+    cmd.env("ALICE_WALLET_DATA_ROOT", env.wallet_root());
+    cmd.env("ALICE_IDENTITY_DIR", env.id_dir());
+    cmd.env_remove("SHARD_PSK");
+    cmd.args([
+        "ai",
+        "--endpoint",
+        "203.0.113.7:29501",
+        "--engine-dir",
+        engine.to_str().unwrap(),
+        "--password",
+        "pw-123456",
+        "--allow-cpu",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("SHARD_PSK"));
+}
+
+/// `doctor --ai --json` produces a valid JSON report with the ai role + the
+/// expected checks, and exits (0 or non-zero) without panicking.
+#[test]
+fn doctor_ai_json_shape() {
+    let out = bin()
+        .args(["doctor", "--ai", "--json", "--allow-cpu"])
+        .assert()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["role"].as_str(), Some("ai"));
+    let checks = v["checks"].as_array().expect("checks array");
+    let names: Vec<&str> = checks.iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"python3"));
+    assert!(names.contains(&"shard engine"));
+    assert!(names.contains(&"endpoint port"));
+}

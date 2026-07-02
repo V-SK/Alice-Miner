@@ -400,6 +400,31 @@ pub fn heartbeat(
     Ok(())
 }
 
+/// Probe the center's health for a preflight (`doctor --ai`). GETs `<base>/health`
+/// (the acp gateway serves it) with a short timeout. Returns `Ok(desc)` when the
+/// host is up + serving (ANY HTTP response, including a gated non-2xx, proves
+/// reachability), or `Err(reason)` on a transport failure / non-https URL. Never
+/// panics. This is a diagnostic probe only — it signs nothing and reads no reward.
+pub fn probe_center_health(center_url: &str) -> Result<String, String> {
+    require_https(center_url)?;
+    let base = center_url.strip_suffix('/').unwrap_or(center_url);
+    let health = format!("{base}/health");
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(5))
+        .user_agent(concat!("alice-miner-ai/", env!("CARGO_PKG_VERSION")))
+        .build();
+    match agent.get(&health).call() {
+        Ok(_) => Ok(format!("center reachable ({health})")),
+        // A non-2xx still proves the host is up + serving (the route may be gated);
+        // treat any HTTP response as reachable — only a transport error is a failure.
+        Err(ureq::Error::Status(code, _)) => {
+            Ok(format!("center reachable ({health} → HTTP {code})"))
+        }
+        Err(e) => Err(format!("cannot reach the center at {health}: {e}")),
+    }
+}
+
 /// POST `/v1/shard/stage/pull` — read THIS node's placement. No PoP (a public spec
 /// read; identity was proven at register). Returns [`PullOutcome::Assigned`] with
 /// the resolved spec + `model_id`/`device`, or [`PullOutcome::NoAssignment`].

@@ -42,6 +42,7 @@ use zeroize::Zeroizing;
 use alice_miner_core::engine::{Command as EngineCommand, Event, IdentitySpec};
 use alice_miner_core::{EngineHandle, EngineState, GpuSelection, Lane, Snapshot};
 
+mod ai;
 mod color;
 mod dashboard;
 mod doctor;
@@ -225,6 +226,30 @@ enum Command {
         otherwise it does nothing. Re-runnable. Credit-only — never a secret in argv, and\n\
         the generate path warns + never silently overwrites an existing identity.")]
     Setup(SetupArgs),
+
+    /// Run as an AI inference STAGE: join the Alice pipeline-parallel swarm.
+    #[command(long_about = "Run this GPU as a pipeline-parallel INFERENCE STAGE coordinated by the\n\
+        Alice scheduling center. The miner registers its public endpoint + free VRAM with the\n\
+        center (proving it owns the reward address), heartbeats to stay in the pool, and — once\n\
+        the center places it into a formed swarm — runs the shard engine as its stage (loading\n\
+        its layer range and serving the pipeline).\n\
+        \n\
+        --center-url <URL>   the acp gateway base URL (default: the production gateway)\n\
+        --endpoint <H:PORT>  the PUBLIC host:port this stage listens on (required; the address\n\
+                             the swarm dials — set up port-forwarding/NAT so peers can reach it)\n\
+        --engine-dir <DIR>   path to your alice-shard-engine checkout (must contain\n\
+                             phase0/pipeline.py; also honored: ALICE_SHARD_ENGINE_PATH)\n\
+        --python <PATH>      the python3 interpreter to run the engine (default: python3)\n\
+        --vram-gb <GB>       free VRAM to advertise (default: auto-detect via nvidia-smi)\n\
+        --region <R>         optional region hint (for locality)\n\
+        --allow-cpu          run without an NVIDIA GPU (for testing — a real stage needs a GPU)\n\
+        --stake-ref <REF>    stake reference for the sybil gate (default: enroll:<address>)\n\
+        \n\
+        The shared swarm key rides the SHARD_PSK environment variable (never the command line);\n\
+        set it before starting. Ctrl-C stops gracefully (the engine subprocess is killed).\n\
+        Credit-only (积分): the ai role serves inference for credit; it shows no hashrate and no\n\
+        earnings. Re-runnable: resolved flags are saved so a bare `alice-miner ai` replays them.")]
+    Ai(AiArgs),
 }
 
 #[derive(clap::Args)]
@@ -398,6 +423,27 @@ struct DoctorArgs {
     /// Scope the engine / relay / GPU checks to a lane (default: the recommended one).
     #[arg(long, default_value = "auto", value_name = "LANE")]
     lane: String,
+    /// Diagnose the `ai` (shard-stage inference) role instead of a mining lane:
+    /// python3, the shard engine + torch, NVIDIA (or --allow-cpu), the endpoint
+    /// port, and the center URL. Reads the same saved ai config `alice-miner ai`
+    /// uses; the flags below refine the probe.
+    #[arg(long)]
+    ai: bool,
+    /// (with --ai) The acp gateway base URL to probe (else the saved / default one).
+    #[arg(long, value_name = "URL")]
+    center_url: Option<String>,
+    /// (with --ai) The public endpoint host:port to check (else the saved one).
+    #[arg(long, value_name = "HOST:PORT")]
+    endpoint: Option<String>,
+    /// (with --ai) The shard-engine dir to check (else ALICE_SHARD_ENGINE_PATH / saved).
+    #[arg(long, value_name = "DIR")]
+    engine_dir: Option<String>,
+    /// (with --ai) The python3 interpreter to check (default: python3 / saved).
+    #[arg(long, value_name = "PATH")]
+    python: Option<String>,
+    /// (with --ai) Treat a missing NVIDIA GPU as a warning, not a failure (testing).
+    #[arg(long)]
+    allow_cpu: bool,
     /// Emit the report as a single JSON object (machine-readable).
     #[arg(long)]
     json: bool,
@@ -440,6 +486,48 @@ struct SetupArgs {
     password_stdin: bool,
 }
 
+#[derive(clap::Args)]
+struct AiArgs {
+    /// The acp gateway base URL the stage registers/heartbeats/pulls against
+    /// (https:// only). Defaults to the production gateway; saved for re-runs.
+    #[arg(long, value_name = "URL")]
+    center_url: Option<String>,
+    /// The PUBLIC `host:port` this stage listens on — the address the swarm dials.
+    /// Required (set up NAT/port-forwarding so peers can reach it). Saved for re-runs.
+    #[arg(long, value_name = "HOST:PORT")]
+    endpoint: Option<String>,
+    /// Path to your alice-shard-engine checkout (must contain phase0/pipeline.py).
+    /// Also honored via the ALICE_SHARD_ENGINE_PATH env var. Saved for re-runs.
+    #[arg(long, value_name = "DIR")]
+    engine_dir: Option<String>,
+    /// The python3 interpreter used to run the engine (default: `python3`).
+    #[arg(long, value_name = "PATH")]
+    python: Option<String>,
+    /// Free VRAM (GB) to advertise. Omit to auto-detect the largest GPU via nvidia-smi.
+    #[arg(long, value_name = "GB")]
+    vram_gb: Option<f64>,
+    /// Optional region hint (informational — used for locality).
+    #[arg(long, value_name = "REGION")]
+    region: Option<String>,
+    /// Explicitly opt in to run WITHOUT an NVIDIA GPU (for testing). A real
+    /// inference stage needs a GPU; this only lets a no-NVIDIA box register.
+    #[arg(long)]
+    allow_cpu: bool,
+    /// Stake reference for the swarm's sybil gate (the server only needs it
+    /// non-empty). Default: `enroll:<your-address>`.
+    #[arg(long, value_name = "REF")]
+    stake_ref: Option<String>,
+    /// Wallet keystore password — the ai role must unlock the signing key to prove
+    /// possession when it registers the stage (the center credits no stage without
+    /// it). INSECURE on the command line (visible in `ps`); prefer `--password-stdin`
+    /// or the interactive prompt.
+    #[arg(long, value_name = "PASS")]
+    password: Option<String>,
+    /// Read the unlock password from the first line of STDIN (secure for scripts).
+    #[arg(long, conflicts_with = "password")]
+    password_stdin: bool,
+}
+
 fn main() {
     let cli = Cli::parse();
     let no_color = cli.no_color;
@@ -457,6 +545,7 @@ fn main() {
         ),
         Some(Command::Doctor(args)) => cmd_doctor(args),
         Some(Command::Setup(args)) => setup::run(args.into(), no_color),
+        Some(Command::Ai(args)) => cmd_ai(args),
         // No subcommand: guide a first-launch user (auto-setup when ~/.alice has no
         // identity AND stdin is a TTY), else print help. Skips silently otherwise.
         None => cmd_no_subcommand(no_color),
@@ -488,6 +577,10 @@ fn cmd_no_subcommand(no_color: bool) -> i32 {
 /// report (human or `--json`). Exits non-zero if any check FAILs so a script can
 /// gate `start` on a clean preflight.
 fn cmd_doctor(args: DoctorArgs) -> i32 {
+    // `--ai` diagnoses the shard-stage inference role instead of a mining lane.
+    if args.ai {
+        return cmd_doctor_ai(args);
+    }
     let cap = alice_miner_core::CapabilityProfile::detect();
     let lane = match resolve_lane(&args.lane, &cap) {
         Ok(l) => l,
@@ -504,6 +597,77 @@ fn cmd_doctor(args: DoctorArgs) -> i32 {
     } else {
         EXIT_OK
     }
+}
+
+/// `doctor --ai`: run the shard-stage inference battery. Merges the `--ai` flags
+/// over the saved ai config (the same one `alice-miner ai` reads), so a bare
+/// `doctor --ai` diagnoses exactly what a subsequent `ai` run would use.
+fn cmd_doctor_ai(args: DoctorArgs) -> i32 {
+    let saved = alice_miner_core::ai_config::load();
+    let engine_dir = args
+        .engine_dir
+        .or_else(|| std::env::var("ALICE_SHARD_ENGINE_PATH").ok().filter(|s| !s.is_empty()))
+        .or(saved.engine_dir)
+        .map(std::path::PathBuf::from);
+    let input = doctor::AiDoctorInput {
+        center_url: args.center_url.or(saved.center_url),
+        endpoint: args.endpoint.or(saved.endpoint),
+        engine_dir,
+        python: args.python.or(saved.python).unwrap_or_else(|| "python3".to_string()),
+        allow_cpu: args.allow_cpu,
+    };
+    let checks = doctor::run_ai_checks(&input);
+    if args.json {
+        println!("{}", doctor::render_ai_json(&checks));
+    } else {
+        print!("{}", doctor::render_ai_report(&checks));
+    }
+    if doctor::has_blocking_failure(&checks) {
+        EXIT_USAGE
+    } else {
+        EXIT_OK
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ai (shard-stage inference worker)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `ai`: run this GPU as a pipeline-parallel inference STAGE coordinated by the
+/// Alice scheduling center. Resolves the wallet unlock password (the register PoP
+/// needs the signing key), builds the resolved config, and hands off to
+/// [`ai::run`]. Credit-only; NEVER creates/overwrites an identity (read-only).
+fn cmd_ai(args: AiArgs) -> i32 {
+    // The register/heartbeat PoP needs the sr25519 signing key, so a keystore-backed
+    // identity needs its unlock. Resolve it up front (stdin / flag / prompt); a
+    // watch-only identity has no keystore and `ai::run` fails closed with a clear
+    // message, so we skip the prompt there (no keystore to unlock).
+    let has_keystore = alice_miner_core::identity::load_pointer()
+        .map(|p| p.keystore_path.is_some())
+        .unwrap_or(false);
+    let unlock = if has_keystore {
+        match resolve_password(args.password.clone(), args.password_stdin) {
+            Ok(p) => Some(Zeroizing::new(p)),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return EXIT_USAGE;
+            }
+        }
+    } else {
+        None
+    };
+
+    let flags = ai::AiFlags {
+        center_url: args.center_url,
+        endpoint: args.endpoint,
+        engine_dir: args.engine_dir,
+        python: args.python,
+        vram_gb: args.vram_gb,
+        region: args.region,
+        stake_ref: args.stake_ref,
+        allow_cpu: args.allow_cpu,
+    };
+    ai::run(flags, unlock)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

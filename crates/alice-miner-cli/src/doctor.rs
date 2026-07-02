@@ -387,6 +387,269 @@ pub fn print_preflight_summary(lane: Lane, cap: &CapabilityProfile) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ai (shard-stage inference worker) doctor section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The inputs the ai doctor battery probes (a subset of the resolved `ai`
+/// settings). All optional so `doctor --ai` can run before the user has supplied
+/// everything and still report exactly what is missing.
+#[derive(Debug, Clone, Default)]
+pub struct AiDoctorInput {
+    pub center_url: Option<String>,
+    pub endpoint: Option<String>,
+    pub engine_dir: Option<std::path::PathBuf>,
+    pub python: String,
+    pub allow_cpu: bool,
+}
+
+/// Run the ai-role diagnostic battery: identity, python3, engine dir + pipeline.py,
+/// torch importable, NVIDIA (or --allow-cpu), endpoint port bindable, center URL
+/// reachable. Reuses the same [`Check`] primitives + honest FAIL/WARN/OK style as
+/// the mining doctor. Network/subprocess probes are bounded; never panics.
+pub fn run_ai_checks(input: &AiDoctorInput) -> Vec<Check> {
+    vec![
+        check_identity(),
+        check_ai_python(&input.python),
+        check_ai_engine_dir(input.engine_dir.as_deref()),
+        check_ai_torch(&input.python),
+        check_ai_nvidia(input.allow_cpu),
+        check_ai_endpoint(input.endpoint.as_deref()),
+        check_ai_center(input.center_url.as_deref()),
+    ]
+}
+
+/// python3 present + its version (the interpreter that runs the engine).
+fn check_ai_python(python: &str) -> Check {
+    const NAME: &str = "python3";
+    match std::process::Command::new(python).arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            let v = String::from_utf8_lossy(&out.stdout);
+            let v = if v.trim().is_empty() {
+                String::from_utf8_lossy(&out.stderr).trim().to_string()
+            } else {
+                v.trim().to_string()
+            };
+            Check::pass(NAME, format!("{python} present ({v})"))
+        }
+        _ => Check::fail(
+            NAME,
+            format!("python3 not found / not runnable at {python:?}"),
+            "install Python 3 (the shard engine runs on it) or pass --python <path-to-python3>",
+        ),
+    }
+}
+
+/// The engine checkout exists and contains phase0/pipeline.py.
+fn check_ai_engine_dir(engine_dir: Option<&std::path::Path>) -> Check {
+    const NAME: &str = "shard engine";
+    match engine_dir {
+        None => Check::fail(
+            NAME,
+            "no engine dir set",
+            "pass --engine-dir <alice-shard-engine checkout> (or set ALICE_SHARD_ENGINE_PATH); \
+             it must contain phase0/pipeline.py",
+        ),
+        Some(dir) if dir.join("phase0/pipeline.py").is_file() => {
+            Check::pass(NAME, format!("phase0/pipeline.py found under {}", dir.display()))
+        }
+        Some(dir) => Check::fail(
+            NAME,
+            format!("phase0/pipeline.py is missing under {}", dir.display()),
+            "point --engine-dir at your alice-shard-engine checkout (the dir that has phase0/)",
+        ),
+    }
+}
+
+/// torch importable in the engine's python (a hard prerequisite for loading model
+/// layers). Bounded by a timeout so a wedged import can't hang the doctor.
+fn check_ai_torch(python: &str) -> Check {
+    const NAME: &str = "torch";
+    match run_with_timeout(
+        std::process::Command::new(python)
+            .args(["-c", "import torch; print(torch.__version__)"]),
+        Duration::from_secs(30),
+    ) {
+        Ok(Some(out)) if out.status.success() => Check::pass(
+            NAME,
+            format!("torch {} importable", String::from_utf8_lossy(&out.stdout).trim()),
+        ),
+        Ok(Some(_)) => Check::fail(
+            NAME,
+            "python3 could not import torch",
+            "install the engine's deps into this python: `pip install torch` (and the rest of \
+             phase0/requirements*.txt) — the stage cannot load model layers without torch",
+        ),
+        Ok(None) => Check::warn(
+            NAME,
+            "torch import check timed out (a slow first import / large environment)",
+            "run `python3 -c \"import torch\"` by hand to confirm it imports before starting",
+        ),
+        Err(e) => Check::fail(
+            NAME,
+            format!("could not run the torch import check: {e}"),
+            "confirm --python points at a working python3",
+        ),
+    }
+}
+
+/// NVIDIA present (nvidia-smi), else a WARN unless --allow-cpu (then Skip-like OK).
+fn check_ai_nvidia(allow_cpu: bool) -> Check {
+    const NAME: &str = "nvidia gpu";
+    let smi_ok = std::process::Command::new("nvidia-smi")
+        .arg("-L")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if smi_ok {
+        Check::pass(NAME, "nvidia-smi reports at least one NVIDIA GPU")
+    } else if allow_cpu {
+        Check::warn(
+            NAME,
+            "no NVIDIA GPU detected, but --allow-cpu was given (testing only)",
+            "a real inference stage needs a GPU; --allow-cpu only lets a no-NVIDIA box register",
+        )
+    } else {
+        Check::fail(
+            NAME,
+            "no NVIDIA GPU detected (nvidia-smi missing or reported none)",
+            "install the NVIDIA driver so nvidia-smi works, or pass --allow-cpu to run without a \
+             GPU for testing (a real stage needs a GPU)",
+        )
+    }
+}
+
+/// The listen port parses and is bindable locally (nothing else already holds it).
+fn check_ai_endpoint(endpoint: Option<&str>) -> Check {
+    const NAME: &str = "endpoint port";
+    let Some(ep) = endpoint else {
+        return Check::fail(
+            NAME,
+            "no endpoint set",
+            "pass --endpoint <public host:port> (the address the swarm dials this stage)",
+        );
+    };
+    let port = match ep.trim().rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()) {
+        Some(p) if p > 0 => p,
+        _ => {
+            return Check::fail(
+                NAME,
+                format!("endpoint {ep:?} is not host:port with a valid 1..=65535 port"),
+                "use host:port, e.g. --endpoint 203.0.113.7:29501",
+            )
+        }
+    };
+    // Try to bind loopback:port — if it binds, nothing else holds it (the engine
+    // will listen there). We immediately drop the listener.
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(_l) => Check::pass(NAME, format!("port {port} is free to bind locally")),
+        Err(e) => Check::warn(
+            NAME,
+            format!("port {port} is not bindable locally right now: {e}"),
+            "another process may hold it (a previous stage?); free it, or advertise a different \
+             port. NOTE: the PUBLIC reachability of the endpoint still depends on your NAT / \
+             port-forwarding — doctor only checks the LOCAL bind",
+        ),
+    }
+}
+
+/// Center URL reachable: a GET /health probe (the acp gateway serves it). https-only.
+/// Delegates to the core's `shard::probe_center_health` (which owns the ureq client).
+fn check_ai_center(center_url: Option<&str>) -> Check {
+    const NAME: &str = "center reachability";
+    let url = center_url.unwrap_or("https://api.aliceprotocol.org");
+    if !url.starts_with("https://") {
+        return Check::fail(
+            NAME,
+            format!("center url is not https://: {url}"),
+            "use an https:// --center-url (a PoP signature must never cross the wire in the clear)",
+        );
+    }
+    match alice_miner_core::shard::probe_center_health(url) {
+        Ok(desc) => Check::pass(NAME, desc),
+        Err(e) => Check::fail(
+            NAME,
+            e,
+            "check the --center-url and your network / firewall (outbound https must be reachable)",
+        ),
+    }
+}
+
+/// Run a command with a wall-clock timeout. Returns `Ok(Some(output))` on
+/// completion, `Ok(None)` on timeout (child killed), `Err` on spawn failure. Used
+/// for the torch import probe (which can be slow on a fresh env).
+fn run_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: Duration,
+) -> Result<Option<std::process::Output>, String> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(_status) => {
+                return child.wait_with_output().map(Some).map_err(|e| e.to_string());
+            }
+            None => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// Render the ai doctor report (human form) — same layout as [`render_report`] but
+/// headed for the ai role.
+pub fn render_ai_report(checks: &[Check]) -> String {
+    let mut s = String::new();
+    s.push_str("Alice Miner doctor — ai (shard-stage inference)\n");
+    s.push_str("─────────────────────────────────────────────\n");
+    for c in checks {
+        s.push_str(&format!("  [{}] {} — {}\n", c.status.word(), c.name, c.detail));
+        if !c.fix.is_empty() {
+            s.push_str(&format!("        fix: {}\n", c.fix));
+        }
+    }
+    let fails = checks.iter().filter(|c| c.status == Status::Fail).count();
+    let warns = checks.iter().filter(|c| c.status == Status::Warn).count();
+    s.push_str("─────────────────────────────────────────────\n");
+    if fails == 0 {
+        s.push_str(&format!("Ready to run the ai role. ({warns} warning(s).)\n"));
+    } else {
+        s.push_str(&format!(
+            "{fails} blocking issue(s), {warns} warning(s). Fix the FAIL lines above, then \
+             re-run `alice-miner doctor --ai`.\n"
+        ));
+    }
+    s
+}
+
+/// Render the ai doctor report as JSON (machine-readable).
+pub fn render_ai_json(checks: &[Check]) -> String {
+    let arr: Vec<serde_json::Value> = checks
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "status": c.status.json_token(),
+                "detail": c.detail,
+                "fix": if c.fix.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(c.fix.clone()) },
+            })
+        })
+        .collect();
+    let fails = checks.iter().filter(|c| c.status == Status::Fail).count();
+    serde_json::json!({ "role": "ai", "ready": fails == 0, "checks": arr }).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,6 +763,83 @@ mod tests {
         for c in arr {
             assert!(c["name"].is_string());
             assert!(["pass", "warn", "fail", "skip"].contains(&c["status"].as_str().unwrap()));
+        }
+    }
+
+    // ── ai (shard-stage inference) doctor ─────────────────────────────────────
+
+    /// The ai engine-dir check FAILs when the dir is missing / lacks pipeline.py,
+    /// and PASSes when it is present — honest, with a fix on the fail path.
+    #[test]
+    fn ai_engine_dir_check_is_honest() {
+        // No dir → fail with a fix.
+        let none = check_ai_engine_dir(None);
+        assert_eq!(none.status, Status::Fail);
+        assert!(none.fix.contains("--engine-dir"));
+
+        // A dir missing pipeline.py → fail.
+        let tmp = std::env::temp_dir().join(format!("ai-doctor-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(check_ai_engine_dir(Some(&tmp)).status, Status::Fail);
+
+        // With phase0/pipeline.py → pass.
+        std::fs::create_dir_all(tmp.join("phase0")).unwrap();
+        std::fs::write(tmp.join("phase0/pipeline.py"), b"# stub").unwrap();
+        assert_eq!(check_ai_engine_dir(Some(&tmp)).status, Status::Pass);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The nvidia check FAILs without a GPU + no --allow-cpu, WARNs with --allow-cpu.
+    #[test]
+    fn ai_nvidia_check_respects_allow_cpu() {
+        let c = check_ai_nvidia(true);
+        // With allow_cpu the worst case is a WARN (never a FAIL) — on a box that
+        // HAS a GPU it PASSes; either way it is not a blocking failure.
+        assert_ne!(c.status, Status::Fail);
+    }
+
+    /// The endpoint check FAILs for a missing / malformed endpoint.
+    #[test]
+    fn ai_endpoint_check_validates() {
+        assert_eq!(check_ai_endpoint(None).status, Status::Fail);
+        assert_eq!(check_ai_endpoint(Some("noport")).status, Status::Fail);
+        assert_eq!(check_ai_endpoint(Some("h:0")).status, Status::Fail);
+        // A high, likely-free port PASSes the local-bind probe (or WARNs if held).
+        let c = check_ai_endpoint(Some("127.0.0.1:52987"));
+        assert_ne!(c.status, Status::Fail, "a valid port is not a hard fail: {c:?}");
+    }
+
+    /// The ai battery runs end-to-end (no panic) and renders valid JSON.
+    #[test]
+    fn ai_battery_and_json_shape() {
+        let input = AiDoctorInput {
+            allow_cpu: true,
+            python: "definitely-not-a-real-python-xyz".into(),
+            ..Default::default()
+        };
+        let checks = run_ai_checks(&input);
+        let names: Vec<&str> = checks.iter().map(|c| c.name).collect();
+        assert!(names.contains(&"python3"));
+        assert!(names.contains(&"shard engine"));
+        assert!(names.contains(&"torch"));
+        assert!(names.contains(&"nvidia gpu"));
+        assert!(names.contains(&"endpoint port"));
+        assert!(names.contains(&"center reachability"));
+        for c in &checks {
+            assert!(!c.detail.is_empty(), "{} has no detail", c.name);
+            if matches!(c.status, Status::Fail | Status::Warn) {
+                assert!(!c.fix.is_empty(), "{} ({:?}) must carry a fix", c.name, c.status);
+            }
+        }
+        let json = render_ai_json(&checks);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(v["role"].as_str(), Some("ai"));
+        assert!(v["checks"].as_array().unwrap().len() >= 6);
+        // The human report is credit-only diagnostics — no reward tokens.
+        let human = render_ai_report(&checks);
+        let low = human.to_ascii_lowercase();
+        for bad in ["hashrate", "earned", "payout", "$"] {
+            assert!(!low.contains(bad), "ai report must not contain {bad:?}");
         }
     }
 }
