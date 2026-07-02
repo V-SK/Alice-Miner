@@ -110,6 +110,14 @@ pub struct LaneRow {
     pub shares: String,
     pub endpoint: String,
     pub failovers: u64,
+    /// The compact per-GPU hardware-telemetry line for this lane (`温度 62°C · 功率
+    /// 145W · 占用 98% · 风扇 55%`), or `None` when no telemetry is available (a CPU
+    /// lane, or a GPU lane before the engine/nvidia-smi first reports one). Rendered as
+    /// a tidy sub-row under the lane so the main table stays uncluttered.
+    pub telemetry: Option<String>,
+    /// The raw GPU temperature (°C) for THIS row, used only to color the telemetry
+    /// sub-row (yellow warm / red hot). `None` when no temperature was reported.
+    pub temp_c: Option<f64>,
 }
 
 impl LaneRow {
@@ -126,7 +134,49 @@ impl LaneRow {
             shares: fmt_lane_shares(l.lane, l.shares_accepted, l.shares_rejected),
             endpoint: l.endpoint.clone().unwrap_or_else(|| "—".into()),
             failovers: l.failovers,
+            telemetry: fmt_telemetry(l.temp_c, l.power_w, l.util_pct, l.fan_pct),
+            temp_c: l.temp_c,
         }
+    }
+}
+
+/// Build the compact per-GPU telemetry line from the four optional readings, or `None`
+/// when NONE of them is present (a CPU lane / no NVIDIA fallback → no sub-row at all).
+/// When at least one is present, every field is shown, an absent one rendering `—`, so
+/// the row shape is stable: `温度 62°C · 功率 145W · 占用 98% · 风扇 55%` (tr!-localized
+/// labels). Pure presentation — no color here (the caller applies temp thresholds).
+fn fmt_telemetry(
+    temp_c: Option<f64>,
+    power_w: Option<f64>,
+    util_pct: Option<f64>,
+    fan_pct: Option<f64>,
+) -> Option<String> {
+    if temp_c.is_none() && power_w.is_none() && util_pct.is_none() && fan_pct.is_none() {
+        return None;
+    }
+    let temp = temp_c.map(|t| format!("{t:.0}°C")).unwrap_or_else(|| "—".into());
+    let power = power_w.map(|p| format!("{p:.0}W")).unwrap_or_else(|| "—".into());
+    let util = util_pct.map(|u| format!("{u:.0}%")).unwrap_or_else(|| "—".into());
+    let fan = fan_pct.map(|f| format!("{f:.0}%")).unwrap_or_else(|| "—".into());
+    Some(format!(
+        "{} {temp} · {} {power} · {} {util} · {} {fan}",
+        tr!("temp", "温度"),
+        tr!("power", "功率"),
+        tr!("util", "占用"),
+        tr!("fan", "风扇"),
+    ))
+}
+
+/// The ANSI color code for a GPU temperature: red at/above [`TEMP_HOT_C`] (thermal-throttle
+/// / danger zone), yellow at/above [`TEMP_WARM_C`] (running warm), else no color (healthy).
+/// Returns `None` (no coloring) when there is no temperature or color is disabled.
+const TEMP_WARM_C: f64 = 75.0;
+const TEMP_HOT_C: f64 = 85.0;
+fn temp_color_code(temp_c: Option<f64>) -> Option<&'static str> {
+    match temp_c {
+        Some(t) if t >= TEMP_HOT_C => Some("\x1b[31m"), // red — hot / throttling
+        Some(t) if t >= TEMP_WARM_C => Some("\x1b[33m"), // yellow — warm
+        _ => None,
     }
 }
 
@@ -164,6 +214,8 @@ pub fn lane_table_rows(snap: &Snapshot) -> Vec<LaneRow> {
             shares: fmt_lane_shares(lane, snap.shares_accepted, snap.shares_rejected),
             endpoint: snap.endpoint.clone().unwrap_or_else(|| "—".into()),
             failovers: snap.failovers,
+            telemetry: fmt_telemetry(snap.temp_c, snap.power_w, snap.util_pct, snap.fan_pct),
+            temp_c: snap.temp_c,
         }],
         None => Vec::new(),
     }
@@ -198,8 +250,31 @@ pub fn render_lane_table(snap: &Snapshot, color: bool) -> String {
             r.failovers,
         );
         out.push_str(&paint_line(&line, r.health, color));
+        // A tidy per-GPU telemetry sub-row under the lane (only when telemetry exists).
+        // Indented past the health gutter + LANE column so it reads as a detail of the
+        // row above; temp thresholds tint it yellow/red when color is on.
+        if let Some(telem) = &r.telemetry {
+            let sub = format!("          └ {telem}\n");
+            out.push_str(&paint_telemetry(&sub, r.temp_c, color));
+        }
     }
     out
+}
+
+/// Color the telemetry sub-row by GPU temperature (yellow warm / red hot) when color is
+/// on; otherwise return it unchanged (the numbers carry the signal on their own). The
+/// trailing newline stays OUTSIDE the reset so the color spans exactly the row text.
+fn paint_telemetry(line: &str, temp_c: Option<f64>, color: bool) -> String {
+    if !color {
+        return line.to_string();
+    }
+    match temp_color_code(temp_c) {
+        Some(code) => {
+            let trimmed = line.strip_suffix('\n').unwrap_or(line);
+            format!("{code}{trimmed}\x1b[0m\n")
+        }
+        None => line.to_string(),
+    }
 }
 
 /// Apply the semaphore color to a whole row (green/amber/red) when color is enabled.
@@ -759,30 +834,22 @@ fn fmt_state(state: alice_miner_core::EngineState) -> &'static str {
     }
 }
 
-/// Format a hashrate as raw `H/s` plus a human-scaled unit (kH/s, MH/s, GH/s) so
-/// both the precise figure (XMR ~ hundreds of H/s) and the big one (KawPoW ~ tens
-/// of MH/s) read cleanly. `None` (no speed line yet) → `—`.
+/// Format a hashrate as the best AUTO-SCALED human unit ONLY (H/s → kH/s → MH/s →
+/// GH/s → TH/s → PH/s). The raw `"<n> H/s (…)"` prefix is intentionally gone: a miner
+/// disliked the tiny raw digit ("太小了"), so every display site now shows just the
+/// scaled headline (a CPU reads `8.43 kH/s`, a GPU `25.00 MH/s`, an ASIC `1.20 TH/s`).
+/// Internal storage stays in H/s; only the DISPLAY scales. `None` / non-finite → `—`.
+/// This is now a thin alias for [`fmt_hashrate_compact`] (they were always the scaled
+/// form; the difference used to be the raw prefix, which is dropped).
 pub fn fmt_hashrate(hs: Option<f64>) -> String {
-    match hs {
-        None => "—".to_string(),
-        Some(h) if !h.is_finite() || h < 0.0 => "—".to_string(),
-        Some(h) => {
-            let human = fmt_hashrate_human(h);
-            // Avoid a redundant "(X H/s · X H/s)" when the value is already < 1 kH/s.
-            if h < 1000.0 {
-                format!("{h:.1} H/s")
-            } else {
-                format!("{h:.1} H/s ({human})")
-            }
-        }
-    }
+    fmt_hashrate_compact(hs)
 }
 
-/// A COMPACT hashrate for fixed-width table cells: the human-scaled value ONLY (no raw
-/// `"{h} H/s (…)"` prefix). The full [`fmt_hashrate`] is too long for the lane-table
-/// SPEED column, so a huge pearlhash magnitude (e.g. 109790000000000 H/s) used to
-/// truncate to its USELESS raw digits and drop the readable `109.79 TH/s`. This keeps
-/// only the scaled form so the headline number a miner reads always fits. `—` for None.
+/// A COMPACT hashrate: the best auto-scaled human unit ONLY (H/s → kH/s → … → PH/s),
+/// never a raw `"{h} H/s (…)"` prefix. This is now the canonical hashrate renderer —
+/// [`fmt_hashrate`] is a thin alias for it — so a fixed-width table cell and the hero
+/// line read the same headline (e.g. `109.79 TH/s`, never the useless raw digits that
+/// used to truncate). `—` for None / non-finite.
 pub fn fmt_hashrate_compact(hs: Option<f64>) -> String {
     match hs {
         Some(h) if h.is_finite() && h >= 0.0 => fmt_hashrate_human(h),
@@ -833,7 +900,11 @@ pub fn fmt_hashrate_human(h: f64) -> String {
     const M: f64 = 1_000_000.0;
     const G: f64 = 1_000_000_000.0;
     const T: f64 = 1_000_000_000_000.0;
-    if h >= T {
+    const P: f64 = 1_000_000_000_000_000.0;
+    if h >= P {
+        // Above TH/s: an ASIC farm / aggregate can reach PH/s (petahash) scale.
+        format!("{:.2} PH/s", h / P)
+    } else if h >= T {
         // GPU-PRL pearlhash can exceed 1 TH/s on a strong card.
         format!("{:.2} TH/s", h / T)
     } else if h >= G {
@@ -935,6 +1006,10 @@ mod tests {
             worker_id: Some("rig-7f3a9c21".into()),
             uptime_s: 3_661,
             failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
             dual: false,
             lanes: vec![LaneSnapshot {
                 lane: Lane::Xmr,
@@ -947,6 +1022,10 @@ mod tests {
                 uptime_s: 3_661,
                 endpoint: Some("hk.aliceprotocol.org:3333".into()),
                 failovers: 0,
+                temp_c: None,
+                power_w: None,
+                util_pct: None,
+                fan_pct: None,
             }],
             last_line: Some("net accepted (142/1) diff 100".into()),
             message: None,
@@ -968,6 +1047,10 @@ mod tests {
             worker_id: Some("rig-7f3a9c21".into()),
             uptime_s: 65,
             failovers: 1,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
             dual: true,
             lanes: vec![
                 LaneSnapshot {
@@ -981,6 +1064,10 @@ mod tests {
                     uptime_s: 65,
                     endpoint: Some("hk.aliceprotocol.org:3333".into()),
                     failovers: 1,
+                    temp_c: None,
+                    power_w: None,
+                    util_pct: None,
+                    fan_pct: None,
                 },
                 LaneSnapshot {
                     lane: Lane::GpuRvn,
@@ -993,6 +1080,10 @@ mod tests {
                     uptime_s: 65,
                     endpoint: Some("hk.aliceprotocol.org:8888".into()),
                     failovers: 0,
+                    temp_c: None,
+                    power_w: None,
+                    util_pct: None,
+                    fan_pct: None,
                 },
             ],
             last_line: Some("Speed 25.00 Mh/s gpu0".into()),
@@ -1005,20 +1096,29 @@ mod tests {
 
     #[test]
     fn hashrate_formats_h_k_m_g() {
-        // Sub-kH XMR: precise H/s only (no redundant human unit).
-        assert_eq!(fmt_hashrate(Some(842.0)), "842.0 H/s");
-        // kH range: raw + kH/s.
-        assert_eq!(fmt_hashrate(Some(8_432.0)), "8432.0 H/s (8.43 kH/s)");
-        // MH range (KawPoW): raw + MH/s.
-        assert_eq!(fmt_hashrate(Some(25_000_000.0)), "25000000.0 H/s (25.00 MH/s)");
+        // Every display site now shows ONLY the best auto-scaled unit (no raw "N H/s
+        // (…)" prefix — the miner disliked the tiny raw digit).
+        // Sub-kH XMR: the scaled H/s form.
+        assert_eq!(fmt_hashrate(Some(842.0)), "842 H/s");
+        // kH range: kH/s only.
+        assert_eq!(fmt_hashrate(Some(8_432.0)), "8.43 kH/s");
+        // MH range (KawPoW): MH/s only.
+        assert_eq!(fmt_hashrate(Some(25_000_000.0)), "25.00 MH/s");
+        // TH range (ASIC / strong pearlhash card): TH/s only.
+        assert_eq!(fmt_hashrate(Some(1_200_000_000_000.0)), "1.20 TH/s");
         // None / non-finite / negative → em dash.
         assert_eq!(fmt_hashrate(None), "—");
         assert_eq!(fmt_hashrate(Some(f64::NAN)), "—");
         assert_eq!(fmt_hashrate(Some(-1.0)), "—");
-        // Human-only scaler.
+        // `fmt_hashrate` and `fmt_hashrate_compact` are now identical (the scaled form).
+        assert_eq!(fmt_hashrate(Some(8_432.0)), fmt_hashrate_compact(Some(8_432.0)));
+        // Human-only scaler, including the new PH tier above TH.
         assert_eq!(fmt_hashrate_human(1_500.0), "1.50 kH/s");
         assert_eq!(fmt_hashrate_human(2_000_000_000.0), "2.00 GH/s");
         assert_eq!(fmt_hashrate_human(500.0), "500 H/s");
+        assert_eq!(fmt_hashrate_human(1_500_000_000_000.0), "1.50 TH/s");
+        // PH/s (petahash): an aggregate / ASIC-farm scale above TH.
+        assert_eq!(fmt_hashrate_human(2_500_000_000_000_000.0), "2.50 PH/s");
     }
 
     #[test]
@@ -1168,6 +1268,10 @@ mod tests {
             worker_id: None,
             uptime_s: 0,
             failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
             dual: false,
             lanes: vec![],
             last_line: None,
@@ -1217,6 +1321,93 @@ mod tests {
         assert!(t.contains("WARM"), "warming lane chip present: {t}");
     }
 
+    // ── Hardware telemetry (temp / power / util / fan) ──────────────────────────
+
+    /// `fmt_telemetry` returns None when nothing is reported, and otherwise a stable
+    /// four-field line with `—` for an absent field (so the shape never shifts).
+    #[test]
+    fn telemetry_line_format_and_none() {
+        assert_eq!(fmt_telemetry(None, None, None, None), None, "no readings → no line");
+        let full = fmt_telemetry(Some(62.4), Some(145.0), Some(98.0), Some(55.0)).unwrap();
+        // Rounded, unit-suffixed, middot-joined (EN labels by default).
+        assert!(full.contains("62°C"), "temp rounded: {full}");
+        assert!(full.contains("145W"), "power: {full}");
+        assert!(full.contains("98%"), "util: {full}");
+        assert!(full.contains("55%"), "fan: {full}");
+        // A partial reading still renders every field, absent ones as `—`.
+        let partial = fmt_telemetry(Some(70.0), None, None, Some(40.0)).unwrap();
+        assert!(partial.contains("70°C") && partial.contains("40%"));
+        assert!(partial.contains('—'), "absent power/util render em dash: {partial}");
+    }
+
+    /// The temp thresholds: healthy (no color), warm (yellow), hot (red).
+    #[test]
+    fn temp_color_thresholds() {
+        assert_eq!(temp_color_code(Some(60.0)), None, "healthy → no color");
+        assert_eq!(temp_color_code(Some(78.0)), Some("\x1b[33m"), "warm → yellow");
+        assert_eq!(temp_color_code(Some(88.0)), Some("\x1b[31m"), "hot → red");
+        assert_eq!(temp_color_code(None), None);
+    }
+
+    /// A GPU lane carrying telemetry renders a tidy sub-row under its lane in the table;
+    /// a lane with no telemetry (e.g. CPU-XMR) renders no sub-row.
+    #[test]
+    fn lane_table_renders_telemetry_subrow() {
+        let mut s = running_snapshot();
+        s.lane = Some(Lane::GpuPrl);
+        s.lanes = vec![LaneSnapshot {
+            lane: Lane::GpuPrl,
+            state: EngineState::Running,
+            hashrate_hs: Some(9.58e12),
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
+            shares_accepted: 42,
+            shares_rejected: 0,
+            uptime_s: 3_661,
+            endpoint: Some("us.aliceprotocol.org:3340".into()),
+            failovers: 0,
+            temp_c: Some(62.0),
+            power_w: Some(145.0),
+            util_pct: Some(98.0),
+            fan_pct: Some(55.0),
+        }];
+        let t = render_lane_table(&s, false);
+        assert!(t.contains("62°C"), "telemetry sub-row present: {t}");
+        assert!(t.contains("145W") && t.contains("98%") && t.contains("55%"), "{t}");
+
+        // The XMR running_snapshot() carries no telemetry → no sub-row.
+        let xmr = render_lane_table(&running_snapshot(), false);
+        assert!(!xmr.contains("°C"), "CPU lane has no telemetry sub-row: {xmr}");
+    }
+
+    /// Color gating on the telemetry sub-row: a HOT card is red when color is on; with
+    /// color off there is no ANSI (the numbers carry the signal).
+    #[test]
+    fn telemetry_subrow_color_is_gated() {
+        let mut s = running_snapshot();
+        s.lane = Some(Lane::GpuPrl);
+        s.lanes = vec![LaneSnapshot {
+            lane: Lane::GpuPrl,
+            state: EngineState::Running,
+            hashrate_hs: Some(9.58e12),
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
+            shares_accepted: 42,
+            shares_rejected: 0,
+            uptime_s: 3_661,
+            endpoint: Some("us.aliceprotocol.org:3340".into()),
+            failovers: 0,
+            temp_c: Some(90.0), // hot
+            power_w: Some(300.0),
+            util_pct: Some(99.0),
+            fan_pct: Some(100.0),
+        }];
+        let plain = render_lane_table(&s, false);
+        assert!(!plain.contains('\x1b'), "no ANSI when color off");
+        let colored = render_lane_table(&s, true);
+        assert!(colored.contains("\x1b[31m"), "hot card telemetry tinted red: {colored:?}");
+    }
+
     /// The lane table's GpuAlpha row is honest: SUBMITTED ("N sub"), never an A/R or
     /// a fabricated accept rate (the relay owns acceptance).
     #[test]
@@ -1234,6 +1425,10 @@ mod tests {
             uptime_s: 3_661,
             endpoint: Some("us.aliceprotocol.org:3341".into()),
             failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
         }];
         let t = render_lane_table(&s, false);
         assert!(t.contains("42 sub"), "submitted label: {t}");
@@ -1291,6 +1486,10 @@ mod tests {
             uptime_s: 3_661,
             endpoint: s.endpoint.clone(),
             failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
         }];
         let out = render_snapshot(&s);
         assert!(out.contains("42 submitted"), "submitted label + count: {out}");
@@ -1544,6 +1743,10 @@ mod tests {
             worker_id: Some("rig-7f3a9c21".into()),
             uptime_s: 120,
             failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
             dual: false,
             lanes: vec![LaneSnapshot {
                 lane: Lane::GpuPrl,
@@ -1556,6 +1759,10 @@ mod tests {
                 uptime_s: 120,
                 endpoint: Some("us.aliceprotocol.org:3340".into()),
                 failovers: 0,
+                temp_c: None,
+                power_w: None,
+                util_pct: None,
+                fan_pct: None,
             }],
             last_line: None,
             message: None,

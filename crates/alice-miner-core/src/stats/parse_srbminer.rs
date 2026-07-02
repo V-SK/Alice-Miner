@@ -44,16 +44,66 @@ pub fn parse_srbminer(raw: &str) -> Option<KawpowSample> {
     }
     let lower = line.to_ascii_lowercase();
     let (accepted, rejected) = share_counts(line, &lower);
+    let (temp_c, power_w, util_pct, fan_pct) = telemetry(&lower);
     let sample = KawpowSample {
         hashrate_hs: parse_hashrate_hs(&lower),
         accepted,
         rejected,
+        temp_c,
+        power_w,
+        util_pct,
+        fan_pct,
     };
-    if sample.hashrate_hs.is_none() && sample.accepted.is_none() && sample.rejected.is_none() {
+    if sample.hashrate_hs.is_none()
+        && sample.accepted.is_none()
+        && sample.rejected.is_none()
+        && sample.temp_c.is_none()
+        && sample.power_w.is_none()
+        && sample.util_pct.is_none()
+        && sample.fan_pct.is_none()
+    {
         None
     } else {
         Some(sample)
     }
+}
+
+/// Best-effort telemetry (temp/power/util/fan) from an SRBMiner line. SRBMiner prints
+/// a periodic device table with `Temperature: 62C`, `Fan: 55%`, `Power: 145W` (labels
+/// vary a little across builds/OSes) and per-GPU efficiency in `GH/W` — which is POWER
+/// EFFICIENCY, NOT board power, so it must NEVER be read as `power_w`. Every field is
+/// fail-soft: absent / unparseable → `None`, never disturbing the hashrate/share path.
+/// The `lower` arg is the already-lower-cased line.
+fn telemetry(lower: &str) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+    let temp_c = labelled_number(lower, "temperature").or_else(|| labelled_number(lower, "temp"));
+    // `power:` label only — the `442.94 gh/w` efficiency token is per-hash power and is
+    // never a board-power reading (the `/w` unit distinguishes it).
+    let power_w = labelled_number(lower, "power");
+    let util_pct =
+        labelled_number(lower, "utilization").or_else(|| labelled_number(lower, "gpu load"));
+    let fan_pct = labelled_number(lower, "fan");
+    (temp_c, power_w, util_pct, fan_pct)
+}
+
+/// First number after a case-insensitive `label` (skipping a `:`/`=`/space run),
+/// tolerating a trailing unit letter (`c`/`w`/`%`). Fail-soft → `None` if absent.
+fn labelled_number(lower: &str, label: &str) -> Option<f64> {
+    let idx = lower.find(label)?;
+    let rest = &lower[idx + label.len()..];
+    let trimmed = rest.trim_start_matches(|c: char| c == ':' || c == '=' || c.is_whitespace());
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+        i += 1;
+    }
+    let start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    trimmed[..i].parse().ok()
 }
 
 /// CUMULATIVE `(accepted, rejected)` for a line, from the two REAL sources (both
@@ -279,6 +329,42 @@ mod tests {
             parse_srbminer("speed 1.5 Th/s").unwrap().hashrate_hs,
             Some(1_500_000_000_000.0)
         );
+    }
+
+    // ── Telemetry (temp / power / util / fan) ──────────────────────────────────
+
+    #[test]
+    fn device_table_temp_fan_power_captured() {
+        // SRBMiner's periodic device line with labelled telemetry.
+        let s = parse_srbminer(
+            "[2026-06-26 13:05:45] GPU0: Temperature: 62C, Fan: 55%, Power: 145W",
+        )
+        .expect("telemetry line");
+        assert_eq!(s.temp_c, Some(62.0));
+        assert_eq!(s.fan_pct, Some(55.0));
+        assert_eq!(s.power_w, Some(145.0));
+    }
+
+    #[test]
+    fn gh_per_w_efficiency_is_not_read_as_board_power() {
+        // The per-GPU hashrate line carries `442.94 GH/W` efficiency — this is per-hash
+        // power, NOT board power, and must never populate power_w.
+        let s = parse_srbminer(
+            "[2026-06-26 13:05:45] GPU2: 125.35 TH/s        [    719|    1|   0|  442.94 GH/W]",
+        )
+        .unwrap();
+        assert_eq!(s.power_w, None, "GH/W efficiency must not be read as board power");
+        assert_eq!(s.hashrate_hs, Some(125.35e12));
+    }
+
+    #[test]
+    fn srbminer_telemetry_is_fail_soft() {
+        // Garbled telemetry must not disturb the hashrate/share parse.
+        let s = parse_srbminer("[ts] GPU0: 0.87 TH/s temperature: --C [3|0|0| 1.20 GH/W]")
+            .expect("parsed");
+        assert_eq!(s.hashrate_hs, Some(0.87e12));
+        assert_eq!(s.accepted, Some(3));
+        assert_eq!(s.temp_c, None, "unparseable temp → None");
     }
 
     #[test]

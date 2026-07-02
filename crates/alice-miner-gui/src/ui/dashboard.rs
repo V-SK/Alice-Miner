@@ -1555,6 +1555,10 @@ mod tests {
             uptime_s: 0,
             endpoint: None,
             failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
         }
     }
 
@@ -1574,6 +1578,10 @@ mod tests {
             worker_id: None,
             uptime_s: 0,
             failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
             dual,
             lanes,
             last_line: None,

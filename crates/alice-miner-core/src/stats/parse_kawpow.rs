@@ -34,8 +34,11 @@
 
 #![allow(dead_code)]
 
-/// One parsed observation from a KawPoW log line. Any field is `None`/absent when
-/// the line didn't carry it (most lines carry at most one kind of figure).
+/// One parsed observation from a GPU miner log line (shared by the kawpow, SRBMiner,
+/// and alpha parsers). Any field is `None`/absent when the line didn't carry it (most
+/// lines carry at most one kind of figure). The telemetry fields (temp/power/util/fan)
+/// are FAIL-SOFT: a parser leaves them `None` whenever the engine didn't report them,
+/// and an unparseable telemetry token never breaks hashrate/share parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct KawpowSample {
     /// Hashrate normalized to H/s (e.g. `25.43 Mh/s` → `25_430_000.0`).
@@ -44,11 +47,25 @@ pub struct KawpowSample {
     pub accepted: Option<u64>,
     /// Cumulative rejected shares, if the line carried a share figure.
     pub rejected: Option<u64>,
+    /// GPU core temperature in °C, if the line reported it (e.g. T-Rex `[T:65C, …]`).
+    pub temp_c: Option<f64>,
+    /// GPU board power draw in watts, if the line reported it (e.g. `P:120W`).
+    pub power_w: Option<f64>,
+    /// GPU utilization percent (0..=100), if the line reported it.
+    pub util_pct: Option<f64>,
+    /// GPU fan speed percent (0..=100), if the line reported it.
+    pub fan_pct: Option<f64>,
 }
 
 impl KawpowSample {
     fn is_empty(&self) -> bool {
-        self.hashrate_hs.is_none() && self.accepted.is_none() && self.rejected.is_none()
+        self.hashrate_hs.is_none()
+            && self.accepted.is_none()
+            && self.rejected.is_none()
+            && self.temp_c.is_none()
+            && self.power_w.is_none()
+            && self.util_pct.is_none()
+            && self.fan_pct.is_none()
     }
 }
 
@@ -57,10 +74,15 @@ impl KawpowSample {
 pub fn parse_kawpow(raw: &str) -> Option<KawpowSample> {
     let line = strip_ansi(raw);
     let shares = parse_shares(&line);
+    let telem = parse_telemetry(&line);
     let sample = KawpowSample {
         hashrate_hs: parse_hashrate(&line),
         accepted: shares.map(|(a, _)| a),
         rejected: shares.map(|(_, r)| r),
+        temp_c: telem.temp_c,
+        power_w: telem.power_w,
+        util_pct: telem.util_pct,
+        fan_pct: telem.fan_pct,
     };
     if sample.is_empty() {
         None
@@ -299,6 +321,75 @@ fn labelled_value(line: &str, label: &str) -> Option<u64> {
     }
 }
 
+// ── Telemetry (temp / power / util / fan) — FAIL-SOFT ─────────────────────────
+
+/// The optional hardware-telemetry fields a KawPoW line may carry. Every field is
+/// best-effort: absent / unparseable → `None` (never breaks hashrate/share parsing).
+#[derive(Debug, Clone, Copy, Default)]
+struct Telemetry {
+    temp_c: Option<f64>,
+    power_w: Option<f64>,
+    util_pct: Option<f64>,
+    fan_pct: Option<f64>,
+}
+
+/// Extract temp/power/util/fan from a KawPoW line, tolerating BOTH the T-Rex compact
+/// `[T:65C, P:120W, ...]` block AND kawpowminer's labelled `temperature 65C` / `fan
+/// 55%` / `power 120W` forms. Every figure is best-effort; the block is IGNORED for
+/// the hashrate path (E:0.17 MH/W efficiency stays out of the rate). Fail-soft.
+fn parse_telemetry(line: &str) -> Telemetry {
+    let lower = line.to_ascii_lowercase();
+    Telemetry {
+        // T-Rex `T:65C` / `T:65` OR labelled `temperature 65C` / `temp 65`.
+        temp_c: value_after_colon(&lower, "t:")
+            .or_else(|| labelled_number(&lower, "temperature"))
+            .or_else(|| labelled_number(&lower, "temp")),
+        // T-Rex `P:120W` / `P:120` OR labelled `power 120W` / `power 120`.
+        power_w: value_after_colon(&lower, "p:").or_else(|| labelled_number(&lower, "power")),
+        // Utilization is rarely on a kawpow line, but honor a labelled `util 98%`.
+        util_pct: labelled_number(&lower, "util")
+            .or_else(|| labelled_number(&lower, "utilization")),
+        // Fan `fan 55%` / `fan:55`.
+        fan_pct: value_after_colon(&lower, "fan:").or_else(|| labelled_number(&lower, "fan")),
+    }
+}
+
+/// The number immediately after a `key:` token (T-Rex compact block form, e.g. the
+/// `T:65C` inside `[T:65C, P:120W]`). Tolerates a trailing unit letter (`C`/`W`) and
+/// bracket/comma punctuation. `None` if the key/number is absent.
+fn value_after_colon(lower: &str, key: &str) -> Option<f64> {
+    let idx = lower.find(key)?;
+    let rest = &lower[idx + key.len()..];
+    parse_leading_number(rest)
+}
+
+/// The first number after a case-insensitive `label` word (kawpowminer labelled form,
+/// e.g. `temperature 65C`). Skips a separating `:`/`=`/space run. `None` if absent.
+fn labelled_number(lower: &str, label: &str) -> Option<f64> {
+    let idx = lower.find(label)?;
+    let rest = &lower[idx + label.len()..];
+    let trimmed = rest.trim_start_matches(|c: char| c == ':' || c == '=' || c.is_whitespace());
+    parse_leading_number(trimmed)
+}
+
+/// Parse the leading signed-decimal number from `s` (ignoring a trailing unit like
+/// `C` / `W` / `%`). `None` if `s` does not start with a digit / sign.
+fn parse_leading_number(s: &str) -> Option<f64> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+        i += 1;
+    }
+    let start_digits = i;
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+        i += 1;
+    }
+    if i == start_digits {
+        return None;
+    }
+    s[..i].parse().ok()
+}
+
 // ── ANSI ─────────────────────────────────────────────────────────────────────
 
 /// Strip ANSI/VT100 CSI escape sequences (`ESC [ ... <final>`), mirroring the
@@ -411,8 +502,11 @@ mod tests {
         assert!(parse_kawpow("kawpowminer 1.2.4").is_none());
         assert!(parse_kawpow("Eth: Connected to stratum server").is_none());
         assert!(parse_kawpow("").is_none());
-        // A bare temperature line must not be read as a hashrate.
-        assert!(parse_kawpow("GPU #0 temperature 65C").is_none());
+        // A bare temperature line now carries telemetry (temp), but must STILL never be
+        // read as a hashrate (the load-bearing invariant): the sample has temp, no rate.
+        let s = parse_kawpow("GPU #0 temperature 65C").expect("temperature is telemetry");
+        assert_eq!(s.temp_c, Some(65.0));
+        assert_eq!(s.hashrate_hs, None, "a bare temperature line is never a hashrate");
     }
 
     #[test]
@@ -427,6 +521,52 @@ mod tests {
     fn gh_s_unit_normalizes() {
         let s = parse_kawpow("kawpowminer Speed 1.5 Gh/s").expect("parsed");
         assert_eq!(s.hashrate_hs, Some(1_500_000_000.0));
+    }
+
+    // ── Telemetry (temp / power / util / fan) ──────────────────────────────────
+
+    #[test]
+    fn trex_compact_block_captures_temp_and_power() {
+        // The T-Rex `[T:65C, P:120W, E:0.17 MH/W]` block: temp + power captured; the
+        // efficiency figure is NOT read as a hashrate (still 20.83 MH/s).
+        let line = "20240101 12:01:42 [ OK ] GPU #0: 20.83 MH/s [T:65C, P:120W, E:0.17 MH/W]";
+        let s = parse_kawpow(line).expect("parsed");
+        assert_eq!(s.hashrate_hs, Some(20_830_000.0));
+        assert_eq!(s.temp_c, Some(65.0));
+        assert_eq!(s.power_w, Some(120.0));
+        // util/fan absent on this line → None.
+        assert_eq!(s.util_pct, None);
+        assert_eq!(s.fan_pct, None);
+    }
+
+    #[test]
+    fn kawpowminer_labelled_temp_fan_power_captured() {
+        // kawpowminer's labelled telemetry (previously discarded).
+        let line = "m 12:01:42 kawpowminer Speed 25.43 Mh/s gpu0 temperature 62C fan 55% power 145W";
+        let s = parse_kawpow(line).expect("parsed");
+        assert_eq!(s.hashrate_hs, Some(25_430_000.0));
+        assert_eq!(s.temp_c, Some(62.0));
+        assert_eq!(s.fan_pct, Some(55.0));
+        assert_eq!(s.power_w, Some(145.0));
+    }
+
+    #[test]
+    fn telemetry_only_line_still_parses() {
+        // A bare telemetry block (no hashrate/shares) still yields a sample so the
+        // supervisor can update temp/power between speed lines.
+        let s = parse_kawpow("[ OK ] GPU #0: idle [T:48C, P:35W]").expect("telemetry-only");
+        assert_eq!(s.temp_c, Some(48.0));
+        assert_eq!(s.power_w, Some(35.0));
+        assert_eq!(s.hashrate_hs, None);
+    }
+
+    #[test]
+    fn telemetry_is_fail_soft_and_never_breaks_hashrate() {
+        // A garbled telemetry token must not disturb the hashrate parse.
+        let s = parse_kawpow("kawpowminer Speed 18.00 Mh/s [T:xxC, P:??]").expect("parsed");
+        assert_eq!(s.hashrate_hs, Some(18_000_000.0));
+        assert_eq!(s.temp_c, None, "unparseable temp → None, not a panic");
+        assert_eq!(s.power_w, None);
     }
 
     #[test]

@@ -48,6 +48,7 @@ mod ai;
 mod color;
 mod dashboard;
 mod doctor;
+mod errmsg;
 mod fleet;
 mod pidfile;
 mod setup;
@@ -468,6 +469,13 @@ struct DoctorArgs {
     /// Emit the report as a single JSON object (machine-readable).
     #[arg(long)]
     json: bool,
+    /// Apply the SAFE auto-repairs for any failing checks (re-download a missing/corrupt
+    /// engine, recreate a malformed config with a backup) and report what was done.
+    /// Prompt-required fixes (background service) ask first on a terminal and are skipped
+    /// in a scripted run. NEVER auto-touches identity / keystore / wallet — those are only
+    /// printed as manual steps.
+    #[arg(long)]
+    fix: bool,
 }
 
 #[derive(clap::Args)]
@@ -776,6 +784,18 @@ fn cmd_doctor(args: DoctorArgs) -> i32 {
         Err(code) => return code,
     };
     let checks = doctor::run_checks(lane, &cap);
+    // `--fix`: apply the SAFE (and, on a TTY, prompt-gated) auto-repairs, then re-run the
+    // battery so the printed report reflects the post-fix state. `--fix` is a human action
+    // (it may prompt) so it is not combined with `--json`.
+    if args.fix {
+        use std::io::IsTerminal;
+        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        print!("{}", doctor::apply_fixes(&checks, interactive, &mut confirm_prompt));
+        println!();
+        let rechecked = doctor::run_checks(lane, &cap);
+        print!("{}", doctor::render_report(&rechecked, lane));
+        return if doctor::has_blocking_failure(&rechecked) { EXIT_USAGE } else { EXIT_OK };
+    }
     if args.json {
         println!("{}", doctor::render_json(&checks, lane));
     } else {
@@ -786,6 +806,20 @@ fn cmd_doctor(args: DoctorArgs) -> i32 {
     } else {
         EXIT_OK
     }
+}
+
+/// A yes/no confirmation prompt on the terminal (used by `doctor --fix` for the
+/// prompt-required service repair). Prints `question`, reads a line, returns true only
+/// for an explicit `y`/`yes`. EOF / anything else → false (the safe default).
+fn confirm_prompt(question: &str) -> bool {
+    use std::io::{BufRead, Write};
+    print!("{question}");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// `doctor --ai`: run the shard-stage inference battery. Merges the `--ai` flags
@@ -806,6 +840,15 @@ fn cmd_doctor_ai(args: DoctorArgs) -> i32 {
         allow_cpu: args.allow_cpu,
     };
     let checks = doctor::run_ai_checks(&input);
+    if args.fix {
+        use std::io::IsTerminal;
+        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        print!("{}", doctor::apply_fixes(&checks, interactive, &mut confirm_prompt));
+        println!();
+        let rechecked = doctor::run_ai_checks(&input);
+        print!("{}", doctor::render_ai_report(&rechecked));
+        return if doctor::has_blocking_failure(&rechecked) { EXIT_USAGE } else { EXIT_OK };
+    }
     if args.json {
         println!("{}", doctor::render_ai_json(&checks));
     } else {
@@ -1140,7 +1183,7 @@ fn cmd_identity(args: IdentityArgs) -> i32 {
             EXIT_OK
         }
         Ok(Event::Error(e)) => {
-            eprintln!("error: {e}");
+            eprintln!("{}", errmsg::render_error(&e));
             EXIT_RUNTIME
         }
         Ok(other) => {
@@ -1646,12 +1689,15 @@ fn cmd_start_with_unlock(
             }
             Ok(Event::Error(e)) => {
                 if args.json {
+                    // Machine path: keep the RAW string (a consumer wants the exact detail).
                     println!("{}", serde_json::json!({ "error": e }));
                 } else if tui.is_some() {
-                    // Defer: print after the alt screen is gone.
-                    deferred_error = Some(e);
+                    // Defer: print the polished message after the alt screen is gone.
+                    deferred_error = Some(errmsg::render_error(&e));
                 } else {
-                    eprintln!("engine error: {e}");
+                    // Human path: the consistent bilingual "what happened + what to do"
+                    // shape (raw detail only under ALICE_MINER_VERBOSE=1).
+                    eprintln!("{}", errmsg::render_error(&e));
                 }
                 exit_code = EXIT_RUNTIME;
                 break;
@@ -1686,7 +1732,9 @@ fn cmd_start_with_unlock(
     // notes/errors land on the user's real shell, not the alternate screen.
     drop(tui);
     if let Some(e) = deferred_error {
-        eprintln!("engine error: {e}");
+        // `e` is already the polished multi-line message (built via errmsg::render_error
+        // when the error was captured), so print it as-is.
+        eprintln!("{e}");
     }
 
     // Best-effort: ensure the child is torn down on the way out (kill_on_drop is
@@ -2302,6 +2350,10 @@ mod tests {
             worker_id: None,
             uptime_s: 0,
             failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
             dual: false,
             lanes: vec![],
             last_line: None,

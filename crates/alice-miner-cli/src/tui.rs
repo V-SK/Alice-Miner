@@ -181,6 +181,17 @@ fn health_color(h: LaneHealth) -> Color {
     }
 }
 
+/// The color for a telemetry sub-row keyed on GPU temperature: red hot (≥85°C), yellow
+/// warm (≥75°C), else a dim gray (healthy — the sub-row is a quiet detail). Mirrors the
+/// line renderer's `temp_color_code` thresholds so the two views agree.
+fn telemetry_color(temp_c: Option<f64>) -> Color {
+    match temp_c {
+        Some(t) if t >= 85.0 => Color::Red,
+        Some(t) if t >= 75.0 => Color::Yellow,
+        _ => Color::DarkGray,
+    }
+}
+
 /// A coarse activity fingerprint (uptime + share counts + quantized hashrate) — when
 /// it stops changing, the stream is wedged and the heartbeat goes stale. Mirrors the
 /// line renderer's `snapshot_fingerprint`. Credit-only (counts only).
@@ -372,22 +383,32 @@ fn render(frame: &mut Frame, snap: &Snapshot, beat: char, stale_s: u64) {
     if has_table {
         let header = Row::new(["", "LANE", "STATE", "SPEED", "SHARES", "ENDPOINT", "F/O"])
             .style(Style::default().add_modifier(Modifier::BOLD));
-        let table_rows: Vec<Row> = rows
-            .iter()
-            .map(|r| {
-                let cells = [
-                    r.health.chip().to_string(),
-                    r.lane.label().to_string(),
-                    r.state.clone(),
-                    r.speed.clone(),
-                    r.shares.clone(),
-                    r.endpoint.clone(),
-                    r.failovers.to_string(),
-                ];
-                // Tint the whole row by its semaphore health (the loud signal).
-                Row::new(cells.map(Cell::from)).style(Style::default().fg(health_color(r.health)))
-            })
-            .collect();
+        let mut table_rows: Vec<Row> = Vec::new();
+        for r in rows.iter() {
+            let cells = [
+                r.health.chip().to_string(),
+                r.lane.label().to_string(),
+                r.state.clone(),
+                r.speed.clone(),
+                r.shares.clone(),
+                r.endpoint.clone(),
+                r.failovers.to_string(),
+            ];
+            // Tint the whole row by its semaphore health (the loud signal).
+            table_rows.push(
+                Row::new(cells.map(Cell::from)).style(Style::default().fg(health_color(r.health))),
+            );
+            // A per-GPU telemetry sub-row (only when telemetry exists), placed under its
+            // lane. The telemetry text sits in the wide ENDPOINT column; temp thresholds
+            // tint it yellow/red so a hot card is obvious at a glance.
+            if let Some(telem) = &r.telemetry {
+                let sub = ["", "  └", "", "", "", telem.as_str(), ""];
+                table_rows.push(
+                    Row::new(sub.map(|c| Cell::from(c.to_string())))
+                        .style(Style::default().fg(telemetry_color(r.temp_c))),
+                );
+            }
+        }
         let widths = [
             Constraint::Length(5),  // health chip (OK/STALL/ERR)
             Constraint::Length(18), // lane label (fits "GPU · Alpha (V100)")
@@ -455,6 +476,10 @@ mod tests {
             worker_id: Some("rig-7f3a".into()),
             uptime_s: 3_661,
             failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
             dual: false,
             lanes: vec![],
             last_line: Some("net accepted (142/1) diff 100".into()),
@@ -477,6 +502,10 @@ mod tests {
             worker_id: Some("rig-7f3a".into()),
             uptime_s: 65,
             failovers: 1,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
             dual: true,
             lanes: vec![
                 LaneSnapshot {
@@ -490,6 +519,10 @@ mod tests {
                     uptime_s: 65,
                     endpoint: Some("hk.aliceprotocol.org:3333".into()),
                     failovers: 1,
+                    temp_c: None,
+                    power_w: None,
+                    util_pct: None,
+                    fan_pct: None,
                 },
                 LaneSnapshot {
                     lane: Lane::GpuRvn,
@@ -502,6 +535,10 @@ mod tests {
                     uptime_s: 65,
                     endpoint: Some("hk.aliceprotocol.org:8888".into()),
                     failovers: 0,
+                    temp_c: None,
+                    power_w: None,
+                    util_pct: None,
+                    fan_pct: None,
                 },
             ],
             last_line: None,

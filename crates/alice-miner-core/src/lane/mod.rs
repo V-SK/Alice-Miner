@@ -58,6 +58,13 @@ impl Lane {
         matches!(self, Lane::GpuPrl | Lane::GpuAlpha)
     }
 
+    /// Whether this lane runs on the GPU (all lanes except CPU-XMR). Used to gate the
+    /// per-run `nvidia-smi` hardware-telemetry fallback poll — never spawned for the
+    /// CPU-XMR lane (it has no per-GPU temp/power/fan to report).
+    pub fn is_gpu_lane(self) -> bool {
+        matches!(self, Lane::GpuPrl | Lane::GpuAlpha | Lane::GpuRvn)
+    }
+
     /// The GPU lane to pair with CPU-XMR in a **dual-mine** run, given the user's
     /// SELECTED lane. An explicitly chosen GPU lane (`GpuPrl`/`GpuAlpha`/`GpuRvn`) is
     /// honoured verbatim — so a **Volta/V100 box dual-mines via AlphaMiner**, not the

@@ -64,6 +64,14 @@ pub const NO_PROGRESS_WINDOW: Duration = Duration::from_secs(600);
 /// stored progress timestamp against `NO_PROGRESS_WINDOW`.
 const WATCHDOG_TICK: Duration = Duration::from_secs(2);
 
+/// How often the `nvidia-smi` telemetry fallback polls (throttled — not every frame).
+/// One lightweight query every ~5s is plenty for a temp/power/fan readout and keeps the
+/// subprocess overhead negligible even on a many-hour run.
+const NVIDIA_TELEMETRY_POLL: Duration = Duration::from_secs(5);
+
+/// Bound on the `nvidia-smi` query so a wedged driver can never stall the poll task.
+const NVIDIA_TELEMETRY_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// A closure the engine supplies that (re)builds the `(program, args)` launch
 /// plan for a given ORDERED endpoint list. Lets the supervisor rebuild the
 /// per-endpoint argv on a Layer-B failover without knowing any lane specifics —
@@ -112,6 +120,17 @@ pub struct LaneStats {
     /// How many times Layer B has advanced the endpoint cursor this run (0 =
     /// never failed over). Drives the dashboard "failed over" note.
     pub failovers: u64,
+    /// GPU core temperature in °C, if the engine reported it (parsed from stdout) OR
+    /// a best-effort `nvidia-smi` fallback filled it. `None` when unavailable (a CPU
+    /// lane, an engine that doesn't report it with no NVIDIA fallback, or Apple/AMD).
+    /// On a multi-GPU rig this is the HOTTEST card's reading (the safety-relevant one).
+    pub temp_c: Option<f64>,
+    /// GPU board power draw in watts, same sourcing/semantics as [`Self::temp_c`].
+    pub power_w: Option<f64>,
+    /// GPU utilization percent (0..=100), same sourcing as [`Self::temp_c`].
+    pub util_pct: Option<f64>,
+    /// GPU fan speed percent (0..=100), same sourcing as [`Self::temp_c`].
+    pub fan_pct: Option<f64>,
 }
 
 impl LaneStats {
@@ -131,6 +150,10 @@ impl LaneStats {
             uptime_s: 0,
             endpoint: None,
             failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
         }
     }
 }
@@ -156,6 +179,15 @@ struct Inner {
     /// fabricated from the 10s figure — a window we didn't measure stays `None`.
     hashrate_60s_hs: Option<f64>,
     hashrate_15m_hs: Option<f64>,
+    /// Latest GPU hardware telemetry (hottest card), last-wins. Populated from the
+    /// engine's own stdout when it reports it, else by the best-effort `nvidia-smi`
+    /// fallback poller ([`spawn_nvidia_telemetry_poll`]). `None` when unavailable.
+    /// The engine-parsed value always takes precedence over the fallback within a tick
+    /// (a real reading beats a smi guess).
+    telem_temp_c: Option<f64>,
+    telem_power_w: Option<f64>,
+    telem_util_pct: Option<f64>,
+    telem_fan_pct: Option<f64>,
     accepted: u64,
     rejected: u64,
     last_line: String,
@@ -220,6 +252,10 @@ impl LaneSupervisor {
                 hashrate_hs: None,
                 hashrate_60s_hs: None,
                 hashrate_15m_hs: None,
+                telem_temp_c: None,
+                telem_power_w: None,
+                telem_util_pct: None,
+                telem_fan_pct: None,
                 accepted: 0,
                 rejected: 0,
                 last_line: String::new(),
@@ -297,6 +333,10 @@ impl LaneSupervisor {
             uptime_s,
             endpoint: Some(g.endpoint_plan.current().host_port()),
             failovers: g.failovers,
+            temp_c: g.telem_temp_c,
+            power_w: g.telem_power_w,
+            util_pct: g.telem_util_pct,
+            fan_pct: g.telem_fan_pct,
         }
     }
 
@@ -383,6 +423,13 @@ impl LaneSupervisor {
             g.hashrate_hs = None;
             g.hashrate_60s_hs = None;
             g.hashrate_15m_hs = None;
+            // Telemetry is INSTANTANEOUS (not cumulative), so clear it on EVERY (re)spawn
+            // — a stale temp/power reading from a dead child is meaningless; the new child
+            // (or the nvidia-smi fallback) re-populates it within a tick.
+            g.telem_temp_c = None;
+            g.telem_power_w = None;
+            g.telem_util_pct = None;
+            g.telem_fan_pct = None;
             // On a fresh start, zero the share counters; on a failover relaunch,
             // KEEP the cumulative accepted/rejected (the user's session totals
             // shouldn't reset just because we rotated endpoints) but re-arm the
@@ -452,6 +499,18 @@ impl LaneSupervisor {
             }
         });
 
+        // GPU telemetry fallback: for an NVIDIA GPU lane whose engine may not print
+        // temp/power/util/fan on stdout, spawn a throttled `nvidia-smi` poller (tied to
+        // THIS run's generation) that fills ONLY the fields the engine left blank. Never
+        // spawned for the CPU-XMR lane, and it self-exits on any box without a working
+        // `nvidia-smi` (Apple Silicon / AMD / no driver) — see `spawn_nvidia_telemetry_poll`.
+        if self.lane.is_gpu_lane() {
+            let inner_smi = self.inner.clone();
+            tokio::spawn(async move {
+                spawn_nvidia_telemetry_poll(inner_smi, gen).await;
+            });
+        }
+
         // Supervision task: wait for exit OR a stop request, then tear down.
         let this = self.clone();
         tokio::spawn(async move {
@@ -477,6 +536,10 @@ impl LaneSupervisor {
                     g.hashrate_hs = None;
                     g.hashrate_60s_hs = None;
                     g.hashrate_15m_hs = None;
+                    g.telem_temp_c = None;
+                    g.telem_power_w = None;
+                    g.telem_util_pct = None;
+                    g.telem_fan_pct = None;
                     g.started_at = None;
                     g.state = if g.stop_requested {
                         ProcState::Stopped
@@ -502,6 +565,10 @@ impl LaneSupervisor {
                     g.hashrate_hs = None;
                     g.hashrate_60s_hs = None;
                     g.hashrate_15m_hs = None;
+                    g.telem_temp_c = None;
+                    g.telem_power_w = None;
+                    g.telem_util_pct = None;
+                    g.telem_fan_pct = None;
                     g.started_at = None;
                     g.last_exit_code = code;
                     if g.forced_error {
@@ -773,6 +840,7 @@ fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
                     g.rejected = r;
                     note_accepted_progress(g, a);
                 }
+                apply_telemetry(g, &sample);
             }
         }
         Lane::GpuPrl => {
@@ -800,6 +868,7 @@ fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
                 if let Some(r) = sample.rejected {
                     g.rejected = r;
                 }
+                apply_telemetry(g, &sample);
             }
         }
         Lane::GpuAlpha => {
@@ -818,10 +887,31 @@ fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
                     g.accepted = a;
                     note_accepted_progress(g, a);
                 }
+                apply_telemetry(g, &sample);
             }
         }
     }
     g.last_line = line;
+}
+
+/// Fold a parsed sample's telemetry (temp/power/util/fan) into the supervisor state,
+/// last-wins per field. Each field is assigned ONLY when the sample carried it, so a
+/// line that reports the rate but no temperature leaves a prior temperature intact
+/// (and a `nvidia-smi` fallback reading survives between engine speed lines). Fail-soft
+/// by construction — a `None` field is simply not written.
+fn apply_telemetry(g: &mut Inner, sample: &crate::stats::KawpowSample) {
+    if let Some(t) = sample.temp_c {
+        g.telem_temp_c = Some(t);
+    }
+    if let Some(p) = sample.power_w {
+        g.telem_power_w = Some(p);
+    }
+    if let Some(u) = sample.util_pct {
+        g.telem_util_pct = Some(u);
+    }
+    if let Some(f) = sample.fan_pct {
+        g.telem_fan_pct = Some(f);
+    }
 }
 
 /// Extract the value following `--log-file` in a child argv (the GPU-PRL SRBMiner
@@ -903,6 +993,151 @@ async fn tail_log_file_into(
             }
         }
     }
+}
+
+/// One row of the `nvidia-smi` telemetry query (the hottest card is picked across rows).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct NvidiaTelemetry {
+    temp_c: Option<f64>,
+    power_w: Option<f64>,
+    util_pct: Option<f64>,
+    fan_pct: Option<f64>,
+}
+
+/// The best-effort **`nvidia-smi` telemetry fallback** (generation-gated). For an
+/// NVIDIA GPU lane whose engine may not print temp/power/util/fan, this polls a single
+/// lightweight `nvidia-smi --query-gpu=temperature.gpu,power.draw,utilization.gpu,fan.speed`
+/// every [`NVIDIA_TELEMETRY_POLL`] (~5s), and fills ONLY the telemetry fields the engine
+/// left `None` for this tick — a real engine reading always wins over an smi guess.
+///
+/// Non-blocking: the (synchronous, timeout-bounded) `nvidia-smi` call runs on a blocking
+/// thread via `spawn_blocking` so it can never starve the tokio runtime. Best-effort +
+/// self-terminating: the FIRST failed query (no `nvidia-smi` on Apple Silicon / AMD / a
+/// box with no driver) ends the task cleanly — we never spawn it if the lane isn't a GPU
+/// lane, and we never keep retrying on a box that plainly has no NVIDIA GPU. The task
+/// also returns as soon as `generation` advances (a newer run / stop).
+async fn spawn_nvidia_telemetry_poll(inner: Arc<Mutex<Inner>>, gen: u64) {
+    loop {
+        // Stop if a newer run took over (or the lane stopped and bumped generation).
+        if inner.lock().expect("mutex").generation != gen {
+            return;
+        }
+        // Run the sync, timeout-bounded query OFF the async worker so a wedged driver
+        // can never stall the runtime.
+        let telem = tokio::task::spawn_blocking(query_nvidia_telemetry)
+            .await
+            .unwrap_or(None);
+        match telem {
+            Some(t) => {
+                let mut g = inner.lock().expect("mutex");
+                if g.generation != gen {
+                    return;
+                }
+                // Fill ONLY the fields the engine hasn't reported for this run — a real
+                // engine-parsed reading (set by `apply_telemetry`) always takes precedence.
+                if g.telem_temp_c.is_none() {
+                    g.telem_temp_c = t.temp_c;
+                }
+                if g.telem_power_w.is_none() {
+                    g.telem_power_w = t.power_w;
+                }
+                if g.telem_util_pct.is_none() {
+                    g.telem_util_pct = t.util_pct;
+                }
+                if g.telem_fan_pct.is_none() {
+                    g.telem_fan_pct = t.fan_pct;
+                }
+            }
+            // A failed query on the FIRST poll = no usable nvidia-smi (Apple/AMD/no driver);
+            // stop rather than spin. (Later transient failures also just end the task; the
+            // engine-parsed telemetry, when present, keeps the readout alive.)
+            None => return,
+        }
+        tokio::time::sleep(NVIDIA_TELEMETRY_POLL).await;
+    }
+}
+
+/// Query `nvidia-smi` once for the current temp/power/util/fan, returning the HOTTEST
+/// card across all rows (the safety-relevant reading on a multi-GPU rig). `None` when
+/// `nvidia-smi` is absent / errors / times out (fail-soft — the caller then stops the
+/// poll). Uses `nounits` so every cell is a bare number.
+fn query_nvidia_telemetry() -> Option<NvidiaTelemetry> {
+    let out = run_nvidia_smi_bounded(
+        &[
+            "--query-gpu=temperature.gpu,power.draw,utilization.gpu,fan.speed",
+            "--format=csv,noheader,nounits",
+        ],
+        NVIDIA_TELEMETRY_TIMEOUT,
+    )?;
+    parse_nvidia_telemetry_csv(&out)
+}
+
+/// Spawn `nvidia-smi <args>`, capture stdout, wait up to `timeout` (kill on timeout).
+/// `None` on ANY failure (missing binary / non-zero exit / non-UTF8 / timeout). Mirrors
+/// the `detect::run_bounded` pattern (no external `timeout(1)` dependency, Windows-safe).
+fn run_nvidia_smi_bounded(args: &[&str], timeout: Duration) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("nvidia-smi")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut out = String::new();
+                if let Some(mut so) = child.stdout.take() {
+                    let _ = so.read_to_string(&mut out);
+                }
+                return status.success().then_some(out);
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Parse the `nvidia-smi` telemetry CSV (`temp, power, util, fan` per row, `nounits`) and
+/// return the HOTTEST card's readings (max temperature). A cell that reads `[N/A]` /
+/// non-numeric → `None` for that field (fail-soft). `None` when no row parsed.
+fn parse_nvidia_telemetry_csv(csv: &str) -> Option<NvidiaTelemetry> {
+    let cell = |s: &str| -> Option<f64> { s.trim().parse::<f64>().ok() };
+    let mut best: Option<NvidiaTelemetry> = None;
+    let mut best_temp = f64::NEG_INFINITY;
+    for line in csv.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        let mut it = l.split(',');
+        let row = NvidiaTelemetry {
+            temp_c: it.next().and_then(cell),
+            power_w: it.next().and_then(cell),
+            util_pct: it.next().and_then(cell),
+            fan_pct: it.next().and_then(cell),
+        };
+        if row == NvidiaTelemetry::default() {
+            continue; // a fully-unparseable row contributes nothing
+        }
+        // Pick the hottest card; a row without a temp still seeds `best` if none yet.
+        let t = row.temp_c.unwrap_or(f64::NEG_INFINITY);
+        if best.is_none() || t > best_temp {
+            best_temp = t;
+            best = Some(row);
+        }
+    }
+    best
 }
 
 /// A higher-than-best hashrate counts as progress (re-arms the watchdog). A
@@ -1048,6 +1283,71 @@ mod tests {
     /// single-endpoint relay plan). The args are fixed.
     fn fixed_rebuild(program: std::path::PathBuf, args: Vec<String>) -> RebuildFn {
         Arc::new(move |_eps: &[Endpoint]| Ok((program.clone(), args.clone())))
+    }
+
+    // ── GPU telemetry (parse + fold) ───────────────────────────────────────────
+
+    /// The `nvidia-smi` CSV parser picks the HOTTEST card and reads each cell, and an
+    /// `[N/A]` cell becomes `None` (fail-soft) rather than corrupting the row.
+    #[test]
+    fn nvidia_telemetry_csv_picks_hottest_and_tolerates_na() {
+        // Two cards; the second is hotter → its readings win.
+        let csv = "61, 210.5, 97, 48\n74, 260.0, 99, 66\n";
+        let t = parse_nvidia_telemetry_csv(csv).expect("parsed");
+        assert_eq!(t.temp_c, Some(74.0), "hottest card");
+        assert_eq!(t.power_w, Some(260.0));
+        assert_eq!(t.util_pct, Some(99.0));
+        assert_eq!(t.fan_pct, Some(66.0));
+
+        // An `[N/A]` fan cell (a common laptop/passive-card case) → fan None, rest read.
+        let na = parse_nvidia_telemetry_csv("65, 180, 90, [N/A]").expect("parsed");
+        assert_eq!(na.temp_c, Some(65.0));
+        assert_eq!(na.fan_pct, None);
+
+        // Empty / all-junk input → None (fail-soft).
+        assert!(parse_nvidia_telemetry_csv("").is_none());
+        assert!(parse_nvidia_telemetry_csv("\n \n").is_none());
+    }
+
+    /// `apply_telemetry` folds a sample last-wins per field, leaving a field the sample
+    /// didn't carry intact (so an engine speed line without a temp keeps a prior temp /
+    /// an nvidia-smi reading).
+    #[test]
+    fn apply_telemetry_is_last_wins_per_field() {
+        let sup = LaneSupervisor::new(Lane::GpuRvn);
+        let mut g = sup.inner.lock().unwrap();
+        apply_telemetry(
+            &mut g,
+            &crate::stats::KawpowSample {
+                temp_c: Some(60.0),
+                power_w: Some(140.0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(g.telem_temp_c, Some(60.0));
+        assert_eq!(g.telem_power_w, Some(140.0));
+        // A later sample with only a new temp updates temp, KEEPS the prior power.
+        apply_telemetry(
+            &mut g,
+            &crate::stats::KawpowSample { temp_c: Some(63.0), ..Default::default() },
+        );
+        assert_eq!(g.telem_temp_c, Some(63.0), "temp updated");
+        assert_eq!(g.telem_power_w, Some(140.0), "power retained (sample carried none)");
+    }
+
+    /// `stats()` surfaces the folded telemetry into the UI-safe `LaneStats`.
+    #[test]
+    fn stats_surface_engine_parsed_telemetry() {
+        let sup = LaneSupervisor::new(Lane::GpuPrl);
+        {
+            let mut g = sup.inner.lock().unwrap();
+            g.telem_temp_c = Some(71.0);
+            g.telem_fan_pct = Some(55.0);
+        }
+        let st = sup.stats();
+        assert_eq!(st.temp_c, Some(71.0));
+        assert_eq!(st.fan_pct, Some(55.0));
+        assert_eq!(st.power_w, None, "unset field stays None");
     }
 
     #[test]

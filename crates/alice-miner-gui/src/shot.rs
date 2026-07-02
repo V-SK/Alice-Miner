@@ -422,6 +422,10 @@ fn demo_mining_snapshot() -> Snapshot {
         worker_id: Some("rig-7f3a9c21".into()),
         uptime_s: 2 * 3600 + 14 * 60 + 9, // 02:14:09
         failovers: 0,
+        temp_c: None,
+        power_w: None,
+        util_pct: None,
+        fan_pct: None,
         dual: false,
         lanes: Vec::new(),
         last_line: Some("accepted (142/1) diff 32001 (12 ms)".into()),
@@ -510,6 +514,10 @@ fn demo_state_snapshot(state: EngineState, message: Option<&str>) -> Snapshot {
         worker_id: Some("rig-7f3a9c21".into()),
         uptime_s: 0,
         failovers: 0,
+        temp_c: None,
+        power_w: None,
+        util_pct: None,
+        fan_pct: None,
         dual: false,
         lanes: Vec::new(),
         last_line: None,
@@ -738,6 +746,11 @@ fn demo_dual_snapshot() -> Snapshot {
         worker_id: Some("rig-7f3a9c21".into()),
         uptime_s: 47 * 60 + 12,
         failovers: 1, // the XMR lane rotated once (Layer B)
+        // Top-level telemetry mirrors the primary (XMR) lane — a CPU lane has none.
+        temp_c: None,
+        power_w: None,
+        util_pct: None,
+        fan_pct: None,
         dual: true,
         lanes: vec![
             alice_miner_core::engine::LaneSnapshot {
@@ -751,6 +764,10 @@ fn demo_dual_snapshot() -> Snapshot {
                 uptime_s: 38 * 60 + 5,
                 endpoint: Some("hk.aliceprotocol.org:3333".into()),
                 failovers: 1,
+                temp_c: None,
+                power_w: None,
+                util_pct: None,
+                fan_pct: None,
             },
             alice_miner_core::engine::LaneSnapshot {
                 lane: Lane::GpuPrl,
@@ -763,6 +780,11 @@ fn demo_dual_snapshot() -> Snapshot {
                 uptime_s: 38 * 60 + 5,
                 endpoint: Some("fi.aliceprotocol.org:3340".into()),
                 failovers: 0,
+                // Demo GPU telemetry so the showcase snapshot exercises the readout.
+                temp_c: Some(62.0),
+                power_w: Some(145.0),
+                util_pct: Some(98.0),
+                fan_pct: Some(55.0),
             },
         ],
         last_line: Some("accepted (142/1) diff 32001 (12 ms)".into()),
@@ -902,6 +924,10 @@ fn demo_prl_snapshot() -> Snapshot {
         worker_id: Some("rig-7f3a9c21".into()),
         uptime_s: 38 * 60 + 5,
         failovers: 0,
+        temp_c: None,
+        power_w: None,
+        util_pct: None,
+        fan_pct: None,
         dual: false,
         lanes: vec![alice_miner_core::engine::LaneSnapshot {
             lane: Lane::GpuPrl,
@@ -914,6 +940,10 @@ fn demo_prl_snapshot() -> Snapshot {
             uptime_s: 38 * 60 + 5,
             endpoint: Some("hk.aliceprotocol.org:3333".into()),
             failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
         }],
         last_line: Some("accepted (64/0) pearlhash".into()),
         message: None,

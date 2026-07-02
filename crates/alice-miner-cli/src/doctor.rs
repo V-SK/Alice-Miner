@@ -63,8 +63,28 @@ impl Status {
     }
 }
 
-/// One diagnostic line: a short `name`, the `status`, a one-line `detail`, and an
-/// EXACT `fix` (a command or step) when the status is not Pass/Skip.
+/// What `doctor --fix` may safely DO for a failing check, if anything. The SAFE
+/// variants are applied non-interactively; `PromptService` asks first on a TTY (and is
+/// skipped in a non-interactive run); everything not covered here has NO auto-fix
+/// (the identity / keyring / wallet class is INTENTIONALLY absent — a fix that could
+/// create or overwrite an identity is only ever PRINTED, never applied). See
+/// [`apply_fixes`] for the safe/prompt/never matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixAction {
+    /// Re-download (SHA-verify per miners.json) this lane's missing/corrupt engine.
+    /// Fully safe + idempotent — reuses the same pinned fetch `start` uses.
+    RedownloadEngine(MinerKind),
+    /// Recreate a malformed settings/config file (backing the old one up first). Safe:
+    /// it never touches identity/keystore/wallet, only the non-secret settings file.
+    RecreateConfig,
+    /// (Re)install / repair the background service — a bigger action, so PROMPT on a
+    /// TTY before doing it, and SKIP entirely in a non-interactive `--fix` run.
+    PromptService,
+}
+
+/// One diagnostic line: a short `name`, the `status`, a one-line `detail`, an EXACT
+/// `fix` string (a command or step) when the status is not Pass/Skip, and an OPTIONAL
+/// machine-applicable [`FixAction`] that `doctor --fix` can carry out.
 #[derive(Debug, Clone)]
 pub struct Check {
     pub name: &'static str,
@@ -72,20 +92,52 @@ pub struct Check {
     pub detail: String,
     /// The exact fix to apply (empty for Pass/Skip).
     pub fix: String,
+    /// A safe/prompt fix `doctor --fix` can apply, if any (`None` = print-only).
+    pub fix_action: Option<FixAction>,
 }
 
 impl Check {
     fn pass(name: &'static str, detail: impl Into<String>) -> Self {
-        Check { name, status: Status::Pass, detail: detail.into(), fix: String::new() }
+        Check {
+            name,
+            status: Status::Pass,
+            detail: detail.into(),
+            fix: String::new(),
+            fix_action: None,
+        }
     }
     fn warn(name: &'static str, detail: impl Into<String>, fix: impl Into<String>) -> Self {
-        Check { name, status: Status::Warn, detail: detail.into(), fix: fix.into() }
+        Check {
+            name,
+            status: Status::Warn,
+            detail: detail.into(),
+            fix: fix.into(),
+            fix_action: None,
+        }
     }
     fn fail(name: &'static str, detail: impl Into<String>, fix: impl Into<String>) -> Self {
-        Check { name, status: Status::Fail, detail: detail.into(), fix: fix.into() }
+        Check {
+            name,
+            status: Status::Fail,
+            detail: detail.into(),
+            fix: fix.into(),
+            fix_action: None,
+        }
     }
     fn skip(name: &'static str, detail: impl Into<String>) -> Self {
-        Check { name, status: Status::Skip, detail: detail.into(), fix: String::new() }
+        Check {
+            name,
+            status: Status::Skip,
+            detail: detail.into(),
+            fix: String::new(),
+            fix_action: None,
+        }
+    }
+
+    /// Attach a machine-applicable [`FixAction`] to a check (builder style).
+    fn with_action(mut self, action: FixAction) -> Self {
+        self.fix_action = Some(action);
+        self
     }
 }
 
@@ -107,6 +159,7 @@ fn kind_for_lane(lane: Lane) -> MinerKind {
 pub fn run_checks(lane: Lane, cap: &CapabilityProfile) -> Vec<Check> {
     let mut checks = vec![
         check_identity(),
+        check_config(),
         check_lane_support(lane, cap),
         check_gpu_compute_capability(lane, cap),
         check_engine(lane),
@@ -115,6 +168,46 @@ pub fn run_checks(lane: Lane, cap: &CapabilityProfile) -> Vec<Check> {
     ];
     checks.extend(platform_guardrails());
     checks
+}
+
+/// Config file integrity: the non-secret `settings.json` (language / lane prefs) must
+/// parse. A malformed file is a WARN (the app falls back to defaults, so it's not
+/// blocking) that `doctor --fix` can safely recreate — it backs the old file up first
+/// and NEVER touches identity / keystore / wallet (those live in separate files).
+fn check_config() -> Check {
+    const NAME: &str = "config";
+    let path = alice_miner_core::settings::settings_path();
+    match std::fs::read_to_string(&path) {
+        // Absent → nothing wrong (defaults apply); PASS.
+        Err(_) => Check::pass(
+            NAME,
+            tr!(
+                "no settings file yet (defaults apply)",
+                "尚无设置文件(使用默认值)"
+            ),
+        ),
+        Ok(s) => {
+            if serde_json::from_str::<serde_json::Value>(&s).is_ok() {
+                Check::pass(
+                    NAME,
+                    tr!("settings file is valid JSON", "设置文件是有效的 JSON"),
+                )
+            } else {
+                Check::warn(
+                    NAME,
+                    tr!(
+                        "the settings file is malformed (not valid JSON)",
+                        "设置文件已损坏(不是有效的 JSON)"
+                    ),
+                    tr!(
+                        "run `alice-miner doctor --fix` to recreate it (the old file is backed up first); or delete it — the app falls back to defaults",
+                        "运行 `alice-miner doctor --fix` 重建它(会先备份旧文件);或删除它 — 应用会回退到默认值"
+                    ),
+                )
+                .with_action(FixAction::RecreateConfig)
+            }
+        }
+    }
 }
 
 /// Identity / address validity: a valid SS58-300 Alice reward address must exist
@@ -169,14 +262,30 @@ fn check_identity() -> Check {
 fn check_lane_support(lane: Lane, cap: &CapabilityProfile) -> Check {
     const NAME: &str = "lane support";
     if cap.support(lane).is_runnable() {
-        Check::pass(NAME, format!("{} is runnable on this device", lane.label()))
+        Check::pass(
+            NAME,
+            format!(
+                "{} {}",
+                lane.label(),
+                tr!("is runnable on this device", "可在此设备上运行")
+            ),
+        )
     } else {
-        let reason = cap.viability.reason(lane).unwrap_or("not viable on this device");
+        let reason = cap
+            .viability
+            .reason(lane)
+            .unwrap_or(tr!("not viable on this device", "在此设备上不可用"));
         Check::fail(
             NAME,
-            format!("{} is {} ({reason})", lane.label(), cap.support(lane).label()),
             format!(
-                "use the recommended lane instead: `alice-miner start --lane {}`",
+                "{} {} {} ({reason})",
+                lane.label(),
+                tr!("is", "为"),
+                cap.support(lane).label()
+            ),
+            format!(
+                "{}: `alice-miner start --lane {}`",
+                tr!("use the recommended lane instead", "改用推荐的通道"),
                 cap.recommended_lane().id()
             ),
         )
@@ -190,28 +299,50 @@ fn check_lane_support(lane: Lane, cap: &CapabilityProfile) -> Check {
 fn check_gpu_compute_capability(lane: Lane, cap: &CapabilityProfile) -> Check {
     const NAME: &str = "gpu compute capability";
     if lane != Lane::GpuPrl {
-        return Check::skip(NAME, "only applies to the GPU-PRL (SRBMiner) lane");
+        return Check::skip(
+            NAME,
+            tr!(
+                "only applies to the GPU-PRL (SRBMiner) lane",
+                "仅适用于 GPU-PRL (SRBMiner) 通道"
+            ),
+        );
     }
     match cap.profile.gpu.max_compute_cap_x10 {
         Some(cc) if cc >= 75 => Check::pass(
             NAME,
-            format!("CC {}.{} ≥ 7.5 — SRBMiner pearlhash is supported", cc / 10, cc % 10),
+            format!(
+                "CC {}.{} {}",
+                cc / 10,
+                cc % 10,
+                tr!("≥ 7.5 — SRBMiner pearlhash is supported", "≥ 7.5 — 支持 SRBMiner pearlhash")
+            ),
         ),
         Some(cc) => Check::fail(
             NAME,
             format!(
-                "CC {}.{} is below 7.5 — SRBMiner pearlhash is unsupported on this card",
+                "CC {}.{} {}",
                 cc / 10,
-                cc % 10
+                cc % 10,
+                tr!(
+                    "is below 7.5 — SRBMiner pearlhash is unsupported on this card",
+                    "低于 7.5 — 此显卡不支持 SRBMiner pearlhash"
+                )
             ),
-            "use the Alpha lane (AlphaMiner covers Volta/V100): \
-             `alice-miner start --lane alpha`",
+            tr!(
+                "use the Alpha lane (AlphaMiner covers Volta/V100): `alice-miner start --lane alpha`",
+                "改用 Alpha 通道(AlphaMiner 覆盖 Volta/V100): `alice-miner start --lane alpha`"
+            ),
         ),
         None => Check::warn(
             NAME,
-            "no NVIDIA compute capability reported (non-NVIDIA card or nvidia-smi missing)",
-            "if this is an NVIDIA card, install the NVIDIA driver so `nvidia-smi` reports \
-             its compute capability; SRBMiner pearlhash needs CC 7.5+",
+            tr!(
+                "no NVIDIA compute capability reported (non-NVIDIA card or nvidia-smi missing)",
+                "未报告 NVIDIA 计算能力(非 NVIDIA 显卡或缺少 nvidia-smi)"
+            ),
+            tr!(
+                "if this is an NVIDIA card, install the NVIDIA driver so `nvidia-smi` reports its compute capability; SRBMiner pearlhash needs CC 7.5+",
+                "如果这是 NVIDIA 显卡,请安装 NVIDIA 驱动以便 `nvidia-smi` 报告其计算能力;SRBMiner pearlhash 需要 CC 7.5+"
+            ),
         ),
     }
 }
@@ -226,23 +357,39 @@ fn check_engine(lane: Lane) -> Check {
     // verifying the SHA pin throughout. A no-network fetchable lane still PASSES
     // (the download will run at start); a present binary PASSES immediately.
     match binaries::resolve_miner_binary(kind) {
-        Ok(path) => Check::pass(NAME, format!("{} resolved at {}", kind.binary_name(), path.display())),
+        Ok(path) => Check::pass(
+            NAME,
+            format!(
+                "{} {} {}",
+                kind.binary_name(),
+                tr!("resolved at", "已解析于"),
+                path.display()
+            ),
+        ),
         Err(e) => {
             if binaries::is_fetchable(kind) {
                 // A real pin + URL exist, but the resolve failed (e.g. offline). The
                 // download will run at start; surface the transient reason as a WARN.
+                // `doctor --fix` can fetch it now (SHA-verified) — a fully-safe action.
                 Check::warn(
                     NAME,
-                    format!("{} not yet cached: {e}", kind.binary_name()),
-                    "it will auto-download (sha-pinned) on the next `alice-miner start` \
-                     when the network is reachable",
+                    format!("{} {}: {e}", kind.binary_name(), tr!("not yet cached", "尚未缓存")),
+                    tr!(
+                        "it will auto-download (sha-pinned) on the next `alice-miner start` when the network is reachable, or run `alice-miner doctor --fix` to fetch it now",
+                        "网络可达时,下次 `alice-miner start` 会自动下载(sha 校验);或运行 `alice-miner doctor --fix` 立即获取"
+                    ),
                 )
+                .with_action(FixAction::RedownloadEngine(kind))
             } else {
                 Check::fail(
                     NAME,
-                    format!("{} is not available: {e}", kind.binary_name()),
+                    format!("{} {}: {e}", kind.binary_name(), tr!("is not available", "不可用")),
                     format!(
-                        "install a packaged release that bundles the engine: {}",
+                        "{}: {}",
+                        tr!(
+                            "install a packaged release that bundles the engine",
+                            "请安装内置引擎的打包版"
+                        ),
                         binaries::RELEASES_URL
                     ),
                 )
@@ -258,17 +405,33 @@ fn check_engine(lane: Lane) -> Check {
 fn check_keyring(lane: Lane) -> Check {
     const NAME: &str = "keyring (background GPU)";
     if !lane.is_prl_lane() {
-        return Check::skip(NAME, "only needed to BACKGROUND a GPU pearlhash lane");
+        return Check::skip(
+            NAME,
+            tr!(
+                "only needed to BACKGROUND a GPU pearlhash lane",
+                "仅在后台运行 GPU pearlhash 通道时需要"
+            ),
+        );
     }
     if alice_miner_core::keyring::is_available() {
-        Check::pass(NAME, "an OS keyring is available to hold the background wallet unlock")
+        Check::pass(
+            NAME,
+            tr!(
+                "an OS keyring is available to hold the background wallet unlock",
+                "系统密钥环可用,可保存后台钱包解锁凭据"
+            ),
+        )
     } else {
         Check::warn(
             NAME,
-            "no OS keyring on this box (e.g. a headless Linux rig)",
-            "foreground mining works without it; for BACKGROUND GPU mining, run on a box \
-             with a keyring (macOS Keychain / Windows Credential Manager / Linux Secret \
-             Service) or background the CPU-XMR lane instead",
+            tr!(
+                "no OS keyring on this box (e.g. a headless Linux rig)",
+                "此机器没有系统密钥环(例如无头 Linux 矿机)"
+            ),
+            tr!(
+                "foreground mining works without it; for BACKGROUND GPU mining, run on a box with a keyring (macOS Keychain / Windows Credential Manager / Linux Secret Service) or background the CPU-XMR lane instead",
+                "前台挖矿无需它;若要后台 GPU 挖矿,请在有密钥环的机器上运行(macOS 钥匙串 / Windows 凭据管理器 / Linux Secret Service),或改为后台运行 CPU-XMR 通道"
+            ),
         )
     }
 }
@@ -321,23 +484,30 @@ fn platform_guardrails() -> Vec<Check> {
     if cfg!(target_os = "windows") {
         out.push(Check::warn(
             "windows defender (PUA)",
-            "Windows Defender flags mining engines as a \"potentially unwanted application\" \
-             (a known false positive) and may quarantine the engine",
+            tr!(
+                "Windows Defender flags mining engines as a \"potentially unwanted application\" (a known false positive) and may quarantine the engine",
+                "Windows Defender 会把挖矿引擎标记为\"潜在有害应用\"(已知误报)并可能隔离它"
+            ),
             format!(
-                "if mining won't start, allow the engine cache in Defender — in an elevated \
-                 PowerShell run: Add-MpPreference -ExclusionPath '{cache}'"
+                "{} Add-MpPreference -ExclusionPath '{cache}'",
+                tr!(
+                    "if mining won't start, allow the engine cache in Defender — in an elevated PowerShell run:",
+                    "如果挖矿无法启动,请在 Defender 中放行引擎缓存 — 在管理员 PowerShell 中运行:"
+                )
             ),
         ));
     }
     if cfg!(target_os = "macos") {
         out.push(Check::warn(
             "macos gatekeeper / app-nap",
-            "macOS App Nap can throttle a backgrounded miner to ~0 H/s, and Gatekeeper can \
-             block a freshly-downloaded engine",
-            "the packaged app sets NSAppSleepDisabled + uses caffeinate to defeat App Nap; if \
-             you launched a raw binary and hashrate drops to 0 when the window is hidden, run \
-             it under `caffeinate -dimsu alice-miner start …` and keep the engine in the \
-             packaged app so Gatekeeper trusts it",
+            tr!(
+                "macOS App Nap can throttle a backgrounded miner to ~0 H/s, and Gatekeeper can block a freshly-downloaded engine",
+                "macOS App Nap 会把后台矿工限速到 ~0 H/s,Gatekeeper 可能拦截刚下载的引擎"
+            ),
+            tr!(
+                "the packaged app sets NSAppSleepDisabled + uses caffeinate to defeat App Nap; if you launched a raw binary and hashrate drops to 0 when the window is hidden, run it under `caffeinate -dimsu alice-miner start …` and keep the engine in the packaged app so Gatekeeper trusts it",
+                "打包版会设置 NSAppSleepDisabled 并使用 caffeinate 来对抗 App Nap;如果你直接运行裸二进制且窗口隐藏时算力掉到 0,请用 `caffeinate -dimsu alice-miner start …` 运行,并把引擎保留在打包版内以便 Gatekeeper 信任它"
+            ),
         ));
     }
     out
@@ -412,6 +582,210 @@ pub fn has_blocking_failure(checks: &[Check]) -> bool {
     checks.iter().any(|c| c.status == Status::Fail)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// `doctor --fix` — safe/prompt/never auto-repair
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The SAFE/PROMPT/NEVER matrix (the brief):
+//   * SAFE (auto-applied, even non-interactively):
+//       - RedownloadEngine → re-fetch the SHA-pinned engine via binaries::ensure_cached_engine
+//       - RecreateConfig    → back up the malformed settings.json, then write a fresh default
+//   * PROMPT (TTY only): PromptService → (re)install/repair the background service; SKIPPED
+//       (with a note) in a non-interactive `--fix` run.
+//   * NEVER: identity / keyring / wallet — a fix that could create/overwrite an identity is
+//       ONLY printed as a manual step, never applied. (Those checks carry no FixAction.)
+
+/// The result of attempting one check's fix. Presentation-only wording is localized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixOutcome {
+    /// A safe fix was applied successfully; the string is a short what-was-done note.
+    Applied(String),
+    /// A prompt-required fix was SKIPPED (non-interactive run, or the user declined).
+    Skipped(String),
+    /// The fix failed; the string is the reason (never a secret).
+    Failed(String),
+}
+
+/// Apply the safe (and, when `interactive`, prompt-gated) fixes for `checks`, returning
+/// a human report of what was done. `prompt` is asked before a [`FixAction::PromptService`]
+/// (only when `interactive`); in a non-interactive run those are SKIPPED with a note.
+/// Never touches identity/keystore/wallet (those checks carry no [`FixAction`]).
+///
+/// The actual side-effecting fix appliers are the small pure-ish functions below; this
+/// only orchestrates + formats, so it stays testable via [`apply_one_fix`].
+pub fn apply_fixes(
+    checks: &[Check],
+    interactive: bool,
+    prompt: &mut dyn FnMut(&str) -> bool,
+) -> String {
+    let mut out = String::new();
+    out.push_str(tr!("Applying safe fixes…\n", "正在应用安全修复…\n"));
+    out.push_str("─────────────────────────────────────────────\n");
+    let mut any = false;
+    for c in checks {
+        let Some(action) = c.fix_action else { continue };
+        // The service fix PROMPTS on a TTY and is SKIPPED non-interactively.
+        if action == FixAction::PromptService {
+            if !interactive {
+                any = true;
+                out.push_str(&format!(
+                    "  [{}] {} — {}\n",
+                    tr!("SKIP", "跳过"),
+                    c.name,
+                    tr!(
+                        "needs a prompt; re-run `doctor --fix` in a terminal to (re)install the service",
+                        "需要确认;请在终端中重新运行 `doctor --fix` 以(重新)安装服务"
+                    ),
+                ));
+                continue;
+            }
+            let q = tr!(
+                "(Re)install/repair the background service now? [y/N]: ",
+                "现在(重新)安装/修复后台服务吗? [y/N]: "
+            );
+            if !prompt(q) {
+                any = true;
+                out.push_str(&format!(
+                    "  [{}] {} — {}\n",
+                    tr!("SKIP", "跳过"),
+                    c.name,
+                    tr!("declined", "已跳过")
+                ));
+                continue;
+            }
+        }
+        any = true;
+        let outcome = apply_one_fix(action);
+        let (tag, msg) = match outcome {
+            FixOutcome::Applied(m) => (tr!("FIXED", "已修复"), m),
+            FixOutcome::Skipped(m) => (tr!("SKIP", "跳过"), m),
+            FixOutcome::Failed(m) => (tr!("FAILED", "失败"), m),
+        };
+        out.push_str(&format!("  [{tag}] {} — {msg}\n", c.name));
+    }
+    // Print the manual-only steps for any non-Pass check WITHOUT a fix action (the
+    // identity/keyring/wallet "never auto-touch" class) so the user still sees them.
+    let manual: Vec<&Check> = checks
+        .iter()
+        .filter(|c| {
+            c.fix_action.is_none()
+                && matches!(c.status, Status::Fail | Status::Warn)
+                && !c.fix.is_empty()
+        })
+        .collect();
+    let had_manual = !manual.is_empty();
+    if had_manual {
+        out.push_str(&format!(
+            "\n{}\n",
+            tr!(
+                "Manual steps (not auto-applied — identity/keyring/wallet are never auto-touched):",
+                "手动步骤(不会自动应用 — 身份/密钥环/钱包绝不自动修改):"
+            )
+        ));
+        for c in manual {
+            out.push_str(&format!("  • {} — {}\n", c.name, c.fix));
+        }
+    }
+    if !any && !had_manual {
+        out.push_str(tr!("Nothing to fix.\n", "无需修复。\n"));
+    }
+    out
+}
+
+/// Apply ONE [`FixAction`] (the safe/prompt appliers). Pure w.r.t. its input action;
+/// touches disk/network only for the specific safe repair. Never handles identity.
+pub fn apply_one_fix(action: FixAction) -> FixOutcome {
+    match action {
+        FixAction::RedownloadEngine(kind) => fix_redownload_engine(kind),
+        FixAction::RecreateConfig => fix_recreate_config(),
+        // Reaching here means the caller already prompted (interactive). The concrete
+        // service install/repair lives in the service module; we surface a clear
+        // "not yet wired" rather than silently claiming success. (Kept explicit so the
+        // matrix is complete even before the service repair path lands.)
+        FixAction::PromptService => FixOutcome::Skipped(
+            tr!(
+                "service (re)install is not available from doctor yet — use `alice-miner service …`",
+                "doctor 暂不支持(重新)安装服务 — 请使用 `alice-miner service …`"
+            )
+            .to_string(),
+        ),
+    }
+}
+
+/// SAFE fix: re-fetch the SHA-pinned engine for `kind` (reuses the same verified fetch
+/// `start` uses). Idempotent — a fetch of an already-cached, verified engine is a no-op
+/// resolve. Fail-soft: a network/verify error is reported, never a panic.
+fn fix_redownload_engine(kind: MinerKind) -> FixOutcome {
+    if !binaries::is_fetchable(kind) {
+        return FixOutcome::Failed(
+            tr!(
+                "no verifiable download source for this engine on this platform (install a packaged release)",
+                "此平台没有此引擎的可验证下载源(请安装打包版)"
+            )
+            .to_string(),
+        );
+    }
+    match binaries::ensure_cached_engine(kind) {
+        Ok(path) => FixOutcome::Applied(format!(
+            "{} {} → {}",
+            tr!("re-downloaded (sha-verified)", "已重新下载(校验通过)"),
+            kind.binary_name(),
+            path.display()
+        )),
+        Err(e) => FixOutcome::Failed(format!(
+            "{}: {e}",
+            tr!("engine re-download failed", "引擎重新下载失败")
+        )),
+    }
+}
+
+/// SAFE fix: recreate a malformed settings/config file. Backs up the old file to
+/// `settings.json.bak` FIRST (best-effort), then writes a fresh default via the core
+/// settings writer. Never touches identity/keystore/wallet (separate files). Fail-soft.
+fn fix_recreate_config() -> FixOutcome {
+    let path = alice_miner_core::settings::settings_path();
+    // Only act if the file exists AND is malformed (defensive re-check so `--fix` never
+    // clobbers a VALID config, even if the check list is stale).
+    match std::fs::read_to_string(&path) {
+        Ok(s) if serde_json::from_str::<serde_json::Value>(&s).is_ok() => {
+            return FixOutcome::Skipped(
+                tr!("config is already valid — nothing to do", "配置已有效 — 无需操作").to_string(),
+            );
+        }
+        Err(_) => {
+            // Absent: writing a default is harmless but not a "repair" — treat as nothing.
+            return FixOutcome::Skipped(
+                tr!("no config file to repair", "没有需要修复的配置文件").to_string(),
+            );
+        }
+        Ok(_) => { /* malformed → proceed to back up + recreate */ }
+    }
+    // Back up the malformed file first (best-effort; a backup failure still lets us fix).
+    let backup = path.with_extension("json.bak");
+    let backed_up = std::fs::copy(&path, &backup).is_ok();
+    match alice_miner_core::settings::save(&alice_miner_core::settings::Settings::default()) {
+        Ok(_) => {
+            let note = if backed_up {
+                format!(
+                    " ({} {})",
+                    tr!("old file backed up to", "旧文件已备份至"),
+                    backup.display()
+                )
+            } else {
+                String::new()
+            };
+            FixOutcome::Applied(format!(
+                "{}{note}",
+                tr!("recreated a fresh default settings file", "已重建一份全新的默认设置文件")
+            ))
+        }
+        Err(e) => FixOutcome::Failed(format!(
+            "{}: {e}",
+            tr!("could not write a fresh settings file", "无法写入新的设置文件")
+        )),
+    }
+}
+
 /// Print a one-line summary to stderr that a `start` pre-flight can show (a light
 /// version of doctor inside `start` — the spec's "run a light version inside
 /// start"). Best-effort; never blocks mining.
@@ -478,12 +852,15 @@ fn check_ai_python(python: &str) -> Check {
             } else {
                 v.trim().to_string()
             };
-            Check::pass(NAME, format!("{python} present ({v})"))
+            Check::pass(NAME, format!("{python} {} ({v})", tr!("present", "已安装")))
         }
         _ => Check::fail(
             NAME,
-            format!("python3 not found / not runnable at {python:?}"),
-            "install Python 3 (the shard engine runs on it) or pass --python <path-to-python3>",
+            format!("{} {python:?}", tr!("python3 not found / not runnable at", "在此处找不到 / 无法运行 python3:")),
+            tr!(
+                "install Python 3 (the shard engine runs on it) or pass --python <path-to-python3>",
+                "请安装 Python 3(分片引擎在其上运行),或传入 --python <python3 路径>"
+            ),
         ),
     }
 }
@@ -494,17 +871,23 @@ fn check_ai_engine_dir(engine_dir: Option<&std::path::Path>) -> Check {
     match engine_dir {
         None => Check::fail(
             NAME,
-            "no engine dir set",
-            "pass --engine-dir <alice-shard-engine checkout> (or set ALICE_SHARD_ENGINE_PATH); \
-             it must contain phase0/pipeline.py",
+            tr!("no engine dir set", "未设置引擎目录"),
+            tr!(
+                "pass --engine-dir <alice-shard-engine checkout> (or set ALICE_SHARD_ENGINE_PATH); it must contain phase0/pipeline.py",
+                "请传入 --engine-dir <alice-shard-engine 检出目录>(或设置 ALICE_SHARD_ENGINE_PATH);它必须包含 phase0/pipeline.py"
+            ),
         ),
-        Some(dir) if dir.join("phase0/pipeline.py").is_file() => {
-            Check::pass(NAME, format!("phase0/pipeline.py found under {}", dir.display()))
-        }
+        Some(dir) if dir.join("phase0/pipeline.py").is_file() => Check::pass(
+            NAME,
+            format!("{} {}", tr!("phase0/pipeline.py found under", "在此处找到 phase0/pipeline.py:"), dir.display()),
+        ),
         Some(dir) => Check::fail(
             NAME,
-            format!("phase0/pipeline.py is missing under {}", dir.display()),
-            "point --engine-dir at your alice-shard-engine checkout (the dir that has phase0/)",
+            format!("{} {}", tr!("phase0/pipeline.py is missing under", "此处缺少 phase0/pipeline.py:"), dir.display()),
+            tr!(
+                "point --engine-dir at your alice-shard-engine checkout (the dir that has phase0/)",
+                "请把 --engine-dir 指向你的 alice-shard-engine 检出目录(含 phase0/ 的目录)"
+            ),
         ),
     }
 }
@@ -520,23 +903,31 @@ fn check_ai_torch(python: &str) -> Check {
     ) {
         Ok(Some(out)) if out.status.success() => Check::pass(
             NAME,
-            format!("torch {} importable", String::from_utf8_lossy(&out.stdout).trim()),
+            format!("torch {} {}", String::from_utf8_lossy(&out.stdout).trim(), tr!("importable", "可导入")),
         ),
         Ok(Some(_)) => Check::fail(
             NAME,
-            "python3 could not import torch",
-            "install the engine's deps into this python: `pip install torch` (and the rest of \
-             phase0/requirements*.txt) — the stage cannot load model layers without torch",
+            tr!("python3 could not import torch", "python3 无法导入 torch"),
+            tr!(
+                "install the engine's deps into this python: `pip install torch` (and the rest of phase0/requirements*.txt) — the stage cannot load model layers without torch",
+                "请把引擎依赖安装到此 python: `pip install torch`(以及 phase0/requirements*.txt 的其余部分)— 没有 torch 该阶段无法加载模型层"
+            ),
         ),
         Ok(None) => Check::warn(
             NAME,
-            "torch import check timed out (a slow first import / large environment)",
-            "run `python3 -c \"import torch\"` by hand to confirm it imports before starting",
+            tr!(
+                "torch import check timed out (a slow first import / large environment)",
+                "torch 导入检查超时(首次导入较慢 / 环境较大)"
+            ),
+            tr!(
+                "run `python3 -c \"import torch\"` by hand to confirm it imports before starting",
+                "启动前请手动运行 `python3 -c \"import torch\"` 确认可导入"
+            ),
         ),
         Err(e) => Check::fail(
             NAME,
-            format!("could not run the torch import check: {e}"),
-            "confirm --python points at a working python3",
+            format!("{}: {e}", tr!("could not run the torch import check", "无法运行 torch 导入检查")),
+            tr!("confirm --python points at a working python3", "请确认 --python 指向一个可用的 python3"),
         ),
     }
 }
@@ -550,19 +941,33 @@ fn check_ai_nvidia(allow_cpu: bool) -> Check {
         .map(|o| o.status.success())
         .unwrap_or(false);
     if smi_ok {
-        Check::pass(NAME, "nvidia-smi reports at least one NVIDIA GPU")
+        Check::pass(
+            NAME,
+            tr!("nvidia-smi reports at least one NVIDIA GPU", "nvidia-smi 报告至少一块 NVIDIA GPU"),
+        )
     } else if allow_cpu {
         Check::warn(
             NAME,
-            "no NVIDIA GPU detected, but --allow-cpu was given (testing only)",
-            "a real inference stage needs a GPU; --allow-cpu only lets a no-NVIDIA box register",
+            tr!(
+                "no NVIDIA GPU detected, but --allow-cpu was given (testing only)",
+                "未检测到 NVIDIA GPU,但已指定 --allow-cpu(仅供测试)"
+            ),
+            tr!(
+                "a real inference stage needs a GPU; --allow-cpu only lets a no-NVIDIA box register",
+                "真正的推理阶段需要 GPU;--allow-cpu 只是让无 NVIDIA 的机器能注册"
+            ),
         )
     } else {
         Check::fail(
             NAME,
-            "no NVIDIA GPU detected (nvidia-smi missing or reported none)",
-            "install the NVIDIA driver so nvidia-smi works, or pass --allow-cpu to run without a \
-             GPU for testing (a real stage needs a GPU)",
+            tr!(
+                "no NVIDIA GPU detected (nvidia-smi missing or reported none)",
+                "未检测到 NVIDIA GPU(缺少 nvidia-smi 或其未报告任何 GPU)"
+            ),
+            tr!(
+                "install the NVIDIA driver so nvidia-smi works, or pass --allow-cpu to run without a GPU for testing (a real stage needs a GPU)",
+                "请安装 NVIDIA 驱动使 nvidia-smi 可用,或传入 --allow-cpu 以在无 GPU 情况下测试运行(真正的阶段需要 GPU)"
+            ),
         )
     }
 }
@@ -573,8 +978,11 @@ fn check_ai_endpoint(endpoint: Option<&str>) -> Check {
     let Some(ep) = endpoint else {
         return Check::fail(
             NAME,
-            "no endpoint set",
-            "pass --endpoint <public host:port> (the address the swarm dials this stage)",
+            tr!("no endpoint set", "未设置端点"),
+            tr!(
+                "pass --endpoint <public host:port> (the address the swarm dials this stage)",
+                "请传入 --endpoint <公网 host:port>(集群拨号到此阶段的地址)"
+            ),
         );
     };
     let port = match ep.trim().rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()) {
@@ -582,21 +990,31 @@ fn check_ai_endpoint(endpoint: Option<&str>) -> Check {
         _ => {
             return Check::fail(
                 NAME,
-                format!("endpoint {ep:?} is not host:port with a valid 1..=65535 port"),
-                "use host:port, e.g. --endpoint 203.0.113.7:29501",
+                format!(
+                    "{} {ep:?}",
+                    tr!(
+                        "not host:port with a valid 1..=65535 port:",
+                        "不是带有效 1..=65535 端口的 host:port:"
+                    )
+                ),
+                tr!("use host:port, e.g. --endpoint 203.0.113.7:29501", "请使用 host:port,例如 --endpoint 203.0.113.7:29501"),
             )
         }
     };
     // Try to bind loopback:port — if it binds, nothing else holds it (the engine
     // will listen there). We immediately drop the listener.
     match std::net::TcpListener::bind(("127.0.0.1", port)) {
-        Ok(_l) => Check::pass(NAME, format!("port {port} is free to bind locally")),
+        Ok(_l) => Check::pass(
+            NAME,
+            format!("{} {port} {}", tr!("port", "端口"), tr!("is free to bind locally", "可在本地绑定")),
+        ),
         Err(e) => Check::warn(
             NAME,
-            format!("port {port} is not bindable locally right now: {e}"),
-            "another process may hold it (a previous stage?); free it, or advertise a different \
-             port. NOTE: the PUBLIC reachability of the endpoint still depends on your NAT / \
-             port-forwarding — doctor only checks the LOCAL bind",
+            format!("{} {port} {}: {e}", tr!("port", "端口"), tr!("is not bindable locally right now", "当前无法在本地绑定")),
+            tr!(
+                "another process may hold it (a previous stage?); free it, or advertise a different port. NOTE: the PUBLIC reachability of the endpoint still depends on your NAT / port-forwarding — doctor only checks the LOCAL bind",
+                "可能有其他进程占用它(上一个阶段?);请释放它,或改用其他端口。注意:端点的公网可达性仍取决于你的 NAT / 端口转发 — doctor 只检查本地绑定"
+            ),
         ),
     }
 }
@@ -609,8 +1027,11 @@ fn check_ai_center(center_url: Option<&str>) -> Check {
     if !url.starts_with("https://") {
         return Check::fail(
             NAME,
-            format!("center url is not https://: {url}"),
-            "use an https:// --center-url (a PoP signature must never cross the wire in the clear)",
+            format!("{}: {url}", tr!("center url is not https://", "center url 不是 https://")),
+            tr!(
+                "use an https:// --center-url (a PoP signature must never cross the wire in the clear)",
+                "请使用 https:// 的 --center-url(PoP 签名绝不能明文传输)"
+            ),
         );
     }
     match alice_miner_core::shard::probe_center_health(url) {
@@ -618,7 +1039,10 @@ fn check_ai_center(center_url: Option<&str>) -> Check {
         Err(e) => Check::fail(
             NAME,
             e,
-            "check the --center-url and your network / firewall (outbound https must be reachable)",
+            tr!(
+                "check the --center-url and your network / firewall (outbound https must be reachable)",
+                "请检查 --center-url 和你的网络 / 防火墙(出站 https 必须可达)"
+            ),
         ),
     }
 }
@@ -807,6 +1231,105 @@ mod tests {
         assert!(!has_blocking_failure(&ok));
         let bad = vec![Check::pass("a", "fine"), Check::fail("c", "broken", "fix")];
         assert!(has_blocking_failure(&bad));
+    }
+
+    // ── doctor --fix (safe / prompt / never matrix) ────────────────────────────
+
+    /// The identity check carries NO [`FixAction`] — a fix that could create/overwrite
+    /// an identity must only be PRINTED, never auto-applied (the hard rule). This locks
+    /// the "NEVER auto-touch identity/keyring/wallet" invariant.
+    #[test]
+    fn identity_and_keyring_checks_have_no_fix_action() {
+        // Identity is never auto-fixable regardless of state.
+        assert!(check_identity().fix_action.is_none(), "identity must never auto-fix");
+        // The keyring / relay checks likewise carry no auto-fix (relay may PASS or FAIL
+        // depending on the box, but never carries a machine fix action either way).
+        assert!(check_keyring(Lane::GpuPrl).fix_action.is_none());
+        assert!(check_relay(Lane::Xmr).fix_action.is_none());
+    }
+
+    /// The engine check attaches a safe RedownloadEngine action ONLY when the engine is
+    /// missing-but-fetchable (a WARN); a resolved engine (PASS) carries no action.
+    #[test]
+    fn engine_check_action_matches_fetchability() {
+        let c = check_engine(Lane::Xmr);
+        match c.status {
+            Status::Pass => assert!(c.fix_action.is_none(), "resolved engine → no fix action"),
+            Status::Warn => assert!(
+                matches!(c.fix_action, Some(FixAction::RedownloadEngine(_))),
+                "fetchable-but-uncached → RedownloadEngine action"
+            ),
+            _ => {}
+        }
+    }
+
+    /// `apply_fixes` in a NON-interactive run SKIPS a prompt-required service fix with a
+    /// note (never silently applies it) and reports the manual-only steps.
+    #[test]
+    fn apply_fixes_skips_prompt_fix_when_non_interactive() {
+        let checks = vec![
+            Check::fail("background service", "not installed", "install it")
+                .with_action(FixAction::PromptService),
+            // A manual-only (no-action) failing check → surfaced under "Manual steps".
+            Check::fail("identity", "no reward identity yet", "create one"),
+        ];
+        // A prompt that would PANIC if called — proving the non-interactive path never asks.
+        let mut never = |_: &str| panic!("must not prompt when non-interactive");
+        let report = apply_fixes(&checks, /*interactive=*/ false, &mut never);
+        assert!(report.contains("background service"), "service line present: {report}");
+        assert!(report.to_lowercase().contains("skip") || report.contains("跳过"), "skipped: {report}");
+        assert!(report.contains("Manual steps"), "manual steps surfaced: {report}");
+        assert!(report.contains("identity"), "identity is a manual step: {report}");
+    }
+
+    /// `apply_fixes` PROMPTS for a service fix on a TTY and honors a "no" answer.
+    #[test]
+    fn apply_fixes_prompts_and_respects_decline() {
+        let checks = vec![Check::fail("background service", "not installed", "install it")
+            .with_action(FixAction::PromptService)];
+        let mut asked = false;
+        let mut decline = |_: &str| {
+            asked = true;
+            false // decline
+        };
+        let report = apply_fixes(&checks, /*interactive=*/ true, &mut decline);
+        assert!(asked, "the service fix must prompt on a TTY");
+        assert!(report.to_lowercase().contains("declined") || report.contains("已跳过"), "{report}");
+    }
+
+    /// The safe RecreateConfig fix backs up a MALFORMED settings file and writes a fresh
+    /// default; it is a no-op (Skipped) on a VALID or absent file (never clobbers a good
+    /// config). Isolated via a temp ALICE_IDENTITY_DIR.
+    #[test]
+    fn recreate_config_backs_up_and_rewrites_only_when_malformed() {
+        let _g = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "alice-doctor-cfg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+        let path = alice_miner_core::settings::settings_path();
+
+        // (a) No file → Skipped (nothing to repair).
+        assert!(matches!(fix_recreate_config(), FixOutcome::Skipped(_)));
+
+        // (b) Malformed file → Applied; a backup exists and the file now parses.
+        std::fs::write(&path, b"{ this is not json").unwrap();
+        assert!(matches!(fix_recreate_config(), FixOutcome::Applied(_)), "malformed → applied");
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&repaired).is_ok(), "repaired to valid JSON");
+        assert!(path.with_extension("json.bak").exists(), "old file backed up");
+
+        // (c) A now-valid file → Skipped (never clobbers a good config).
+        assert!(matches!(fix_recreate_config(), FixOutcome::Skipped(_)), "valid → no-op");
+
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The json form is valid JSON with the expected shape (lane, ready, checks[]).

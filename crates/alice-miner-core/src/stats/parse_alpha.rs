@@ -47,13 +47,33 @@ pub fn parse_alpha(raw: &str) -> Option<KawpowSample> {
     }
     let hashrate_hs = logfmt_f64(line, "hashrate_th_s").map(|th| th * 1e12);
     let accepted = logfmt_u64(line, "hits");
-    if hashrate_hs.is_none() && accepted.is_none() {
+    // Best-effort telemetry from the status line's optional logfmt keys. alpha-miner
+    // builds vary in which they emit; each is fail-soft (absent → None) and matched on
+    // a WHOLE key so `gpu_temp_c` never collides with another key. Never breaks the
+    // hashrate/hits parse.
+    let temp_c = logfmt_f64(line, "gpu_temp_c")
+        .or_else(|| logfmt_f64(line, "temp_c"))
+        .or_else(|| logfmt_f64(line, "temperature_c"));
+    let power_w = logfmt_f64(line, "gpu_power_w").or_else(|| logfmt_f64(line, "power_w"));
+    let util_pct = logfmt_f64(line, "gpu_util_pct").or_else(|| logfmt_f64(line, "util_pct"));
+    let fan_pct = logfmt_f64(line, "gpu_fan_pct").or_else(|| logfmt_f64(line, "fan_pct"));
+    if hashrate_hs.is_none()
+        && accepted.is_none()
+        && temp_c.is_none()
+        && power_w.is_none()
+        && util_pct.is_none()
+        && fan_pct.is_none()
+    {
         return None;
     }
     Some(KawpowSample {
         hashrate_hs,
         accepted,
         rejected: None, // the client never sees a pool reject — the relay owns acceptance
+        temp_c,
+        power_w,
+        util_pct,
+        fan_pct,
     })
 }
 
@@ -140,6 +160,28 @@ mod tests {
         let only_hits = "ts component=miner status attempts=1 hits=7";
         assert_eq!(parse_alpha(only_hits).unwrap().accepted, Some(7));
         assert_eq!(parse_alpha(only_hits).unwrap().hashrate_hs, None);
+    }
+
+    #[test]
+    fn status_line_optional_telemetry_keys_are_captured() {
+        // A build that DOES emit telemetry keys on the status line.
+        let line = "ts component=miner status attempts=8 hits=2 hashrate_th_s=9.58 gpu_temp_c=61 gpu_power_w=210 gpu_util_pct=99 gpu_fan_pct=48";
+        let s = parse_alpha(line).expect("parsed");
+        assert_eq!(s.hashrate_hs, Some(9.58e12));
+        assert_eq!(s.temp_c, Some(61.0));
+        assert_eq!(s.power_w, Some(210.0));
+        assert_eq!(s.util_pct, Some(99.0));
+        assert_eq!(s.fan_pct, Some(48.0));
+    }
+
+    #[test]
+    fn status_line_without_telemetry_keys_leaves_them_none() {
+        // The real V100 capture has no telemetry keys → all None (fail-soft).
+        let s = parse_alpha(STATUS1).expect("parsed");
+        assert_eq!(s.temp_c, None);
+        assert_eq!(s.power_w, None);
+        assert_eq!(s.util_pct, None);
+        assert_eq!(s.fan_pct, None);
     }
 
     #[test]

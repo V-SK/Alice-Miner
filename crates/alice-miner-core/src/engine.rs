@@ -177,6 +177,19 @@ pub struct Snapshot {
     /// How many times Layer B has rotated the endpoint cursor this run (0 = never
     /// failed over). The dashboard shows a "failed over" note when > 0.
     pub failovers: u64,
+    /// Top-level GPU hardware telemetry (mirrors the PRIMARY lane; the hottest card on
+    /// a multi-GPU rig), from the engine's stdout or the `nvidia-smi` fallback. `None`
+    /// when unavailable. In DUAL mode this stays the primary lane's reading — the
+    /// per-lane `lanes` rows carry each lane's own telemetry. Additive +
+    /// `skip`-when-`None` so `--json` stays backward-compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power_w: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub util_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_pct: Option<f64>,
     /// Whether dual-mine is active (both lanes running). Drives the dashboard's
     /// two-row lane stack.
     pub dual: bool,
@@ -242,6 +255,20 @@ pub struct LaneSnapshot {
     pub endpoint: Option<String>,
     /// This lane's Layer-B failover count this run.
     pub failovers: u64,
+    /// GPU hardware telemetry for THIS lane (the hottest card on a multi-GPU rig),
+    /// sourced from the engine's own stdout when it reports it, else a best-effort
+    /// `nvidia-smi` fallback. `None` when unavailable (a CPU lane, an engine that
+    /// doesn't report it with no NVIDIA fallback, or Apple/AMD). Additive +
+    /// `skip`-when-`None`, so `--json` stays backward-compatible for any lane/older
+    /// stream that carries no telemetry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power_w: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub util_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_pct: Option<f64>,
 }
 
 impl Snapshot {
@@ -259,6 +286,10 @@ impl Snapshot {
             worker_id: None,
             uptime_s: 0,
             failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
             dual: false,
             lanes: Vec::new(),
             last_line: None,
@@ -1192,6 +1223,11 @@ fn build_snapshot(
             uptime_s: st.uptime_s,
             endpoint: st.endpoint.clone(),
             failovers: st.failovers,
+            // Per-lane GPU telemetry (engine stdout or nvidia-smi fallback; hottest card).
+            temp_c: st.temp_c,
+            power_w: st.power_w,
+            util_pct: st.util_pct,
+            fan_pct: st.fan_pct,
         });
     }
 
@@ -1209,6 +1245,12 @@ fn build_snapshot(
         snap.endpoint = st.endpoint.clone();
         snap.uptime_s = st.uptime_s;
         snap.failovers = st.failovers;
+        // Top-level telemetry mirrors the primary lane (the per-lane rows carry each
+        // lane's own). Even in dual mode this stays the primary's reading.
+        snap.temp_c = st.temp_c;
+        snap.power_w = st.power_w;
+        snap.util_pct = st.util_pct;
+        snap.fan_pct = st.fan_pct;
         snap.message = st.message.clone();
         if !st.last_line.is_empty() {
             snap.last_line = Some(st.last_line);
@@ -1295,6 +1337,10 @@ mod tests {
             worker_id: Some("worker".into()),
             uptime_s: 42,
             failovers: 1,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
             dual: true,
             lanes: vec![
                 LaneSnapshot {
@@ -1308,6 +1354,10 @@ mod tests {
                     uptime_s: 42,
                     endpoint: Some("hk.aliceprotocol.org:3333".into()),
                     failovers: 1,
+                    temp_c: None,
+                    power_w: None,
+                    util_pct: None,
+                    fan_pct: None,
                 },
                 LaneSnapshot {
                     lane: Lane::GpuRvn,
@@ -1321,6 +1371,10 @@ mod tests {
                     uptime_s: 42,
                     endpoint: Some("hk.aliceprotocol.org:8888".into()),
                     failovers: 0,
+                    temp_c: None,
+                    power_w: None,
+                    util_pct: None,
+                    fan_pct: None,
                 },
             ],
             last_line: Some("net accepted (7/1)".into()),
