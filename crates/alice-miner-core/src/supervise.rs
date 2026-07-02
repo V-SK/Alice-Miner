@@ -621,15 +621,25 @@ impl LaneSupervisor {
                     match rebuild(&order) {
                         Ok((program, args)) => {
                             if let Err(e) = self.spawn_run(program, args, true) {
+                                // The raw `e` can carry the internal relaunch detail; keep
+                                // it out of the primary status (a clear, actionable line
+                                // there) and only echo it under the verbose env for debug.
+                                log_verbose("failover relaunch failed", &e);
                                 let mut g = self.inner.lock().expect("mutex");
                                 g.state = ProcState::Error;
-                                g.message = Some(format!("failover relaunch failed: {e}"));
+                                g.message = Some(region_retry_message());
                             }
                         }
                         Err(e) => {
+                            // The raw `e` here is the failover-plan REBUILD error — for a
+                            // pearlhash lane it can surface a bare `POST https://…/m4/challenge:
+                            // …` URL (the PoP endpoint), which is noise to the user and leaks an
+                            // internal path. Show a clear bilingual "region unreachable, retrying"
+                            // status instead; keep the raw error only under the verbose env.
+                            log_verbose("failover plan rebuild failed", &e);
                             let mut g = self.inner.lock().expect("mutex");
                             g.state = ProcState::Error;
-                            g.message = Some(format!("failover plan rebuild failed: {e}"));
+                            g.message = Some(region_retry_message());
                         }
                     }
                     // This watchdog's generation is now stale (spawn_run bumped it);
@@ -692,6 +702,29 @@ enum WatchAction {
         rebuild: Option<RebuildFn>,
         backoff: Duration,
     },
+}
+
+/// The user-facing status shown when a failover-plan rebuild / relaunch fails —
+/// a clear, actionable, bilingual line. Replaces surfacing the RAW rebuild error
+/// (which, on a pearlhash lane, can be a bare `POST https://…/m4/challenge: …`
+/// leaking an internal PoP endpoint) in the primary status; the raw error is kept
+/// only in the verbose debug log ([`log_verbose`]). Localized via [`crate::tr!`].
+fn region_retry_message() -> String {
+    crate::tr!(
+        "Region endpoint temporarily unreachable; retrying other regions",
+        "区域节点暂时不可达,正在重试其他区域"
+    )
+    .to_string()
+}
+
+/// Echo a raw internal error to STDERR ONLY when the verbose env is set
+/// (`ALICE_MINER_VERBOSE=1`), so the detail is available for debugging without
+/// leaking an internal endpoint / path into the user's primary status line. A no-op
+/// otherwise. NOT localized (a developer-facing debug line).
+fn log_verbose(context: &str, err: &str) {
+    if std::env::var("ALICE_MINER_VERBOSE").map(|v| v == "1").unwrap_or(false) {
+        eprintln!("[verbose] {context}: {err}");
+    }
 }
 
 /// Update the snapshot from one raw engine output line, dispatching to the
