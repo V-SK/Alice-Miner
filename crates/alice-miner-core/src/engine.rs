@@ -766,13 +766,20 @@ fn start_one_lane(
     if lane == Lane::GpuPrl {
         let cap = crate::CapabilityProfile::detect();
         if !cap.support(Lane::GpuPrl).is_runnable() {
-            return Err(format!(
-                "GPU-PRL (SRBMiner) can't run on this GPU: {}. Use the Alpha lane \
-                 (`--lane alpha`) — AlphaMiner covers Volta/V100.",
-                cap.viability
-                    .reason(Lane::GpuPrl)
-                    .unwrap_or("compute capability below 7.5"),
-            ));
+            let reason = cap
+                .viability
+                .reason(Lane::GpuPrl)
+                .unwrap_or("compute capability below 7.5");
+            return Err(match crate::i18n::lang() {
+                crate::i18n::Lang::En => format!(
+                    "GPU-PRL (SRBMiner) can't run on this GPU: {reason}. Use the Alpha lane \
+                     (`--lane alpha`) — AlphaMiner covers Volta/V100."
+                ),
+                crate::i18n::Lang::Zh => format!(
+                    "GPU-PRL (SRBMiner) 无法在此 GPU 上运行: {reason}。请改用 Alpha 通道 \
+                     (`--lane alpha`) — AlphaMiner 覆盖 Volta/V100。"
+                ),
+            });
         }
     }
     // GPU-PRL targets the region relays ordered by lowest RTT (operator override /

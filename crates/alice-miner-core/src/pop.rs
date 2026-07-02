@@ -453,11 +453,13 @@ pub fn establish_pop(
     //   (sign_message_b64 also checks this, but checking up front avoids a wasted
     //    challenge round-trip and gives the clearest user-facing error.)
     if secrets.to_keypair().is_err() {
-        return Err(
+        return Err(crate::tr!(
             "this reward identity is watch-only (address pasted, no signing key); the GPU-PRL \
-             lane needs a wallet key to prove possession — import the mnemonic/seed instead"
-                .into(),
-        );
+             lane needs a wallet key to prove possession — import the mnemonic/seed instead",
+            "此奖励身份为仅观察 (watch-only)(粘贴的地址,无签名密钥);GPU-PRL \
+             通道需要钱包密钥来证明所有权 — 请改为导入助记词/种子"
+        )
+        .into());
     }
 
     let challenge_url = region_challenge_url(region_host)?;

@@ -64,9 +64,9 @@ impl LaneSupport {
     /// A short, honest UI label for the support level.
     pub fn label(self) -> &'static str {
         match self {
-            LaneSupport::Viable => "available",
-            LaneSupport::ComingSoon => "coming soon",
-            LaneSupport::Unavailable => "not supported",
+            LaneSupport::Viable => crate::tr!("available", "可用"),
+            LaneSupport::ComingSoon => crate::tr!("coming soon", "即将支持"),
+            LaneSupport::Unavailable => crate::tr!("not supported", "不支持"),
         }
     }
 }

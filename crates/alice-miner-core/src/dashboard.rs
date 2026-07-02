@@ -197,7 +197,7 @@ impl CreditScore {
     /// The ONLY honest way to label a confirmed score in the UI: it is credit,
     /// it is pending (payout OFF, phase-J), never a number/`$`. Bilingual.
     pub fn pending_label(self) -> &'static str {
-        "server-confirmed · pending · 待发放"
+        crate::tr!("server-confirmed · pending", "server-confirmed · pending · 待发放")
     }
 }
 
@@ -275,10 +275,19 @@ impl CreditError {
     /// An honest, calm, NON-numeric UI message for this error.
     pub fn message(&self) -> &'static str {
         match self {
-            CreditError::Unreachable => "couldn't reach the credit service · 待确认",
-            CreditError::Unparseable => "credit response unavailable · 待确认",
+            CreditError::Unreachable => crate::tr!(
+                "couldn't reach the credit service",
+                "couldn't reach the credit service · 待确认"
+            ),
+            CreditError::Unparseable => crate::tr!(
+                "credit response unavailable",
+                "credit response unavailable · 待确认"
+            ),
             // Deliberately neutral — we never hint at the dropped number.
-            CreditError::PaidAcuNotZero => "credit response withheld (payout is off) · 待确认",
+            CreditError::PaidAcuNotZero => crate::tr!(
+                "credit response withheld (payout is off)",
+                "credit response withheld (payout is off) · 待确认"
+            ),
         }
     }
 }
@@ -808,12 +817,12 @@ impl Reconciliation {
     /// A short, honest, bilingual badge label.
     pub fn label(self) -> &'static str {
         match self {
-            Reconciliation::Idle => "idle · 空闲",
-            Reconciliation::ActivityOnly => "activity flowing · 计入中",
-            Reconciliation::Confirming => "confirming… · 确认中",
-            Reconciliation::InSync => "in sync · 已同步",
-            Reconciliation::ConfirmedIdle => "confirmed · 已确认",
-            Reconciliation::Unconfirmed => "unconfirmed · 待确认",
+            Reconciliation::Idle => crate::tr!("idle", "idle · 空闲"),
+            Reconciliation::ActivityOnly => crate::tr!("activity flowing", "activity flowing · 计入中"),
+            Reconciliation::Confirming => crate::tr!("confirming…", "confirming… · 确认中"),
+            Reconciliation::InSync => crate::tr!("in sync", "in sync · 已同步"),
+            Reconciliation::ConfirmedIdle => crate::tr!("confirmed", "confirmed · 已确认"),
+            Reconciliation::Unconfirmed => crate::tr!("unconfirmed", "unconfirmed · 待确认"),
         }
     }
 

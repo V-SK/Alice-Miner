@@ -261,8 +261,12 @@ pub struct PrlPayoutDisplay {
 }
 
 impl PrlPayoutDisplay {
-    /// The fixed panel label.
-    const LABEL: &'static str = "15% PRL 返还 (credit-only)";
+    /// The fixed panel label, in the current CLI language. A function (not a
+    /// `const`) because [`crate::tr!`] resolves the process-global language at call
+    /// time and is not `const`-evaluable.
+    pub fn label() -> &'static str {
+        crate::tr!("15% PRL return (credit-only)", "15% PRL 返还 (credit-only)")
+    }
 
     /// Build a display block WITHOUT any network call: known enrolled flag + the
     /// (masked) payout address, with the default "pending" text. The caller can
@@ -271,7 +275,7 @@ impl PrlPayoutDisplay {
     pub fn new(enrolled: bool, payout_address: Option<&str>) -> Self {
         Self {
             currency: "PRL".into(),
-            label: Self::LABEL.into(),
+            label: Self::label().into(),
             enrolled,
             payout_masked: payout_address.map(mask_payout),
             pending_text: default_pending_text(enrolled, payout_address.is_some()),
@@ -296,9 +300,21 @@ impl PrlPayoutDisplay {
 /// just an honest status word for the panel.
 fn default_pending_text(enrolled: bool, has_address: bool) -> String {
     match (enrolled, has_address) {
-        (true, _) => "已绑定 · 返还按链上 credit 结算 (pending)".into(),
-        (false, true) => "未绑定 · 启动 GPU-PRL 挖矿以绑定返还地址".into(),
-        (false, false) => "未设置返还地址 (设置 ALICE_GPU_PRL_PAYOUT_ADDRESS)".into(),
+        (true, _) => crate::tr!(
+            "bound · return settles by on-chain credit (pending)",
+            "已绑定 · 返还按链上 credit 结算 (pending)"
+        )
+        .into(),
+        (false, true) => crate::tr!(
+            "not bound · start GPU-PRL mining to bind the return address",
+            "未绑定 · 启动 GPU-PRL 挖矿以绑定返还地址"
+        )
+        .into(),
+        (false, false) => crate::tr!(
+            "no return address set (set ALICE_GPU_PRL_PAYOUT_ADDRESS)",
+            "未设置返还地址 (设置 ALICE_GPU_PRL_PAYOUT_ADDRESS)"
+        )
+        .into(),
     }
 }
 
@@ -349,9 +365,15 @@ fn pending_text_from_envelope(body: &str) -> Option<String> {
             // Word-only: confirm there IS pending credit, without minting a fiat
             // figure. `CreditScore` deliberately has NO `Display` (so a careless
             // `{score}` can't leak a number); use its honest pending label.
-            Some(format!("已确认 credit · {}", score.pending_label()))
+            let label = score.pending_label();
+            Some(match crate::i18n::lang() {
+                crate::i18n::Lang::En => format!("credit confirmed · {label}"),
+                crate::i18n::Lang::Zh => format!("已确认 credit · {label}"),
+            })
         }
-        CreditState::Confirming => Some("等待确认 (confirming)".into()),
+        CreditState::Confirming => {
+            Some(crate::tr!("awaiting confirmation (confirming)", "等待确认 (confirming)").into())
+        }
         // NotExposed / Error (incl. paid_acu!=0 violation) → fail-open: keep default.
         _ => None,
     }
@@ -470,9 +492,12 @@ mod tests {
         assert!(t.contains("credit"));
         // Never a "$".
         assert!(!t.contains('$'));
-        // not-found → confirming.
+        // not-found → confirming (default language is English).
         let nf = r#"{"found":false,"paid_acu":"0"}"#;
-        assert_eq!(pending_text_from_envelope(nf).as_deref(), Some("等待确认 (confirming)"));
+        assert_eq!(
+            pending_text_from_envelope(nf).as_deref(),
+            Some("awaiting confirmation (confirming)")
+        );
         // garbage → fail-open None.
         assert_eq!(pending_text_from_envelope("not json"), None);
     }

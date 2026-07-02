@@ -269,11 +269,16 @@ pub fn ensure_cached_engine_with_progress(
     }
 
     let spec = fetch_spec_for(kind).ok_or_else(|| {
-        format!(
-            "the {} engine is not installed and no verified download is configured \
-             for this platform (the lane stays unavailable).",
-            kind.binary_name()
-        )
+        let name = kind.binary_name();
+        match crate::i18n::lang() {
+            crate::i18n::Lang::En => format!(
+                "the {name} engine is not installed and no verified download is configured \
+                 for this platform (the lane stays unavailable)."
+            ),
+            crate::i18n::Lang::Zh => format!(
+                "{name} 引擎未安装,且此平台没有配置可验证的下载源(该通道保持不可用)。"
+            ),
+        }
     })?;
 
     std::fs::create_dir_all(&dir)
@@ -319,11 +324,17 @@ fn verify_bytes_sha256(bytes: &[u8], expected: &str, what: &str) -> Result<(), S
     if got.eq_ignore_ascii_case(expected) {
         Ok(())
     } else {
-        Err(format!(
-            "refusing to install {what}: downloaded SHA-256 {got} does not match the \
-             pinned {expected}. The download was tampered with or corrupted; nothing \
-             was written."
-        ))
+        Err(match crate::i18n::lang() {
+            crate::i18n::Lang::En => format!(
+                "refusing to install {what}: downloaded SHA-256 {got} does not match the \
+                 pinned {expected}. The download was tampered with or corrupted; nothing \
+                 was written."
+            ),
+            crate::i18n::Lang::Zh => format!(
+                "拒绝安装 {what}:下载的 SHA-256 {got} 与固定值 {expected} 不匹配。\
+                 下载内容已被篡改或损坏;未写入任何文件。"
+            ),
+        })
     }
 }
 
@@ -458,43 +469,66 @@ fn read_error_message(path: &Path, e: &std::io::Error) -> String {
             .parent()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| path.display().to_string());
-        return format!(
-            "the mining engine {} was blocked/quarantined by antivirus. Windows Defender flags \
-             mining software as a \"potentially unwanted application\" — a known false positive. \
-             To mine, allow this folder in Defender: open an elevated PowerShell (Run as \
-             administrator) and run\n    Add-MpPreference -ExclusionPath '{}'\nthen start mining \
-             again. (You can undo it later with Remove-MpPreference -ExclusionPath.)",
-            path.display(),
-            folder
-        );
+        let bin = path.display();
+        return match crate::i18n::lang() {
+            crate::i18n::Lang::En => format!(
+                "the mining engine {bin} was blocked/quarantined by antivirus. Windows Defender flags \
+                 mining software as a \"potentially unwanted application\" — a known false positive. \
+                 To mine, allow this folder in Defender: open an elevated PowerShell (Run as \
+                 administrator) and run\n    Add-MpPreference -ExclusionPath '{folder}'\nthen start mining \
+                 again. (You can undo it later with Remove-MpPreference -ExclusionPath.)"
+            ),
+            crate::i18n::Lang::Zh => format!(
+                "挖矿引擎 {bin} 被杀毒软件拦截/隔离。Windows Defender 会把挖矿软件标记为\
+                 \"潜在有害应用\" — 这是已知的误报。要继续挖矿,请在 Defender 中放行该文件夹:\
+                 以管理员身份打开 PowerShell(Run as administrator)并运行\n    \
+                 Add-MpPreference -ExclusionPath '{folder}'\n然后重新开始挖矿。\
+                 (之后可用 Remove-MpPreference -ExclusionPath 撤销。)"
+            ),
+        };
     }
-    format!("cannot read {} for integrity check: {e}", path.display())
+    match crate::i18n::lang() {
+        crate::i18n::Lang::En => format!("cannot read {} for integrity check: {e}", path.display()),
+        crate::i18n::Lang::Zh => format!("无法读取 {} 进行完整性校验: {e}", path.display()),
+    }
 }
 
 /// Verify the resolved bundled binary at `path` against the pinned SHA-256 for
 /// `kind`. Refuses (clear `Err`, no exec) when there is no real pin to check
 /// against, or when the on-disk hash does not match the pin.
 fn verify_pinned(kind: MinerKind, path: &Path) -> Result<(), String> {
+    let name = kind.binary_name();
     let Some(pin) = pinned_sha256_for(kind) else {
-        return Err(format!(
-            "refusing to run the {} engine at {}: no pinned SHA-256 is available for this \
-             platform yet (the bundled binary cannot be integrity-verified). The lane stays \
-             unavailable until a pinned build ships.",
-            kind.binary_name(),
-            path.display()
-        ));
+        let at = path.display();
+        return Err(match crate::i18n::lang() {
+            crate::i18n::Lang::En => format!(
+                "refusing to run the {name} engine at {at}: no pinned SHA-256 is available for this \
+                 platform yet (the bundled binary cannot be integrity-verified). The lane stays \
+                 unavailable until a pinned build ships."
+            ),
+            crate::i18n::Lang::Zh => format!(
+                "拒绝运行位于 {at} 的 {name} 引擎:此平台尚无固定的 SHA-256 \
+                 (无法对内置二进制做完整性校验)。在固定校验的构建发布前,该通道保持不可用。"
+            ),
+        });
     };
     let got = file_sha256(path)?;
     if got.eq_ignore_ascii_case(&pin) {
         Ok(())
     } else {
-        Err(format!(
-            "refusing to run the {} engine at {}: SHA-256 integrity check FAILED \
-             (got {got}, pinned {pin}). The on-disk binary does not match the signed \
-             release; it may have been tampered with or replaced.",
-            kind.binary_name(),
-            path.display()
-        ))
+        let at = path.display();
+        Err(match crate::i18n::lang() {
+            crate::i18n::Lang::En => format!(
+                "refusing to run the {name} engine at {at}: SHA-256 integrity check FAILED \
+                 (got {got}, pinned {pin}). The on-disk binary does not match the signed \
+                 release; it may have been tampered with or replaced."
+            ),
+            crate::i18n::Lang::Zh => format!(
+                "拒绝运行位于 {at} 的 {name} 引擎:SHA-256 完整性校验失败 \
+                 (实际 {got},固定 {pin})。磁盘上的二进制与签名发布不匹配;\
+                 可能已被篡改或替换。"
+            ),
+        })
     }
 }
 
@@ -628,7 +662,13 @@ pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
     //    so a placeholder lane (kawpowminer / macOS-only xmrig) stays honest.
     if is_fetchable(kind) {
         return ensure_cached_engine(kind).map_err(|e| {
-            format!("the {} engine is not installed and auto-download failed: {e}", kind.binary_name())
+            let name = kind.binary_name();
+            match crate::i18n::lang() {
+                crate::i18n::Lang::En => {
+                    format!("the {name} engine is not installed and auto-download failed: {e}")
+                }
+                crate::i18n::Lang::Zh => format!("{name} 引擎未安装,且自动下载失败: {e}"),
+            }
         });
     }
 
@@ -638,45 +678,77 @@ pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
     // release elsewhere, means this is an unpackaged DEV build (e.g. `target/release`
     // on macOS with no `.app` sibling). Lead with the actionable fix — install a
     // packaged release — instead of a bare "not installed" (#14).
+    let name = kind.binary_name();
+    let env = kind.env_override();
+    let en = crate::i18n::lang() == crate::i18n::Lang::En;
     Err(match kind {
-        MinerKind::CpuXmr => format!(
-            "CPU miner not bundled in this build: `{}` was not found beside the \
-             executable at {} and no verified download is configured for this \
-             platform — this is an unpackaged dev build. Install a packaged release \
-             from {} (which bundles the engine), or set {} to a pinned `{}`.",
-            kind.binary_name(),
-            candidate.display(),
-            RELEASES_URL,
-            kind.env_override(),
-            kind.binary_name(),
-        ),
-        MinerKind::GpuRvn => format!(
-            "GPU miner not bundled in this build: the KawPowMiner engine `{}` was not \
-             found and no verified download is configured for this platform. Install a \
-             packaged release from {}, or set {} to a kawpowminer/T-Rex binary. The \
-             RVN lane stays unavailable.",
-            kind.binary_name(),
-            RELEASES_URL,
-            kind.env_override(),
-        ),
-        MinerKind::GpuPrl => format!(
-            "GPU miner not bundled in this build: the SRBMiner-MULTI engine `{}` was not \
-             found and no verified download is configured for this platform (SRBMiner \
-             ships no macOS build). Install a packaged release from {}, or set {} to an \
-             SRBMiner-MULTI binary. The GPU-PRL lane stays unavailable.",
-            kind.binary_name(),
-            RELEASES_URL,
-            kind.env_override(),
-        ),
-        MinerKind::GpuAlpha => format!(
-            "GPU miner not bundled in this build: the AlphaMiner engine `{}` was not \
-             found and no verified download is configured for this platform (alpha-miner \
-             is NVIDIA-CUDA only). Install a packaged release from {}, or set {} to an \
-             alpha-miner binary. The GPU-Alpha (V100/Volta) lane stays unavailable.",
-            kind.binary_name(),
-            RELEASES_URL,
-            kind.env_override(),
-        ),
+        MinerKind::CpuXmr => {
+            let cand = candidate.display();
+            if en {
+                format!(
+                    "CPU miner not bundled in this build: `{name}` was not found beside the \
+                     executable at {cand} and no verified download is configured for this \
+                     platform — this is an unpackaged dev build. Install a packaged release \
+                     from {RELEASES_URL} (which bundles the engine), or set {env} to a pinned `{name}`."
+                )
+            } else {
+                format!(
+                    "此构建未内置 CPU 矿机:在可执行文件旁 {cand} 未找到 `{name}`,\
+                     且此平台没有配置可验证的下载源 — 这是一个未打包的 dev 构建。\
+                     请从 {RELEASES_URL} 安装打包版(其中内置引擎),或将 {env} 设为固定校验的 `{name}`。"
+                )
+            }
+        }
+        MinerKind::GpuRvn => {
+            if en {
+                format!(
+                    "GPU miner not bundled in this build: the KawPowMiner engine `{name}` was not \
+                     found and no verified download is configured for this platform. Install a \
+                     packaged release from {RELEASES_URL}, or set {env} to a kawpowminer/T-Rex binary. The \
+                     RVN lane stays unavailable."
+                )
+            } else {
+                format!(
+                    "此构建未内置 GPU 矿机:未找到 KawPowMiner 引擎 `{name}`,\
+                     且此平台没有配置可验证的下载源。请从 {RELEASES_URL} 安装打包版,\
+                     或将 {env} 设为 kawpowminer/T-Rex 二进制。RVN 通道保持不可用。"
+                )
+            }
+        }
+        MinerKind::GpuPrl => {
+            if en {
+                format!(
+                    "GPU miner not bundled in this build: the SRBMiner-MULTI engine `{name}` was not \
+                     found and no verified download is configured for this platform (SRBMiner \
+                     ships no macOS build). Install a packaged release from {RELEASES_URL}, or set {env} to an \
+                     SRBMiner-MULTI binary. The GPU-PRL lane stays unavailable."
+                )
+            } else {
+                format!(
+                    "此构建未内置 GPU 矿机:未找到 SRBMiner-MULTI 引擎 `{name}`,\
+                     且此平台没有配置可验证的下载源(SRBMiner 无 macOS 版本)。\
+                     请从 {RELEASES_URL} 安装打包版,或将 {env} 设为 SRBMiner-MULTI 二进制。\
+                     GPU-PRL 通道保持不可用。"
+                )
+            }
+        }
+        MinerKind::GpuAlpha => {
+            if en {
+                format!(
+                    "GPU miner not bundled in this build: the AlphaMiner engine `{name}` was not \
+                     found and no verified download is configured for this platform (alpha-miner \
+                     is NVIDIA-CUDA only). Install a packaged release from {RELEASES_URL}, or set {env} to an \
+                     alpha-miner binary. The GPU-Alpha (V100/Volta) lane stays unavailable."
+                )
+            } else {
+                format!(
+                    "此构建未内置 GPU 矿机:未找到 AlphaMiner 引擎 `{name}`,\
+                     且此平台没有配置可验证的下载源(alpha-miner 仅支持 NVIDIA-CUDA)。\
+                     请从 {RELEASES_URL} 安装打包版,或将 {env} 设为 alpha-miner 二进制。\
+                     GPU-Alpha (V100/Volta) 通道保持不可用。"
+                )
+            }
+        }
     })
 }
 
