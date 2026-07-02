@@ -861,6 +861,9 @@ fn run_menu_action(action: menu::MenuAction, no_color: bool) -> i32 {
             python: None,
             allow_cpu: false,
             json: false,
+            // The menu item is "Doctor + self-repair": apply the SAFE fixes (engine
+            // re-download / config recreate); service is prompted, identity never touched.
+            fix: true,
         }),
         // Check for updates (interactive apply flow — asks before applying).
         menu::MenuAction::Update => update::run(update::UpdateArgs { check: false, yes: false }),
