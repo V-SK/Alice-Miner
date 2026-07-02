@@ -221,6 +221,10 @@ pub fn build_miner_launch_plan(
         // socket stays up; retries/retry-pause (defaults 5/5, explicit here) make
         // a genuine drop reconnect instead of stalling. (Fixes the "mining then
         // suddenly 0" idle-disconnect path; xmrig 6.26 supports all three.)
+        // NOTE: the Alice transport proxy now answers `keepalived` with a
+        // {"status":"KEEPALIVED"} no-op (it previously returned unknown_method,
+        // which made xmrig drop the pool → the v0.4.0 Mac-stall report; fixed
+        // server-side in acp transport_service.stratum_server).
         "--keepalive".into(),
         "--retries".into(),
         "5".into(),
