@@ -13,17 +13,21 @@
 use alice_miner_core::detect::capability::ALL_LANES;
 use alice_miner_core::detect::GpuDevice;
 use alice_miner_core::engine::LaneSnapshot;
+use alice_miner_core::tr;
 use alice_miner_core::{
     CapabilityProfile, CreditState, EngineState, GpuInfo, GpuVendor, Lane, Snapshot,
     LANE_KEY_GPU_ALPHA, LANE_KEY_GPU_PRL,
 };
 
 /// The ONLY way the CLI ever renders rewards: it is CREDIT (accruing now,
-/// server-confirmable), credit-only (payout gated, phase-J), bilingual, never a
+/// server-confirmable), credit-only (payout gated, phase-J), localized, never a
 /// number / `$`. Leads with "credit" not "pending" — the credit is real and
-/// accruing, whereas "待发放" wrongly implied a queued payout. (The GUI's
-/// `strings::REWARD_PENDING` is the older wording, intentionally not aligned yet.)
-const REWARD_CREDIT: &str = "credit · 积分 (credit-only)";
+/// accruing, whereas a queued-"payout" wording would be dishonest. Localized via
+/// [`tr!`] so it reads "credit (credit-only)" in English / "积分 (credit-only)" in
+/// 中文 (the machine-facing `credit-only` marker stays in both).
+fn reward_credit() -> String {
+    format!("{} (credit-only)", tr!("credit", "积分"))
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Lane semaphore + always-on lane table (the "make silent zeros LOUD" core).
@@ -257,7 +261,7 @@ pub fn render_detect(cap: &CapabilityProfile) -> String {
     }
 
     // The lane-viability matrix (which lanes this device can run + recommended).
-    out.push_str("Lanes:\n");
+    out.push_str(tr!("Lanes:\n", "通道:\n"));
     let recommended = cap.recommended_lane();
     // Pad to the WIDEST lane label so the STATE column always aligns. The longest
     // is "GPU · Alpha (V100)" (18 chars) — a fixed `{:<10}` truncated past it and
@@ -270,7 +274,11 @@ pub fn render_detect(cap: &CapabilityProfile) -> String {
         .unwrap_or(10);
     for &lane in ALL_LANES.iter() {
         let support = cap.support(lane);
-        let marker = if lane == recommended { "  (recommended)" } else { "" };
+        let marker = if lane == recommended {
+            tr!("  (recommended)", "  (推荐)")
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "  {:<pad$} {}{}\n",
             lane.label(),
@@ -301,9 +309,10 @@ fn fmt_gpu_list(gpus: &[GpuDevice]) -> String {
         };
         s.push_str(&format!("    gpu[{}]:        {}{}\n", d.index, d.name, vram));
     }
-    s.push_str(
+    s.push_str(tr!(
         "    (--gpus selects by the MINER's device ids, which can differ from gpu[n]\n     above and may include an integrated GPU — run `gpu-devices` to list them.\n     Omit --gpus = every card.)\n",
-    );
+        "    (--gpus 按矿机的设备 id 选择,可能与上面的 gpu[n] 不同,\n     且可能包含集成显卡 — 运行 `gpu-devices` 查看列表。\n     不加 --gpus = 使用每一张卡。)\n"
+    ));
     s
 }
 
@@ -312,14 +321,19 @@ fn fmt_gpu_list(gpus: &[GpuDevice]) -> String {
 /// pearlhash; an OpenCL integrated GPU is flagged so it's never picked by mistake.
 pub fn render_gpu_devices(devices: &[alice_miner_core::lane::gpu_prl::SrbGpuDevice]) -> String {
     if devices.is_empty() {
-        return "No GPU devices reported by the miner (no usable GPU, or the engine \
-                couldn't enumerate one).\n"
-            .to_string();
+        return tr!(
+            "No GPU devices reported by the miner (no usable GPU, or the engine couldn't enumerate one).\n",
+            "矿机未报告任何 GPU 设备(没有可用 GPU,或引擎无法枚举)。\n"
+        )
+        .to_string();
     }
-    let mut s = String::from("GPU devices (the ids `start --lane gpu --gpus <id>` selects):\n");
+    let mut s = String::from(tr!(
+        "GPU devices (the ids `start --lane gpu --gpus <id>` selects):\n",
+        "GPU 设备(`start --lane gpu --gpus <id>` 选择的 id):\n"
+    ));
     for d in devices {
         let note = if d.backend != "CUDA" {
-            "  (integrated/OpenCL — not for pearlhash)"
+            tr!("  (integrated/OpenCL — not for pearlhash)", "  (集成/OpenCL — 不用于 pearlhash)")
         } else {
             ""
         };
@@ -333,16 +347,16 @@ pub fn render_gpu_devices(devices: &[alice_miner_core::lane::gpu_prl::SrbGpuDevi
             d.id, d.backend, d.name, pci, note
         ));
     }
-    s.push_str(
-        "  Pick the id(s) above (NOT detect's gpu[n]); comma-separate for several, \
-         e.g. --gpus 1,2.\n",
-    );
+    s.push_str(tr!(
+        "  Pick the id(s) above (NOT detect's gpu[n]); comma-separate for several, e.g. --gpus 1,2.\n",
+        "  从上面选取 id(不是 detect 的 gpu[n]);多张用逗号分隔,例如 --gpus 1,2。\n"
+    ));
     s
 }
 
 fn fmt_gpu(gpu: &GpuInfo) -> String {
     match gpu.vendor {
-        GpuVendor::None => "none (CPU-only)".to_string(),
+        GpuVendor::None => tr!("none (CPU-only)", "无 (仅 CPU)").to_string(),
         GpuVendor::Nvidia => {
             if gpu.vram_gb > 0 {
                 format!("{} · {} GB VRAM", gpu.model, gpu.vram_gb)
@@ -350,8 +364,8 @@ fn fmt_gpu(gpu: &GpuInfo) -> String {
                 gpu.model.clone()
             }
         }
-        GpuVendor::Amd => format!("{} (lane coming soon)", gpu.model),
-        GpuVendor::Apple => format!("{} (unified memory)", gpu.model),
+        GpuVendor::Amd => format!("{} {}", gpu.model, tr!("(lane coming soon)", "(通道即将推出)")),
+        GpuVendor::Apple => format!("{} {}", gpu.model, tr!("(unified memory)", "(统一内存)")),
     }
 }
 
@@ -364,7 +378,7 @@ fn fmt_gpu(gpu: &GpuInfo) -> String {
 /// is `None`. NEVER prints a password / seed / key.
 pub fn render_identity(identity: &alice_miner_core::Identity, mnemonic: Option<&str>) -> String {
     let mut out = String::new();
-    out.push_str("Identity established:\n");
+    out.push_str(tr!("Identity established:\n", "身份已建立:\n"));
     out.push_str(&format!("  address:    {}\n", identity.address));
     out.push_str(&format!("  watch_only: {}\n", identity.watch_only));
     if let Some(ks) = identity.keystore_path.as_ref() {
@@ -376,9 +390,18 @@ pub fn render_identity(identity: &alice_miner_core::Identity, mnemonic: Option<&
     ));
     if let Some(phrase) = mnemonic {
         out.push('\n');
-        out.push_str("  ── BACK UP THIS RECOVERY PHRASE (24 words) ──\n");
-        out.push_str("  This is the ONLY way to recover this identity. Anyone with these\n");
-        out.push_str("  words controls the address. Store it offline — never paste it online.\n\n");
+        out.push_str(tr!(
+            "  ── BACK UP THIS RECOVERY PHRASE (24 words) ──\n",
+            "  ── 请备份此恢复助记词(24 个词)──\n"
+        ));
+        out.push_str(tr!(
+            "  This is the ONLY way to recover this identity. Anyone with these\n",
+            "  这是恢复此身份的唯一方式。任何持有这些词的人\n"
+        ));
+        out.push_str(tr!(
+            "  words controls the address. Store it offline — never paste it online.\n\n",
+            "  都能控制该地址。请离线保存 — 切勿在线粘贴。\n\n"
+        ));
         out.push_str(&format!("  {phrase}\n"));
         out.push_str("  ─────────────────────────────────────────────\n");
     }
@@ -415,19 +438,28 @@ pub fn render_start_banner(lane: Lane, dual: bool) -> String {
         // (mirrors `engine.rs` `start_run`'s `gpu_lane`).
         let gpu = if lane == Lane::GpuRvn { "RVN" } else { "PRL" };
         format!(
-            "Starting dual-mine (CPU·XMR + GPU·{gpu}) — Ctrl-C or `alice-miner stop` to stop.\n"
+            "{}\n",
+            tr!(
+                "Starting dual-mine (CPU·XMR + GPU·{}) — Ctrl-C or `alice-miner stop` to stop.",
+                "启动双挖 (CPU·XMR + GPU·{}) — Ctrl-C 或 `alice-miner stop` 停止。"
+            )
+            .replace("{}", gpu)
         )
     } else {
         format!(
-            "Starting {} lane — Ctrl-C or `alice-miner stop` to stop.\n",
-            lane.label()
+            "{}\n",
+            tr!(
+                "Starting {} lane — Ctrl-C or `alice-miner stop` to stop.",
+                "启动 {} 通道 — Ctrl-C 或 `alice-miner stop` 停止。"
+            )
+            .replace("{}", lane.label())
         )
     }
 }
 
 /// The transient banner printed when a stop is requested.
 pub fn render_stopping_banner() -> String {
-    "Stopping…\n".to_string()
+    tr!("Stopping…\n", "正在停止…\n").to_string()
 }
 
 /// Per-tick render context: an advancing heartbeat spinner frame + how stale the
@@ -517,12 +549,13 @@ pub fn render_snapshot_ctx(snap: &Snapshot, ctx: &RenderCtx) -> String {
     };
 
     out.push_str(&format!(
-        "[{}]{dual_tag} {hr} · {shares_seg} · up {} · {}{} · rewards {}\n",
+        "[{}]{dual_tag} {hr} · {shares_seg} · up {} · {}{} · {} {}\n",
         fmt_state(snap.state),
         fmt_uptime(snap.uptime_s),
         endpoint,
         failover,
-        REWARD_CREDIT,
+        tr!("rewards", "奖励"),
+        reward_credit(),
     ));
 
     // Triple-window speed line (xmrig-grade): `speed 10s/60s/15m <a>/<b>/<c>`, shown
@@ -557,7 +590,10 @@ pub fn render_snapshot_ctx(snap: &Snapshot, ctx: &RenderCtx) -> String {
         && snap.state == alice_miner_core::EngineState::Running
         && snap.message.as_deref().map(str::is_empty).unwrap_or(true)
     {
-        out.push_str("    rewards: counting (PoP active · credit-only)\n");
+        out.push_str(tr!(
+            "    rewards: counting (PoP active · credit-only)\n",
+            "    奖励: 正在计入 (PoP 已激活 · credit-only)\n"
+        ));
     }
 
     // The ALWAYS-ON per-lane table (was dual-only): one row per running lane (or a
@@ -603,11 +639,14 @@ pub fn render_credit_line(credit: &CreditState) -> Option<String> {
     match credit {
         // No live endpoint wired → no cumulative line (don't invent one).
         CreditState::NotExposed => None,
-        CreditState::Confirming => {
-            Some("    credited (cumulative): syncing… · 同步中 (credit-only)\n".to_string())
-        }
+        CreditState::Confirming => Some(format!(
+            "    {}: {}\n",
+            tr!("credited (cumulative)", "已计入(累计)"),
+            tr!("syncing… (credit-only)", "同步中 (credit-only)")
+        )),
         CreditState::Error { reason } => Some(format!(
-            "    credited (cumulative): — · {} (credit-only)\n",
+            "    {}: — · {} (credit-only)\n",
+            tr!("credited (cumulative)", "已计入(累计)"),
             reason.message()
         )),
         CreditState::Confirmed { totals, .. } => {
@@ -621,8 +660,13 @@ pub fn render_credit_line(credit: &CreditState) -> Option<String> {
                 String::new()
             };
             Some(format!(
-                "    credited (cumulative): {} shares (24h {}){} · {REWARD_CREDIT}\n",
-                totals.accepted_total, totals.accepted_24h, split,
+                "    {}: {} {} (24h {}){} · {}\n",
+                tr!("credited (cumulative)", "已计入(累计)"),
+                totals.accepted_total,
+                tr!("shares", "份额"),
+                totals.accepted_24h,
+                split,
+                reward_credit(),
             ))
         }
     }
@@ -666,9 +710,13 @@ pub fn render_credited_vs_raw_note(snap: &Snapshot, credit: &CreditState) -> Opt
     // credited accepted-share count is still 0 → the shares aren't landing.
     if totals.accepted_24h == 0 {
         Some(format!(
-            "    ! credited 0 < raw {} — shares may not be landing \
-             (check PoP / pool / firewall)\n",
+            "    ! {} {} — {}\n",
+            tr!("credited 0 < raw", "已计入 0 < 实测"),
             fmt_hashrate_human(raw),
+            tr!(
+                "shares may not be landing (check PoP / pool / firewall)",
+                "份额可能未被接受(请检查 PoP / 矿池 / 防火墙)"
+            ),
         ))
     } else {
         None
@@ -681,7 +729,11 @@ pub fn render_credited_vs_raw_note(snap: &Snapshot, credit: &CreditState) -> Opt
 /// collection address), and the engine's honest pending TEXT. NEVER prints a "$" or
 /// a number: the `PrlPayoutDisplay.paid` field (hard-pinned 0.0) is not read here.
 fn render_prl_return_line(disp: &alice_miner_core::PrlPayoutDisplay) -> String {
-    let state = if disp.enrolled { "已绑定 · bound" } else { "待绑定 · pending" };
+    let state = if disp.enrolled {
+        tr!("bound", "已绑定")
+    } else {
+        tr!("pending", "待绑定")
+    };
     let wallet = match disp.payout_masked.as_deref() {
         Some(masked) => format!(" · {masked}"),
         None => String::new(),
@@ -689,7 +741,8 @@ fn render_prl_return_line(disp: &alice_miner_core::PrlPayoutDisplay) -> String {
     // The engine's pending_text is already number-free + honest (see
     // `prl_payout::default_pending_text`); surface it verbatim.
     format!(
-        "    └ 15% PRL 返还 (credit-only) [{state}]{wallet} · {}\n",
+        "    └ {} [{state}]{wallet} · {}\n",
+        tr!("15% PRL return (credit-only)", "15% PRL 返还 (credit-only)"),
         disp.pending_text
     )
 }
@@ -807,10 +860,15 @@ fn reject_health_note(accepted: u64, rejected: u64) -> Option<String> {
     let pct = rejected as f64 / total as f64 * 100.0;
     if pct > 20.0 {
         Some(format!(
-            "HIGH reject rate {pct:.0}% — wasted work; check GPU stability / overclock / pool"
+            "{} {pct:.0}%{}",
+            tr!("HIGH reject rate", "拒绝率过高"),
+            tr!(
+                " — wasted work; check GPU stability / overclock / pool",
+                " — 无效算力;请检查 GPU 稳定性 / 超频 / 矿池"
+            )
         ))
     } else if pct > 5.0 {
-        Some(format!("elevated reject rate {pct:.0}%"))
+        Some(format!("{} {pct:.0}%", tr!("elevated reject rate", "拒绝率偏高")))
     } else {
         None
     }
@@ -1283,8 +1341,8 @@ mod tests {
         all.push_str(&render_start_banner(Lane::GpuRvn, true));
         all.push_str(&render_stopping_banner());
 
-        // The reward line is present and is the ONLY reward wording.
-        assert!(all.contains(REWARD_CREDIT));
+        // The reward line is present and is the ONLY reward wording (EN default).
+        assert!(all.contains(&reward_credit()));
 
         let lower = all.to_lowercase();
         // Fiat / positive-earnings claims can never appear.
@@ -1347,7 +1405,7 @@ mod tests {
         for forbidden in ["$", "usd", "fiat", "paid", "earned", "已发放"] {
             assert!(!lower.contains(forbidden), "credit line leaked `{forbidden}`: {line}");
         }
-        assert!(line.contains(REWARD_CREDIT));
+        assert!(line.contains(&reward_credit()));
     }
 
     // ── Piece 6: credited-vs-raw divergence note ────────────────────────────────
@@ -1512,8 +1570,8 @@ mod tests {
         // Bound, with a configured return wallet.
         let disp = alice_miner_core::PrlPayoutDisplay::new(true, Some(PAYOUT_OK));
         let s = render_snapshot(&prl_snapshot(disp));
-        assert!(s.contains("15% PRL 返还 (credit-only)"), "renders the block: {s}");
-        assert!(s.contains("已绑定 · bound"), "shows the bound state");
+        assert!(s.contains("15% PRL return (credit-only)"), "renders the block: {s}");
+        assert!(s.contains("[bound]"), "shows the bound state");
         // The wallet is MASKED (prefix + … + suffix), never the full address.
         assert!(s.contains("prl1p") && s.contains('…'), "masked wallet shown");
         assert!(!s.contains(PAYOUT_OK), "the FULL return wallet is never printed");
@@ -1527,8 +1585,8 @@ mod tests {
     fn prl_return_line_renders_unbound_no_address() {
         let disp = alice_miner_core::PrlPayoutDisplay::new(false, None);
         let s = render_snapshot(&prl_snapshot(disp));
-        assert!(s.contains("15% PRL 返还 (credit-only)"));
-        assert!(s.contains("待绑定 · pending"), "unbound → pending state");
+        assert!(s.contains("15% PRL return (credit-only)"));
+        assert!(s.contains("[pending]"), "unbound → pending state");
         assert!(!s.contains('$'));
     }
 
@@ -1561,7 +1619,7 @@ mod tests {
     #[test]
     fn prl_return_line_absent_for_non_prl_snapshot() {
         let s = render_snapshot(&running_snapshot()); // prl_payout: None
-        assert!(!s.contains("15% PRL 返还"), "XMR dashboard has no PRL line");
+        assert!(!s.contains("15% PRL return"), "XMR dashboard has no PRL line");
     }
 
     /// CREDIT-ONLY: a PRL snapshot's rendered HUMAN output carries no forbidden

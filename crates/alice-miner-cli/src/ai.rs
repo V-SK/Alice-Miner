@@ -29,6 +29,7 @@ use zeroize::Zeroizing;
 
 use alice_miner_core::ai_config::{self, AiConfig};
 use alice_miner_core::shard::{self, PullAssignment, PullOutcome, SHARD_PSK_ENV};
+use alice_miner_core::tr;
 
 use crate::{EXIT_OK, EXIT_RUNTIME, EXIT_USAGE};
 
@@ -472,36 +473,49 @@ impl AssignmentView {
 pub fn render_status(s: &AiStatus) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "ai · shard-stage inference · credit-only (积分)\n  state: {}\n",
+        "{}\n  {}: {}\n",
+        tr!(
+            "ai · shard-stage inference · credit-only (积分)",
+            "ai · 分片推理 · credit-only (积分)"
+        ),
+        tr!("state", "状态"),
         s.state.label()
     ));
-    out.push_str(&format!("  endpoint: {}\n", s.endpoint));
-    out.push_str(&format!("  center: {}\n", s.center_url));
+    out.push_str(&format!("  {}: {}\n", tr!("endpoint", "端点"), s.endpoint));
+    out.push_str(&format!("  {}: {}\n", tr!("center", "调度中心"), s.center_url));
     match &s.assignment {
         Some(a) => {
             out.push_str(&format!(
-                "  assignment: model {} · stage {}/{} ({}) · layers [{}:{}]\n",
+                "  {}: model {} · stage {}/{} ({}) · layers [{}:{}]\n",
+                tr!("assignment", "分配"),
                 a.model_id, a.stage_index, a.n_stages, a.role, a.layer_lo, a.layer_hi
             ));
         }
-        None => out.push_str("  assignment: none yet (waiting for the center to place this stage)\n"),
+        None => out.push_str(&format!(
+            "  {}: {}\n",
+            tr!("assignment", "分配"),
+            tr!(
+                "none yet (waiting for the center to place this stage)",
+                "暂无(等待调度中心分配此阶段)"
+            )
+        )),
     }
     if let Some(sr) = s.session_ready {
         out.push_str(&format!("  session_ready: {sr}\n"));
     }
     if s.engine_uptime_s > 0 {
-        out.push_str(&format!("  engine uptime: {}s\n", s.engine_uptime_s));
+        out.push_str(&format!("  {}: {}s\n", tr!("engine uptime", "引擎运行时长"), s.engine_uptime_s));
     }
     if s.restarts > 0 {
-        out.push_str(&format!("  engine restarts: {}\n", s.restarts));
+        out.push_str(&format!("  {}: {}\n", tr!("engine restarts", "引擎重启次数"), s.restarts));
     }
     match s.last_heartbeat_ok {
-        Some(true) => out.push_str("  last heartbeat: ok\n"),
-        Some(false) => out.push_str("  last heartbeat: FAILED\n"),
+        Some(true) => out.push_str(&format!("  {}: ok\n", tr!("last heartbeat", "最近心跳"))),
+        Some(false) => out.push_str(&format!("  {}: FAILED\n", tr!("last heartbeat", "最近心跳"))),
         None => {}
     }
     if let Some(m) = &s.last_message {
-        out.push_str(&format!("  note: {m}\n"));
+        out.push_str(&format!("  {}: {m}\n", tr!("note", "提示")));
     }
     out
 }
@@ -512,10 +526,17 @@ pub fn run(flags: AiFlags, unlock_password: Option<Zeroizing<String>>) -> i32 {
     // Resolve the reward identity (READ-ONLY — we never create/overwrite it here).
     let Some(pointer) = alice_miner_core::identity::load_pointer() else {
         eprintln!(
-            "error: no reward identity yet — create or import one first:\n  \
-             alice-miner identity --create   (or --import \"<24 words>\")\n\
-             (the ai role must prove it owns the reward address to register a stage; a \
-             watch-only pasted address has no signing key and cannot register)"
+            "error: {}",
+            tr!(
+                "no reward identity yet — create or import one first:\n  \
+                 alice-miner identity --create   (or --import \"<24 words>\")\n\
+                 (the ai role must prove it owns the reward address to register a stage; a \
+                 watch-only pasted address has no signing key and cannot register)",
+                "尚无奖励身份 — 请先创建或导入:\n  \
+                 alice-miner identity --create   (或 --import \"<24 个词>\")\n\
+                 (ai 角色必须证明拥有奖励地址才能注册阶段;\
+                 仅粘贴的观察地址没有签名密钥,无法注册)"
+            )
         );
         return EXIT_USAGE;
     };
@@ -537,10 +558,17 @@ pub fn run(flags: AiFlags, unlock_password: Option<Zeroizing<String>>) -> i32 {
         Ok(v) if !v.is_empty() => Zeroizing::new(v),
         _ => {
             eprintln!(
-                "error: {SHARD_PSK_ENV} is not set. The shard swarm needs a shared pre-shared key \
-                 to authenticate stage-to-stage frames; the coordinator distributes it out of band. \
-                 Set it in the environment (never on the command line) before starting:\n  \
-                 export {SHARD_PSK_ENV}=<the swarm key>   # then: alice-miner ai ..."
+                "error: {}",
+                tr!(
+                    "SHARD_PSK is not set. The shard swarm needs a shared pre-shared key to \
+                     authenticate stage-to-stage frames; the coordinator distributes it out of band. \
+                     Set it in the environment (never on the command line) before starting:\n  \
+                     export SHARD_PSK=<the swarm key>   # then: alice-miner ai ...",
+                    "SHARD_PSK 未设置。分片群需要共享的预共享密钥来认证阶段间数据帧;\
+                     协调方会带外分发。启动前请在环境变量中设置(切勿写在命令行):\n  \
+                     export SHARD_PSK=<群密钥>   # 然后: alice-miner ai ..."
+                )
+                .replace("SHARD_PSK", SHARD_PSK_ENV)
             );
             return EXIT_USAGE;
         }
@@ -570,12 +598,20 @@ pub fn run(flags: AiFlags, unlock_password: Option<Zeroizing<String>>) -> i32 {
     };
 
     println!(
-        "Alice Miner ai — shard-stage inference worker (credit-only, 积分)\n  \
-         center: {}\n  endpoint: {}\n  engine: {}\n  advertised VRAM: {:.1} GB · region: {}\n",
+        "{}\n  {}: {}\n  {}: {}\n  {}: {}\n  {}: {:.1} GB · {}: {}\n",
+        tr!(
+            "Alice Miner ai — shard-stage inference worker (credit-only, 积分)",
+            "Alice Miner ai — 分片推理工作节点 (credit-only, 积分)"
+        ),
+        tr!("center", "调度中心"),
         settings.center_url,
+        tr!("endpoint", "端点"),
         settings.endpoint,
+        tr!("engine", "引擎"),
         settings.engine_dir.join(PIPELINE_REL).display(),
+        tr!("advertised VRAM", "声明显存"),
         settings.vram_gb,
+        tr!("region", "区域"),
         settings.region,
     );
 
@@ -628,7 +664,13 @@ fn run_loop(
         return EXIT_RUNTIME;
     }
     status.state = AiState::WaitingAssignment;
-    status.last_message = Some("registered; waiting for a swarm placement".into());
+    status.last_message = Some(
+        tr!(
+            "registered; waiting for a swarm placement",
+            "已注册;等待群分配"
+        )
+        .into(),
+    );
     print!("{}", render_status(&status));
 
     let mut engine: Option<EngineChild> = None;
@@ -788,7 +830,13 @@ fn run_loop(
     if let Some(mut child) = engine.take() {
         child.kill();
     }
-    println!("\nai role stopped. (credit-only — no rewards were paid.)");
+    println!(
+        "\n{}",
+        tr!(
+            "ai role stopped. (credit-only — no rewards were paid.)",
+            "ai 角色已停止。(credit-only — 未发放任何奖励。)"
+        )
+    );
     EXIT_OK
 }
 
@@ -868,12 +916,22 @@ mod tests {
     }
 
     /// A temp engine dir with a stub `phase0/pipeline.py` so resolve_config's
-    /// existence check passes without a real checkout.
+    /// existence check passes without a real checkout. The name uses a nanosecond
+    /// clock + a process-wide atomic counter so two parallel tests can NEVER collide
+    /// on the same dir (a second-granularity name did, and one test's cleanup would
+    /// delete another's pipeline.py mid-run — a flaky failure).
     fn temp_engine_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!(
-            "alice-ai-engine-{}-{}",
+            "alice-ai-engine-{}-{}-{}",
             std::process::id(),
-            now_unix()
+            nanos,
+            SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(dir.join("phase0")).unwrap();
         std::fs::write(dir.join(PIPELINE_REL), b"# stub\n").unwrap();

@@ -25,6 +25,7 @@ use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use alice_miner_core::binaries::{self, MinerKind};
+use alice_miner_core::tr;
 use alice_miner_core::{CapabilityProfile, EndpointPlan, Lane};
 
 /// The outcome of one diagnostic check.
@@ -123,21 +124,42 @@ fn check_identity() -> Check {
     match alice_miner_core::identity::load_pointer() {
         Some(p) => {
             if alice_miner_core::lane::xmr::validate_alice_address(&p.address).is_some() {
-                let watch = if p.keystore_path.is_none() { " (watch-only)" } else { "" };
-                Check::pass(NAME, format!("reward address is a valid Alice SS58-300 address{watch}"))
+                let watch = if p.keystore_path.is_none() {
+                    tr!(" (watch-only)", " (仅观察)")
+                } else {
+                    ""
+                };
+                Check::pass(
+                    NAME,
+                    format!(
+                        "{}{watch}",
+                        tr!(
+                            "reward address is a valid Alice SS58-300 address",
+                            "奖励地址是有效的 Alice SS58-300 地址"
+                        )
+                    ),
+                )
             } else {
                 Check::fail(
                     NAME,
-                    "the stored reward address is not a valid Alice SS58-300 address",
-                    "re-create or re-paste your identity: `alice-miner identity --create` \
-                     (or `--paste <address>`)",
+                    tr!(
+                        "the stored reward address is not a valid Alice SS58-300 address",
+                        "存储的奖励地址不是有效的 Alice SS58-300 地址"
+                    ),
+                    tr!(
+                        "re-create or re-paste your identity: `alice-miner identity --create` (or `--paste <address>`)",
+                        "重新创建或重新粘贴身份: `alice-miner identity --create` (或 `--paste <地址>`)"
+                    ),
                 )
             }
         }
         None => Check::fail(
             NAME,
-            "no reward identity yet",
-            "create one: `alice-miner identity --create` (or `--paste <address>` for watch-only)",
+            tr!("no reward identity yet", "尚无奖励身份"),
+            tr!(
+                "create one: `alice-miner identity --create` (or `--paste <address>` for watch-only)",
+                "请创建一个: `alice-miner identity --create` (或 `--paste <地址>` 用于仅观察)"
+            ),
         ),
     }
 }
@@ -260,12 +282,17 @@ fn check_relay(lane: Lane) -> Check {
     let ep = plan.current();
     let host_port = ep.host_port();
     match tcp_reachable(&ep.host, ep.port, Duration::from_secs(3)) {
-        Ok(()) => Check::pass(NAME, format!("connected to the relay {host_port}")),
+        Ok(()) => Check::pass(
+            NAME,
+            format!("{} {host_port}", tr!("connected to the relay", "已连接到中继")),
+        ),
         Err(e) => Check::fail(
             NAME,
-            format!("cannot reach the relay {host_port}: {e}"),
-            "check your network / firewall (the stratum port must be reachable outbound); \
-             a VPN or captive portal can block it",
+            format!("{} {host_port}: {e}", tr!("cannot reach the relay", "无法连接到中继")),
+            tr!(
+                "check your network / firewall (the stratum port must be reachable outbound); a VPN or captive portal can block it",
+                "请检查网络 / 防火墙(stratum 端口必须可出站访问);VPN 或强制门户网络可能会拦截它"
+            ),
         ),
     }
 }
@@ -321,23 +348,36 @@ fn platform_guardrails() -> Vec<Check> {
 /// only — a unit test scans for forbidden reward/secret tokens).
 pub fn render_report(checks: &[Check], lane: Lane) -> String {
     let mut s = String::new();
-    s.push_str(&format!("Alice Miner doctor — lane {}\n", lane.cli_lane_arg()));
+    s.push_str(&format!(
+        "{} {}\n",
+        tr!("Alice Miner doctor — lane", "Alice Miner doctor — 通道"),
+        lane.cli_lane_arg()
+    ));
     s.push_str("─────────────────────────────────────────────\n");
     for c in checks {
         s.push_str(&format!("  [{}] {} — {}\n", c.status.word(), c.name, c.detail));
         if !c.fix.is_empty() {
-            s.push_str(&format!("        fix: {}\n", c.fix));
+            s.push_str(&format!("        {}: {}\n", tr!("fix", "修复"), c.fix));
         }
     }
     let fails = checks.iter().filter(|c| c.status == Status::Fail).count();
     let warns = checks.iter().filter(|c| c.status == Status::Warn).count();
     s.push_str("─────────────────────────────────────────────\n");
     if fails == 0 {
-        s.push_str(&format!("Ready to mine. ({warns} warning(s).)\n"));
+        s.push_str(&format!(
+            "{}\n",
+            tr!("Ready to mine.", "已就绪,可以开始挖矿。")
+                .to_string()
+                + &format!(" ({warns} {})", tr!("warning(s).", "个警告。"))
+        ));
     } else {
         s.push_str(&format!(
-            "{fails} blocking issue(s), {warns} warning(s). Fix the FAIL lines above, then \
-             re-run `alice-miner doctor`.\n"
+            "{fails} {}, {warns} {}\n",
+            tr!("blocking issue(s)", "个阻塞问题"),
+            tr!(
+                "warning(s). Fix the FAIL lines above, then re-run `alice-miner doctor`.",
+                "个警告。请修复上面的 FAIL 行,然后重新运行 `alice-miner doctor`。"
+            )
         ));
     }
     s
@@ -381,8 +421,16 @@ pub fn print_preflight_summary(lane: Lane, cap: &CapabilityProfile) {
         let mut err = std::io::stderr();
         let _ = writeln!(
             err,
-            "preflight: {} — {}\n  fix: {}\n  (run `alice-miner doctor` for the full report)",
-            first_fail.name, first_fail.detail, first_fail.fix
+            "{}: {} — {}\n  {}: {}\n  {}",
+            tr!("preflight", "预检"),
+            first_fail.name,
+            first_fail.detail,
+            tr!("fix", "修复"),
+            first_fail.fix,
+            tr!(
+                "(run `alice-miner doctor` for the full report)",
+                "(运行 `alice-miner doctor` 查看完整报告)"
+            )
         );
     }
 }
@@ -611,23 +659,34 @@ fn run_with_timeout(
 /// headed for the ai role.
 pub fn render_ai_report(checks: &[Check]) -> String {
     let mut s = String::new();
-    s.push_str("Alice Miner doctor — ai (shard-stage inference)\n");
+    s.push_str(tr!(
+        "Alice Miner doctor — ai (shard-stage inference)\n",
+        "Alice Miner doctor — ai (分片推理)\n"
+    ));
     s.push_str("─────────────────────────────────────────────\n");
     for c in checks {
         s.push_str(&format!("  [{}] {} — {}\n", c.status.word(), c.name, c.detail));
         if !c.fix.is_empty() {
-            s.push_str(&format!("        fix: {}\n", c.fix));
+            s.push_str(&format!("        {}: {}\n", tr!("fix", "修复"), c.fix));
         }
     }
     let fails = checks.iter().filter(|c| c.status == Status::Fail).count();
     let warns = checks.iter().filter(|c| c.status == Status::Warn).count();
     s.push_str("─────────────────────────────────────────────\n");
     if fails == 0 {
-        s.push_str(&format!("Ready to run the ai role. ({warns} warning(s).)\n"));
+        s.push_str(&format!(
+            "{} ({warns} {})\n",
+            tr!("Ready to run the ai role.", "ai 角色已就绪。"),
+            tr!("warning(s).", "个警告。")
+        ));
     } else {
         s.push_str(&format!(
-            "{fails} blocking issue(s), {warns} warning(s). Fix the FAIL lines above, then \
-             re-run `alice-miner doctor --ai`.\n"
+            "{fails} {}, {warns} {}\n",
+            tr!("blocking issue(s)", "个阻塞问题"),
+            tr!(
+                "warning(s). Fix the FAIL lines above, then re-run `alice-miner doctor --ai`.",
+                "个警告。请修复上面的 FAIL 行,然后重新运行 `alice-miner doctor --ai`。"
+            )
         ));
     }
     s

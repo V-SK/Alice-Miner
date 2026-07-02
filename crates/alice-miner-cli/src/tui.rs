@@ -37,6 +37,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 use ratatui::backend::CrosstermBackend;
 
+use alice_miner_core::tr;
 use alice_miner_core::{EngineState, Snapshot};
 
 use crate::dashboard::{
@@ -44,12 +45,18 @@ use crate::dashboard::{
 };
 
 /// The reward wording — the ONLY way rewards are shown (mirrors the line
-/// dashboard's `REWARD_CREDIT`). Never a number / `$`.
-const REWARD_CREDIT: &str = "credit · 积分 (credit-only)";
+/// dashboard's `reward_credit()`). Never a number / `$`. Localized via [`tr!`].
+fn reward_credit() -> String {
+    format!("{} (credit-only)", tr!("credit", "积分"))
+}
 
 /// The footer keybinding bar — k9s/lazygit style, persistent across the dashboard.
-/// Lists the keys that actually do something in the `start` panel.
-const KEYBINDINGS: &[(&str, &str)] = &[("q", "quit"), ("Esc", "quit"), ("^C", "quit")];
+/// Lists the keys that actually do something in the `start` panel. The action word
+/// is localized at render time (see [`footer_spans`] / [`keybindings_line`]).
+fn quit_action() -> &'static str {
+    tr!("quit", "退出")
+}
+const KEYBINDING_KEYS: &[&str] = &["q", "Esc", "^C"];
 
 /// The live-TUI terminal guard. Owns the alternate-screen + raw-mode lifecycle so
 /// the terminal is always restored — on normal exit (`Drop`) and on panic (a hook
@@ -246,12 +253,14 @@ pub fn stats_line(snap: &Snapshot) -> String {
     let pct = accepted_pct(snap.shares_accepted, snap.shares_rejected);
     let pct = if pct.is_empty() { String::new() } else { format!(" ({pct})") };
     format!(
-        "{}   ·   shares {}A/{}R{}   ·   rewards {}",
+        "{}   ·   {} {}A/{}R{}   ·   {} {}",
         fmt_hashrate(snap.hashrate_hs),
+        tr!("shares", "份额"),
         snap.shares_accepted,
         snap.shares_rejected,
         pct,
-        REWARD_CREDIT,
+        tr!("rewards", "奖励"),
+        reward_credit(),
     )
 }
 
@@ -263,7 +272,13 @@ pub fn crediting_line(snap: &Snapshot) -> Option<String> {
     let is_prl = snap.lane.map(|l| l.is_prl_lane()).unwrap_or(false);
     let healthy = snap.state == EngineState::Running
         && snap.message.as_deref().map(str::is_empty).unwrap_or(true);
-    (is_prl && healthy).then(|| "rewards: counting (PoP active · credit-only)".to_string())
+    (is_prl && healthy).then(|| {
+        tr!(
+            "rewards: counting (PoP active · credit-only)",
+            "奖励: 正在计入 (PoP 已激活 · credit-only)"
+        )
+        .to_string()
+    })
 }
 
 /// Build the ALWAYS-ON per-lane rows for the lane table (was dual-only). Reuses the
@@ -280,9 +295,10 @@ pub fn lane_rows(snap: &Snapshot) -> Vec<LaneRow> {
 /// the styled bar; this is the greppable equivalent, exposed for tests).
 #[allow(dead_code)] // plain-text mirror of footer_spans; used by tests
 pub fn keybindings_line() -> String {
-    KEYBINDINGS
+    let action = quit_action();
+    KEYBINDING_KEYS
         .iter()
-        .map(|(k, a)| format!("{k} {a}"))
+        .map(|k| format!("{k} {action}"))
         .collect::<Vec<_>>()
         .join("  ·  ")
 }
@@ -300,7 +316,7 @@ pub fn ticker_text(snap: &Snapshot) -> String {
             return format!("| {l}");
         }
     }
-    "q / Esc / Ctrl-C to stop".to_string()
+    tr!("q / Esc / Ctrl-C to stop", "q / Esc / Ctrl-C 停止").to_string()
 }
 
 /// Render the whole panel into `frame` from `snap`. `beat` is the heartbeat glyph and
@@ -344,8 +360,11 @@ fn render(frame: &mut Frame, snap: &Snapshot, beat: char, stale_s: u64) {
     if let Some(c) = crediting_line(snap) {
         stats_lines.push(Line::from(Span::styled(c, Style::default().fg(Color::Green))));
     }
-    let stats = Paragraph::new(stats_lines)
-        .block(Block::default().borders(Borders::ALL).title(" Activity "));
+    let stats = Paragraph::new(stats_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", tr!("Activity", "活动"))),
+    );
     frame.render_widget(stats, chunks[1]);
 
     // 3) ALWAYS-ON per-lane table with the green/amber/red semaphore per row.
@@ -378,9 +397,11 @@ fn render(frame: &mut Frame, snap: &Snapshot, beat: char, stale_s: u64) {
             Constraint::Min(20),    // endpoint
             Constraint::Length(4),  // failovers
         ];
-        let table = Table::new(table_rows, widths)
-            .header(header)
-            .block(Block::default().borders(Borders::ALL).title(" Lanes "));
+        let table = Table::new(table_rows, widths).header(header).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ", tr!("Lanes", "通道"))),
+        );
         frame.render_widget(table, chunks[next]);
         next += 1;
     }
@@ -399,8 +420,9 @@ fn render(frame: &mut Frame, snap: &Snapshot, beat: char, stale_s: u64) {
 
 /// The footer keybinding spans: each key in reverse-video, its action dimmed.
 fn footer_spans() -> Vec<Span<'static>> {
+    let action = quit_action();
     let mut spans = Vec::new();
-    for (i, (k, a)) in KEYBINDINGS.iter().enumerate() {
+    for (i, k) in KEYBINDING_KEYS.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
@@ -408,7 +430,7 @@ fn footer_spans() -> Vec<Span<'static>> {
             format!(" {k} "),
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(format!(" {a}"), Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(format!(" {action}"), Style::default().fg(Color::DarkGray)));
     }
     spans
 }
@@ -520,7 +542,7 @@ mod tests {
         assert!(s.contains("8.43 kH/s"), "{s}");
         assert!(s.contains("142A/1R"));
         assert!(s.contains("(99%)"));
-        assert!(s.contains(REWARD_CREDIT));
+        assert!(s.contains(&reward_credit()));
         let lower = s.to_lowercase();
         for forbidden in ["$", "usd", "paid", "earned", "已发放"] {
             assert!(!lower.contains(forbidden), "stats leaked `{forbidden}`: {s}");

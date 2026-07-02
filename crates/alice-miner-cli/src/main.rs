@@ -869,12 +869,24 @@ fn cmd_service(args: ServiceArgs) -> i32 {
     // Default + explicit --status: report state.
     if args.status || (!args.install && !args.uninstall) {
         let (word, msg) = match service::status() {
-            ServiceState::Running => ("running", "Background mining is installed and running."),
+            ServiceState::Running => (
+                "running",
+                tr!(
+                    "Background mining is installed and running.",
+                    "后台挖矿已安装并正在运行。"
+                ),
+            ),
             ServiceState::Loaded => (
                 "loaded",
-                "Background mining is installed (not currently running; it will keep retrying).",
+                tr!(
+                    "Background mining is installed (not currently running; it will keep retrying).",
+                    "后台挖矿已安装(当前未运行;它会持续重试)。"
+                ),
             ),
-            ServiceState::NotInstalled => ("not_installed", "Background mining is not installed."),
+            ServiceState::NotInstalled => (
+                "not_installed",
+                tr!("Background mining is not installed.", "后台挖矿未安装。"),
+            ),
         };
         if args.json {
             println!("{{\"service\":\"{word}\"}}");
@@ -892,7 +904,7 @@ fn cmd_service(args: ServiceArgs) -> i32 {
         }
         return match service::uninstall() {
             Ok(()) => {
-                println!("Background mining removed.");
+                println!("{}", tr!("Background mining removed.", "后台挖矿已移除。"));
                 EXIT_OK
             }
             Err(e) => {
@@ -906,7 +918,14 @@ fn cmd_service(args: ServiceArgs) -> i32 {
     let cli_path = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("error: cannot locate the miner CLI to background: {e}");
+            eprintln!(
+                "error: {}",
+                tr!(
+                    "cannot locate the miner CLI to background: {e}",
+                    "无法定位要放入后台的矿工 CLI: {e}"
+                )
+                .replace("{e}", &e.to_string())
+            );
             return EXIT_RUNTIME;
         }
     };
@@ -936,8 +955,11 @@ fn cmd_service(args: ServiceArgs) -> i32 {
     if lane.is_prl_lane() {
         let Some(addr) = alice_miner_core::identity::load_pointer().map(|p| p.address) else {
             eprintln!(
-                "error: no identity yet — create or import one (`identity --create`) before \
-                 backgrounding a GPU lane."
+                "error: {}",
+                tr!(
+                    "no identity yet — create or import one (`identity --create`) before backgrounding a GPU lane.",
+                    "尚无身份 — 在将 GPU 通道放入后台前,请先创建或导入一个(`identity --create`)。"
+                )
             );
             return EXIT_USAGE;
         };
@@ -966,8 +988,18 @@ fn cmd_service(args: ServiceArgs) -> i32 {
     let spec = ServiceSpec { lane, cli_path, run_at_login: args.at_login };
     match service::install(&spec) {
         Ok(()) => {
-            let tail = if args.at_login { " It will also start at login." } else { "" };
-            println!("Background mining installed and started.{tail}");
+            let tail = if args.at_login {
+                tr!(" It will also start at login.", " 它也会在登录时启动。")
+            } else {
+                ""
+            };
+            println!(
+                "{}{tail}",
+                tr!(
+                    "Background mining installed and started.",
+                    "后台挖矿已安装并启动。"
+                )
+            );
             if !args.json {
                 print!("{}", next_steps_after_service_install());
             }
@@ -1139,11 +1171,17 @@ fn cmd_identity_show(json: bool) -> i32 {
                 println!("{}", serde_json::json!({ "address": null, "pointer": path.display().to_string() }));
             } else {
                 eprintln!(
-                    "No identity yet. Create or import one first:\n  \
+                    "{}\n  \
                      alice-miner identity --create\n  \
                      alice-miner identity --import \"<24 words>\"\n  \
-                     alice-miner identity --paste <address>   (watch-only)\n\
-                     (expected pointer: {})",
+                     alice-miner identity --paste <address>   {}\n\
+                     ({}: {})",
+                    tr!(
+                        "No identity yet. Create or import one first:",
+                        "尚无身份。请先创建或导入一个:"
+                    ),
+                    tr!("(watch-only)", "(仅观察)"),
+                    tr!("expected pointer", "预期指针"),
                     path.display()
                 );
             }
@@ -1165,8 +1203,14 @@ fn cmd_set_prl_payout(addr: &str, json: bool) -> i32 {
                     serde_json::json!({ "prl_payout": masked, "set": true, "stored": path.display().to_string() })
                 );
             } else {
-                println!("15% PRL return address saved: {masked}");
-                println!("  binds to your Alice address on the next GPU mining start (PoP).");
+                println!("{}: {masked}", tr!("15% PRL return address saved", "15% PRL 返还地址已保存"));
+                println!(
+                    "  {}",
+                    tr!(
+                        "binds to your Alice address on the next GPU mining start (PoP).",
+                        "将在下次 GPU 挖矿启动时(PoP)绑定到你的 Alice 地址。"
+                    )
+                );
             }
             EXIT_OK
         }
@@ -1185,7 +1229,7 @@ fn cmd_show_prl_payout(json: bool) -> i32 {
             if json {
                 println!("{}", serde_json::json!({ "prl_payout": masked, "set": true }));
             } else {
-                println!("15% PRL return address: {masked}");
+                println!("{}: {masked}", tr!("15% PRL return address", "15% PRL 返还地址"));
             }
             EXIT_OK
         }
@@ -1193,8 +1237,15 @@ fn cmd_show_prl_payout(json: bool) -> i32 {
             if json {
                 println!("{}", serde_json::json!({ "prl_payout": null, "set": false }));
             } else {
-                println!("15% PRL return address: not set");
-                println!("  set one with:  alice-miner identity --set-prl-payout <prl1p…>");
+                println!(
+                    "{}: {}",
+                    tr!("15% PRL return address", "15% PRL 返还地址"),
+                    tr!("not set", "未设置")
+                );
+                println!(
+                    "  {}  alice-miner identity --set-prl-payout <prl1p…>",
+                    tr!("set one with:", "设置方式:")
+                );
             }
             EXIT_OK
         }
@@ -1238,8 +1289,9 @@ fn build_identity_spec(
         Ok(IdentitySpec::Paste { address, label })
     } else {
         eprintln!(
-            "error: choose one of:\n  \
-             --create | --import <MNEMONIC> | --import-seed <HEX> | --paste <ADDR> | --show"
+            "error: {}\n  \
+             --create | --import <MNEMONIC> | --import-seed <HEX> | --paste <ADDR> | --show",
+            tr!("choose one of:", "请选择其中之一:")
         );
         Err(EXIT_USAGE)
     }
@@ -1302,9 +1354,14 @@ fn cmd_start_with_unlock(
             ServiceState::Running | ServiceState::Loaded
         ) {
             eprintln!(
-                "error: background mining is already active (one miner per machine). Stop it with \
-                 `alice-miner service --uninstall` first, then run start — or just let the \
-                 background service keep mining."
+                "error: {}",
+                tr!(
+                    "background mining is already active (one miner per machine). Stop it with \
+                     `alice-miner service --uninstall` first, then run start — or just let the \
+                     background service keep mining.",
+                    "后台挖矿已在运行(每台机器只允许一个矿工)。请先用 \
+                     `alice-miner service --uninstall` 停止它再运行 start — 或直接让后台服务继续挖矿。"
+                )
             );
             return EXIT_USAGE;
         }
@@ -1318,11 +1375,15 @@ fn cmd_start_with_unlock(
 
     if !cap.support(lane).is_runnable() {
         eprintln!(
-            "error: the {} lane is {} on this device ({}). Recommended lane: {}.",
-            lane.label(),
-            cap.support(lane).label(),
-            cap.viability.reason(lane).unwrap_or("not viable"),
-            cap.recommended_lane().label(),
+            "error: {}",
+            tr!(
+                "the {lane} lane is {state} on this device ({reason}). Recommended lane: {rec}.",
+                "本设备上 {lane} 通道 {state}({reason})。推荐通道: {rec}。"
+            )
+            .replace("{lane}", lane.label())
+            .replace("{state}", cap.support(lane).label())
+            .replace("{reason}", cap.viability.reason(lane).unwrap_or("not viable"))
+            .replace("{rec}", cap.recommended_lane().label())
         );
         return EXIT_USAGE;
     }
@@ -1336,13 +1397,18 @@ fn cmd_start_with_unlock(
             // Volta box), not a hardcoded PRL, so the honest reason matches the device.
             let gpu = lane.dual_gpu_partner();
             eprintln!(
-                "error: dual-mine needs 2 viable lanes; this device has {} ({} is {}: {}). \
-                 Run a single lane instead, e.g. `alice-miner start --lane {}`.",
-                runnable.len(),
-                gpu.label(),
-                cap.support(gpu).label(),
-                cap.viability.reason(gpu).unwrap_or("not viable"),
-                cap.recommended_lane().id(),
+                "error: {}",
+                tr!(
+                    "dual-mine needs 2 viable lanes; this device has {n} ({gpu} is {state}: {reason}). \
+                     Run a single lane instead, e.g. `alice-miner start --lane {rec}`.",
+                    "双挖需要 2 个可用通道;本设备只有 {n} 个({gpu} {state}: {reason})。\
+                     请改用单通道,例如 `alice-miner start --lane {rec}`。"
+                )
+                .replace("{n}", &runnable.len().to_string())
+                .replace("{gpu}", gpu.label())
+                .replace("{state}", cap.support(gpu).label())
+                .replace("{reason}", cap.viability.reason(gpu).unwrap_or("not viable"))
+                .replace("{rec}", cap.recommended_lane().id())
             );
             return EXIT_USAGE;
         }
@@ -1648,8 +1714,11 @@ fn cmd_start_with_unlock(
             }
         } else {
             eprintln!(
-                "note: the lane never reached the Running state \
-                 (the relay may be unreachable from here)."
+                "note: {}",
+                tr!(
+                    "the lane never reached the Running state (the relay may be unreachable from here).",
+                    "该通道从未进入 Running 状态(此处可能无法连接到中继)。"
+                )
             );
         }
     }
@@ -1720,7 +1789,14 @@ fn resolve_lane(s: &str, cap: &alice_miner_core::CapabilityProfile) -> Result<La
         "rvn" => Ok(Lane::GpuRvn),
         "auto" => Ok(cap.recommended_lane()),
         other => {
-            eprintln!("error: unknown lane `{other}` (use: xmr | gpu | prl | alpha | rvn | auto)");
+            eprintln!(
+                "error: {}",
+                tr!(
+                    "unknown lane `{lane}` (use: xmr | gpu | prl | alpha | rvn | auto)",
+                    "未知通道 `{lane}`(可用: xmr | gpu | prl | alpha | rvn | auto)"
+                )
+                .replace("{lane}", other)
+            );
             Err(EXIT_USAGE)
         }
     }
@@ -1734,27 +1810,48 @@ fn cmd_stop(args: StopArgs) -> i32 {
     match pidfile::read_pid() {
         None => {
             eprintln!(
-                "No running miner found (no pid file at {}).",
-                pidfile::pid_path().display()
+                "{}",
+                tr!(
+                    "No running miner found (no pid file at {p}).",
+                    "未找到运行中的矿工(无 pid 文件于 {p})。"
+                )
+                .replace("{p}", &pidfile::pid_path().display().to_string())
             );
             // Not an error per se, but non-zero so scripts can branch.
             EXIT_RUNTIME
         }
         Some(pid) if !pidfile::is_alive(pid) => {
-            eprintln!("No running miner (stale pid {pid}); cleaning up.");
+            eprintln!(
+                "{}",
+                tr!(
+                    "No running miner (stale pid {pid}); cleaning up.",
+                    "没有运行中的矿工(过期 pid {pid});正在清理。"
+                )
+                .replace("{pid}", &pid.to_string())
+            );
             pidfile::remove();
             EXIT_RUNTIME
         }
         Some(pid) => {
-            println!("Stopping miner (pid {pid})…");
+            println!(
+                "{}",
+                tr!("Stopping miner (pid {pid})…", "正在停止矿工(pid {pid})…")
+                    .replace("{pid}", &pid.to_string())
+            );
             match pidfile::stop_pid(pid, Duration::from_secs(args.timeout_s)) {
                 pidfile::StopOutcome::Graceful => {
-                    println!("Miner stopped cleanly.");
+                    println!("{}", tr!("Miner stopped cleanly.", "矿工已干净停止。"));
                     pidfile::remove();
                     EXIT_OK
                 }
                 pidfile::StopOutcome::Killed => {
-                    println!("Miner did not exit in time; sent SIGKILL. No orphan left.");
+                    println!(
+                        "{}",
+                        tr!(
+                            "Miner did not exit in time; sent SIGKILL. No orphan left.",
+                            "矿工未按时退出;已发送 SIGKILL。没有遗留孤儿进程。"
+                        )
+                    );
                     pidfile::remove();
                     EXIT_OK
                 }
@@ -1796,8 +1893,13 @@ fn resolve_password(flag: Option<String>, from_stdin: bool) -> Result<String, St
     }
     if let Some(p) = flag {
         eprintln!(
-            "warning: --password is INSECURE — it is visible in the process table (ps) and \
-             your shell history. Use the interactive prompt (omit --password) or --password-stdin."
+            "warning: {}",
+            tr!(
+                "--password is INSECURE — it is visible in the process table (ps) and your shell \
+                 history. Use the interactive prompt (omit --password) or --password-stdin.",
+                "--password 不安全 — 它在进程表(ps)和 shell 历史中可见。\
+                 请使用交互式提示(省略 --password)或 --password-stdin。"
+            )
         );
         return if p.is_empty() {
             Err("passphrase must not be empty".into())
@@ -1805,7 +1907,7 @@ fn resolve_password(flag: Option<String>, from_stdin: bool) -> Result<String, St
             Ok(p)
         };
     }
-    rpassword::prompt_password("Keystore passphrase: ")
+    rpassword::prompt_password(tr!("Keystore passphrase: ", "密钥库口令: "))
         .map_err(|e| format!("failed to read passphrase: {e}"))
         .and_then(|p| {
             if p.is_empty() {
@@ -1828,7 +1930,10 @@ fn resolve_password(flag: Option<String>, from_stdin: bool) -> Result<String, St
 /// the user now has a reward address, so point them straight at mining. A
 /// watch-only (pasted) identity can still mine to its own address.
 fn next_steps_after_identity(_identity: &alice_miner_core::Identity) -> String {
-    "\nNext: start mining to this address\n  alice-miner start\n".to_string()
+    format!(
+        "\n{}\n  alice-miner start\n",
+        tr!("Next: start mining to this address", "下一步: 向此地址开始挖矿")
+    )
 }
 
 /// After `start` reaches the Running state: tell the user how to keep mining in
@@ -1836,8 +1941,11 @@ fn next_steps_after_identity(_identity: &alice_miner_core::Identity) -> String {
 /// `service --install --lane <lane>` accepts, so the line is copy-paste ready.
 fn next_steps_after_running(lane: Lane) -> String {
     format!(
-        "\nTip: to keep mining after you close this window, install the background service:\n  \
-         alice-miner service --install --lane {}\n",
+        "\n{}\n  alice-miner service --install --lane {}\n",
+        tr!(
+            "Tip: to keep mining after you close this window, install the background service:",
+            "提示: 想在关闭此窗口后继续挖矿,请安装后台服务:"
+        ),
         lane.cli_lane_arg()
     )
 }
@@ -1856,11 +1964,13 @@ fn prl_payout_nudge(lane: Lane) -> Option<String> {
     // "don't nag" since the existing show/set path surfaces that.
     match alice_miner_core::prl_payout::load_payout_address() {
         Ok(Some(_)) => None,
-        Ok(None) => Some(
-            "\nThis GPU lane earns the 15% PRL return. To claim it, set your PRL return address:\n  \
-             alice-miner identity --set-prl-payout <prl1p…>\n"
-                .to_string(),
-        ),
+        Ok(None) => Some(format!(
+            "\n{}\n  alice-miner identity --set-prl-payout <prl1p…>\n",
+            tr!(
+                "This GPU lane earns the 15% PRL return. To claim it, set your PRL return address:",
+                "此 GPU 通道可获得 15% PRL 返还。要领取它,请设置你的 PRL 返还地址:"
+            )
+        )),
         Err(_) => None,
     }
 }
@@ -1868,9 +1978,11 @@ fn prl_payout_nudge(lane: Lane) -> Option<String> {
 /// After `service --install` succeeds: how to check status / uninstall, so the
 /// user isn't left guessing whether the background agent took.
 fn next_steps_after_service_install() -> String {
-    "\nCheck it any time:   alice-miner service --status\n\
-     Stop background mining: alice-miner service --uninstall\n"
-        .to_string()
+    format!(
+        "\n{}:   alice-miner service --status\n{}: alice-miner service --uninstall\n",
+        tr!("Check it any time", "随时查看状态"),
+        tr!("Stop background mining", "停止后台挖矿")
+    )
 }
 
 #[cfg(test)]

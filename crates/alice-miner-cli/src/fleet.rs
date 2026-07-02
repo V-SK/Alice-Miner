@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use alice_miner_core::tr;
 use alice_miner_core::Snapshot;
 
 use crate::dashboard::fmt_hashrate;
@@ -162,7 +163,7 @@ pub fn render_roster(rows: &[RosterRow]) -> String {
     ));
     out.push_str(&format!("{}\n", "─".repeat(96)));
     if rows.is_empty() {
-        out.push_str("  (no sources)\n");
+        out.push_str(tr!("  (no sources)\n", "  (无数据源)\n"));
         return out;
     }
     for row in rows {
@@ -239,14 +240,25 @@ fn build_rows(paths: &[PathBuf]) -> Vec<RosterRow> {
 /// only on a TTY; piped/non-TTY just prints one frame so the output stays clean).
 pub fn run(paths: &[PathBuf], once: bool, interval: Duration) -> i32 {
     if paths.is_empty() {
-        eprintln!("error: fleet needs at least one --json stream file to read.");
+        eprintln!(
+            "error: {}",
+            tr!(
+                "fleet needs at least one --json stream file to read.",
+                "fleet 至少需要一个 --json 流文件来读取。"
+            )
+        );
         return crate::EXIT_USAGE;
     }
     if paths.len() > MAX_SOURCES {
         // Honest: say we capped, don't silently drop.
         println!(
-            "note: {} sources given; showing the first {MAX_SOURCES} (roster cap).",
-            paths.len()
+            "note: {}",
+            tr!(
+                "{n} sources given; showing the first {cap} (roster cap).",
+                "提供了 {n} 个数据源;仅显示前 {cap} 个(名单上限)。"
+            )
+            .replace("{n}", &paths.len().to_string())
+            .replace("{cap}", &MAX_SOURCES.to_string())
         );
     }
 
@@ -269,7 +281,14 @@ pub fn run(paths: &[PathBuf], once: bool, interval: Duration) -> i32 {
         // ratatui panel is `start`'s job, the roster stays dependency-light).
         print!("\x1b[2J\x1b[H");
         print!("{}", render_roster(&build_rows(paths)));
-        println!("  (refreshing every {}s · Ctrl-C to exit)", interval.as_secs());
+        println!(
+            "  {}",
+            tr!(
+                "(refreshing every {s}s · Ctrl-C to exit)",
+                "(每 {s}秒刷新 · Ctrl-C 退出)"
+            )
+            .replace("{s}", &interval.as_secs().to_string())
+        );
         use std::io::Write;
         let _ = std::io::stdout().flush();
         // Sleep in small slices so Ctrl-C is responsive.

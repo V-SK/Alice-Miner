@@ -29,6 +29,7 @@
 
 use std::io::{IsTerminal, Write};
 
+use alice_miner_core::tr;
 use alice_miner_core::{CapabilityProfile, Lane};
 use zeroize::Zeroizing;
 
@@ -143,29 +144,38 @@ fn prompt_line(prompt: &str) -> Option<String> {
 /// Run the guided wizard. Returns a process exit code. Never panics; never puts a
 /// secret in argv; refuses to clobber an existing identity in the generate path.
 pub fn run(cfg: SetupConfig, no_color: bool) -> i32 {
-    println!("Alice Miner setup");
+    println!("{}", tr!("Alice Miner setup", "Alice Miner 安装向导"));
     println!("─────────────────");
 
     // (1) Detect hardware + recommend a lane.
     let cap = CapabilityProfile::detect();
-    println!("Device: {}", cap.profile.display);
+    println!("{}: {}", tr!("Device", "设备"), cap.profile.display);
     let lane = match crate::resolve_lane(&cfg.lane, &cap) {
         Ok(l) => l,
         Err(code) => return code,
     };
     println!(
-        "Lane:   {} ({})",
+        "{}:   {} ({})",
+        tr!("Lane", "通道"),
         lane.label(),
-        if cfg.lane.eq_ignore_ascii_case("auto") { "recommended" } else { "selected" }
+        if cfg.lane.eq_ignore_ascii_case("auto") {
+            tr!("recommended", "推荐")
+        } else {
+            tr!("selected", "已选")
+        }
     );
     // Honest viability gate (the same one `start` uses) — refuse early.
     if !cap.support(lane).is_runnable() {
         eprintln!(
-            "error: the {} lane is {} on this device ({}). Try `alice-miner setup --lane {}`.",
-            lane.label(),
-            cap.support(lane).label(),
-            cap.viability.reason(lane).unwrap_or("not viable"),
-            cap.recommended_lane().id()
+            "error: {}",
+            tr!(
+                "the {lane} lane is {state} on this device ({reason}). Try `alice-miner setup --lane {rec}`.",
+                "本设备上 {lane} 通道 {state}({reason})。请尝试 `alice-miner setup --lane {rec}`。"
+            )
+            .replace("{lane}", lane.label())
+            .replace("{state}", cap.support(lane).label())
+            .replace("{reason}", cap.viability.reason(lane).unwrap_or("not viable"))
+            .replace("{rec}", cap.recommended_lane().id())
         );
         return EXIT_USAGE;
     }
@@ -178,7 +188,7 @@ pub fn run(cfg: SetupConfig, no_color: bool) -> i32 {
         Ok(pair) => pair,
         Err(code) => return code,
     };
-    println!("Address: {address}");
+    println!("{}: {address}", tr!("Address", "地址"));
 
     // (3) Optional 15% PRL return address for a GPU lane.
     if let Err(code) = maybe_set_prl_payout(&cfg, lane) {
@@ -187,19 +197,37 @@ pub fn run(cfg: SetupConfig, no_color: bool) -> i32 {
 
     // (4) Confirm.
     if !confirm(&cfg, lane, &address) {
-        println!("Setup cancelled. Re-run `alice-miner setup` any time.");
+        println!(
+            "{}",
+            tr!(
+                "Setup cancelled. Re-run `alice-miner setup` any time.",
+                "已取消安装。你可以随时重新运行 `alice-miner setup`。"
+            )
+        );
         return EXIT_OK;
     }
 
     // (5) Start (or stop here) + (6) point at the live dashboard.
     match start_choice(&cfg) {
         StartChoice::No => {
-            println!("\nSetup complete. Start mining when ready:");
+            println!(
+                "\n{}",
+                tr!(
+                    "Setup complete. Start mining when ready:",
+                    "安装完成。准备好后即可开始挖矿:"
+                )
+            );
             println!("  alice-miner start --lane {}", lane.cli_lane_arg());
             EXIT_OK
         }
         _ => {
-            println!("\nStarting the miner — a live dashboard follows (Ctrl-C to stop).");
+            println!(
+                "\n{}",
+                tr!(
+                    "Starting the miner — a live dashboard follows (Ctrl-C to stop).",
+                    "正在启动矿工 — 稍后显示实时面板 (Ctrl-C 停止)。"
+                )
+            );
             // Reuse the EXACT `start` path so setup can't drift from real mining.
             // `password` stays None — the generated passphrase is NEVER put on argv;
             // it rides the separate in-process `prefetched_unlock` channel below.
@@ -242,11 +270,15 @@ fn resolve_reward_address(
             // An existing identity? Offer to reuse it (the common re-run case).
             if let Some(p) = alice_miner_core::identity::load_pointer() {
                 if alice_miner_core::lane::xmr::validate_alice_address(&p.address).is_some() {
-                    println!("Found an existing reward address: {}", p.address);
+                    println!(
+                        "{}: {}",
+                        tr!("Found an existing reward address", "找到已有的奖励地址"),
+                        p.address
+                    );
                     if !can_prompt(cfg) {
                         return Ok((p.address, None));
                     }
-                    let ans = prompt_line("Use it? [Y/n] ").unwrap_or_default();
+                    let ans = prompt_line(tr!("Use it? [Y/n] ", "使用它?[Y/n] ")).unwrap_or_default();
                     if ans.is_empty() || ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes") {
                         return Ok((p.address, None));
                     }
@@ -254,20 +286,29 @@ fn resolve_reward_address(
             }
             if !can_prompt(cfg) {
                 eprintln!(
-                    "error: no reward address. Pass --address <alice-addr> or --generate \
-                     (no interactive prompt available)."
+                    "error: {}",
+                    tr!(
+                        "no reward address. Pass --address <alice-addr> or --generate (no interactive prompt available).",
+                        "没有奖励地址。请传入 --address <alice-地址> 或 --generate(无法进行交互式提示)。"
+                    )
                 );
                 return Err(EXIT_USAGE);
             }
             // Paste or generate?
-            println!("Set your reward address:");
-            println!("  1) paste an existing Alice address");
-            println!("  2) generate a new identity (you'll back up a 24-word phrase)");
-            let choice = prompt_line("Choose [1/2]: ").unwrap_or_default();
+            println!("{}", tr!("Set your reward address:", "设置你的奖励地址:"));
+            println!("  {}", tr!("1) paste an existing Alice address", "1) 粘贴已有的 Alice 地址"));
+            println!(
+                "  {}",
+                tr!(
+                    "2) generate a new identity (you'll back up a 24-word phrase)",
+                    "2) 生成新身份(你需要备份 24 个词的助记词)"
+                )
+            );
+            let choice = prompt_line(tr!("Choose [1/2]: ", "选择 [1/2]: ")).unwrap_or_default();
             if choice == "2" {
                 generate_identity_address(cfg).map(|(a, pw)| (a, Some(pw)))
             } else {
-                let pasted = prompt_line("Alice address: ").unwrap_or_default();
+                let pasted = prompt_line(tr!("Alice address: ", "Alice 地址: ")).unwrap_or_default();
                 validate_or_reject(&pasted).map(|a| (a, None))
             }
         }
@@ -286,13 +327,27 @@ fn validate_or_reject(addr: &str) -> Result<String, i32> {
                 // The pointer write failed (e.g. read-only home): still proceed with
                 // the validated address in-memory (start gets it via --address).
                 Err(e) => {
-                    eprintln!("warning: could not save the address pointer ({e}); continuing.");
+                    eprintln!(
+                        "warning: {}",
+                        tr!(
+                            "could not save the address pointer ({e}); continuing.",
+                            "无法保存地址指针({e});继续。"
+                        )
+                        .replace("{e}", &e.to_string())
+                    );
                     Ok(canonical)
                 }
             }
         }
         None => {
-            eprintln!("error: '{addr}' is not a valid Alice address (must be SS58 format-300).");
+            eprintln!(
+                "error: {}",
+                tr!(
+                    "'{addr}' is not a valid Alice address (must be SS58 format-300).",
+                    "'{addr}' 不是有效的 Alice 地址(必须是 SS58 format-300)。"
+                )
+                .replace("{addr}", addr)
+            );
             Err(EXIT_USAGE)
         }
     }
@@ -312,11 +367,17 @@ fn generate_identity_address(cfg: &SetupConfig) -> Result<(String, Zeroizing<Str
     // HAZARD GUARD: never silently overwrite an existing identity.
     if let Some(p) = alice_miner_core::identity::load_pointer() {
         eprintln!(
-            "error: an identity already exists ({}). Generating a new one would replace your \
-             reward identity. If that's what you want, run `alice-miner identity --create` \
-             explicitly (it backs up the old keystore first); otherwise re-run setup with \
-             --address <that-address> to keep mining to it.",
-            p.address
+            "error: {}",
+            tr!(
+                "an identity already exists ({addr}). Generating a new one would replace your \
+                 reward identity. If that's what you want, run `alice-miner identity --create` \
+                 explicitly (it backs up the old keystore first); otherwise re-run setup with \
+                 --address <that-address> to keep mining to it.",
+                "身份已存在({addr})。生成新身份会替换你的奖励身份。如果你确实想这么做,\
+                 请显式运行 `alice-miner identity --create`(它会先备份旧的密钥库);\
+                 否则请用 --address <该地址> 重新运行 setup 以继续向它挖矿。"
+            )
+            .replace("{addr}", &p.address)
         );
         return Err(EXIT_USAGE);
     }
@@ -336,13 +397,22 @@ fn generate_identity_address(cfg: &SetupConfig) -> Result<(String, Zeroizing<Str
             // Forced-backup block — same wording family as `identity --create`. The
             // mnemonic goes to STDERR so a piped stdout can't slurp it.
             eprintln!();
-            eprintln!("  ── BACK UP THIS RECOVERY PHRASE (24 words) ──");
+            eprintln!(
+                "  {}",
+                tr!(
+                    "── BACK UP THIS RECOVERY PHRASE (24 words) ──",
+                    "── 请备份此恢复助记词(24 个词)──"
+                )
+            );
             eprintln!("  {}", mnemonic.as_str());
             eprintln!("  ─────────────────────────────────────────────");
             Ok((identity.address, password))
         }
         Err(e) => {
-            eprintln!("error: failed to create identity: {e}");
+            eprintln!(
+                "error: {}",
+                tr!("failed to create identity: {e}", "创建身份失败: {e}").replace("{e}", &e.to_string())
+            );
             Err(EXIT_RUNTIME)
         }
     }
@@ -366,14 +436,26 @@ fn maybe_set_prl_payout(cfg: &SetupConfig, lane: Lane) -> Result<(), i32> {
     if !can_prompt(cfg) {
         // Non-interactive + GPU lane + unset: just note it (mining still works).
         println!(
-            "Note: this GPU lane earns the 15% PRL return. Set it later with \
-             `alice-miner identity --set-prl-payout <prl1p…>`."
+            "{}",
+            tr!(
+                "Note: this GPU lane earns the 15% PRL return. Set it later with `alice-miner identity --set-prl-payout <prl1p…>`.",
+                "提示: 此 GPU 通道可获得 15% PRL 返还。稍后可用 `alice-miner identity --set-prl-payout <prl1p…>` 设置。"
+            )
         );
         return Ok(());
     }
-    println!("This GPU lane earns the 15% PRL return (optional).");
-    let ans = prompt_line("Set your PRL return address now? paste prl1p… or leave blank to skip: ")
-        .unwrap_or_default();
+    println!(
+        "{}",
+        tr!(
+            "This GPU lane earns the 15% PRL return (optional).",
+            "此 GPU 通道可获得 15% PRL 返还(可选)。"
+        )
+    );
+    let ans = prompt_line(tr!(
+        "Set your PRL return address now? paste prl1p… or leave blank to skip: ",
+        "现在设置 PRL 返还地址?粘贴 prl1p… 或留空跳过: "
+    ))
+    .unwrap_or_default();
     if ans.is_empty() {
         return Ok(());
     }
@@ -386,7 +468,10 @@ fn save_prl(addr: &str) -> Result<(), i32> {
     match alice_miner_core::prl_payout::save_payout_address(addr) {
         Ok(_) => {
             let masked = alice_miner_core::prl_payout::mask_payout(addr.trim());
-            println!("15% PRL return address saved: {masked}");
+            println!(
+                "{}: {masked}",
+                tr!("15% PRL return address saved", "15% PRL 返还地址已保存")
+            );
             Ok(())
         }
         Err(e) => {
@@ -398,13 +483,13 @@ fn save_prl(addr: &str) -> Result<(), i32> {
 
 /// The confirmation step. `--yes` (or a non-interactive run) accepts silently.
 fn confirm(cfg: &SetupConfig, lane: Lane, address: &str) -> bool {
-    println!("\nReady to mine:");
-    println!("  lane:    {}", lane.label());
-    println!("  address: {address}");
+    println!("\n{}", tr!("Ready to mine:", "准备开始挖矿:"));
+    println!("  {}:    {}", tr!("lane", "通道"), lane.label());
+    println!("  {}: {address}", tr!("address", "地址"));
     if cfg.yes || !can_prompt(cfg) {
         return true;
     }
-    let ans = prompt_line("Start now? [Y/n] ").unwrap_or_default();
+    let ans = prompt_line(tr!("Start now? [Y/n] ", "现在开始?[Y/n] ")).unwrap_or_default();
     ans.is_empty() || ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes")
 }
 
