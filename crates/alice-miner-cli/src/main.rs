@@ -45,13 +45,17 @@ use alice_miner_core::tr;
 use alice_miner_core::{EngineHandle, EngineState, GpuSelection, Lane, Snapshot};
 
 mod ai;
+mod balance;
 mod color;
 mod dashboard;
 mod doctor;
 mod fleet;
+mod logo;
+mod menu;
 mod pidfile;
 mod setup;
 mod tui;
+mod update;
 
 // ── Exit codes ──────────────────────────────────────────────────────────────
 /// Success.
@@ -271,6 +275,39 @@ enum Command {
         The global `--lang <en|zh>` flag does the same for a single run (and also\n\
         persists when passed explicitly).")]
     Lang(LangArgs),
+
+    /// Show your THREE reward buckets: credit (积分), PRL rebate, and ALICE token.
+    #[command(long_about = "Show the three honest reward buckets for your Alice address (or\n\
+        --address), by querying the PUBLIC read API (credit-only, no secret):\n\
+        \n\
+        Credit (积分)        credit-only points from AI + credit mining (a cumulative\n\
+                            accepted-share count). Converts to ALICE at the real-money launch.\n\
+        PRL rebate          the REAL 15% pearlhash return (returned crypto) to your prl1p\n\
+                            address — its binding + accrual state (the amount is off until\n\
+                            payout is enabled; never a fabricated number).\n\
+        ALICE (real token)  the REAL on-chain token. Not exposed on-chain pre-launch, so it\n\
+                            shows the honest pending state — never a fabricated balance.\n\
+        \n\
+        --address <ADDR>  look up an address other than the active identity (watch-only OK)\n\
+        --json            emit the three buckets as one JSON object (nulls where unknown)\n\
+        \n\
+        Credit is credit-only (not cash); PRL is real returned crypto; ALICE is the real\n\
+        token (pending launch). An offline / unreachable read API is reported clearly.")]
+    Balance(balance::BalanceArgs),
+
+    /// Check for a newer signed version and (with consent) apply it.
+    #[command(long_about = "Check for a newer signed release and, with your consent, apply it —\n\
+        using the SAME ed25519-signed manifest + SHA-256-verified artifact + atomic-swap\n\
+        pipeline the desktop app uses. NEVER auto-applies without consent.\n\
+        \n\
+        alice-miner update           check → if newer, show it and ask before applying\n\
+        alice-miner update --check   check + report (current vs latest + notes) only\n\
+        alice-miner update --yes     check → apply a newer version without prompting\n\
+        \n\
+        A non-blocking startup check also prints a one-line 'new version available' banner\n\
+        on `start` / `ai` (cached ~6h; opt out with ALICE_MINER_NO_UPDATE_CHECK=1). The\n\
+        check never blocks or delays mining.")]
+    Update(update::UpdateArgs),
 }
 
 #[derive(clap::Args)]
@@ -580,8 +617,10 @@ fn main() {
         Some(Command::Setup(args)) => setup::run(args.into(), no_color),
         Some(Command::Ai(args)) => cmd_ai(args),
         Some(Command::Lang(args)) => cmd_lang(args),
-        // No subcommand: guide a first-launch user (auto-setup when ~/.alice has no
-        // identity AND stdin is a TTY), else print help. Skips silently otherwise.
+        Some(Command::Balance(args)) => balance::run(args),
+        Some(Command::Update(args)) => update::run(args),
+        // No subcommand: on an interactive TTY, launch the interactive menu; else
+        // (piped / non-TTY) print help. Never a surprise prompt for a script.
         None => cmd_no_subcommand(no_color),
     };
     std::process::exit(code);
@@ -663,10 +702,18 @@ fn command_allows_prompt(command: Option<&Command>) -> bool {
         Some(Command::Identity(a)) => !a.json,
         Some(Command::Start(a)) => !a.json && !a.from_service,
         Some(Command::Doctor(a)) => !a.json,
+        Some(Command::Balance(a)) => !a.json,
         // `lang` itself sets the language; don't first-run-prompt on the way in.
         Some(Command::Lang(_)) => false,
-        // setup / ai / bare-binary: interactive-friendly → allow the prompt.
-        Some(Command::Setup(_)) | Some(Command::Ai(_)) | None => true,
+        // `update`: the interactive apply already confirms; the terminal-line prompt
+        // for language would clash with its own prompt — skip the pre-prompt.
+        Some(Command::Update(_)) => false,
+        // setup / ai: interactive-friendly → allow the stderr line prompt.
+        Some(Command::Setup(_)) | Some(Command::Ai(_)) => true,
+        // Bare-binary: the interactive MENU owns the first-run language pick (a nicer
+        // TUI chooser), so DON'T fire the stderr line prompt on the way in. The menu's
+        // fallback (non-TTY) path prints help, which needs no language pick.
+        None => false,
     }
 }
 
@@ -742,10 +789,14 @@ fn cmd_lang(args: LangArgs) -> i32 {
     }
 }
 
-/// The bare-binary path (no subcommand). On a FIRST launch — no `~/.alice`
-/// identity AND an interactive stdin TTY — auto-run the guided `setup` wizard.
-/// Otherwise print the top-level help (a script piping in, or an already-set-up
-/// user who just typed the bare command, gets help, never a surprise prompt).
+/// The bare-binary path (no subcommand):
+///
+///   * FIRST launch (no `~/.alice` identity AND an interactive TTY) → the guided
+///     `setup` wizard, unchanged (the right first step for a brand-new user).
+///   * Already set up + interactive TTY → the fancy interactive MENU (logo + items),
+///     which dispatches to the SAME command entry points a power user would type.
+///   * Non-TTY / piped / redirected → print the top-level help (never a prompt), so a
+///     script that pipes in gets the usual help.
 fn cmd_no_subcommand(no_color: bool) -> i32 {
     use std::io::IsTerminal;
     let has_identity = alice_miner_core::identity::load_pointer().is_some();
@@ -754,11 +805,122 @@ fn cmd_no_subcommand(no_color: bool) -> i32 {
         // First launch, interactive → guide them through setup.
         return setup::run(setup::SetupConfig::first_launch(), no_color);
     }
-    // Otherwise: print help and exit cleanly (clap renders the long help).
+    if interactive {
+        // Already set up → the interactive launcher. It owns the first-run language
+        // pick (a TUI chooser), returns a MenuAction, and we dispatch it below to the
+        // existing command functions (the menu never reimplements a command).
+        let action = menu::run();
+        // Non-blocking version banner AFTER the menu screen is torn down (so it prints
+        // to the restored terminal, not the alternate screen). Bounded + ~6h cached +
+        // opt-out; never blocks. Skipped when the user chose Update (which checks itself).
+        if action != menu::MenuAction::Update {
+            update::startup_banner(false);
+        }
+        return run_menu_action(action, no_color);
+    }
+    // Non-TTY / piped: print help and exit cleanly (clap renders the long help).
     use clap::CommandFactory;
     let mut cmd = Cli::command();
     let _ = cmd.print_help();
     println!();
+    EXIT_OK
+}
+
+/// Dispatch a [`menu::MenuAction`] to the EXISTING command entry point (never a
+/// reimplementation). This is the one place the menu's choice becomes a real command.
+fn run_menu_action(action: menu::MenuAction, no_color: bool) -> i32 {
+    match action {
+        // Start mining on the recommended (auto) lane — the same `cmd_start` a power
+        // user drives with `alice-miner start --lane auto`.
+        menu::MenuAction::StartMining => cmd_start(start_args_auto(), no_color),
+        // Status & telemetry: the read-only device + lane-viability telemetry screen
+        // (`detect`). The LIVE mining dashboard streams from Start; this is the
+        // no-mining "what does this box see" view.
+        menu::MenuAction::Status => cmd_detect(DetectArgs { json: false }),
+        // Balance: the three-bucket read-only balance for the active identity.
+        menu::MenuAction::Balance => balance::run(balance::BalanceArgs { address: None, json: false }),
+        // Settings: language / identity / background service. A small sub-screen that
+        // just shows the current settings + how to change them (each via its own
+        // command); we surface the active identity + language and the service status.
+        menu::MenuAction::Settings => cmd_settings_overview(),
+        // Doctor + self-repair on the recommended lane.
+        menu::MenuAction::Doctor => cmd_doctor(DoctorArgs {
+            lane: "auto".to_string(),
+            ai: false,
+            center_url: None,
+            endpoint: None,
+            engine_dir: None,
+            python: None,
+            allow_cpu: false,
+            json: false,
+        }),
+        // Check for updates (interactive apply flow — asks before applying).
+        menu::MenuAction::Update => update::run(update::UpdateArgs { check: false, yes: false }),
+        menu::MenuAction::Quit => EXIT_OK,
+    }
+}
+
+/// A default `start` invocation on the AUTO (recommended) lane — the menu's "Start
+/// mining" path. Mirrors `alice-miner start --lane auto` with every other flag at its
+/// clap default.
+fn start_args_auto() -> StartArgs {
+    StartArgs {
+        lane: "auto".to_string(),
+        address: None,
+        dual: false,
+        json: false,
+        plain: false,
+        duration_s: 0,
+        password: None,
+        password_stdin: false,
+        gpus: None,
+        from_service: false,
+    }
+}
+
+/// The Settings overview the menu's [4] item shows: the active identity address, the
+/// current UI language, and the background-service status — plus the exact command to
+/// change each. Read-only; it dispatches to no mutating path (the user runs the named
+/// command to change a setting). Credit-only — never a secret.
+fn cmd_settings_overview() -> i32 {
+    println!("\n  {}", tr!("Settings", "设置"));
+    println!("  {}", "─".repeat(50));
+    // Language.
+    println!(
+        "  {}: {}   ({}: alice-miner lang <en|zh>)",
+        tr!("Language", "语言"),
+        i18n::lang().code(),
+        tr!("change", "更改")
+    );
+    // Identity (public address only; never a secret).
+    match alice_miner_core::identity::load_pointer() {
+        Some(p) => println!(
+            "  {}: {}   ({}: alice-miner identity --show)",
+            tr!("Identity", "身份"),
+            p.address,
+            tr!("details", "详情")
+        ),
+        None => println!(
+            "  {}: {}   ({}: alice-miner identity --create)",
+            tr!("Identity", "身份"),
+            tr!("none yet", "尚无"),
+            tr!("create", "创建")
+        ),
+    }
+    // Background service status.
+    use alice_miner_core::service::{self, ServiceState};
+    let svc = match service::status() {
+        ServiceState::Running => tr!("running", "运行中"),
+        ServiceState::Loaded => tr!("installed (idle)", "已安装(空闲)"),
+        ServiceState::NotInstalled => tr!("not installed", "未安装"),
+    };
+    println!(
+        "  {}: {}   ({}: alice-miner service --install)",
+        tr!("Background mining", "后台挖矿"),
+        svc,
+        tr!("manage", "管理")
+    );
+    println!("  {}\n", "─".repeat(50));
     EXIT_OK
 }
 
@@ -827,6 +989,11 @@ fn cmd_doctor_ai(args: DoctorArgs) -> i32 {
 /// needs the signing key), builds the resolved config, and hands off to
 /// [`ai::run`]. Credit-only; NEVER creates/overwrites an identity (read-only).
 fn cmd_ai(args: AiArgs) -> i32 {
+    // Non-blocking startup version check (the ai role has no `--json` toggle here, so
+    // the banner is allowed; it never blocks or delays the stage). Opt out with
+    // ALICE_MINER_NO_UPDATE_CHECK=1. See `update::startup_banner`.
+    update::startup_banner(false);
+
     // The register/heartbeat PoP needs the sr25519 signing key, so a keystore-backed
     // identity needs its unlock. Resolve it up front (stdin / flag / prompt); a
     // watch-only identity has no keystore and `ai::run` fails closed with a clear
@@ -1317,6 +1484,12 @@ fn cmd_start_with_unlock(
     no_color: bool,
     prefetched_unlock: Option<Zeroizing<String>>,
 ) -> i32 {
+    // Non-blocking startup version check: print a one-line "new version available"
+    // banner if one exists, WITHOUT ever blocking or delaying mining (bounded thread +
+    // ~6h cache; opt out with ALICE_MINER_NO_UPDATE_CHECK=1). Suppressed in `--json` /
+    // background-service mode (machine consumers get no banner). See `update::startup_banner`.
+    update::startup_banner(args.json || args.from_service);
+
     // Resolve the color / TUI decision ONCE (NO_COLOR / --no-color / TERM=dumb /
     // FORCE_COLOR + the TTY check). Drives both whether the in-place panel is used
     // and whether the line renderer emits ANSI — so a journal / pipe stays clean.
