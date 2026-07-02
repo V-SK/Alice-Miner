@@ -48,6 +48,8 @@ pub mod shard;
 pub mod stats;
 pub mod supervise;
 pub mod terminal;
+pub mod train_config;
+pub mod train_worker;
 
 /// Test-only: a single process-global lock guarding the `ALICE_MINER_*_BIN` env
 /// vars. Both [`binaries`] and [`engine`] tests set/read these, and Rust runs

@@ -55,6 +55,8 @@ pub enum MenuAction {
     Doctor,
     /// [6] Check for updates.
     Update,
+    /// [7] Training — the RLVR training worker (`main.rs` runs the `train` role).
+    Training,
     /// [0] Quit (also chosen on q / Esc / Ctrl-C, or when the terminal can't go raw).
     Quit,
 }
@@ -75,6 +77,7 @@ const ITEMS: &[Item] = &[
     Item { action: MenuAction::Settings, key: '4' },
     Item { action: MenuAction::Doctor, key: '5' },
     Item { action: MenuAction::Update, key: '6' },
+    Item { action: MenuAction::Training, key: '7' },
     Item { action: MenuAction::Quit, key: '0' },
 ];
 
@@ -87,6 +90,7 @@ fn item_label(a: MenuAction) -> String {
         MenuAction::Settings => tr!("Settings", "设置").to_string(),
         MenuAction::Doctor => tr!("Doctor + self-repair", "诊断与自修复").to_string(),
         MenuAction::Update => tr!("Check for updates", "检查更新").to_string(),
+        MenuAction::Training => tr!("Training", "训练").to_string(),
         MenuAction::Quit => tr!("Quit", "退出").to_string(),
     }
 }
@@ -111,6 +115,9 @@ fn item_hint(a: MenuAction) -> String {
         }
         MenuAction::Update => {
             tr!("check for a newer signed version", "检查更新的已签名版本").to_string()
+        }
+        MenuAction::Training => {
+            tr!("solve RLVR coding tasks for credit (积分)", "为积分解决 RLVR 编码任务").to_string()
         }
         MenuAction::Quit => tr!("exit alice-miner", "退出 alice-miner").to_string(),
     }
@@ -340,7 +347,7 @@ fn draw_menu(f: &mut Frame, sel: usize) {
         Span::styled(format!(" {}  ", tr!("move", "移动")), Style::default().fg(Color::DarkGray)),
         Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Cyan)),
         Span::styled(format!(" {}  ", tr!("select", "选择")), Style::default().fg(Color::DarkGray)),
-        Span::styled(" 1-6 ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(" 1-7 ", Style::default().fg(Color::Black).bg(Color::Cyan)),
         Span::styled(format!(" {}  ", tr!("jump", "跳转")), Style::default().fg(Color::DarkGray)),
         Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Cyan)),
         Span::styled(format!(" {}", tr!("quit", "退出")), Style::default().fg(Color::DarkGray)),
@@ -416,7 +423,7 @@ mod tests {
     #[test]
     fn item_keys_are_expected_and_unique() {
         let keys: Vec<char> = ITEMS.iter().map(|i| i.key).collect();
-        assert_eq!(keys, vec!['1', '2', '3', '4', '5', '6', '0']);
+        assert_eq!(keys, vec!['1', '2', '3', '4', '5', '6', '7', '0']);
         let mut sorted = keys.clone();
         sorted.sort_unstable();
         sorted.dedup();

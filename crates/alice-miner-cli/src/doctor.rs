@@ -1133,6 +1133,254 @@ pub fn render_ai_json(checks: &[Check]) -> String {
     serde_json::json!({ "role": "ai", "ready": fails == 0, "checks": arr }).to_string()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// train (RLVR training worker) doctor section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The inputs the train doctor battery probes (a subset of the resolved `train`
+/// settings). All optional so `doctor --train` can run before the user has supplied
+/// everything and still report exactly what is missing.
+#[derive(Debug, Clone)]
+pub struct TrainDoctorInput {
+    pub center_url: Option<String>,
+    pub trainer_dir: Option<std::path::PathBuf>,
+    pub python: String,
+    pub base_model: Option<String>,
+    pub device: String,
+    pub allow_cpu: bool,
+}
+
+impl Default for TrainDoctorInput {
+    fn default() -> Self {
+        TrainDoctorInput {
+            center_url: None,
+            trainer_dir: None,
+            python: "python3".to_string(),
+            base_model: None,
+            device: "cuda".to_string(),
+            allow_cpu: false,
+        }
+    }
+}
+
+/// Run the train-role diagnostic battery: identity, python3, torch importable, the
+/// trainer dir (run_m0.py + code_exec.py), a base model resolvable, NVIDIA (or the
+/// cpu/allow-cpu path), and the center URL reachable. Reuses the same [`Check`]
+/// primitives + honest FAIL/WARN/OK style as the mining + ai doctors.
+pub fn run_train_checks(input: &TrainDoctorInput) -> Vec<Check> {
+    vec![
+        check_identity(),
+        check_ai_python(&input.python),
+        check_ai_torch(&input.python),
+        check_train_trainer_dir(input.trainer_dir.as_deref()),
+        check_train_base_model(input.base_model.as_deref()),
+        check_train_device(&input.device, input.allow_cpu),
+        check_ai_center(input.center_url.as_deref()),
+    ]
+}
+
+/// The trainer dir exists and contains run_m0.py + code_exec.py (the candidate
+/// generator imports `_load_base`/`_render` from run_m0 and `extract_code` from
+/// code_exec).
+fn check_train_trainer_dir(trainer_dir: Option<&std::path::Path>) -> Check {
+    const NAME: &str = "trainer dir";
+    match trainer_dir {
+        None => Check::fail(
+            NAME,
+            tr!("no trainer dir set", "未设置训练器目录"),
+            tr!(
+                "pass --trainer-dir <training-mint-m0 checkout> (or set ALICE_TRAIN_TRAINER_PATH); it must contain run_m0.py + code_exec.py",
+                "请传入 --trainer-dir <training-mint-m0 检出目录>(或设置 ALICE_TRAIN_TRAINER_PATH);它必须包含 run_m0.py + code_exec.py"
+            ),
+        ),
+        Some(dir) => {
+            let has_run = dir.join("run_m0.py").is_file();
+            let has_exec = dir.join("code_exec.py").is_file();
+            if has_run && has_exec {
+                Check::pass(
+                    NAME,
+                    format!(
+                        "{} {}",
+                        tr!("run_m0.py + code_exec.py found under", "在此处找到 run_m0.py + code_exec.py:"),
+                        dir.display()
+                    ),
+                )
+            } else {
+                let missing = if !has_run { "run_m0.py" } else { "code_exec.py" };
+                Check::fail(
+                    NAME,
+                    format!("{missing} {} {}", tr!("is missing under", "缺失于"), dir.display()),
+                    tr!(
+                        "point --trainer-dir at a COMPLETE training-mint-m0 checkout (the dir with both run_m0.py and code_exec.py)",
+                        "请把 --trainer-dir 指向一个完整的 training-mint-m0 检出目录(同时包含 run_m0.py 与 code_exec.py)"
+                    ),
+                )
+            }
+        }
+    }
+}
+
+/// The base model id is set (a HF id or a local path). We do NOT download it here (a
+/// multi-GB pull is not a doctor action); a local path is checked for existence, an HF
+/// id is accepted as-is with a note that the first `train` run downloads it.
+fn check_train_base_model(base_model: Option<&str>) -> Check {
+    const NAME: &str = "base model";
+    let Some(model) = base_model.filter(|m| !m.trim().is_empty()) else {
+        // Unset → the train role falls back to its built-in default; a WARN naming that.
+        return Check::warn(
+            NAME,
+            tr!(
+                "no base model set (the train role uses its built-in default)",
+                "未设置基础模型(train 角色将使用内置默认模型)"
+            ),
+            tr!(
+                "pass --base-model <hf-id-or-path> to match the coordinator's corpus; the default is a small instruct model",
+                "请传入 --base-model <hf-id-或路径> 以匹配调度中心的语料;默认是一个小型 instruct 模型"
+            ),
+        );
+    };
+    // A path-like value that exists locally → PASS (a local checkout). Otherwise treat
+    // it as an HF id (resolvable at run time; the first run downloads it).
+    let looks_local = model.contains('/') && std::path::Path::new(model).exists();
+    if looks_local {
+        Check::pass(
+            NAME,
+            format!("{} {model}", tr!("local base model path exists:", "本地基础模型路径存在:")),
+        )
+    } else {
+        Check::pass(
+            NAME,
+            format!(
+                "{model} — {}",
+                tr!(
+                    "treated as a Hugging Face id (downloaded on the first train run)",
+                    "视为 Hugging Face id(首次 train 运行时下载)"
+                )
+            ),
+        )
+    }
+}
+
+/// The device is one of cuda/cpu/mps, and if cuda, an NVIDIA GPU is present (else FAIL
+/// unless --allow-cpu, then WARN). A cpu/mps device is accepted with a testing note.
+fn check_train_device(device: &str, allow_cpu: bool) -> Check {
+    const NAME: &str = "device";
+    match device {
+        "cpu" => Check::warn(
+            NAME,
+            tr!("device is cpu (testing only — slow)", "设备为 cpu(仅供测试 — 很慢)"),
+            tr!(
+                "a real training worker needs a GPU; use --device cuda on an NVIDIA box for real throughput",
+                "真正的训练工作节点需要 GPU;请在 NVIDIA 机器上使用 --device cuda 以获得真实吞吐"
+            ),
+        ),
+        "mps" => Check::warn(
+            NAME,
+            tr!("device is mps (Apple Metal — testing)", "设备为 mps(Apple Metal — 测试)"),
+            tr!(
+                "mps works for a smoke test; the coordinator's corpus expects a CUDA GPU for real throughput",
+                "mps 可用于冒烟测试;调度中心的语料在真实吞吐下需要 CUDA GPU"
+            ),
+        ),
+        "cuda" => {
+            let smi_ok = std::process::Command::new("nvidia-smi")
+                .arg("-L")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if smi_ok {
+                Check::pass(
+                    NAME,
+                    tr!("cuda — nvidia-smi reports at least one NVIDIA GPU", "cuda — nvidia-smi 报告至少一块 NVIDIA GPU"),
+                )
+            } else if allow_cpu {
+                Check::warn(
+                    NAME,
+                    tr!(
+                        "device is cuda but no NVIDIA GPU was detected; --allow-cpu will downshift to CPU (testing)",
+                        "设备为 cuda 但未检测到 NVIDIA GPU;--allow-cpu 将降级到 CPU(测试)"
+                    ),
+                    tr!(
+                        "a real training worker needs a GPU; --allow-cpu only lets a no-NVIDIA box generate on CPU",
+                        "真正的训练工作节点需要 GPU;--allow-cpu 仅让无 NVIDIA 的机器在 CPU 上生成"
+                    ),
+                )
+            } else {
+                Check::fail(
+                    NAME,
+                    tr!(
+                        "device is cuda but no NVIDIA GPU was detected (nvidia-smi missing or reported none)",
+                        "设备为 cuda 但未检测到 NVIDIA GPU(缺少 nvidia-smi 或其未报告任何 GPU)"
+                    ),
+                    tr!(
+                        "install the NVIDIA driver so nvidia-smi works, or pass --device cpu (or --allow-cpu) to generate on CPU for testing (a real worker needs a GPU)",
+                        "请安装 NVIDIA 驱动使 nvidia-smi 可用,或传入 --device cpu(或 --allow-cpu)以在 CPU 上生成用于测试(真正的工作节点需要 GPU)"
+                    ),
+                )
+            }
+        }
+        other => Check::fail(
+            NAME,
+            format!("{} {other:?}", tr!("unknown device", "未知设备")),
+            tr!("use --device cuda | cpu | mps", "请使用 --device cuda | cpu | mps"),
+        ),
+    }
+}
+
+/// Render the train doctor report (human form) — same layout as [`render_report`] but
+/// headed for the train role.
+pub fn render_train_report(checks: &[Check]) -> String {
+    let mut s = String::new();
+    s.push_str(tr!(
+        "Alice Miner doctor — train (RLVR training worker)\n",
+        "Alice Miner doctor — train (RLVR 训练工作节点)\n"
+    ));
+    s.push_str("─────────────────────────────────────────────\n");
+    for c in checks {
+        s.push_str(&format!("  [{}] {} — {}\n", c.status.word(), c.name, c.detail));
+        if !c.fix.is_empty() {
+            s.push_str(&format!("        {}: {}\n", tr!("fix", "修复"), c.fix));
+        }
+    }
+    let fails = checks.iter().filter(|c| c.status == Status::Fail).count();
+    let warns = checks.iter().filter(|c| c.status == Status::Warn).count();
+    s.push_str("─────────────────────────────────────────────\n");
+    if fails == 0 {
+        s.push_str(&format!(
+            "{} ({warns} {})\n",
+            tr!("Ready to run the train role.", "train 角色已就绪。"),
+            tr!("warning(s).", "个警告。")
+        ));
+    } else {
+        s.push_str(&format!(
+            "{fails} {}, {warns} {}\n",
+            tr!("blocking issue(s)", "个阻塞问题"),
+            tr!(
+                "warning(s). Fix the FAIL lines above, then re-run `alice-miner doctor --train`.",
+                "个警告。请修复上面的 FAIL 行,然后重新运行 `alice-miner doctor --train`。"
+            )
+        ));
+    }
+    s
+}
+
+/// Render the train doctor report as JSON (machine-readable).
+pub fn render_train_json(checks: &[Check]) -> String {
+    let arr: Vec<serde_json::Value> = checks
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "status": c.status.json_token(),
+                "detail": c.detail,
+                "fix": if c.fix.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(c.fix.clone()) },
+            })
+        })
+        .collect();
+    let fails = checks.iter().filter(|c| c.status == Status::Fail).count();
+    serde_json::json!({ "role": "train", "ready": fails == 0, "checks": arr }).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1422,6 +1670,89 @@ mod tests {
         let low = human.to_ascii_lowercase();
         for bad in ["hashrate", "earned", "payout", "$"] {
             assert!(!low.contains(bad), "ai report must not contain {bad:?}");
+        }
+    }
+
+    // ── train (RLVR training) doctor ──────────────────────────────────────────
+
+    /// The train trainer-dir check FAILs when the dir is missing / lacks run_m0.py or
+    /// code_exec.py, and PASSes when both are present — honest, with a fix on the fail.
+    #[test]
+    fn train_trainer_dir_check_is_honest() {
+        // No dir → fail with a fix.
+        let none = check_train_trainer_dir(None);
+        assert_eq!(none.status, Status::Fail);
+        assert!(none.fix.contains("--trainer-dir"));
+
+        let tmp = std::env::temp_dir().join(format!("train-doctor-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Only run_m0.py → still fail (code_exec.py missing).
+        std::fs::write(tmp.join("run_m0.py"), b"# stub").unwrap();
+        assert_eq!(check_train_trainer_dir(Some(&tmp)).status, Status::Fail);
+        // Both present → pass.
+        std::fs::write(tmp.join("code_exec.py"), b"# stub").unwrap();
+        assert_eq!(check_train_trainer_dir(Some(&tmp)).status, Status::Pass);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The train device check: cpu/mps WARN (testing), cuda without a GPU FAILs unless
+    /// --allow-cpu (then WARN), an unknown device FAILs.
+    #[test]
+    fn train_device_check_is_honest() {
+        assert_eq!(check_train_device("cpu", false).status, Status::Warn);
+        assert_eq!(check_train_device("mps", false).status, Status::Warn);
+        assert_eq!(check_train_device("bogus", false).status, Status::Fail);
+        // cuda: PASS on a GPU box, else FAIL (no --allow-cpu) / WARN (--allow-cpu).
+        let cuda = check_train_device("cuda", false);
+        assert!(matches!(cuda.status, Status::Pass | Status::Fail), "got {:?}", cuda.status);
+        let cuda_allow = check_train_device("cuda", true);
+        assert_ne!(cuda_allow.status, Status::Fail, "allow-cpu is never a hard fail");
+    }
+
+    /// The base-model check WARNs when unset (built-in default) and PASSes for a
+    /// HF-id-like value (treated as downloadable).
+    #[test]
+    fn train_base_model_check() {
+        assert_eq!(check_train_base_model(None).status, Status::Warn);
+        assert_eq!(check_train_base_model(Some("")).status, Status::Warn);
+        assert_eq!(
+            check_train_base_model(Some("Qwen/Qwen2.5-3B-Instruct")).status,
+            Status::Pass
+        );
+    }
+
+    /// The train battery runs end-to-end (no panic), renders valid JSON, and stays
+    /// credit-only.
+    #[test]
+    fn train_battery_and_json_shape() {
+        let input = TrainDoctorInput {
+            allow_cpu: true,
+            python: "definitely-not-a-real-python-xyz".into(),
+            device: "cpu".into(),
+            ..Default::default()
+        };
+        let checks = run_train_checks(&input);
+        let names: Vec<&str> = checks.iter().map(|c| c.name).collect();
+        assert!(names.contains(&"python3"));
+        assert!(names.contains(&"torch"));
+        assert!(names.contains(&"trainer dir"));
+        assert!(names.contains(&"base model"));
+        assert!(names.contains(&"device"));
+        assert!(names.contains(&"center reachability"));
+        for c in &checks {
+            assert!(!c.detail.is_empty(), "{} has no detail", c.name);
+            if matches!(c.status, Status::Fail | Status::Warn) {
+                assert!(!c.fix.is_empty(), "{} ({:?}) must carry a fix", c.name, c.status);
+            }
+        }
+        let json = render_train_json(&checks);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(v["role"].as_str(), Some("train"));
+        assert!(v["checks"].as_array().unwrap().len() >= 6);
+        let human = render_train_report(&checks);
+        let low = human.to_ascii_lowercase();
+        for bad in ["hashrate", "earned", "payout", "$"] {
+            assert!(!low.contains(bad), "train report must not contain {bad:?}");
         }
     }
 }

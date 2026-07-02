@@ -55,6 +55,7 @@ mod logo;
 mod menu;
 mod pidfile;
 mod setup;
+mod train;
 mod tui;
 mod update;
 
@@ -264,6 +265,30 @@ enum Command {
         Credit-only (积分): the ai role serves inference for credit; it shows no hashrate and no\n\
         earnings. Re-runnable: resolved flags are saved so a bare `alice-miner ai` replays them.")]
     Ai(AiArgs),
+
+    /// Run as an RLVR TRAINING worker: lease a coding task, solve it, submit it.
+    #[command(long_about = "Run this GPU as an RLVR TRAINING worker coordinated by the Alice training\n\
+        coordinator. The miner registers its reward address (proving it owns it), LEASES one coding\n\
+        task (a prompt + entry point; the hidden tests never leave the coordinator), produces a\n\
+        CANDIDATE solution with your own GPU/model, and SUBMITS it — the coordinator re-executes it\n\
+        against the hidden tests and (credit-only) folds a credit weight. Loops back to lease.\n\
+        \n\
+        --center-url <URL>    the acp gateway base URL (default: the production gateway)\n\
+        --trainer-dir <DIR>   path to your training-mint-m0 checkout (must contain run_m0.py +\n\
+                              code_exec.py; also honored: ALICE_TRAIN_TRAINER_PATH)\n\
+        --python <PATH>       the python3 interpreter to run the generator (default: python3)\n\
+        --base-model <ID>     the base model to generate candidates with (HF id or local path)\n\
+        --device <DEV>        the device the generation runs on: cuda | cpu | mps (default: cuda)\n\
+        --allow-cpu           auto-downshift to CPU when no NVIDIA GPU is present (for testing —\n\
+                              a real training worker needs a GPU)\n\
+        --region <R>          optional region hint (for locality)\n\
+        --stake-ref <REF>     stake reference for the sybil gate (default: enroll:<address>)\n\
+        \n\
+        The candidate generator reuses the M0 harness's OWN model loader + prompt renderer (imported\n\
+        from your trainer dir) so its precision can never drift from the harness. Ctrl-C stops\n\
+        gracefully. Credit-only (积分): the train role trains for credit; it shows no hashrate and no\n\
+        earnings. Re-runnable: resolved flags are saved so a bare `alice-miner train` replays them.")]
+    Train(TrainArgs),
 
     /// Set or show the UI language (`en` / `zh`), persisted for later runs.
     #[command(long_about = "Set or show the UI language for the headless CLI, persisted to\n\
@@ -486,8 +511,24 @@ struct DoctorArgs {
     /// python3, the shard engine + torch, NVIDIA (or --allow-cpu), the endpoint
     /// port, and the center URL. Reads the same saved ai config `alice-miner ai`
     /// uses; the flags below refine the probe.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "train")]
     ai: bool,
+    /// Diagnose the `train` (RLVR training) role instead of a mining lane: python3,
+    /// torch, the trainer dir (run_m0.py + code_exec.py), a base model resolvable,
+    /// NVIDIA (or --allow-cpu), and the center URL. Reads the same saved train config
+    /// `alice-miner train` uses; the flags below refine the probe.
+    #[arg(long, conflicts_with = "ai")]
+    train: bool,
+    /// (with --train) The training-mint-m0 trainer dir to check (else
+    /// ALICE_TRAIN_TRAINER_PATH / saved).
+    #[arg(long, value_name = "DIR")]
+    trainer_dir: Option<String>,
+    /// (with --train) The base model id to check is resolvable (else the saved / default).
+    #[arg(long, value_name = "ID")]
+    base_model: Option<String>,
+    /// (with --train) The device to check: cuda | cpu | mps (else the saved / default).
+    #[arg(long, value_name = "DEV")]
+    device: Option<String>,
     /// (with --ai) The acp gateway base URL to probe (else the saved / default one).
     #[arg(long, value_name = "URL")]
     center_url: Option<String>,
@@ -595,6 +636,48 @@ struct AiArgs {
 }
 
 #[derive(clap::Args)]
+struct TrainArgs {
+    /// The acp gateway base URL the worker registers/leases/submits against
+    /// (https:// only). Defaults to the production gateway; saved for re-runs.
+    #[arg(long, value_name = "URL")]
+    center_url: Option<String>,
+    /// Path to your training-mint-m0 checkout (must contain run_m0.py + code_exec.py).
+    /// Also honored via the ALICE_TRAIN_TRAINER_PATH env var. Saved for re-runs.
+    #[arg(long, value_name = "DIR")]
+    trainer_dir: Option<String>,
+    /// The python3 interpreter used to run the candidate generator (default: `python3`).
+    #[arg(long, value_name = "PATH")]
+    python: Option<String>,
+    /// The base model to generate candidates with (a HF model id or a local path).
+    /// Default: a small instruct model; override to match the coordinator's corpus.
+    #[arg(long, value_name = "ID")]
+    base_model: Option<String>,
+    /// The device the generation runs on: `cuda` | `cpu` | `mps` (default: cuda).
+    #[arg(long, value_name = "DEV")]
+    device: Option<String>,
+    /// Auto-downshift to CPU when no NVIDIA GPU is present (for testing). A real
+    /// training worker needs a GPU; this only lets a no-NVIDIA box generate on CPU.
+    #[arg(long)]
+    allow_cpu: bool,
+    /// Optional region hint (informational — used for locality).
+    #[arg(long, value_name = "REGION")]
+    region: Option<String>,
+    /// Stake reference for the coordinator's sybil gate (the server only needs it
+    /// non-empty). Default: `enroll:<your-address>`.
+    #[arg(long, value_name = "REF")]
+    stake_ref: Option<String>,
+    /// Wallet keystore password — the train role must unlock the signing key to prove
+    /// possession when it registers/leases/submits (the center credits nothing without
+    /// it). INSECURE on the command line (visible in `ps`); prefer `--password-stdin`
+    /// or the interactive prompt.
+    #[arg(long, value_name = "PASS")]
+    password: Option<String>,
+    /// Read the unlock password from the first line of STDIN (secure for scripts).
+    #[arg(long, conflicts_with = "password")]
+    password_stdin: bool,
+}
+
+#[derive(clap::Args)]
 struct LangArgs {
     /// The language to switch to: `en` (English) or `zh` (中文). Omit to just print
     /// the current language.
@@ -624,6 +707,7 @@ fn main() {
         Some(Command::Doctor(args)) => cmd_doctor(args),
         Some(Command::Setup(args)) => setup::run(args.into(), no_color),
         Some(Command::Ai(args)) => cmd_ai(args),
+        Some(Command::Train(args)) => cmd_train(args),
         Some(Command::Lang(args)) => cmd_lang(args),
         Some(Command::Balance(args)) => balance::run(args),
         Some(Command::Update(args)) => update::run(args),
@@ -716,8 +800,8 @@ fn command_allows_prompt(command: Option<&Command>) -> bool {
         // `update`: the interactive apply already confirms; the terminal-line prompt
         // for language would clash with its own prompt — skip the pre-prompt.
         Some(Command::Update(_)) => false,
-        // setup / ai: interactive-friendly → allow the stderr line prompt.
-        Some(Command::Setup(_)) | Some(Command::Ai(_)) => true,
+        // setup / ai / train: interactive-friendly → allow the stderr line prompt.
+        Some(Command::Setup(_)) | Some(Command::Ai(_)) | Some(Command::Train(_)) => true,
         // Bare-binary: the interactive MENU owns the first-run language pick (a nicer
         // TUI chooser), so DON'T fire the stderr line prompt on the way in. The menu's
         // fallback (non-TTY) path prints help, which needs no language pick.
@@ -855,9 +939,13 @@ fn run_menu_action(action: menu::MenuAction, no_color: bool) -> i32 {
         menu::MenuAction::Doctor => cmd_doctor(DoctorArgs {
             lane: "auto".to_string(),
             ai: false,
+            train: false,
             center_url: None,
             endpoint: None,
             engine_dir: None,
+            trainer_dir: None,
+            base_model: None,
+            device: None,
             python: None,
             allow_cpu: false,
             json: false,
@@ -867,7 +955,29 @@ fn run_menu_action(action: menu::MenuAction, no_color: bool) -> i32 {
         }),
         // Check for updates (interactive apply flow — asks before applying).
         menu::MenuAction::Update => update::run(update::UpdateArgs { check: false, yes: false }),
+        // Training: run the RLVR training worker with default flags (the config the
+        // user saved on a prior `train` run replays; a first run without a saved
+        // trainer dir fails closed with the exact flag to pass — never a fake run).
+        menu::MenuAction::Training => cmd_train(train_args_default()),
         menu::MenuAction::Quit => EXIT_OK,
+    }
+}
+
+/// A default `train` invocation (every flag at its clap default) — the menu's
+/// "Training" path. Resolved settings from a prior run replay; an unconfigured first
+/// run reports the exact `--trainer-dir` to pass rather than pretending to train.
+fn train_args_default() -> TrainArgs {
+    TrainArgs {
+        center_url: None,
+        trainer_dir: None,
+        python: None,
+        base_model: None,
+        device: None,
+        allow_cpu: false,
+        region: None,
+        stake_ref: None,
+        password: None,
+        password_stdin: false,
     }
 }
 
@@ -942,6 +1052,10 @@ fn cmd_doctor(args: DoctorArgs) -> i32 {
     // `--ai` diagnoses the shard-stage inference role instead of a mining lane.
     if args.ai {
         return cmd_doctor_ai(args);
+    }
+    // `--train` diagnoses the RLVR training role instead of a mining lane.
+    if args.train {
+        return cmd_doctor_train(args);
     }
     let cap = alice_miner_core::CapabilityProfile::detect();
     let lane = match resolve_lane(&args.lane, &cap) {
@@ -1026,6 +1140,46 @@ fn cmd_doctor_ai(args: DoctorArgs) -> i32 {
     }
 }
 
+/// `doctor --train`: run the RLVR training-role battery. Merges the `--train` flags
+/// over the saved train config (the same one `alice-miner train` reads), so a bare
+/// `doctor --train` diagnoses exactly what a subsequent `train` run would use.
+fn cmd_doctor_train(args: DoctorArgs) -> i32 {
+    let saved = alice_miner_core::train_config::load();
+    let trainer_dir = args
+        .trainer_dir
+        .or_else(|| std::env::var("ALICE_TRAIN_TRAINER_PATH").ok().filter(|s| !s.is_empty()))
+        .or(saved.trainer_dir)
+        .map(std::path::PathBuf::from);
+    let input = doctor::TrainDoctorInput {
+        center_url: args.center_url.or(saved.center_url),
+        trainer_dir,
+        python: args.python.or(saved.python).unwrap_or_else(|| "python3".to_string()),
+        base_model: args.base_model.or(saved.base_model),
+        device: args.device.or(saved.device).unwrap_or_else(|| "cuda".to_string()),
+        allow_cpu: args.allow_cpu,
+    };
+    let checks = doctor::run_train_checks(&input);
+    if args.fix {
+        use std::io::IsTerminal;
+        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        print!("{}", doctor::apply_fixes(&checks, interactive, &mut confirm_prompt));
+        println!();
+        let rechecked = doctor::run_train_checks(&input);
+        print!("{}", doctor::render_train_report(&rechecked));
+        return if doctor::has_blocking_failure(&rechecked) { EXIT_USAGE } else { EXIT_OK };
+    }
+    if args.json {
+        println!("{}", doctor::render_train_json(&checks));
+    } else {
+        print!("{}", doctor::render_train_report(&checks));
+    }
+    if doctor::has_blocking_failure(&checks) {
+        EXIT_USAGE
+    } else {
+        EXIT_OK
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ai (shard-stage inference worker)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1070,6 +1224,52 @@ fn cmd_ai(args: AiArgs) -> i32 {
         allow_cpu: args.allow_cpu,
     };
     ai::run(flags, unlock)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// train (RLVR training worker)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `train`: run this GPU as an RLVR TRAINING worker coordinated by the Alice training
+/// coordinator. Resolves the wallet unlock password (the register/lease/submit PoP
+/// needs the signing key), builds the resolved config, and hands off to [`train::run`].
+/// Credit-only; NEVER creates/overwrites an identity (read-only).
+fn cmd_train(args: TrainArgs) -> i32 {
+    // Non-blocking startup version check (the train role has no `--json` toggle here, so
+    // the banner is allowed; it never blocks or delays the worker). Opt out with
+    // ALICE_MINER_NO_UPDATE_CHECK=1. See `update::startup_banner`.
+    update::startup_banner(false);
+
+    // The register/lease/submit PoP needs the sr25519 signing key, so a keystore-backed
+    // identity needs its unlock. Resolve it up front (stdin / flag / prompt); a
+    // watch-only identity has no keystore and `train::run` fails closed with a clear
+    // message, so we skip the prompt there (no keystore to unlock).
+    let has_keystore = alice_miner_core::identity::load_pointer()
+        .map(|p| p.keystore_path.is_some())
+        .unwrap_or(false);
+    let unlock = if has_keystore {
+        match resolve_password(args.password.clone(), args.password_stdin) {
+            Ok(p) => Some(Zeroizing::new(p)),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return EXIT_USAGE;
+            }
+        }
+    } else {
+        None
+    };
+
+    let flags = train::TrainFlags {
+        center_url: args.center_url,
+        trainer_dir: args.trainer_dir,
+        python: args.python,
+        base_model: args.base_model,
+        device: args.device,
+        region: args.region,
+        stake_ref: args.stake_ref,
+        allow_cpu: args.allow_cpu,
+    };
+    train::run(flags, unlock)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2287,6 +2487,50 @@ mod tests {
             Command::Stop(a) => assert_eq!(a.timeout_s, 8),
             _ => panic!("expected stop"),
         }
+
+        // train: defaults (all None) + full flags parse to the expected shape.
+        let cli = Cli::try_parse_from(["alice-miner", "train"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Train(a) => {
+                assert!(a.center_url.is_none() && a.trainer_dir.is_none());
+                assert!(!a.allow_cpu);
+            }
+            _ => panic!("expected train"),
+        }
+        let cli = Cli::try_parse_from([
+            "alice-miner", "train", "--center-url", "https://api.aliceprotocol.org",
+            "--trainer-dir", "/opt/m0", "--base-model", "Qwen/Qwen2.5-3B-Instruct",
+            "--device", "cpu", "--allow-cpu", "--region", "us",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Train(a) => {
+                assert_eq!(a.center_url.as_deref(), Some("https://api.aliceprotocol.org"));
+                assert_eq!(a.trainer_dir.as_deref(), Some("/opt/m0"));
+                assert_eq!(a.base_model.as_deref(), Some("Qwen/Qwen2.5-3B-Instruct"));
+                assert_eq!(a.device.as_deref(), Some("cpu"));
+                assert!(a.allow_cpu);
+                assert_eq!(a.region.as_deref(), Some("us"));
+            }
+            _ => panic!("expected train"),
+        }
+
+        // doctor --train parses with the train-specific flags; --ai and --train conflict.
+        let cli = Cli::try_parse_from([
+            "alice-miner", "doctor", "--train", "--trainer-dir", "/opt/m0", "--device", "cpu",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Doctor(a) => {
+                assert!(a.train && !a.ai);
+                assert_eq!(a.trainer_dir.as_deref(), Some("/opt/m0"));
+            }
+            _ => panic!("expected doctor"),
+        }
+        assert!(
+            Cli::try_parse_from(["alice-miner", "doctor", "--ai", "--train"]).is_err(),
+            "--ai and --train are mutually exclusive"
+        );
     }
 
     /// Mutually-exclusive identity flags are rejected by clap (e.g. --create with
