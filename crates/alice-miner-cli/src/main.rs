@@ -40,6 +40,8 @@ use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
 use alice_miner_core::engine::{Command as EngineCommand, Event, IdentitySpec};
+use alice_miner_core::i18n::{self, Lang};
+use alice_miner_core::tr;
 use alice_miner_core::{EngineHandle, EngineState, GpuSelection, Lane, Snapshot};
 
 mod ai;
@@ -88,6 +90,13 @@ struct Cli {
     /// subcommand. `FORCE_COLOR` overrides all of these and forces color on.
     #[arg(long, global = true)]
     no_color: bool,
+
+    /// UI language for messages: `en` (English) or `zh` (中文). A global flag so it
+    /// applies to any subcommand. When passed it is remembered (`~/.alice/settings.json`)
+    /// so later runs default to it. Without it: the saved preference, else a first-run
+    /// prompt on an interactive terminal, else the `LANG`/`LC_ALL` env, else English.
+    #[arg(long = "lang", visible_alias = "language", global = true, value_name = "LANG")]
+    lang: Option<String>,
 
     /// The subcommand to run. OPTIONAL: with no subcommand, the binary auto-runs
     /// the `setup` wizard on a FIRST launch (no `~/.alice` identity AND an
@@ -250,6 +259,18 @@ enum Command {
         Credit-only (积分): the ai role serves inference for credit; it shows no hashrate and no\n\
         earnings. Re-runnable: resolved flags are saved so a bare `alice-miner ai` replays them.")]
     Ai(AiArgs),
+
+    /// Set or show the UI language (`en` / `zh`), persisted for later runs.
+    #[command(long_about = "Set or show the UI language for the headless CLI, persisted to\n\
+        ~/.alice/settings.json so every later run defaults to it.\n\
+        \n\
+        alice-miner lang        print the current language\n\
+        alice-miner lang en     switch to English\n\
+        alice-miner lang zh     switch to 中文\n\
+        \n\
+        The global `--lang <en|zh>` flag does the same for a single run (and also\n\
+        persists when passed explicitly).")]
+    Lang(LangArgs),
 }
 
 #[derive(clap::Args)]
@@ -528,9 +549,21 @@ struct AiArgs {
     password_stdin: bool,
 }
 
+#[derive(clap::Args)]
+struct LangArgs {
+    /// The language to switch to: `en` (English) or `zh` (中文). Omit to just print
+    /// the current language.
+    #[arg(value_name = "LANG")]
+    lang: Option<String>,
+}
+
 fn main() {
     let cli = Cli::parse();
     let no_color = cli.no_color;
+    // Resolve + set the process-global UI language ONCE, before any user-facing
+    // output. Order: --lang flag → saved settings → interactive first-run prompt →
+    // LANG/LC_ALL/LANGUAGE env → English. See `resolve_language`.
+    resolve_language(cli.lang.as_deref(), cli.command.as_ref());
     let code = match cli.command {
         Some(Command::Detect(args)) => cmd_detect(args),
         Some(Command::GpuDevices(args)) => cmd_gpu_devices(args),
@@ -546,11 +579,167 @@ fn main() {
         Some(Command::Doctor(args)) => cmd_doctor(args),
         Some(Command::Setup(args)) => setup::run(args.into(), no_color),
         Some(Command::Ai(args)) => cmd_ai(args),
+        Some(Command::Lang(args)) => cmd_lang(args),
         // No subcommand: guide a first-launch user (auto-setup when ~/.alice has no
         // identity AND stdin is a TTY), else print help. Skips silently otherwise.
         None => cmd_no_subcommand(no_color),
     };
     std::process::exit(code);
+}
+
+/// Resolve the process-global UI language ONCE, before any user-facing output, and
+/// install it via [`i18n::set_lang`]. Resolution order (first hit wins):
+///
+///   (a) the `--lang <en|zh>` flag — always honored, and PERSISTED when explicitly
+///       passed so a later bare run keeps it.
+///   (b) the persisted `~/.alice/settings.json` preference.
+///   (c) an INTERACTIVE first-run prompt — only when stdout+stdin are TTYs, there is
+///       NO saved preference, and the subcommand is one where a prompt is safe (not
+///       a scripted / service / `--json` context). The choice is persisted so it is
+///       never asked again.
+///   (d) the `LANG` / `LC_ALL` / `LANGUAGE` env (zh* ⇒ 中文).
+///   (e) English (the default).
+///
+/// The prompt NEVER blocks a scripted or service run: a non-TTY stdin/stdout, a
+/// `--json` output mode, the `service`/`fleet`/`stop` paths, and an explicit
+/// `--lang`/saved-pref all skip it.
+fn resolve_language(flag: Option<&str>, command: Option<&Command>) {
+    // (a) --lang flag: honor + persist (an explicit choice is remembered).
+    if let Some(raw) = flag {
+        match raw.parse::<Lang>() {
+            Ok(lang) => {
+                i18n::set_lang(lang);
+                let _ = alice_miner_core::settings::save_lang(lang);
+                return;
+            }
+            Err(e) => {
+                // Bad value: warn (in English — lang isn't resolved yet) and fall
+                // through to the remaining sources rather than aborting.
+                eprintln!("warning: {e}; ignoring --lang");
+            }
+        }
+    }
+
+    // (b) persisted preference.
+    if let Some(lang) = alice_miner_core::settings::load().parsed_lang() {
+        i18n::set_lang(lang);
+        return;
+    }
+
+    // (c) interactive first-run prompt (only when safe — see `command_allows_prompt`).
+    use std::io::IsTerminal;
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if interactive && command_allows_prompt(command) {
+        if let Some(lang) = prompt_for_language() {
+            i18n::set_lang(lang);
+            // Persist so we never ask again (best-effort; a write failure just means
+            // we may ask next time — never fatal).
+            let _ = alice_miner_core::settings::save_lang(lang);
+            return;
+        }
+    }
+
+    // (d) environment locale.
+    if let Some(lang) = lang_from_env() {
+        i18n::set_lang(lang);
+        return;
+    }
+
+    // (e) default English (the global already starts at En; set explicitly for clarity).
+    i18n::set_lang(Lang::En);
+}
+
+/// Whether a subcommand is one where an interactive first-run language prompt is
+/// safe. FALSE for the machine / daemon / file-reading paths so a scripted or
+/// service run is NEVER blocked on a prompt: `service` (daemon), `fleet` (reads
+/// files), `stop` (one-shot control), and any invocation that carries `--json`.
+fn command_allows_prompt(command: Option<&Command>) -> bool {
+    match command {
+        // Daemon / control / file-reader paths: never prompt.
+        Some(Command::Service(_)) | Some(Command::Fleet(_)) | Some(Command::Stop(_)) => false,
+        // A `--json` output mode is a machine consumer — never prompt.
+        Some(Command::Detect(a)) => !a.json,
+        Some(Command::GpuDevices(a)) => !a.json,
+        Some(Command::Identity(a)) => !a.json,
+        Some(Command::Start(a)) => !a.json && !a.from_service,
+        Some(Command::Doctor(a)) => !a.json,
+        // `lang` itself sets the language; don't first-run-prompt on the way in.
+        Some(Command::Lang(_)) => false,
+        // setup / ai / bare-binary: interactive-friendly → allow the prompt.
+        Some(Command::Setup(_)) | Some(Command::Ai(_)) | None => true,
+    }
+}
+
+/// Print the first-run language chooser to STDERR (so it never pollutes a stdout
+/// the user might capture) and read one line from stdin. `1`→English, `2`→中文;
+/// empty / invalid / a read error → `None` (the caller then falls through to the
+/// env → English default without persisting). Only reached on an interactive TTY.
+fn prompt_for_language() -> Option<Lang> {
+    use std::io::Write;
+    // Bilingual prompt (we don't know the language yet, so show both).
+    eprint!("Select language / 选择语言:\n  [1] English\n  [2] 中文\n> ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return None;
+    }
+    match line.trim() {
+        "1" => Some(Lang::En),
+        "2" => Some(Lang::Zh),
+        // Also accept the codes/names directly, for the power user.
+        other => other.parse::<Lang>().ok().or(Some(Lang::En)).filter(|_| !other.is_empty()),
+    }
+}
+
+/// Read a language preference from the `LANG` / `LC_ALL` / `LANGUAGE` env vars, in
+/// that precedence. Returns the FIRST that parses to a known language; `None` if
+/// none are set or none parse (the caller then defaults to English). A `C` /
+/// `POSIX` locale parses to nothing → `None` → English.
+fn lang_from_env() -> Option<Lang> {
+    for var in ["LC_ALL", "LANG", "LANGUAGE"] {
+        if let Ok(val) = std::env::var(var) {
+            if let Ok(lang) = val.parse::<Lang>() {
+                return Some(lang);
+            }
+        }
+    }
+    None
+}
+
+/// `lang`: set or show the persisted UI language. With an argument, parse + persist
+/// it (and apply it to this run's remaining output); with none, print the current
+/// resolved language. Credit-only-irrelevant (pure preference).
+fn cmd_lang(args: LangArgs) -> i32 {
+    match args.lang.as_deref() {
+        Some(raw) => match raw.parse::<Lang>() {
+            Ok(lang) => {
+                i18n::set_lang(lang);
+                match alice_miner_core::settings::save_lang(lang) {
+                    Ok(path) => {
+                        println!(
+                            "{} {} ({})",
+                            tr!("Language set to", "语言已设为"),
+                            lang.code(),
+                            path.display()
+                        );
+                        EXIT_OK
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        EXIT_RUNTIME
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                EXIT_USAGE
+            }
+        },
+        None => {
+            println!("{} {}", tr!("Current language:", "当前语言:"), i18n::lang().code());
+            EXIT_OK
+        }
+    }
 }
 
 /// The bare-binary path (no subcommand). On a FIRST launch — no `~/.alice`
