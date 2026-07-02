@@ -762,6 +762,146 @@ fn http_get_credit(url: &str) -> Result<String, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Balance view — the THREE honest reward buckets for the `balance` CLI command.
+//
+// Reuses the SAME read-API `miner-lookup` path + transport (`http_get_credit`) the
+// Source-B credit poller uses, then surfaces three honest, non-overlapping buckets:
+//
+//   * CREDIT (积分) — the credit-only cumulative accepted-share COUNT (AI + credit
+//     mining). Converts to ALICE only at the real-money launch. From the read
+//     model's `summary.accepted_shares_total` (via `parse_credit_envelope`).
+//   * PRL rebate — the REAL 15% pearlhash rebate (returned crypto), from the read
+//     model's `prl_subsidy` section: whether the payout address is bound + the
+//     accrual status. NEVER a fabricated amount (the payout rail is gated OFF, so
+//     the amounts read `None`; the UI shows "—", not a number).
+//   * ALICE token — the REAL on-chain token. The public read model does NOT expose
+//     an on-chain balance (`paid_acu` is stamped `"0"` — credit-only), so this is
+//     `None` = the honest "pending real-money launch" state UNLESS an explicit
+//     read-only chain RPC is configured (`ALICE_MINER_CHAIN_RPC`), in which case the
+//     caller may resolve it; we never invent a number here.
+//
+// Every field is `Option`: `None` means "unknown / not exposed yet", which the CLI
+// renders as an honest pending state — never a fabricated 0-as-fact.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Env var naming an OPTIONAL read-only Alice-chain RPC endpoint. When set (and
+/// `https://`), the on-chain ALICE-token bucket MAY be resolved from it; when unset
+/// (the default today), that bucket stays the honest "pending real-money launch"
+/// state. Present so the flip to a live on-chain read is config, not a rebuild.
+pub const ENV_CHAIN_RPC_URL: &str = "ALICE_MINER_CHAIN_RPC";
+
+/// The PRL-rebate (15% pearlhash return) sub-view of the balance, parsed from the
+/// read model's `prl_subsidy` section. Credit-only-safe: it carries the BINDING
+/// status + accrual state, never a fabricated PRL amount (the payout rail is gated
+/// OFF, so `period_prl` / `cumulative_paid_prl` are `None` server-side → we show "—").
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
+pub struct PrlRebateView {
+    /// Whether a `prl1p…` payout address is bound (enrolled) for this Alice address.
+    /// `false` = accrual still shown, but the miner should register a return address.
+    pub bound: bool,
+    /// The one-way fingerprint of the bound payout address (NEVER the raw `prl1p…`).
+    /// `None` when unbound or the server withheld it.
+    pub payout_address_fingerprint: Option<String>,
+    /// The rebate percentage the server reports (e.g. 15).
+    pub rebate_pct: Option<f64>,
+    /// The accrual status string the server reports (e.g. `"accruing"`). The real
+    /// PRL amount is deliberately absent (payout gated OFF) — this is a state, not
+    /// a number.
+    pub status: Option<String>,
+}
+
+/// The result of the read-model half of a balance lookup: the three honest buckets'
+/// raw inputs. `credit` is the credit-only [`CreditState`] (its `Confirmed.totals`
+/// carries the cumulative accepted-share COUNT); `prl_rebate` is the parsed
+/// `prl_subsidy` section (or `None` when the section is absent — unenrolled /
+/// not-found); `found` echoes the envelope's `found`. The on-chain ALICE token is
+/// resolved separately by the caller (it is not in this read model).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BalanceLookup {
+    /// The credit-only credit state (Source B) — the 积分 bucket source.
+    pub credit: CreditState,
+    /// The parsed PRL 15%-rebate section (`prl_subsidy`), when present.
+    pub prl_rebate: Option<PrlRebateView>,
+    /// Whether the address was found in the read model at all.
+    pub found: bool,
+}
+
+/// The `prl_subsidy` section shape (only the fields the balance view surfaces).
+/// Fail-open on absence (all `serde(default)`), so a not-found / unenrolled address
+/// simply yields an all-default view the caller treats as "unbound".
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PrlSubsidyEnvelope {
+    #[serde(default)]
+    bound: bool,
+    #[serde(default)]
+    payout_address_fingerprint: Option<String>,
+    #[serde(default)]
+    rebate_pct: Option<f64>,
+    #[serde(default)]
+    algorithms: Vec<PrlAlgoEnvelope>,
+}
+
+/// One `prl_subsidy.algorithms[]` element — we surface only the `status` string
+/// (the real PRL amounts are `None` server-side; we never render a fabricated one).
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PrlAlgoEnvelope {
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// The top-level envelope fields the balance parser reads beyond the credit-only
+/// `CreditEnvelope`: just the optional `prl_subsidy` section.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BalanceEnvelope {
+    #[serde(default)]
+    prl_subsidy: Option<PrlSubsidyEnvelope>,
+}
+
+/// Parse a read-model `miner-lookup` body into a [`BalanceLookup`]: the credit-only
+/// [`CreditState`] (via [`parse_credit_envelope`], so the `paid_acu != "0"` DROP
+/// guard still applies) PLUS the `prl_subsidy` section. The PRL amounts are never
+/// read (payout gated OFF); only the binding + accrual STATE is surfaced.
+pub fn parse_balance_lookup(body: &str) -> BalanceLookup {
+    let credit = parse_credit_envelope(body);
+    // `found` mirrors the credit parse (Confirmed / Confirming-with-found).
+    let found = matches!(credit, CreditState::Confirmed { .. });
+    let env: BalanceEnvelope = serde_json::from_str(body).unwrap_or_default();
+    let prl_rebate = env.prl_subsidy.map(|s| {
+        // The section's status is per-algorithm; surface the first non-empty one (they
+        // share the same rail state — "accruing" while payout is gated OFF).
+        let status = s
+            .algorithms
+            .iter()
+            .find_map(|a| a.status.clone())
+            .filter(|s| !s.is_empty());
+        PrlRebateView {
+            bound: s.bound,
+            payout_address_fingerprint: s.payout_address_fingerprint,
+            rebate_pct: s.rebate_pct,
+            status,
+        }
+    });
+    BalanceLookup { credit, prl_rebate, found }
+}
+
+/// Perform ONE best-effort, read-only balance lookup for `address` against the public
+/// read API (the SAME `{base}/read/miner-lookup?address=` path + https-only, capped,
+/// ~10 s transport the Source-B credit poller uses). Returns the parsed
+/// [`BalanceLookup`] on success, or a human error string on a transport / non-https
+/// failure (the caller renders an honest offline message — never a fabricated value).
+///
+/// A watch-only / pasted address is fine (a public read needs only the address). The
+/// read-API base honors [`ENV_READ_API_URL`] exactly like the credit poller.
+pub fn fetch_balance_lookup(address: &str) -> Result<BalanceLookup, String> {
+    let client = PoolStatsClient::public_default();
+    let url = client
+        .lookup_url(address)
+        .ok_or_else(|| "read API is not configured for lookups".to_string())?;
+    let body = http_get_credit(&url)?;
+    Ok(parse_balance_lookup(&body))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Reconciliation — a QUALITATIVE badge (local activity vs server-confirmed).
 // No fabricated numbers, no "X% confirmed" — only a small honest status word.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1144,6 +1284,88 @@ mod tests {
         let totals = state.totals().expect("Confirmed carries totals");
         assert_eq!(totals.accepted_total, 42);
         assert_eq!(totals.accepted_24h, 7);
+    }
+
+    /// The balance parser surfaces the THREE honest buckets from a full envelope with a
+    /// `prl_subsidy` section: the credit-only cumulative COUNT (积分), the PRL rebate
+    /// binding + accrual state (real PRL — but NO fabricated amount), and `found`. The
+    /// on-chain ALICE token is NOT in the read model (resolved separately by the CLI).
+    #[test]
+    fn balance_parses_three_buckets_with_prl_subsidy() {
+        let body = r#"{
+            "found": true,
+            "paid_acu": "0",
+            "live_reward_enabled": false,
+            "payout_executor_enabled": false,
+            "summary": {"pending_alice": 0.0, "accepted_shares_total": 873, "accepted_shares_24h": 142},
+            "lanes": [
+                {"key": "main_pool_gpu_alpha", "label": "GPU · Alpha", "accepted": 500},
+                {"key": "main_pool_gpu_prl", "label": "GPU · PRL", "accepted": 373}
+            ],
+            "prl_subsidy": {
+                "bound": true,
+                "payout_address_fingerprint": "prlfp_ab12cd34",
+                "region": "us",
+                "rebate_pct": 15,
+                "algorithms": [
+                    {"algo": "pearlhash", "valid_submissions": 500, "period_prl": null,
+                     "cumulative_paid_prl": null, "status": "accruing"}
+                ]
+            }
+        }"#;
+        let b = parse_balance_lookup(body);
+        assert!(b.found);
+        // Bucket 1 — credit (积分): the cumulative accepted-share COUNT.
+        let totals = b.credit.totals().expect("confirmed carries totals");
+        assert_eq!(totals.accepted_total, 873);
+        // Bucket 2 — PRL rebate (real PRL): bound, fingerprint (never raw prl1p), accruing.
+        let prl = b.prl_rebate.expect("prl_subsidy present");
+        assert!(prl.bound);
+        assert_eq!(prl.payout_address_fingerprint.as_deref(), Some("prlfp_ab12cd34"));
+        assert_eq!(prl.rebate_pct, Some(15.0));
+        assert_eq!(prl.status.as_deref(), Some("accruing"));
+        // Honesty: no real PRL AMOUNT is surfaced anywhere in the view (payout gated OFF).
+        // (The struct has no amount field by construction.)
+    }
+
+    /// An UNBOUND miner (mined but never registered a prl1p return address) still shows
+    /// the PRL section with `bound: false` (so the UI can nudge enrollment), and the
+    /// balance parser reflects that honestly.
+    #[test]
+    fn balance_prl_rebate_unbound_still_shown() {
+        let body = r#"{"found":true,"paid_acu":"0",
+            "summary":{"pending_alice":0.0,"accepted_shares_total":10,"accepted_shares_24h":10},
+            "prl_subsidy":{"bound":false,"payout_address_fingerprint":null,"rebate_pct":15,
+                "algorithms":[{"status":"accruing"}]}}"#;
+        let b = parse_balance_lookup(body);
+        let prl = b.prl_rebate.expect("section present even when unbound");
+        assert!(!prl.bound);
+        assert!(prl.payout_address_fingerprint.is_none());
+        assert_eq!(prl.status.as_deref(), Some("accruing"));
+    }
+
+    /// A not-found address has NO `prl_subsidy` section (the server omits it) → the
+    /// balance parser yields `prl_rebate: None` and `found: false`. Nothing fabricated.
+    #[test]
+    fn balance_not_found_has_no_prl_section() {
+        let body = r#"{"found":false,"paid_acu":"0"}"#;
+        let b = parse_balance_lookup(body);
+        assert!(!b.found);
+        assert!(b.prl_rebate.is_none());
+        assert!(!b.credit.has_confirmed_credit());
+    }
+
+    /// THE #18 GUARD over the balance view: a `paid_acu != "0"` envelope drops the
+    /// credit bucket to `Error` (no COUNT surfaced) EVEN as the PRL section parses —
+    /// the credit-only violation is never laundered through the balance path.
+    #[test]
+    fn balance_paid_acu_violation_drops_credit_bucket() {
+        let body = r#"{"found":true,"paid_acu":"9.9",
+            "summary":{"pending_alice":9.0,"accepted_shares_total":1000,"accepted_shares_24h":50},
+            "prl_subsidy":{"bound":true,"rebate_pct":15,"algorithms":[{"status":"accruing"}]}}"#;
+        let b = parse_balance_lookup(body);
+        assert_eq!(b.credit, CreditState::Error { reason: CreditError::PaidAcuNotZero });
+        assert!(b.credit.totals().is_none(), "no count surfaced on a violation");
     }
 
     /// THE #18 GUARD over the FULL count model: a `paid_acu != "0"` envelope that ALSO
