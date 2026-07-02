@@ -30,6 +30,7 @@ pub use alice_crypto;
 pub use alice_release;
 pub use alice_supervise;
 
+pub mod ai_config;
 pub mod binaries;
 pub mod dashboard;
 pub mod detect;
@@ -41,6 +42,7 @@ pub mod lane;
 pub mod pop;
 pub mod prl_payout;
 pub mod service;
+pub mod shard;
 pub mod stats;
 pub mod supervise;
 pub mod terminal;
