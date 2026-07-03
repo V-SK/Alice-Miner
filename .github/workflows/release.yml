@@ -37,8 +37,12 @@ jobs:
         run: cargo install cargo-audit --locked
       # Authoritative, continuously-updated advisory check over Cargo.lock.
       # Fails the job on a known vulnerability so a release can't ship one.
+      # --ignore: documented-out-of-threat-model advisories (rationale in audit.toml).
+      #   RUSTSEC-2026-0194/0195 (quick-xml <0.41 XML-DoS): quick-xml is a Linux-only,
+      #   BUILD-TIME wayland-scanner dep parsing TRUSTED protocol XML — never runtime
+      #   attacker input; absent from macOS/Windows binaries. See audit.toml.
       - name: Run cargo audit
-        run: cargo audit
+        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 
   build:
     name: Build ${{ matrix.name }}
