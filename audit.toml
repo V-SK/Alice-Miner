@@ -1,0 +1,24 @@
+# cargo-audit config (read by the `cargo audit` job in .github/workflows/release.yml).
+#
+# Each ignore MUST carry a rationale. We ignore ONLY advisories that are provably
+# out of our threat model — never to silence a real exposure.
+
+[advisories]
+ignore = [
+    # quick-xml < 0.41.0: O(N^2) attribute parsing → CPU-DoS when parsing UNTRUSTED XML
+    # with tens of thousands of attributes on one tag.
+    #
+    # Not applicable to Alice Miner:
+    #   * quick-xml is pulled ONLY by wayland-scanner (dependency chain:
+    #     alice-miner-gui → eframe → winit → smithay-client-toolkit → wayland-scanner
+    #     → quick-xml), which is a LINUX-ONLY, BUILD-TIME code generator. The macOS and
+    #     Windows binaries don't even contain quick-xml.
+    #   * wayland-scanner parses the system's TRUSTED wayland-protocol .xml definitions at
+    #     BUILD time — never remote / attacker-controlled input at runtime. The shipped
+    #     miner binary does not runtime-parse untrusted XML through quick-xml.
+    #   * The fix requires bumping the entire eframe/winit/smithay/wayland GUI stack
+    #     (wayland-scanner 0.31.10 pins quick-xml < 0.41), a high-risk cascade for zero
+    #     real exposure. Revisit when eframe upgrades wayland-scanner.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
