@@ -760,20 +760,27 @@ fn fix_recreate_config() -> FixOutcome {
         }
         Ok(_) => { /* malformed → proceed to back up + recreate */ }
     }
-    // Back up the malformed file first (best-effort; a backup failure still lets us fix).
+    // Back up the malformed file BEFORE overwriting it. If the backup can't be written
+    // (read-only dir, ENOSPC, …), abort rather than destroy the original with no copy —
+    // the user may want to recover a hand-edit. Never proceed unbacked-up.
     let backup = path.with_extension("json.bak");
-    let backed_up = std::fs::copy(&path, &backup).is_ok();
+    if let Err(e) = std::fs::copy(&path, &backup) {
+        return FixOutcome::Failed(format!(
+            "{} {}: {e}",
+            tr!(
+                "could not back up the malformed config before recreating it; left it untouched —",
+                "重建前无法备份损坏的配置文件,已保持原样未改动 —"
+            ),
+            backup.display()
+        ));
+    }
     match alice_miner_core::settings::save(&alice_miner_core::settings::Settings::default()) {
         Ok(_) => {
-            let note = if backed_up {
-                format!(
-                    " ({} {})",
-                    tr!("old file backed up to", "旧文件已备份至"),
-                    backup.display()
-                )
-            } else {
-                String::new()
-            };
+            let note = format!(
+                " ({} {})",
+                tr!("old file backed up to", "旧文件已备份至"),
+                backup.display()
+            );
             FixOutcome::Applied(format!(
                 "{}{note}",
                 tr!("recreated a fresh default settings file", "已重建一份全新的默认设置文件")
@@ -844,8 +851,10 @@ pub fn run_ai_checks(input: &AiDoctorInput) -> Vec<Check> {
 /// python3 present + its version (the interpreter that runs the engine).
 fn check_ai_python(python: &str) -> Check {
     const NAME: &str = "python3";
-    match std::process::Command::new(python).arg("--version").output() {
-        Ok(out) if out.status.success() => {
+    let mut cmd = std::process::Command::new(python);
+    cmd.arg("--version");
+    match run_with_timeout(&mut cmd, PROBE_TIMEOUT) {
+        Ok(Some(out)) if out.status.success() => {
             let v = String::from_utf8_lossy(&out.stdout);
             let v = if v.trim().is_empty() {
                 String::from_utf8_lossy(&out.stderr).trim().to_string()
@@ -935,11 +944,9 @@ fn check_ai_torch(python: &str) -> Check {
 /// NVIDIA present (nvidia-smi), else a WARN unless --allow-cpu (then Skip-like OK).
 fn check_ai_nvidia(allow_cpu: bool) -> Check {
     const NAME: &str = "nvidia gpu";
-    let smi_ok = std::process::Command::new("nvidia-smi")
-        .arg("-L")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let mut cmd = std::process::Command::new("nvidia-smi");
+    cmd.arg("-L");
+    let smi_ok = matches!(run_with_timeout(&mut cmd, PROBE_TIMEOUT), Ok(Some(o)) if o.status.success());
     if smi_ok {
         Check::pass(
             NAME,
@@ -1046,6 +1053,11 @@ fn check_ai_center(center_url: Option<&str>) -> Check {
         ),
     }
 }
+
+/// Wall-clock cap on the quick version/GPU probes (`python3 --version`, `nvidia-smi`).
+/// A wedged driver can hang `nvidia-smi` indefinitely; past this the child is killed so
+/// `doctor` can never stall. Ample for a healthy binary.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run a command with a wall-clock timeout. Returns `Ok(Some(output))` on
 /// completion, `Ok(None)` on timeout (child killed), `Err` on spawn failure. Used
@@ -1283,11 +1295,9 @@ fn check_train_device(device: &str, allow_cpu: bool) -> Check {
             ),
         ),
         "cuda" => {
-            let smi_ok = std::process::Command::new("nvidia-smi")
-                .arg("-L")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            let mut cmd = std::process::Command::new("nvidia-smi");
+            cmd.arg("-L");
+            let smi_ok = matches!(run_with_timeout(&mut cmd, PROBE_TIMEOUT), Ok(Some(o)) if o.status.success());
             if smi_ok {
                 Check::pass(
                     NAME,

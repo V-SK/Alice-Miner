@@ -77,6 +77,21 @@ const IDLE_TICK: Duration = Duration::from_secs(15);
 /// lease is single-use server-side, so a give-up drops the lease and pulls a new one.
 const MAX_GEN_FAILURES: u32 = 3;
 
+/// Wall-clock cap on a single generation subprocess. A hung `model.generate()` (bad
+/// driver, wedged GPU) is killed past this so the worker stays responsive to Ctrl-C and
+/// moves on. Generous for a slow CPU run of a small model; a real GPU is far under it.
+const GEN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// How often the generation loop wakes to check the stop flag + deadline while draining
+/// the subprocess stdout channel. Short so Ctrl-C tears down promptly.
+const GEN_POLL_TICK: Duration = Duration::from_millis(200);
+
+/// Hard cap on candidate-block bytes accumulated from the subprocess stdout. The real
+/// candidate is a few KiB; this bounds memory if a hostile/broken LOCAL model floods the
+/// block sentinels. Past the cap we stop accumulating (the candidate is truncated →
+/// rejected downstream as malformed, never fabricated).
+const MAX_CANDIDATE_BYTES: usize = 1 << 20; // 1 MiB
+
 /// The embedded generation driver, written to the log dir at runtime and invoked with
 /// the trainer dir on PYTHONPATH. Kept in the miner (not the trainer repo) so the
 /// generation path is a single auditable file. See the module docstring.
@@ -681,7 +696,7 @@ fn solve_task(
         if stop.load(Ordering::SeqCst) {
             return None;
         }
-        match run_gen_once(settings, driver_path, task) {
+        match run_gen_once(settings, driver_path, task, stop) {
             Ok(Some(code)) => return Some(code),
             Ok(None) => {
                 failures += 1;
@@ -729,8 +744,10 @@ fn run_gen_once(
     settings: &TrainSettings,
     driver_path: &std::path::Path,
     task: &LeasedTask,
+    stop: &Arc<AtomicBool>,
 ) -> Result<Option<String>, String> {
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
 
     let log_dir = train_config::train_log_dir();
     std::fs::create_dir_all(&log_dir)
@@ -788,37 +805,84 @@ fn run_gen_once(
         });
     }
 
-    // Read stdout on THIS thread, parsing the candidate between the sentinels and
-    // mirroring every line to the log.
-    let mut candidate: Option<String> = None;
+    // Read stdout on a reader thread that forwards each line over a channel, so THIS
+    // thread can poll the stop flag + a wall-clock deadline between lines and kill the
+    // child promptly (a bare `reader.lines()` here would block Ctrl-C until the child
+    // emits EOF). The reader thread stops relaying once the candidate block exceeds the
+    // byte cap — a hostile/broken LOCAL model can't OOM us.
+    let (tx, rx) = mpsc::channel::<String>();
     if let Some(out) = child.stdout.take() {
-        let reader = BufReader::new(out);
-        let mut in_block = false;
-        let mut buf = String::new();
-        for line in reader.lines().map_while(Result::ok) {
-            if let Ok(mut f) = log.lock() {
-                let _ = writeln!(f, "{line}");
-            }
-            if line.trim() == CANDIDATE_BEGIN {
-                in_block = true;
-                buf.clear();
-                continue;
-            }
-            if line.trim() == CANDIDATE_END {
-                in_block = false;
-                let code = buf.trim_end_matches('\n').to_string();
-                if !code.trim().is_empty() {
-                    candidate = Some(code);
+        std::thread::spawn(move || {
+            let reader = BufReader::new(out);
+            for line in reader.lines().map_while(Result::ok) {
+                // A closed receiver (main thread moved on / killed the child) ends the
+                // reader cleanly.
+                if tx.send(line).is_err() {
+                    break;
                 }
-                continue;
             }
-            if in_block {
-                buf.push_str(&line);
-                buf.push('\n');
+        });
+    }
+
+    let mut candidate: Option<String> = None;
+    let mut in_block = false;
+    let mut buf = String::new();
+    let mut capped = false;
+    let deadline = Instant::now() + GEN_TIMEOUT;
+    let mut killed_reason: Option<&str> = None;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            killed_reason = Some("stop requested");
+            break;
+        }
+        if Instant::now() >= deadline {
+            killed_reason = Some("generation timed out");
+            break;
+        }
+        match rx.recv_timeout(GEN_POLL_TICK) {
+            Ok(line) => {
+                if let Ok(mut f) = log.lock() {
+                    let _ = writeln!(f, "{line}");
+                }
+                if line.trim() == CANDIDATE_BEGIN {
+                    in_block = true;
+                    buf.clear();
+                    capped = false;
+                    continue;
+                }
+                if line.trim() == CANDIDATE_END {
+                    in_block = false;
+                    let code = buf.trim_end_matches('\n').to_string();
+                    // A capped (truncated) block is dropped — never submit a partial
+                    // candidate as if it were whole.
+                    if !capped && !code.trim().is_empty() {
+                        candidate = Some(code);
+                    }
+                    continue;
+                }
+                if in_block && !capped {
+                    if buf.len() + line.len() + 1 > MAX_CANDIDATE_BYTES {
+                        capped = true;
+                        if let Ok(mut f) = log.lock() {
+                            let _ = writeln!(f, "[alice] candidate block exceeded {MAX_CANDIDATE_BYTES} bytes — truncated, rejected");
+                        }
+                    } else {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                }
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break, // child closed stdout → done
         }
     }
 
+    if let Some(reason) = killed_reason {
+        let _ = child.kill();
+        if let Ok(mut f) = log.lock() {
+            let _ = writeln!(f, "[alice] killed generation subprocess: {reason}");
+        }
+    }
     let exit = child
         .wait()
         .map_err(|e| format!("failed to wait for the generator: {e}"))?;

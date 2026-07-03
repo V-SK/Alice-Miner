@@ -266,7 +266,14 @@ fn field_after(s: &str, tag: char) -> Option<u64> {
 /// T-Rex `<acc>/<sub>` counter → `(acc, sub-acc)`. Validates `acc <= sub` (the
 /// Python guard: an `acc > sub` pair is a false match and skipped). Picks the
 /// LAST valid counter on the line (the cumulative one).
+///
+/// Gated to a shares-context line (`share` present, case-insensitive) so an unrelated
+/// `N/M` token — a date `2024/01`, a `Pool 1/8 peers` line — can't be misread as a
+/// share count. T-Rex always frames this counter with "Shares".
 fn parse_slash_counter(line: &str) -> Option<(u64, u64)> {
+    if !line.to_ascii_lowercase().contains("share") {
+        return None;
+    }
     let mut best: Option<(u64, u64)> = None;
     let bytes = line.as_bytes();
     let mut i = 0;
