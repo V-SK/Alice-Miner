@@ -80,7 +80,18 @@ pub fn delete_unlock_password(address: &str) -> Result<(), String> {
 /// reachable and empty = available; any other error (e.g. a headless Linux without
 /// Secret Service) means it is unusable. The service layer gates GPU background on this
 /// so we never fall back to a plaintext secret.
+///
+/// MEMOIZED once per process: keyring availability is a machine property that does not
+/// change during a run, and the underlying probe is a live macOS Security-framework call
+/// that flaps under concurrent access (it made a GUI test flaky under `cargo test`'s
+/// parallel harness). `OnceLock` runs the racy probe exactly once and serializes the
+/// first init, so every caller sees a single, stable answer.
 pub fn is_available() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(probe_available)
+}
+
+fn probe_available() -> bool {
     match keyring::Entry::new(KEYRING_SERVICE, "__availability_probe__") {
         Ok(e) => matches!(e.get_password(), Ok(_) | Err(keyring::Error::NoEntry)),
         Err(_) => false,
