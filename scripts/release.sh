@@ -55,6 +55,7 @@ OUT_DIR="${ROOT_DIR}/dist"
 TARGETS=""          # platform keys; empty => just the host
 DO_SIGN=0
 DO_PUBLISH=0
+FROM_ARTIFACTS=""   # dir of pre-built CI packages; empty => local cross-compile
 REPO=""             # owner/name for gh; default: gh infers from git remote
 PRODUCT="alice-miner"
 # Offline private key location (NEVER committed; NEVER read by CI). Shared with
@@ -157,6 +158,7 @@ while [[ $# -gt 0 ]]; do
     --out)           OUT_DIR="$2"; shift 2 ;;
     --repo)          REPO="$2"; shift 2 ;;
     --base-url)      BASE_URL="$2"; shift 2 ;;
+    --from-artifacts) FROM_ARTIFACTS="$2"; shift 2 ;;
     --sign)          DO_SIGN=1; shift ;;
     --publish)       DO_PUBLISH=1; shift ;;
     -h|--help)       sed -n '2,52p' "$0"; exit 0 ;;
@@ -207,6 +209,20 @@ for plat in ${TARGETS}; do
   triple="$(target_triple "${plat}")"
   artifact="$(artifact_name "${plat}")"
   [[ -z "${triple}" || -z "${artifact}" ]] && { echo "unknown platform: ${plat}" >&2; exit 1; }
+
+  # --from-artifacts DIR: use the pre-built, already-packaged CI artifact verbatim
+  # instead of a local cross-compile (the production 3-OS path — the CI build matrix
+  # produces the signed per-OS packages; a maintainer downloads them here, then signs
+  # the manifest offline + publishes). No re-packaging: the CI .zip/.tar.gz IS the
+  # release artifact (macOS ad-hoc codesign + engine bundling already happened in CI).
+  if [[ -n "${FROM_ARTIFACTS}" ]]; then
+    src="${FROM_ARTIFACTS%/}/${artifact}"
+    [[ -f "${src}" ]] || { echo "missing pre-built artifact: ${src}" >&2; exit 1; }
+    echo "Using pre-built CI artifact ${src}"
+    cp "${src}" "${OUT_DIR}/${artifact}"
+    echo "  -> ${OUT_DIR}/${artifact}"
+    continue
+  fi
 
   echo "Building ${plat} (${triple})…"
   ( cd "${ROOT_DIR}" && cargo build --release --target "${triple}" -p alice-miner-gui )
