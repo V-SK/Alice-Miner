@@ -46,6 +46,14 @@ def main() -> int:
                     help="low temp for a deterministic-ish single candidate")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--load-in-4bit", action="store_true")
+    ap.add_argument(
+        "--multi-gpu",
+        choices=["shard"],
+        default=None,
+        help="spread ONE base across all local GPUs (device_map='auto', naive "
+        "pipeline split) so a big MoE that won't fit on one card can still "
+        "generate. Matches the harness's base-eval 'shard' layout exactly.",
+    )
     args = ap.parse_args()
 
     # The task arrives on stdin as JSON (never argv — a prompt can be large).
@@ -78,14 +86,19 @@ def main() -> int:
         return 3
 
     _log(f"loading base model {args.base_model!r} on {args.device} "
-         f"(4bit={args.load_in_4bit}) ...")
+         f"(4bit={args.load_in_4bit}, multi_gpu={args.multi_gpu}) ...")
     try:
         tok = AutoTokenizer.from_pretrained(args.base_model)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
         tok.padding_side = "left"
+        # multi_gpu="shard" -> _load_base resolves device_map="auto" (naive
+        # pipeline split across every local GPU), the SAME layout the harness
+        # uses for base-eval; generation inputs go to model.device exactly as
+        # base-eval does, so the candidate distribution still matches the scorer.
         model = _load_base(args.base_model, device=args.device,
-                           four_bit=args.load_in_4bit, for_training=False)
+                           four_bit=args.load_in_4bit, for_training=False,
+                           multi_gpu=args.multi_gpu)
     except Exception as e:  # noqa: BLE001
         _log(f"model load failed: {e}")
         return 4

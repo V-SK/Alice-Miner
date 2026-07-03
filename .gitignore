@@ -5,3 +5,5 @@
 assets/macos/*.iconset/
 assets/macos/AliceMiner-icon.svg
 assets/macos/AliceMiner-*.png
+__pycache__/
+*.pyc

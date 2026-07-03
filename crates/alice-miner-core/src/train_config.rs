@@ -38,9 +38,22 @@ pub struct TrainConfig {
     /// The device the generation runs on ("cuda" / "cpu" / "mps").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    /// Load the base in 4-bit (QLoRA-class NF4) so a big MoE base fits a modest card.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub four_bit: bool,
+    /// Multi-GPU placement for a base that won't fit one card. Only `"shard"` today
+    /// (device_map="auto", naive pipeline split across all local GPUs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_gpu: Option<String>,
     /// Optional region hint (informational — the coordinator uses it for locality).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+}
+
+/// serde skip helper: omit a `false` bool from the persisted JSON.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Resolve the config path: `<identity_dir>/train_config.json`. Honors
@@ -145,8 +158,10 @@ mod tests {
                 center_url: Some("https://api.aliceprotocol.org".into()),
                 trainer_dir: Some("/opt/training-mint-m0".into()),
                 python: Some("python3".into()),
-                base_model: Some("Qwen/Qwen2.5-3B-Instruct".into()),
+                base_model: Some("Qwen/Qwen3-30B-A3B-Instruct-2507".into()),
                 device: Some("cuda".into()),
+                four_bit: true,
+                multi_gpu: Some("shard".into()),
                 region: None,
             };
             let path = save(&cfg).expect("save");
@@ -156,6 +171,9 @@ mod tests {
             let raw = std::fs::read_to_string(&path).unwrap();
             assert!(!raw.contains("region"), "unset region omitted: {raw}");
             assert!(raw.contains("\"schema\": 1"));
+            // set 4-bit + shard round-trip through the JSON.
+            assert!(raw.contains("\"four_bit\": true"), "four_bit persisted: {raw}");
+            assert!(raw.contains("\"multi_gpu\": \"shard\""), "multi_gpu persisted: {raw}");
         });
     }
 

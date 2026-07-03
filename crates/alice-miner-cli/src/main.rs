@@ -649,12 +649,26 @@ struct TrainArgs {
     #[arg(long, value_name = "PATH")]
     python: Option<String>,
     /// The base model to generate candidates with (a HF model id or a local path).
-    /// Default: a small instruct model; override to match the coordinator's corpus.
+    /// Default: the coordinator's training base (`Qwen/Qwen3-30B-A3B-Instruct-2507`);
+    /// override only to match a different corpus, or to a small model for a smoke test.
     #[arg(long, value_name = "ID")]
     base_model: Option<String>,
     /// The device the generation runs on: `cuda` | `cpu` | `mps` (default: cuda).
     #[arg(long, value_name = "DEV")]
     device: Option<String>,
+    /// Load the base in 4-bit (QLoRA-class NF4). The default 30B-A3B MoE base won't fit a
+    /// modest card in bf16, so a real GPU worker wants this (~24 GB single-card floor).
+    /// Saved for re-runs; use `--no-four-bit` to turn it back off.
+    #[arg(long)]
+    four_bit: bool,
+    /// Turn 4-bit back off (overrides a saved `--four-bit`); e.g. a small override base
+    /// on a big card that can run full precision.
+    #[arg(long, conflicts_with = "four_bit")]
+    no_four_bit: bool,
+    /// Spread ONE base across all local GPUs when it won't fit one card. Only `shard`
+    /// (device_map="auto", naive pipeline split). Saved for re-runs.
+    #[arg(long, value_name = "MODE")]
+    multi_gpu: Option<String>,
     /// Auto-downshift to CPU when no NVIDIA GPU is present (for testing). A real
     /// training worker needs a GPU; this only lets a no-NVIDIA box generate on CPU.
     #[arg(long)]
@@ -973,6 +987,9 @@ fn train_args_default() -> TrainArgs {
         python: None,
         base_model: None,
         device: None,
+        four_bit: false,
+        no_four_bit: false,
+        multi_gpu: None,
         allow_cpu: false,
         region: None,
         stake_ref: None,
@@ -1265,6 +1282,16 @@ fn cmd_train(args: TrainArgs) -> i32 {
         python: args.python,
         base_model: args.base_model,
         device: args.device,
+        // Tri-state: only override the saved value when the user actually passed
+        // --four-bit / --no-four-bit (else None), so a bare re-run keeps the last choice.
+        four_bit: if args.four_bit {
+            Some(true)
+        } else if args.no_four_bit {
+            Some(false)
+        } else {
+            None
+        },
+        multi_gpu: args.multi_gpu,
         region: args.region,
         stake_ref: args.stake_ref,
         allow_cpu: args.allow_cpu,

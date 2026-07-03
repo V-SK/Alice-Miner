@@ -64,9 +64,14 @@ const CODE_EXEC_REL: &str = "code_exec.py";
 const ENV_TRAINER_DIR: &str = "ALICE_TRAIN_TRAINER_PATH";
 
 /// The default base model the worker generates candidates with when none is supplied.
-/// A small instruct model that runs on a modest GPU (or CPU under `--allow-cpu` for a
-/// smoke test); a real deployment overrides it to match the coordinator's corpus.
-const DEFAULT_BASE_MODEL: &str = "Qwen/Qwen2.5-3B-Instruct";
+/// This MUST match the coordinator's training base (`run_m0.py --base-model` default) so
+/// a miner's candidate distribution is the one the RLVR harness scores:
+/// `Qwen/Qwen3-30B-A3B-Instruct-2507` — a Qwen3 A3B MoE (30.5B total / 3.3B active, 128
+/// experts, Apache-2.0). It won't fit a modest card in bf16, so a real worker pairs it
+/// with `--four-bit` (QLoRA-class NF4, ~24 GB single-card floor) and/or `--multi-gpu
+/// shard` (device_map="auto" across all local GPUs). A tiny smoke test can still override
+/// `--base-model` to a small model and run on CPU under `--allow-cpu`.
+const DEFAULT_BASE_MODEL: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507";
 
 /// How often the register→lease→solve→submit loop wakes between cycles when idle
 /// (a NoTask tick). Solving itself is not on this cadence — it runs to completion.
@@ -142,6 +147,8 @@ pub struct TrainSettings {
     pub python: String,
     pub base_model: String,
     pub device: String,
+    pub four_bit: bool,
+    pub multi_gpu: Option<String>,
     pub region: String,
     pub stake_ref: String,
     pub allow_cpu: bool,
@@ -155,6 +162,10 @@ pub struct TrainFlags {
     pub python: Option<String>,
     pub base_model: Option<String>,
     pub device: Option<String>,
+    /// Load the base in 4-bit (QLoRA-class NF4). `None` = fall back to saved/false.
+    pub four_bit: Option<bool>,
+    /// Multi-GPU placement (`Some("shard")` = device_map="auto" across all local GPUs).
+    pub multi_gpu: Option<String>,
     pub region: Option<String>,
     pub stake_ref: Option<String>,
     pub allow_cpu: bool,
@@ -248,6 +259,35 @@ pub fn resolve_config(
         device
     };
 
+    // 4-bit: explicit flag > saved > false. The big-MoE default base won't fit a modest
+    // card in bf16, so a real GPU worker almost always wants this; it's honest to leave it
+    // opt-in (a small override base on a big card can run full precision).
+    let four_bit = flags.four_bit.or(saved.four_bit.then_some(true)).unwrap_or(false);
+
+    // Multi-GPU placement: explicit flag > saved. Only "shard" is understood today
+    // (device_map="auto", naive pipeline split); reject anything else as a usage error so
+    // a typo can't silently fall through to single-GPU and OOM.
+    let multi_gpu = flags
+        .multi_gpu
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| saved.multi_gpu.clone().filter(|s| !s.trim().is_empty()));
+    if let Some(mode) = multi_gpu.as_deref() {
+        if mode != "shard" {
+            return Err(format!(
+                "--multi-gpu only accepts 'shard' (device_map=auto across all local GPUs); \
+                 got {mode:?}"
+            ));
+        }
+        // Sharding a base across GPUs is meaningless on CPU — catch the contradiction early.
+        if device == "cpu" {
+            return Err(
+                "--multi-gpu shard needs GPUs but the device resolved to 'cpu' (no NVIDIA GPU \
+                 / --device cpu). Drop --multi-gpu for a CPU smoke test."
+                    .to_string(),
+            );
+        }
+    }
+
     let region = flags
         .region
         .or_else(|| saved.region.clone())
@@ -264,6 +304,8 @@ pub fn resolve_config(
         python,
         base_model,
         device,
+        four_bit,
+        multi_gpu,
         region,
         stake_ref,
         allow_cpu: flags.allow_cpu,
@@ -290,6 +332,8 @@ fn persist(settings: &TrainSettings) {
         python: Some(settings.python.clone()),
         base_model: Some(settings.base_model.clone()),
         device: Some(settings.device.clone()),
+        four_bit: settings.four_bit,
+        multi_gpu: settings.multi_gpu.clone(),
         region: (settings.region != "unknown").then(|| settings.region.clone()),
     };
     let _ = train_config::save(&cfg);
@@ -769,7 +813,18 @@ fn run_gen_once(
         .arg("--base-model")
         .arg(&settings.base_model)
         .arg("--device")
-        .arg(&settings.device)
+        .arg(&settings.device);
+    // 4-bit + multi-GPU steer the driver's `_load_base` (the harness's OWN loader) so the
+    // big-MoE base fits: NF4 quant and/or device_map="auto" across all local GPUs. Both
+    // are load-placement only — the generation + candidate extraction are unchanged, so
+    // the candidate distribution still matches what the coordinator's verifier scored.
+    if settings.four_bit {
+        cmd.arg("--load-in-4bit");
+    }
+    if let Some(mode) = settings.multi_gpu.as_deref() {
+        cmd.arg("--multi-gpu").arg(mode);
+    }
+    cmd
         // The trainer dir on PYTHONPATH so `from run_m0 import …` + `from code_exec
         // import …` resolve. The driver's cwd is the trainer dir so relative imports in
         // run_m0 (e.g. `from code_exec import …`) also resolve.
@@ -1055,6 +1110,66 @@ mod tests {
         // Unset stake_ref → the address-scoped default.
         assert_eq!(s.stake_ref, format!("enroll:{ADDR}"));
         assert_eq!(s.python, "python3");
+        // Unset 4-bit / multi-gpu → off by default.
+        assert!(!s.four_bit);
+        assert_eq!(s.multi_gpu, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_config_four_bit_flag_over_saved() {
+        let dir = temp_trainer_dir();
+        let base = TrainFlags {
+            trainer_dir: Some(dir.to_string_lossy().to_string()),
+            device: Some("cpu".into()),
+            ..Default::default()
+        };
+        // Explicit --four-bit → on.
+        let s = resolve_config(
+            TrainFlags { four_bit: Some(true), ..base.clone() },
+            ADDR,
+            &TrainConfig::default(),
+        )
+        .expect("resolve");
+        assert!(s.four_bit, "explicit --four-bit turns it on");
+        // Saved on, no flag → stays on.
+        let saved = TrainConfig { four_bit: true, ..TrainConfig::default() };
+        let s = resolve_config(base.clone(), ADDR, &saved).expect("resolve");
+        assert!(s.four_bit, "saved four_bit replays");
+        // Saved on, explicit --no-four-bit (Some(false)) → off (flag wins).
+        let s = resolve_config(
+            TrainFlags { four_bit: Some(false), ..base }, ADDR, &saved,
+        )
+        .expect("resolve");
+        assert!(!s.four_bit, "explicit --no-four-bit overrides saved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_config_multi_gpu_rejects_unknown_mode() {
+        let dir = temp_trainer_dir();
+        let f = TrainFlags {
+            trainer_dir: Some(dir.to_string_lossy().to_string()),
+            device: Some("cpu".into()),
+            multi_gpu: Some("auto".into()),
+            ..Default::default()
+        };
+        let e = resolve_config(f, ADDR, &TrainConfig::default()).unwrap_err();
+        assert!(e.contains("shard") && e.contains("auto"), "names the bad mode: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_config_multi_gpu_shard_on_cpu_rejected() {
+        let dir = temp_trainer_dir();
+        let f = TrainFlags {
+            trainer_dir: Some(dir.to_string_lossy().to_string()),
+            device: Some("cpu".into()),
+            multi_gpu: Some("shard".into()),
+            ..Default::default()
+        };
+        let e = resolve_config(f, ADDR, &TrainConfig::default()).unwrap_err();
+        assert!(e.contains("cpu"), "shard-on-cpu is a clear usage error: {e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
