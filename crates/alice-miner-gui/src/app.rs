@@ -1080,6 +1080,15 @@ impl MinerApp {
     /// lane — a quiet GPU lane is flagged even while XMR is healthy. Single-lane runs read
     /// the top-level clock (sum == lane), so behaviour there is identical.
     pub fn share_stall_secs(&self) -> Option<u64> {
+        self.share_stall_secs_at(Instant::now())
+    }
+
+    /// Stall computation against an injected `now` — testable + panic-free. Uses
+    /// `saturating_duration_since` (never the `Instant - Duration` operator or a panicking
+    /// `elapsed`/`duration_since`), so a clock reading that appears earlier than a stored
+    /// clock (e.g. a non-monotonic reading, or a fresh runner where the origin is close)
+    /// saturates to 0 instead of panicking.
+    fn share_stall_secs_at(&self, now: Instant) -> Option<u64> {
         if self.state() != EngineState::Running {
             return None;
         }
@@ -1098,7 +1107,11 @@ impl MinerApp {
                         && l.hashrate_hs.unwrap_or(0.0) > 0.0
                         && l.shares_accepted > 0
                 })
-                .filter_map(|l| self.lane_acc_clocks.get(&l.lane).map(|(_, t)| t.elapsed().as_secs()))
+                .filter_map(|l| {
+                    self.lane_acc_clocks
+                        .get(&l.lane)
+                        .map(|(_, t)| now.saturating_duration_since(*t).as_secs())
+                })
                 .max();
         }
         let hr = self.snapshot.as_ref().and_then(|s| s.hashrate_hs).unwrap_or(0.0);
@@ -1106,7 +1119,8 @@ impl MinerApp {
         if hr <= 0.0 || acc == 0 {
             return None; // warming up / not producing yet
         }
-        self.last_acc_change.map(|t| t.elapsed().as_secs())
+        self.last_acc_change
+            .map(|t| now.saturating_duration_since(t).as_secs())
     }
 
     /// The engine lifecycle state (Idle until the first snapshot).
@@ -2131,11 +2145,15 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         assert_eq!(app.share_stall_secs(), None);
 
         // Running, hashing, has landed shares, change-clock old → stalled (>= ~400s).
+        // Inject `now = base + 400s` (addition never underflows, unlike `Instant - 400s`
+        // which panics on a fresh Windows runner whose Instant origin is < 400s ago).
+        let base = Instant::now();
+        let now = base + std::time::Duration::from_secs(400);
         app.snapshot = Some(running_snapshot()); // hr 8400, acc 10
         app.last_acc_count = 10;
-        app.last_acc_change = Some(Instant::now() - std::time::Duration::from_secs(400));
+        app.last_acc_change = Some(base);
         assert!(
-            app.share_stall_secs().unwrap() >= 300,
+            app.share_stall_secs_at(now).unwrap() >= 300,
             "a producing-then-quiet lane is flagged"
         );
 
@@ -2144,7 +2162,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         warming.shares_accepted = 0;
         warming.hashrate_hs = Some(0.0);
         app.snapshot = Some(warming);
-        assert_eq!(app.share_stall_secs(), None, "warming up is not a stall");
+        assert_eq!(app.share_stall_secs_at(now), None, "warming up is not a stall");
     }
 
     /// SHOULD-FIX A: in dual-mine a stalled GPU-PRL lane is flagged even while the XMR
@@ -2195,19 +2213,23 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             },
         ];
         app.snapshot = Some(s);
-        // Top-level clock is fresh (XMR keeps the sum advancing) …
-        app.last_acc_change = Some(Instant::now());
-        // … but the GPU lane's own clock is ~400s stale, XMR's fresh.
-        app.lane_acc_clocks.insert(Lane::Xmr, (200, Instant::now()));
-        app.lane_acc_clocks
-            .insert(Lane::GpuPrl, (7, Instant::now() - Duration::from_secs(400)));
-        let secs = app.share_stall_secs().expect("stalled GPU lane is flagged");
+        // Inject `now = base + 400s` (safe addition; `Instant - 400s` panics on a fresh
+        // Windows runner). XMR's clock is `now` (fresh, 0s); the GPU lane's clock is `base`
+        // (400s stale relative to `now`).
+        let base = Instant::now();
+        let now = base + Duration::from_secs(400);
+        app.last_acc_change = Some(now);
+        app.lane_acc_clocks.insert(Lane::Xmr, (200, now));
+        app.lane_acc_clocks.insert(Lane::GpuPrl, (7, base));
+        let secs = app
+            .share_stall_secs_at(now)
+            .expect("stalled GPU lane is flagged");
         assert!(secs >= 300, "the GPU lane's ~400s stall surfaces (got {secs}s)");
 
         // Both lanes fresh → no stall.
-        app.lane_acc_clocks.insert(Lane::GpuPrl, (7, Instant::now()));
+        app.lane_acc_clocks.insert(Lane::GpuPrl, (7, now));
         assert_eq!(
-            app.share_stall_secs(),
+            app.share_stall_secs_at(now),
             Some(0),
             "both lanes fresh → ~0s, below the banner threshold"
         );
