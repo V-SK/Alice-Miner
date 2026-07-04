@@ -361,6 +361,42 @@ pub fn render_detect(cap: &CapabilityProfile) -> String {
             marker
         ));
     }
+    out.push_str(&render_detect_next_steps(cap));
+    out
+}
+
+/// Whether this device can plausibly do AI work (serve / shard / train): an NVIDIA GPU
+/// is present, OR it is Apple Silicon (unified-memory Metal). Pure over the profile —
+/// the SAME gate the detect AI-funnel line and the setup cross-sell use so they can't
+/// disagree about whether to offer AI participation.
+pub fn is_ai_capable(cap: &CapabilityProfile) -> bool {
+    cap.profile.gpu.vendor == GpuVendor::Nvidia || cap.profile.apple_silicon
+}
+
+/// The bilingual NEXT-STEPS tail appended under `detect`'s device + lane matrix (the
+/// human render only — the `--json` path serializes the raw profile and never calls
+/// this, so `detect --json` stays byte-identical). Pure `&CapabilityProfile -> String`
+/// so it is unit-tested directly:
+///   (1) always: `start --lane <recommended>` using the profile's own recommended lane;
+///   (2) when the device is AI-capable (NVIDIA / Apple Silicon): the AI-funnel line
+///       pointing at `ai --menu`.
+/// CREDIT-ONLY: no earnings language — it offers to START / to EXPLORE, never a payout.
+pub fn render_detect_next_steps(cap: &CapabilityProfile) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\n{}\n  alice-miner start --lane {}\n",
+        tr!("Next: start mining on the recommended lane", "下一步: 在推荐通道上开始挖矿"),
+        cap.recommended_lane().cli_lane_arg(),
+    ));
+    if is_ai_capable(cap) {
+        out.push_str(&format!(
+            "\n{}\n  alice-miner ai --menu\n",
+            tr!(
+                "This machine may also be able to do AI work — see what it can do:",
+                "这台机器可能还能承担 AI 工作 — 查看它能做什么:"
+            ),
+        ));
+    }
     out
 }
 
@@ -1026,6 +1062,98 @@ mod tests {
         assert!(two.contains("--gpus"), "hints the per-card flag");
         assert!(two.contains("gpu-devices"), "points to the authoritative id list");
         assert!(two.contains("integrated GPU"), "warns the ids can differ / include an iGPU");
+    }
+
+    // ── detect next-steps + AI funnel (#40) ───────────────────────────────────
+
+    /// Build a synthetic [`CapabilityProfile`] from an OS + apple_silicon flag + GPU, so
+    /// the next-steps assembly can be tested for both AI-capable and CPU-only devices.
+    fn cap_with(
+        os: alice_miner_core::OsFamily,
+        apple_silicon: bool,
+        gpu: GpuInfo,
+    ) -> CapabilityProfile {
+        let profile = alice_miner_core::DeviceProfile {
+            os,
+            arch: if apple_silicon { "aarch64".into() } else { "x86_64".into() },
+            apple_silicon,
+            logical_cores: 8,
+            cpu_model: "Test CPU".into(),
+            gpu,
+            memory_gb: 32,
+            display: "Test CPU · 8 cores".into(),
+            warnings: vec![],
+        };
+        CapabilityProfile::from_profile(profile)
+    }
+
+    fn nvidia_gpu() -> GpuInfo {
+        GpuInfo {
+            vendor: GpuVendor::Nvidia,
+            model: "NVIDIA GeForce RTX 3070 Ti".into(),
+            vram_gb: 8,
+            gpus: Vec::new(),
+            max_compute_cap_x10: Some(86),
+        }
+    }
+
+    fn no_gpu() -> GpuInfo {
+        GpuInfo {
+            vendor: GpuVendor::None,
+            model: String::new(),
+            vram_gb: 0,
+            gpus: Vec::new(),
+            max_compute_cap_x10: None,
+        }
+    }
+
+    /// `is_ai_capable` is true for an NVIDIA GPU or Apple Silicon, false for a CPU-only
+    /// (no-GPU) x86 box.
+    #[test]
+    fn is_ai_capable_gate() {
+        // NVIDIA present → AI-capable.
+        assert!(is_ai_capable(&cap_with(alice_miner_core::OsFamily::Linux, false, nvidia_gpu())));
+        // Apple Silicon → AI-capable (unified-memory Metal).
+        let apple_gpu = GpuInfo {
+            vendor: GpuVendor::Apple,
+            model: "Apple M2 Max".into(),
+            vram_gb: 0,
+            gpus: Vec::new(),
+            max_compute_cap_x10: None,
+        };
+        assert!(is_ai_capable(&cap_with(alice_miner_core::OsFamily::Macos, true, apple_gpu)));
+        // CPU-only x86 → NOT AI-capable.
+        assert!(!is_ai_capable(&cap_with(alice_miner_core::OsFamily::Linux, false, no_gpu())));
+    }
+
+    /// The detect next-steps tail ALWAYS names `start --lane <recommended>` (the
+    /// profile's own recommended lane), and appends the AI-funnel line ONLY on an
+    /// AI-capable device. Credit-only: no earnings language.
+    #[test]
+    fn detect_next_steps_assembly() {
+        // AI-capable (NVIDIA): start line + AI funnel.
+        let ai_cap = cap_with(alice_miner_core::OsFamily::Linux, false, nvidia_gpu());
+        let ai = render_detect_next_steps(&ai_cap);
+        assert!(
+            ai.contains(&format!("start --lane {}", ai_cap.recommended_lane().cli_lane_arg())),
+            "names the recommended lane's start command: {ai}"
+        );
+        assert!(ai.contains("ai --menu"), "AI-capable → the AI funnel line: {ai}");
+        // CPU-only: start line ONLY — no AI funnel (never nudge a box toward AI it can't do).
+        let cpu_cap = cap_with(alice_miner_core::OsFamily::Linux, false, no_gpu());
+        let cpu = render_detect_next_steps(&cpu_cap);
+        assert!(
+            cpu.contains(&format!("start --lane {}", cpu_cap.recommended_lane().cli_lane_arg())),
+            "names the recommended lane: {cpu}"
+        );
+        assert!(!cpu.contains("ai --menu"), "CPU-only → NO AI funnel: {cpu}");
+        // Credit-only: neither variant leaks earnings language.
+        for blob in [&ai, &cpu] {
+            let low = blob.to_ascii_lowercase();
+            for bad in ["$", "earned", "payout", "paid"] {
+                assert!(!low.contains(bad), "next-steps must not contain {bad:?}: {blob}");
+            }
+        }
     }
 
     fn running_snapshot() -> Snapshot {

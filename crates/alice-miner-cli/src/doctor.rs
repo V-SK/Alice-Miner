@@ -848,30 +848,58 @@ pub fn run_ai_checks(input: &AiDoctorInput) -> Vec<Check> {
     ]
 }
 
-/// python3 present + its version (the interpreter that runs the engine).
+/// python3 present AND ≥ 3.11 (the acp worker does `from datetime import UTC`, a 3.11
+/// feature — a 3.10 box otherwise gets a green PASS then dies at runtime). We probe the
+/// interpreter's OWN `sys.version_info` (not the human `--version` banner) so the
+/// major.minor is machine-parseable, then GATE: < 3.11 => FAIL with the SAME shared
+/// wording serve.rs's preflight uses (the 3.11 floor + the deadsnakes install hint).
 fn check_ai_python(python: &str) -> Check {
     const NAME: &str = "python3";
     let mut cmd = std::process::Command::new(python);
-    cmd.arg("--version");
+    cmd.arg("-c");
+    cmd.arg("import sys; print(sys.version_info[0], sys.version_info[1])");
     match run_with_timeout(&mut cmd, PROBE_TIMEOUT) {
         Ok(Some(out)) if out.status.success() => {
-            let v = String::from_utf8_lossy(&out.stdout);
-            let v = if v.trim().is_empty() {
-                String::from_utf8_lossy(&out.stderr).trim().to_string()
-            } else {
-                v.trim().to_string()
-            };
-            Check::pass(NAME, format!("{python} {} ({v})", tr!("present", "已安装")))
+            let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            match crate::serve::parse_python_version(&raw) {
+                // Parsed a version → GATE it against the 3.11 floor.
+                Ok((major, minor)) if crate::serve::python_version_ok(major, minor) => Check::pass(
+                    NAME,
+                    format!(
+                        "{python} {major}.{minor} {}",
+                        tr!("(≥ 3.11)", "(≥ 3.11)")
+                    ),
+                ),
+                Ok((major, minor)) => Check::fail(
+                    NAME,
+                    format!(
+                        "{python} {major}.{minor} — {}",
+                        tr!(
+                            "below the 3.11 floor the acp worker needs (it uses `from datetime import UTC`)",
+                            "低于 acp 工作节点所需的 3.11 下限(它使用 `from datetime import UTC`)"
+                        )
+                    ),
+                    crate::serve::python_311_install_hint(),
+                ),
+                // Ran but we couldn't parse a version → treat like not-runnable.
+                Err(_) => python_not_runnable_check(NAME, python),
+            }
         }
-        _ => Check::fail(
-            NAME,
-            format!("{} {python:?}", tr!("python3 not found / not runnable at", "在此处找不到 / 无法运行 python3:")),
-            tr!(
-                "install Python 3 (the shard engine runs on it) or pass --python <path-to-python3>",
-                "请安装 Python 3(分片引擎在其上运行),或传入 --python <python3 路径>"
-            ),
-        ),
+        _ => python_not_runnable_check(NAME, python),
     }
+}
+
+/// The shared "python3 not found / not runnable" FAIL check — a version we couldn't
+/// even obtain. Names the interpreter + the same 3.11 install hint serve.rs prints.
+fn python_not_runnable_check(name: &'static str, python: &str) -> Check {
+    Check::fail(
+        name,
+        format!(
+            "{} {python:?}",
+            tr!("python3 not found / not runnable at", "在此处找不到 / 无法运行 python3:")
+        ),
+        crate::serve::python_311_install_hint(),
+    )
 }
 
 /// The engine checkout exists and contains phase0/pipeline.py.
@@ -1143,6 +1171,237 @@ pub fn render_ai_json(checks: &[Check]) -> String {
         .collect();
     let fails = checks.iter().filter(|c| c.status == Status::Fail).count();
     serde_json::json!({ "role": "ai", "ready": fails == 0, "checks": arr }).to_string()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// serve (single-GPU consumer serving worker) doctor section
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Mirrors the ai section's shape (AiDoctorInput / run_ai_checks / render_ai_report /
+// render_ai_json). The three python probes REUSE serve.rs's `pub(crate)` preflight
+// helpers verbatim (probe_python_ok / probe_worker_imports / probe_llama_cpp) so
+// `doctor --serve` diagnoses EXACTLY what a subsequent `serve` run would fail-close on —
+// never a second, drifting copy of the checks.
+
+/// The inputs the serve doctor battery probes (a subset of the resolved `serve`
+/// settings, merged from flags over the saved `serve_config`). All optional so
+/// `doctor --serve` can run before the user has supplied everything and still report
+/// exactly what is missing.
+#[derive(Debug, Clone, Default)]
+pub struct ServeDoctorInput {
+    pub center_url: Option<String>,
+    pub worker_dir: Option<std::path::PathBuf>,
+    pub python: String,
+    /// The saved serving tier (the M2 wizard's model_class), if any.
+    pub tier: Option<String>,
+    /// The saved serving runtime (`cuda`/`mlx`/`gguf`), if any.
+    pub runtime: Option<String>,
+}
+
+/// Run the serve-role diagnostic battery: identity, saved serve_config presence, the
+/// worker dir holds the worker_client entry, the three preflight probes (python ≥ 3.11,
+/// the worker package imports, the llama-cpp backend imports), and center reachability.
+/// Reuses the same [`Check`] primitives + honest FAIL/WARN/OK style as the mining + ai
+/// doctors, and reuses serve.rs's preflight helpers verbatim. Never panics.
+pub fn run_serve_checks(input: &ServeDoctorInput) -> Vec<Check> {
+    vec![
+        check_identity(),
+        check_serve_config(input),
+        check_serve_worker_dir(input.worker_dir.as_deref()),
+        check_serve_python(&input.python, input.worker_dir.as_deref()),
+        check_serve_worker_imports(&input.python, input.worker_dir.as_deref()),
+        check_serve_llama_cpp(&input.python, input.worker_dir.as_deref()),
+        check_ai_center(input.center_url.as_deref()),
+    ]
+}
+
+/// The saved serve choice: a tier+runtime (what the M2 wizard writes) and/or a worker
+/// dir (what a prior `serve` run persists). PASS when a tier is saved (the machine has
+/// committed to a model); WARN when nothing is saved yet (serve will self-provision via
+/// --auto-vram, which is fine — just noted so a first-timer knows to run the wizard).
+fn check_serve_config(input: &ServeDoctorInput) -> Check {
+    const NAME: &str = "serve config";
+    match (input.tier.as_deref(), input.runtime.as_deref()) {
+        (Some(tier), Some(runtime)) => Check::pass(
+            NAME,
+            format!(
+                "{} {tier} ({runtime})",
+                tr!("saved serving tier:", "已保存的服务档位:")
+            ),
+        ),
+        (Some(tier), None) => Check::pass(
+            NAME,
+            format!("{} {tier}", tr!("saved serving tier:", "已保存的服务档位:")),
+        ),
+        _ => Check::warn(
+            NAME,
+            tr!(
+                "no serving tier saved yet (serve will self-provision via --auto-vram)",
+                "尚未保存服务档位(serve 将通过 --auto-vram 自动适配)"
+            ),
+            tr!(
+                "run `alice-miner ai --menu` to pick a serving tier for this machine, or pass `alice-miner serve --tiers <tier> --runtime <runtime>`",
+                "运行 `alice-miner ai --menu` 为这台机器选择服务档位,或使用 `alice-miner serve --tiers <档位> --runtime <运行时>`"
+            ),
+        ),
+    }
+}
+
+/// The worker dir is set AND contains `src/alice_acp/worker_client/__main__.py` — the
+/// signal it is a real `alice-acp-minerai` checkout. Uses the SAME relative-path
+/// constant serve.rs's `resolve_config` requires (never a forked second string).
+fn check_serve_worker_dir(worker_dir: Option<&std::path::Path>) -> Check {
+    const NAME: &str = "worker dir";
+    let rel = crate::serve::WORKER_MAIN_REL_PATH;
+    match worker_dir {
+        None => Check::fail(
+            NAME,
+            tr!("no worker dir set", "未设置工作节点目录"),
+            tr!(
+                "pass --worker-dir <alice-acp-minerai checkout> (or set ALICE_ACP_WORKER_PATH); it must contain src/alice_acp/worker_client/__main__.py",
+                "请传入 --worker-dir <alice-acp-minerai 检出目录>(或设置 ALICE_ACP_WORKER_PATH);它必须包含 src/alice_acp/worker_client/__main__.py"
+            ),
+        ),
+        Some(dir) if dir.join(rel).is_file() => Check::pass(
+            NAME,
+            format!("{} {}", tr!("worker_client entry found under", "在此处找到 worker_client 入口:"), dir.display()),
+        ),
+        Some(dir) => Check::fail(
+            NAME,
+            format!("{rel} {} {}", tr!("is missing under", "缺失于"), dir.display()),
+            tr!(
+                "point --worker-dir at your alice-acp-minerai checkout (the dir with src/alice_acp/worker_client/__main__.py)",
+                "请把 --worker-dir 指向你的 alice-acp-minerai 检出目录(含 src/alice_acp/worker_client/__main__.py 的目录)"
+            ),
+        ),
+    }
+}
+
+/// python present AND ≥ 3.11, via serve.rs's `probe_python_ok` (the EXACT preflight the
+/// serve role fail-closes on). The probe needs the worker dir on PYTHONPATH; without a
+/// worker dir we still gate the interpreter version against the CWD.
+fn check_serve_python(python: &str, worker_dir: Option<&std::path::Path>) -> Check {
+    const NAME: &str = "python3 (≥ 3.11)";
+    let dir = worker_dir.unwrap_or_else(|| std::path::Path::new("."));
+    match crate::serve::probe_python_ok(python, dir) {
+        Ok((major, minor)) => Check::pass(
+            NAME,
+            format!("{python} {major}.{minor} {}", tr!("(≥ 3.11)", "(≥ 3.11)")),
+        ),
+        Err(msg) => Check::fail(
+            NAME,
+            format!("{python} — {}", tr!("python check failed", "python 检查失败")),
+            msg,
+        ),
+    }
+}
+
+/// The worker package imports (`import alice_acp.worker_client`), via serve.rs's
+/// `probe_worker_imports`. SKIP when no worker dir is set (nothing to import against —
+/// the worker-dir check already FAILs, so this stays quiet rather than double-failing).
+fn check_serve_worker_imports(python: &str, worker_dir: Option<&std::path::Path>) -> Check {
+    const NAME: &str = "worker_client import";
+    let Some(dir) = worker_dir else {
+        return Check::skip(
+            NAME,
+            tr!(
+                "needs a --worker-dir first (see the worker dir check above)",
+                "需先设置 --worker-dir(见上方工作节点目录检查)"
+            ),
+        );
+    };
+    match crate::serve::probe_worker_imports(python, dir) {
+        Ok(()) => Check::pass(
+            NAME,
+            tr!("alice_acp.worker_client imports", "alice_acp.worker_client 可导入"),
+        ),
+        Err(msg) => Check::fail(
+            NAME,
+            tr!("the worker package does not import", "worker 包无法导入"),
+            msg,
+        ),
+    }
+}
+
+/// The llama-cpp serving backend imports (`import llama_cpp`), via serve.rs's
+/// `probe_llama_cpp`. On failure the shared known-good source-build recipe is the fix.
+/// SKIP when no worker dir is set (same reason as the import check above).
+fn check_serve_llama_cpp(python: &str, worker_dir: Option<&std::path::Path>) -> Check {
+    const NAME: &str = "llama-cpp backend";
+    let Some(dir) = worker_dir else {
+        return Check::skip(
+            NAME,
+            tr!(
+                "needs a --worker-dir first (see the worker dir check above)",
+                "需先设置 --worker-dir(见上方工作节点目录检查)"
+            ),
+        );
+    };
+    match crate::serve::probe_llama_cpp(python, dir) {
+        Ok(()) => Check::pass(
+            NAME,
+            tr!("llama_cpp imports (serving backend present)", "llama_cpp 可导入(服务后端已就绪)"),
+        ),
+        Err(msg) => Check::fail(
+            NAME,
+            tr!("the llama-cpp backend is not importable", "llama-cpp 后端无法导入"),
+            msg,
+        ),
+    }
+}
+
+/// Render the serve doctor report (human form) — same layout as [`render_report`] but
+/// headed for the serve role.
+pub fn render_serve_report(checks: &[Check]) -> String {
+    let mut s = String::new();
+    s.push_str(tr!(
+        "Alice Miner doctor — serve (single-GPU serving)\n",
+        "Alice Miner doctor — serve (单卡服务)\n"
+    ));
+    s.push_str("─────────────────────────────────────────────\n");
+    for c in checks {
+        s.push_str(&format!("  [{}] {} — {}\n", c.status.word(), c.name, c.detail));
+        if !c.fix.is_empty() {
+            s.push_str(&format!("        {}: {}\n", tr!("fix", "修复"), c.fix));
+        }
+    }
+    let fails = checks.iter().filter(|c| c.status == Status::Fail).count();
+    let warns = checks.iter().filter(|c| c.status == Status::Warn).count();
+    s.push_str("─────────────────────────────────────────────\n");
+    if fails == 0 {
+        s.push_str(&format!(
+            "{} ({warns} {})\n",
+            tr!("Ready to run the serve role.", "serve 角色已就绪。"),
+            tr!("warning(s).", "个警告。")
+        ));
+    } else {
+        s.push_str(&format!(
+            "{fails} {}, {warns} {}\n",
+            tr!("blocking issue(s)", "个阻塞问题"),
+            tr!(
+                "warning(s). Fix the FAIL lines above, then re-run `alice-miner doctor --serve`.",
+                "个警告。请修复上面的 FAIL 行,然后重新运行 `alice-miner doctor --serve`。"
+            )
+        ));
+    }
+    s
+}
+
+/// Render the serve doctor report as JSON (machine-readable).
+pub fn render_serve_json(checks: &[Check]) -> String {
+    let arr: Vec<serde_json::Value> = checks
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "status": c.status.json_token(),
+                "detail": c.detail,
+                "fix": if c.fix.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(c.fix.clone()) },
+            })
+        })
+        .collect();
+    let fails = checks.iter().filter(|c| c.status == Status::Fail).count();
+    serde_json::json!({ "role": "serve", "ready": fails == 0, "checks": arr }).to_string()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1681,6 +1940,143 @@ mod tests {
         for bad in ["hashrate", "earned", "payout", "$"] {
             assert!(!low.contains(bad), "ai report must not contain {bad:?}");
         }
+    }
+
+    /// The ai python check GATES on ≥ 3.11: a too-old interpreter FAILs (never a green
+    /// PASS that would crash at runtime on `from datetime import UTC`), and the fix names
+    /// the 3.11 floor + the deadsnakes hint (the SAME shared wording serve.rs prints). We
+    /// can't force a 3.10 to exist here, so we assert the SHARED gate + hint wiring
+    /// directly — the check builds its FAIL from exactly these (see check_ai_python).
+    #[test]
+    fn ai_python_gate_names_311_and_deadsnakes() {
+        // The shared version gate (reused verbatim by check_ai_python): < 3.11 fails.
+        assert!(!crate::serve::python_version_ok(3, 10));
+        assert!(crate::serve::python_version_ok(3, 11));
+        // The shared install hint the FAIL check attaches names the floor + deadsnakes.
+        let hint = crate::serve::python_311_install_hint();
+        assert!(hint.contains("3.11"), "names the 3.11 floor: {hint}");
+        assert!(hint.contains("deadsnakes"), "names the deadsnakes route: {hint}");
+        // A garbage probe output is NOT a valid version → not runnable (never a PASS).
+        assert!(crate::serve::parse_python_version("garbage").is_err());
+        assert!(crate::serve::parse_python_version("3").is_err());
+        // And a live probe of a definitely-missing interpreter is a hard FAIL with a fix.
+        let c = check_ai_python("definitely-not-a-real-python-xyz");
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.fix.contains("3.11"), "the fix names the 3.11 floor: {}", c.fix);
+    }
+
+    // ── serve (single-GPU serving) doctor ─────────────────────────────────────
+
+    /// A temp worker dir with a stub worker_client entry, so the worker-dir check PASSes
+    /// without a real checkout (mirrors serve.rs's temp_worker_dir).
+    fn temp_worker_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "alice-doctor-serve-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join("src/alice_acp/worker_client")).unwrap();
+        std::fs::write(
+            dir.join("src/alice_acp/worker_client/__main__.py"),
+            b"# stub\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    /// The serve worker-dir check FAILs when the dir is missing / lacks the worker_client
+    /// entry, and PASSes when it is present — honest, with a fix on the fail path.
+    #[test]
+    fn serve_worker_dir_check_is_honest() {
+        // No dir → fail with a fix naming --worker-dir.
+        let none = check_serve_worker_dir(None);
+        assert_eq!(none.status, Status::Fail);
+        assert!(none.fix.contains("--worker-dir"));
+
+        // A dir missing the entry → fail.
+        let empty = std::env::temp_dir().join(format!("serve-doctor-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(check_serve_worker_dir(Some(&empty)).status, Status::Fail);
+        let _ = std::fs::remove_dir_all(&empty);
+
+        // With the worker_client entry → pass.
+        let dir = temp_worker_dir();
+        assert_eq!(check_serve_worker_dir(Some(&dir)).status, Status::Pass);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The serve-config check PASSes when a tier is saved (the wizard committed a model),
+    /// WARNs when nothing is saved (serve self-provisions via --auto-vram) — with a fix
+    /// pointing at the participation menu.
+    #[test]
+    fn serve_config_check_reflects_saved_tier() {
+        // Nothing saved → WARN pointing at the wizard.
+        let w = check_serve_config(&ServeDoctorInput::default());
+        assert_eq!(w.status, Status::Warn);
+        assert!(w.fix.contains("ai --menu") || w.fix.contains("serve --tiers"));
+        // A saved tier+runtime → PASS naming them.
+        let input = ServeDoctorInput {
+            tier: Some("alice_lite_4b".into()),
+            runtime: Some("cuda".into()),
+            ..Default::default()
+        };
+        let p = check_serve_config(&input);
+        assert_eq!(p.status, Status::Pass);
+        assert!(p.detail.contains("alice_lite_4b"));
+    }
+
+    /// The import + backend checks SKIP (not FAIL) when no worker dir is set (the
+    /// worker-dir check already FAILs — they shouldn't double-fail on the same cause).
+    #[test]
+    fn serve_import_checks_skip_without_worker_dir() {
+        assert_eq!(check_serve_worker_imports("python3", None).status, Status::Skip);
+        assert_eq!(check_serve_llama_cpp("python3", None).status, Status::Skip);
+    }
+
+    /// The serve battery runs end-to-end (no panic), renders valid JSON with the serve
+    /// role + the expected checks, and stays credit-only. Uses a bogus python so the
+    /// probes fail-close deterministically without needing a real acp checkout.
+    #[test]
+    fn serve_battery_and_json_shape() {
+        let dir = temp_worker_dir();
+        let input = ServeDoctorInput {
+            python: "definitely-not-a-real-python-xyz".into(),
+            worker_dir: Some(dir.clone()),
+            tier: Some("alice_lite_4b".into()),
+            runtime: Some("cuda".into()),
+            ..Default::default()
+        };
+        let checks = run_serve_checks(&input);
+        let names: Vec<&str> = checks.iter().map(|c| c.name).collect();
+        assert!(names.contains(&"serve config"));
+        assert!(names.contains(&"worker dir"));
+        assert!(names.contains(&"python3 (≥ 3.11)"));
+        assert!(names.contains(&"worker_client import"));
+        assert!(names.contains(&"llama-cpp backend"));
+        assert!(names.contains(&"center reachability"));
+        for c in &checks {
+            assert!(!c.detail.is_empty(), "{} has no detail", c.name);
+            if matches!(c.status, Status::Fail | Status::Warn) {
+                assert!(!c.fix.is_empty(), "{} ({:?}) must carry a fix", c.name, c.status);
+            }
+        }
+        let json = render_serve_json(&checks);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(v["role"].as_str(), Some("serve"));
+        assert!(v["checks"].as_array().unwrap().len() >= 6);
+        let human = render_serve_report(&checks);
+        let low = human.to_ascii_lowercase();
+        for bad in ["hashrate", "earned", "payout", "$"] {
+            assert!(!low.contains(bad), "serve report must not contain {bad:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── train (RLVR training) doctor ──────────────────────────────────────────

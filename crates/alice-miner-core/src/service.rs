@@ -112,8 +112,11 @@ fn xml_escape(s: &str) -> String {
 }
 
 /// The per-user log path for the agent's stdout/stderr (under the AliceMiner data
-/// dir, NOT the keystore). Used by the launchd `StandardOutPath` keys.
-fn agent_log_path() -> PathBuf {
+/// dir, NOT the keystore). Used by the launchd `StandardOutPath` keys AND surfaced to
+/// the user by `alice-miner service --logs` / the install success line. Public so the
+/// CLI can name + tail the SAME file launchd/systemd/Task-Scheduler write to (whatever
+/// this returns on the current OS — the CLI does no path handling of its own).
+pub fn background_log_path() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("AliceMiner")
@@ -133,7 +136,7 @@ fn agent_log_path() -> PathBuf {
 /// Windows=Task Scheduler don't use it).
 pub fn rotate_background_log_if_oversized() {
     const MAX_BYTES: u64 = 8 * 1024 * 1024; // 8 MiB
-    rotate_log_if_oversized(&agent_log_path(), MAX_BYTES);
+    rotate_log_if_oversized(&background_log_path(), MAX_BYTES);
 }
 
 /// Inner, path-parameterised body of [`rotate_background_log_if_oversized`] (testable
@@ -158,7 +161,7 @@ fn rotate_log_if_oversized(path: &Path, max_bytes: u64) {
 pub fn launchd_plist_xml(spec: &ServiceSpec) -> Result<String, String> {
     let lane = background_lane_arg(spec.lane)?;
     let cli = xml_escape(&spec.cli_path.to_string_lossy());
-    let log = xml_escape(&agent_log_path().to_string_lossy());
+    let log = xml_escape(&background_log_path().to_string_lossy());
     let run_at_load = if spec.run_at_login { "<true/>" } else { "<false/>" };
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -299,7 +302,7 @@ pub fn install(spec: &ServiceSpec) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
-    if let Some(logdir) = agent_log_path().parent() {
+    if let Some(logdir) = background_log_path().parent() {
         let _ = std::fs::create_dir_all(logdir);
     }
     // Best-effort unload of any prior agent so the new definition takes effect.

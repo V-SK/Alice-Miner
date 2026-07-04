@@ -494,3 +494,22 @@ fn doctor_ai_json_shape() {
     assert!(names.contains(&"shard engine"));
     assert!(names.contains(&"endpoint port"));
 }
+
+/// `doctor --serve --json` produces a valid JSON report with the serve role + the
+/// expected checks, and exits (0 or non-zero) without panicking.
+#[test]
+fn doctor_serve_json_shape() {
+    let out = bin()
+        .args(["doctor", "--serve", "--json"])
+        .assert()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["role"].as_str(), Some("serve"));
+    let checks = v["checks"].as_array().expect("checks array");
+    let names: Vec<&str> = checks.iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"serve config"));
+    assert!(names.contains(&"worker dir"));
+    assert!(names.contains(&"python3 (≥ 3.11)"));
+}

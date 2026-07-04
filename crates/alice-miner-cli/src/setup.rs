@@ -218,6 +218,10 @@ pub fn run(cfg: SetupConfig, no_color: bool) -> i32 {
                 )
             );
             println!("  alice-miner start --lane {}", lane.cli_lane_arg());
+            // AI-funnel cross-sell: when this box can plausibly do AI work (NVIDIA /
+            // Apple Silicon), point at the participation menu. Gated on the SAME
+            // capability the detect funnel uses (credit-only — no earnings promise).
+            print!("{}", ai_funnel_cross_sell(&cap));
             EXIT_OK
         }
         _ => {
@@ -493,6 +497,24 @@ fn confirm(cfg: &SetupConfig, lane: Lane, address: &str) -> bool {
     ans.is_empty() || ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes")
 }
 
+/// The one-line AI-funnel cross-sell for the end of the wizard: when this device can
+/// plausibly do AI work (NVIDIA / Apple Silicon per [`crate::dashboard::is_ai_capable`]),
+/// point at `ai --menu`. Returns "" when not AI-capable (so a CPU-only box is not nudged
+/// toward AI it can't do). Credit-only — offers to EXPLORE, never a payout. Pure so it is
+/// unit-tested against a synthetic profile.
+fn ai_funnel_cross_sell(cap: &CapabilityProfile) -> String {
+    if !crate::dashboard::is_ai_capable(cap) {
+        return String::new();
+    }
+    format!(
+        "\n{}\n  alice-miner ai --menu\n",
+        tr!(
+            "This machine may also be able to do AI work — see what it can do:",
+            "这台机器可能还能承担 AI 工作 — 查看它能做什么:"
+        )
+    )
+}
+
 /// Resolve the final start choice: `Ask` becomes Yes under `--yes` or a
 /// non-interactive run (the copy-paste line is meant to start), else it prompts in
 /// `confirm` already, so by here Ask → Yes.
@@ -670,6 +692,46 @@ mod tests {
             None => std::env::remove_var("ALICE_IDENTITY_DIR"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The AI-funnel cross-sell appears at the end of the wizard ONLY on an AI-capable
+    /// device (NVIDIA / Apple Silicon), is empty on a CPU-only box, and is credit-only
+    /// (no earnings language). Reuses the shared `is_ai_capable` gate via a synthetic
+    /// profile.
+    #[test]
+    fn ai_funnel_cross_sell_gated_and_credit_only() {
+        use alice_miner_core::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
+        let cap = |vendor: GpuVendor, apple: bool| {
+            CapabilityProfile::from_profile(DeviceProfile {
+                os: if apple { OsFamily::Macos } else { OsFamily::Linux },
+                arch: if apple { "aarch64".into() } else { "x86_64".into() },
+                apple_silicon: apple,
+                logical_cores: 8,
+                cpu_model: "Test CPU".into(),
+                gpu: GpuInfo {
+                    vendor,
+                    model: String::new(),
+                    vram_gb: 0,
+                    gpus: Vec::new(),
+                    max_compute_cap_x10: if vendor == GpuVendor::Nvidia { Some(86) } else { None },
+                },
+                memory_gb: 32,
+                display: "Test CPU".into(),
+                warnings: vec![],
+            })
+        };
+        // NVIDIA / Apple Silicon → the funnel line is present.
+        let nvidia = ai_funnel_cross_sell(&cap(GpuVendor::Nvidia, false));
+        assert!(nvidia.contains("ai --menu"), "NVIDIA → funnel: {nvidia}");
+        let apple = ai_funnel_cross_sell(&cap(GpuVendor::Apple, true));
+        assert!(apple.contains("ai --menu"), "Apple Silicon → funnel: {apple}");
+        // CPU-only → empty (no nudge toward AI it can't do).
+        assert_eq!(ai_funnel_cross_sell(&cap(GpuVendor::None, false)), "");
+        // Credit-only.
+        let low = nvidia.to_ascii_lowercase();
+        for bad in ["$", "earned", "payout", "paid"] {
+            assert!(!low.contains(bad), "cross-sell must not contain {bad:?}: {nvidia}");
+        }
     }
 
     /// Serialize the identity-dir-env tests through the ONE crate-wide lock (shared

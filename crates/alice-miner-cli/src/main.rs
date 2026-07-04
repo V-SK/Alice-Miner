@@ -55,6 +55,7 @@ mod logo;
 mod menu;
 mod pidfile;
 mod serve;
+mod service_logs;
 mod setup;
 mod train;
 mod tui;
@@ -184,6 +185,8 @@ enum Command {
         --install     install + start the background agent\n\
         --uninstall   stop + remove the background agent\n\
         --status      print whether it is installed / running (the default)\n\
+        --logs        print the last N lines (--lines, default 50) of the background log\n\
+        --follow      with --logs: keep tailing the log until Ctrl-C\n\
         --lane xmr    the lane to background: xmr (secret-free) or a GPU pearlhash\n\
                       lane (prl/alpha/gpu/auto) whose unlock is stored in the keyring\n\
         --at-login    also start mining automatically at login/boot")]
@@ -213,6 +216,9 @@ enum Command {
         Windows Defender / macOS App-Nap) into one self-serve screen.\n\
         \n\
         --lane <LANE>  scope the engine / relay / GPU checks to a lane (default: auto)\n\
+        --ai           diagnose the shard-stage inference role instead of a mining lane\n\
+        --train        diagnose the RLVR training role instead of a mining lane\n\
+        --serve        diagnose the single-GPU serving role instead of a mining lane\n\
         --json         emit the report as one JSON object (for scripting)\n\
         \n\
         Exits non-zero if any check FAILs, so a script can gate `start` on a clean\n\
@@ -497,6 +503,15 @@ struct ServiceArgs {
     /// Print whether the agent is installed / running (the default action).
     #[arg(long, conflicts_with_all = ["install", "uninstall"])]
     status: bool,
+    /// Print the last N lines (see --lines) of the background mining log.
+    #[arg(long, conflicts_with_all = ["install", "uninstall", "status"])]
+    logs: bool,
+    /// With --logs: keep tailing the log (append new lines until Ctrl-C).
+    #[arg(long, requires = "logs")]
+    follow: bool,
+    /// With --logs: how many trailing lines to show (default 50).
+    #[arg(long, default_value_t = 50, value_name = "N")]
+    lines: usize,
     /// Which lane to background: `xmr` (secret-free), or a GPU pearlhash lane
     /// (`prl`/`alpha`/`gpu`/`auto`) whose wallet unlock is stored in the OS keyring.
     #[arg(long, default_value = "xmr", value_name = "LANE")]
@@ -547,6 +562,16 @@ struct DoctorArgs {
     /// `alice-miner train` uses; the flags below refine the probe.
     #[arg(long, conflicts_with = "ai")]
     train: bool,
+    /// Diagnose the `serve` (single-GPU consumer serving) role instead of a mining
+    /// lane: the saved serve config, the worker dir (worker_client entry), python ≥
+    /// 3.11, the worker package + llama-cpp backend imports, and the center URL. Reads
+    /// the same saved serve config `alice-miner serve` uses; the flags below refine it.
+    #[arg(long, conflicts_with_all = ["ai", "train"])]
+    serve: bool,
+    /// (with --serve) The alice-acp-minerai worker checkout to check (else
+    /// ALICE_ACP_WORKER_PATH / saved). Must contain src/alice_acp/worker_client/__main__.py.
+    #[arg(long, value_name = "DIR")]
+    worker_dir: Option<String>,
     /// (with --train) The training-mint-m0 trainer dir to check (else
     /// ALICE_TRAIN_TRAINER_PATH / saved).
     #[arg(long, value_name = "DIR")]
@@ -1033,6 +1058,8 @@ fn run_menu_action(action: menu::MenuAction, no_color: bool) -> i32 {
             lane: "auto".to_string(),
             ai: false,
             train: false,
+            serve: false,
+            worker_dir: None,
             center_url: None,
             endpoint: None,
             engine_dir: None,
@@ -1161,6 +1188,10 @@ fn cmd_doctor(args: DoctorArgs) -> i32 {
     if args.train {
         return cmd_doctor_train(args);
     }
+    // `--serve` diagnoses the single-GPU serving role instead of a mining lane.
+    if args.serve {
+        return cmd_doctor_serve(args);
+    }
     let cap = alice_miner_core::CapabilityProfile::detect();
     let lane = match resolve_lane(&args.lane, &cap) {
         Ok(l) => l,
@@ -1276,6 +1307,46 @@ fn cmd_doctor_train(args: DoctorArgs) -> i32 {
         println!("{}", doctor::render_train_json(&checks));
     } else {
         print!("{}", doctor::render_train_report(&checks));
+    }
+    if doctor::has_blocking_failure(&checks) {
+        EXIT_USAGE
+    } else {
+        EXIT_OK
+    }
+}
+
+/// `doctor --serve`: run the single-GPU serving-role battery. Merges the `--serve`
+/// flags over the saved serve config (the same one `alice-miner serve` reads), so a
+/// bare `doctor --serve` diagnoses exactly what a subsequent `serve` run would
+/// fail-close on. The three python probes REUSE serve.rs's preflight helpers.
+fn cmd_doctor_serve(args: DoctorArgs) -> i32 {
+    let saved = alice_miner_core::serve_config::load();
+    let worker_dir = args
+        .worker_dir
+        .or_else(|| std::env::var("ALICE_ACP_WORKER_PATH").ok().filter(|s| !s.is_empty()))
+        .or(saved.worker_dir)
+        .map(std::path::PathBuf::from);
+    let input = doctor::ServeDoctorInput {
+        center_url: args.center_url.or(saved.center_url),
+        worker_dir,
+        python: args.python.or(saved.python).unwrap_or_else(|| "python3".to_string()),
+        tier: saved.tier,
+        runtime: saved.runtime,
+    };
+    let checks = doctor::run_serve_checks(&input);
+    if args.fix {
+        use std::io::IsTerminal;
+        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        print!("{}", doctor::apply_fixes(&checks, interactive, &mut confirm_prompt));
+        println!();
+        let rechecked = doctor::run_serve_checks(&input);
+        print!("{}", doctor::render_serve_report(&rechecked));
+        return if doctor::has_blocking_failure(&rechecked) { EXIT_USAGE } else { EXIT_OK };
+    }
+    if args.json {
+        println!("{}", doctor::render_serve_json(&checks));
+    } else {
+        print!("{}", doctor::render_serve_report(&checks));
     }
     if doctor::has_blocking_failure(&checks) {
         EXIT_USAGE
@@ -1431,6 +1502,12 @@ fn cmd_serve(args: ServeArgs) -> i32 {
 fn cmd_service(args: ServiceArgs) -> i32 {
     use alice_miner_core::service::{self, ServiceSpec, ServiceState};
 
+    // `--logs [--follow] [--lines N]`: show the background miner log (a read action, like
+    // --status). Handled first so it never falls through to the status default.
+    if args.logs {
+        return service_logs::run(args.follow, args.lines);
+    }
+
     // Default + explicit --status: report state.
     if args.status || (!args.install && !args.uninstall) {
         let (word, msg) = match service::status() {
@@ -1566,6 +1643,15 @@ fn cmd_service(args: ServiceArgs) -> i32 {
                 )
             );
             if !args.json {
+                // Surface the log path (backgrounding swallows the live dashboard, so the
+                // log is the only window into what the agent is doing) + how to view it.
+                let log = alice_miner_core::service::background_log_path();
+                println!(
+                    "{}: {} — {}",
+                    tr!("logs", "日志"),
+                    log.display(),
+                    tr!("view with `alice-miner service --logs`", "使用 `alice-miner service --logs` 查看")
+                );
                 print!("{}", next_steps_after_service_install());
             }
             EXIT_OK

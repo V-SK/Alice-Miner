@@ -71,7 +71,12 @@ const ENV_WORKER_DIR: &str = "ALICE_ACP_WORKER_PATH";
 const ENV_POP_SECRET_URI: &str = "ALICE_WORKER_POP_SECRET_URI";
 
 /// The minimum python the worker needs (`from datetime import UTC` lands in 3.11).
-const MIN_PYTHON_MINOR: u32 = 11;
+pub(crate) const MIN_PYTHON_MINOR: u32 = 11;
+
+/// The worker_client entry relative path (`src/alice_acp/worker_client/__main__.py`),
+/// exposed so the `doctor --serve` section checks for the SAME entry `resolve_config`
+/// requires (never a forked second string).
+pub(crate) const WORKER_MAIN_REL_PATH: &str = WORKER_MAIN_REL;
 
 /// Max consecutive worker crash-restarts before `serve` gives up (bounded so a
 /// hard-failing worker — bad deps, OOM — can't spin forever; the give-up error
@@ -347,8 +352,9 @@ pub fn python_version_ok(major: u32, minor: u32) -> bool {
 
 /// The bilingual error for a too-old python (the acp worker does `from datetime import
 /// UTC`, which is a 3.11 feature; a 3.10 dies at import). Pure so it's the same string
-/// the test asserts.
-fn python_too_old_error(major: u32, minor: u32, python: &str) -> String {
+/// the test asserts. Shared with `doctor --serve` (the deadsnakes 3.11 hint + wording
+/// live here ONCE — never a forked second wording).
+pub(crate) fn python_too_old_error(major: u32, minor: u32, python: &str) -> String {
     // Build the version-bearing middle clause first (a `tr!` over `format!().as_str()`
     // would drop the temporary at statement end — bind it to a `let`).
     let en_mid = format!(
@@ -361,10 +367,19 @@ fn python_too_old_error(major: u32, minor: u32, python: &str) -> String {
         "{}: {python} {}. {}",
         tr!("python too old", "python 版本过低"),
         tr!(en_mid.as_str(), zh_mid.as_str()),
-        tr!(
-            "install python 3.11+ and pass --python <path/to/python3.11>",
-            "请安装 python 3.11+ 并通过 --python <python3.11 的路径> 指定"
-        )
+        python_311_install_hint()
+    )
+}
+
+/// The known-good "install python 3.11+" hint (bilingual), including the deadsnakes
+/// route Ubuntu boxes use. Shared by serve.rs's preflight error AND `doctor`'s python
+/// gate so the two can never fork a second wording. Pure.
+pub(crate) fn python_311_install_hint() -> &'static str {
+    tr!(
+        "install python 3.11+ and pass --python <path/to/python3.11> (on Ubuntu: \
+         `sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt install python3.11`)",
+        "请安装 python 3.11+ 并通过 --python <python3.11 的路径> 指定(Ubuntu 上: \
+         `sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt install python3.11`)"
     )
 }
 
@@ -392,15 +407,21 @@ fn llama_cpp_missing_hint() -> String {
 /// Run `<python> -c "<code>"` with `PYTHONPATH=<worker_dir>/src`, returning
 /// `Ok(stdout)` on a clean (exit-0) run, `Err(<stderr tail>)` on a non-zero exit /
 /// spawn failure. Used by the import preflights so a missing dep surfaces honestly.
-fn python_probe(settings: &ServeSettings, code: &str) -> Result<String, String> {
-    let pythonpath = worker_pythonpath(&settings.worker_dir, None);
-    let out = std::process::Command::new(&settings.python)
+/// Takes `python` + `worker_dir` directly (not the full [`ServeSettings`]) so the
+/// `doctor --serve` section can reuse the SAME probe with just those two.
+pub(crate) fn python_probe(
+    python: &str,
+    worker_dir: &std::path::Path,
+    code: &str,
+) -> Result<String, String> {
+    let pythonpath = worker_pythonpath(worker_dir, None);
+    let out = std::process::Command::new(python)
         .arg("-c")
         .arg(code)
         .env("PYTHONPATH", &pythonpath)
-        .current_dir(&settings.worker_dir)
+        .current_dir(worker_dir)
         .output()
-        .map_err(|e| format!("failed to run {} -c: {e}", settings.python))?;
+        .map_err(|e| format!("failed to run {python} -c: {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
@@ -412,31 +433,39 @@ fn python_probe(settings: &ServeSettings, code: &str) -> Result<String, String> 
     }
 }
 
-/// Doctor-style preflight, fail-closed, BEFORE spawning the loop. Each failure is an
-/// actionable bilingual `Err(String)` (mapped to EXIT_USAGE by the caller):
-///   1. python runs and is ≥ 3.11;
-///   2. the worker package imports (`import alice_acp.worker_client`);
-///   3. the llama-cpp backend imports (`import llama_cpp`) — else the source-build hint.
-fn preflight(settings: &ServeSettings) -> Result<(), String> {
-    // 1. python ≥ 3.11.
-    let ver = python_probe(settings, "import sys; print(sys.version_info[0], sys.version_info[1])")
-        .map_err(|tail| {
-            format!(
-                "{} ({}): {tail}",
-                tr!(
-                    "could not run the configured python",
-                    "无法运行所配置的 python"
-                ),
-                settings.python
-            )
-        })?;
+/// Preflight probe 1 — python runs and is ≥ 3.11. On success returns the found
+/// `(major, minor)` (the doctor detail prints it); on failure an actionable bilingual
+/// `Err(String)`. Shared by [`preflight`] AND `doctor --serve` so the two can never
+/// drift. `pub(crate)`.
+pub(crate) fn probe_python_ok(
+    python: &str,
+    worker_dir: &std::path::Path,
+) -> Result<(u32, u32), String> {
+    let ver = python_probe(
+        python,
+        worker_dir,
+        "import sys; print(sys.version_info[0], sys.version_info[1])",
+    )
+    .map_err(|tail| {
+        format!(
+            "{} ({python}): {tail}",
+            tr!("could not run the configured python", "无法运行所配置的 python")
+        )
+    })?;
     let (major, minor) = parse_python_version(&ver)?;
     if !python_version_ok(major, minor) {
-        return Err(python_too_old_error(major, minor, &settings.python));
+        return Err(python_too_old_error(major, minor, python));
     }
+    Ok((major, minor))
+}
 
-    // 2. the worker package imports (surfaces missing deps honestly).
-    python_probe(settings, "import alice_acp.worker_client").map_err(|tail| {
+/// Preflight probe 2 — the worker package imports (`import alice_acp.worker_client`).
+/// Surfaces a missing dep honestly. Shared with `doctor --serve`. `pub(crate)`.
+pub(crate) fn probe_worker_imports(
+    python: &str,
+    worker_dir: &std::path::Path,
+) -> Result<(), String> {
+    python_probe(python, worker_dir, "import alice_acp.worker_client").map(|_| ()).map_err(|tail| {
         format!(
             "{}\n{tail}\n  {}",
             tr!(
@@ -448,12 +477,28 @@ fn preflight(settings: &ServeSettings) -> Result<(), String> {
                 "请在此 python 中安装 worker 的依赖,然后重新运行: alice-miner serve"
             )
         )
-    })?;
+    })
+}
 
-    // 3. the llama-cpp backend imports (the serve backend is llama-cpp). On failure,
-    // print the known-good source-build recipe and FAIL CLOSED (never auto-pip).
-    python_probe(settings, "import llama_cpp").map_err(|_tail| llama_cpp_missing_hint())?;
+/// Preflight probe 3 — the llama-cpp backend imports (`import llama_cpp`). On failure
+/// the known-good source-build recipe (we FAIL CLOSED — never auto-pip). Shared with
+/// `doctor --serve`. `pub(crate)`.
+pub(crate) fn probe_llama_cpp(
+    python: &str,
+    worker_dir: &std::path::Path,
+) -> Result<(), String> {
+    python_probe(python, worker_dir, "import llama_cpp").map(|_| ()).map_err(|_tail| llama_cpp_missing_hint())
+}
 
+/// Doctor-style preflight, fail-closed, BEFORE spawning the loop. Each failure is an
+/// actionable bilingual `Err(String)` (mapped to EXIT_USAGE by the caller):
+///   1. python runs and is ≥ 3.11;
+///   2. the worker package imports (`import alice_acp.worker_client`);
+///   3. the llama-cpp backend imports (`import llama_cpp`) — else the source-build hint.
+fn preflight(settings: &ServeSettings) -> Result<(), String> {
+    probe_python_ok(&settings.python, &settings.worker_dir)?;
+    probe_worker_imports(&settings.python, &settings.worker_dir)?;
+    probe_llama_cpp(&settings.python, &settings.worker_dir)?;
     Ok(())
 }
 
