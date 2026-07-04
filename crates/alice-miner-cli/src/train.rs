@@ -264,6 +264,18 @@ pub fn resolve_config(
     // opt-in (a small override base on a big card can run full precision).
     let four_bit = flags.four_bit.or(saved.four_bit.then_some(true)).unwrap_or(false);
 
+    // 4-bit NF4 is bitsandbytes, which is CUDA-only. On any non-cuda device the harness
+    // _load_base raises SystemExit at load time — every candidate generation would crash only
+    // after a tokenizer/model fetch. Catch the contradiction here (parallel to the shard guard
+    // below) so it fails fast as a usage error instead of at runtime.
+    if four_bit && device != "cuda" {
+        return Err(format!(
+            "--four-bit (NF4/bitsandbytes) needs --device cuda but the device resolved to \
+             {device:?} (no NVIDIA GPU / --device cpu|mps). Drop --four-bit for a CPU/MPS smoke \
+             test, or run on a CUDA GPU."
+        ));
+    }
+
     // Multi-GPU placement: explicit flag > saved. Only "shard" is understood today
     // (device_map="auto", naive pipeline split); reject anything else as a usage error so
     // a typo can't silently fall through to single-GPU and OOM.
@@ -278,13 +290,14 @@ pub fn resolve_config(
                  got {mode:?}"
             ));
         }
-        // Sharding a base across GPUs is meaningless on CPU — catch the contradiction early.
-        if device == "cpu" {
-            return Err(
-                "--multi-gpu shard needs GPUs but the device resolved to 'cpu' (no NVIDIA GPU \
-                 / --device cpu). Drop --multi-gpu for a CPU smoke test."
-                    .to_string(),
-            );
+        // Sharding a base across GPUs needs CUDA GPUs — the harness _resolve_device_map only
+        // builds a shard map for device=cuda and silently drops the request on cpu/mps. Reject
+        // any non-cuda device early so the placement can't vanish without an error.
+        if device != "cuda" {
+            return Err(format!(
+                "--multi-gpu shard needs CUDA GPUs but the device resolved to {device:?} (no \
+                 NVIDIA GPU / --device cpu|mps). Drop --multi-gpu for a CPU/MPS smoke test."
+            ));
         }
     }
 
@@ -784,6 +797,31 @@ fn solve_task(
 /// trainer dir is on `PYTHONPATH` so the driver imports `run_m0`/`code_exec`.
 /// Returns `Ok(Some(code))` on a non-empty candidate, `Ok(None)` when the driver
 /// exited without emitting one (a clean "no candidate"), `Err` on a spawn/IO failure.
+/// The ordered argv (after the python executable) the generation driver is spawned with.
+///
+/// 4-bit + multi-GPU steer the driver's `_load_base` (the harness's OWN loader) so the big-MoE
+/// base fits: NF4 quant and/or device_map="auto" across all local GPUs. Both are load-placement
+/// only — generation + candidate extraction are unchanged, so the candidate distribution still
+/// matches what the coordinator's verifier scored. Kept as a pure helper so the pass-through of
+/// the T1 flags (the commit's headline) is unit-testable without spawning a process.
+fn gen_driver_args(settings: &TrainSettings, driver_path: &std::path::Path) -> Vec<String> {
+    let mut args = vec![
+        driver_path.to_string_lossy().into_owned(),
+        "--base-model".to_string(),
+        settings.base_model.clone(),
+        "--device".to_string(),
+        settings.device.clone(),
+    ];
+    if settings.four_bit {
+        args.push("--load-in-4bit".to_string());
+    }
+    if let Some(mode) = settings.multi_gpu.as_deref() {
+        args.push("--multi-gpu".to_string());
+        args.push(mode.to_string());
+    }
+    args
+}
+
 fn run_gen_once(
     settings: &TrainSettings,
     driver_path: &std::path::Path,
@@ -809,21 +847,7 @@ fn run_gen_once(
     .to_string();
 
     let mut cmd = Command::new(&settings.python);
-    cmd.arg(driver_path)
-        .arg("--base-model")
-        .arg(&settings.base_model)
-        .arg("--device")
-        .arg(&settings.device);
-    // 4-bit + multi-GPU steer the driver's `_load_base` (the harness's OWN loader) so the
-    // big-MoE base fits: NF4 quant and/or device_map="auto" across all local GPUs. Both
-    // are load-placement only — the generation + candidate extraction are unchanged, so
-    // the candidate distribution still matches what the coordinator's verifier scored.
-    if settings.four_bit {
-        cmd.arg("--load-in-4bit");
-    }
-    if let Some(mode) = settings.multi_gpu.as_deref() {
-        cmd.arg("--multi-gpu").arg(mode);
-    }
+    cmd.args(gen_driver_args(settings, driver_path));
     cmd
         // The trainer dir on PYTHONPATH so `from run_m0 import …` + `from code_exec
         // import …` resolve. The driver's cwd is the trainer dir so relative imports in
@@ -1118,31 +1142,88 @@ mod tests {
 
     #[test]
     fn resolve_config_four_bit_flag_over_saved() {
+        // Precedence: flag > saved > false. On a cpu box the four-bit guard rejects a resolved
+        // four_bit=true (NF4/bitsandbytes is CUDA-only), so the ERROR is the observable proof
+        // that four_bit resolved on; the --no-four-bit case must instead resolve cleanly to off.
         let dir = temp_trainer_dir();
         let base = TrainFlags {
             trainer_dir: Some(dir.to_string_lossy().to_string()),
             device: Some("cpu".into()),
             ..Default::default()
         };
-        // Explicit --four-bit → on.
-        let s = resolve_config(
+        // Explicit --four-bit on cpu → resolves on, then the cuda guard rejects it.
+        let e = resolve_config(
             TrainFlags { four_bit: Some(true), ..base.clone() },
             ADDR,
             &TrainConfig::default(),
         )
-        .expect("resolve");
-        assert!(s.four_bit, "explicit --four-bit turns it on");
-        // Saved on, no flag → stays on.
+        .unwrap_err();
+        assert!(e.contains("four-bit") && e.contains("cuda"), "explicit --four-bit resolved on: {e}");
+        // Saved on, no flag → replays on → same guard rejection.
         let saved = TrainConfig { four_bit: true, ..TrainConfig::default() };
-        let s = resolve_config(base.clone(), ADDR, &saved).expect("resolve");
-        assert!(s.four_bit, "saved four_bit replays");
-        // Saved on, explicit --no-four-bit (Some(false)) → off (flag wins).
+        let e = resolve_config(base.clone(), ADDR, &saved).unwrap_err();
+        assert!(e.contains("four-bit"), "saved four_bit replays on: {e}");
+        // Saved on, explicit --no-four-bit (Some(false)) → off (flag wins) → resolves cleanly.
         let s = resolve_config(
             TrainFlags { four_bit: Some(false), ..base }, ADDR, &saved,
         )
         .expect("resolve");
         assert!(!s.four_bit, "explicit --no-four-bit overrides saved");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_config_four_bit_on_cpu_rejected() {
+        let dir = temp_trainer_dir();
+        let f = TrainFlags {
+            trainer_dir: Some(dir.to_string_lossy().to_string()),
+            device: Some("cpu".into()),
+            four_bit: Some(true),
+            ..Default::default()
+        };
+        let e = resolve_config(f, ADDR, &TrainConfig::default()).unwrap_err();
+        assert!(
+            e.contains("four-bit") && e.contains("cuda"),
+            "four-bit on cpu is a clear usage error, not a runtime crash: {e}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gen_driver_args_passes_through_four_bit_and_shard() {
+        // The commit's headline: the T1 flags reach the spawned python driver. Build settings
+        // directly (bypassing the device guard) and assert argv, present iff each flag is set.
+        let driver = std::path::Path::new("/trainer/train_gen.py");
+        let mk = |four_bit: bool, multi: Option<&str>| TrainSettings {
+            center_url: "https://c".into(),
+            trainer_dir: "/trainer".into(),
+            python: "python3".into(),
+            base_model: DEFAULT_BASE_MODEL.to_string(),
+            device: "cuda".into(),
+            four_bit,
+            multi_gpu: multi.map(str::to_string),
+            region: "us".into(),
+            stake_ref: "enroll:x".into(),
+            allow_cpu: false,
+        };
+        // Base flags always present, in order.
+        let a = gen_driver_args(&mk(false, None), driver);
+        assert_eq!(
+            a,
+            vec![
+                "/trainer/train_gen.py", "--base-model",
+                DEFAULT_BASE_MODEL, "--device", "cuda",
+            ]
+        );
+        assert!(!a.iter().any(|s| s == "--load-in-4bit"), "no 4-bit when unset");
+        assert!(!a.iter().any(|s| s == "--multi-gpu"), "no shard when unset");
+        // 4-bit set → --load-in-4bit appended.
+        let a = gen_driver_args(&mk(true, None), driver);
+        assert!(a.iter().any(|s| s == "--load-in-4bit"), "4-bit flag passed through: {a:?}");
+        // shard set → --multi-gpu shard appended as an adjacent pair.
+        let a = gen_driver_args(&mk(true, Some("shard")), driver);
+        let i = a.iter().position(|s| s == "--multi-gpu").expect("multi-gpu present");
+        assert_eq!(a.get(i + 1).map(String::as_str), Some("shard"), "mode follows flag: {a:?}");
     }
 
     #[test]

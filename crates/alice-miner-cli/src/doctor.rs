@@ -1246,8 +1246,8 @@ fn check_train_base_model(base_model: Option<&str>) -> Check {
                 "未设置基础模型(train 角色将使用内置默认模型)"
             ),
             tr!(
-                "pass --base-model <hf-id-or-path> to match the coordinator's corpus; the default is a small instruct model",
-                "请传入 --base-model <hf-id-或路径> 以匹配调度中心的语料;默认是一个小型 instruct 模型"
+                "pass --base-model <hf-id-or-path> to match the coordinator's corpus; the default is the 30B-A3B MoE (Qwen3-30B-A3B-Instruct-2507), which needs --four-bit on a 24GB GPU or --multi-gpu shard across cards",
+                "请传入 --base-model <hf-id-或路径> 以匹配调度中心的语料;默认是 30B-A3B MoE(Qwen3-30B-A3B-Instruct-2507),在 24GB 显卡上需配 --four-bit,或用 --multi-gpu shard 跨卡"
             ),
         );
     };
