@@ -695,11 +695,26 @@ pub fn render_snapshot_ctx(snap: &Snapshot, ctx: &RenderCtx) -> String {
     out
 }
 
+/// Format a credit-point (积分) magnitude for display: an integer when whole (`234`),
+/// else two decimals (`12.50`). Non-finite / negative is clamped to `0` (credit points
+/// are never negative). This renders 积分 ONLY — the caller must never suffix it with a
+/// `$` / currency / ALICE-token unit.
+fn fmt_credit_points(v: f64) -> String {
+    let v = if v.is_finite() && v > 0.0 { v } else { 0.0 };
+    if (v.round() - v).abs() < 1e-9 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v:.2}")
+    }
+}
+
 /// Render the **cumulative server-confirmed credit** line (Source B) for the human
-/// dashboard. CREDIT-ONLY by construction: it surfaces only accepted-share COUNTS
-/// (cumulative total, 24h, and the GPU·Alpha / GPU·PRL split) — never a `$`, a fiat
-/// figure, or a "paid"/"earned" claim. The credit-only `pending_alice` magnitude on
-/// `Confirmed` is deliberately NOT rendered (it stays "credit · 积分 (credit-only)").
+/// dashboard. CREDIT-ONLY by construction: the CUMULATIVE CREDIT is shown as a 积分
+/// (credit-point) NUMBER (V's 2026-07-04 directive) with a 累计/已折付 split, alongside
+/// the accepted-share COUNTS (cumulative total, 24h, GPU·Alpha / GPU·PRL split) — never
+/// a `$`, a fiat figure, an ALICE-token claim, or a "paid"/"earned" English word. The
+/// cumulative credit = pending (待折付) + folded (已折付); today folding is gated OFF so
+/// 已折付 honestly reads 0.
 ///
 /// Honest states (mirrors the read_api's fail-closed philosophy):
 ///   * `None` (no line at all) for `NotExposed` — the poller hasn't been wired to a
@@ -708,8 +723,8 @@ pub fn render_snapshot_ctx(snap: &Snapshot, ctx: &RenderCtx) -> String {
 ///     show a fabricated 0).
 ///   * `Error` → "credited (cumulative): —" + a calm reason (network unreachable /
 ///     withheld); never a number, never the dropped value.
-///   * `Confirmed` → the real COUNTS (a server 0 IS shown as 0 — a real measured
-///     zero, distinct from "syncing"/"—").
+///   * `Confirmed` → the real credit NUMBER + split + COUNTS (a server 0 IS shown as
+///     0 — a real measured zero, distinct from "syncing"/"—").
 pub fn render_credit_line(credit: &CreditState) -> Option<String> {
     match credit {
         // No live endpoint wired → no cumulative line (don't invent one).
@@ -734,15 +749,36 @@ pub fn render_credit_line(credit: &CreditState) -> Option<String> {
             } else {
                 String::new()
             };
-            Some(format!(
-                "    {}: {} {} (24h {}){} · {}\n",
+            // Line 1 — the CUMULATIVE CREDIT NUMBER (积分), V's directive. Credit points,
+            // never money. `credit N 积分 (confirmed)`.
+            let credit_line = format!(
+                "    {}: {} {} ({})\n",
+                tr!("credit (cumulative)", "积分(累计)"),
+                fmt_credit_points(totals.cumulative_credit()),
+                tr!("积分", "积分"),
+                tr!("confirmed", "已确认"),
+            );
+            // Line 2 — the 累计/已折付 split: folded (已折付, 0 today) vs pending (待折付).
+            let split_line = format!(
+                "      {} {} {} · {} {} {}\n",
+                tr!("folded", "已折付"),
+                fmt_credit_points(totals.paid_credit),
+                tr!("积分", "积分"),
+                tr!("pending", "待折付"),
+                fmt_credit_points(totals.pending_credit),
+                tr!("积分", "积分"),
+            );
+            // Line 3 — the accepted-share COUNTS (kept: don't remove information).
+            let counts_line = format!(
+                "      {}: {} {} (24h {}){} · {}\n",
                 tr!("credited (cumulative)", "已计入(累计)"),
                 totals.accepted_total,
                 tr!("shares", "份额"),
                 totals.accepted_24h,
                 split,
                 reward_credit(),
-            ))
+            );
+            Some(format!("{credit_line}{split_line}{counts_line}"))
         }
     }
 }
@@ -1574,6 +1610,9 @@ mod tests {
             totals: CreditTotals {
                 accepted_total: 873,
                 accepted_24h: 142,
+                // The sample Confirmed credit: pending 12.5 积分, folded 0 today.
+                pending_credit: 12.5,
+                paid_credit: 0.0,
                 lanes: vec![
                     LaneCredit {
                         key: alice_miner_core::LANE_KEY_GPU_ALPHA.into(),
@@ -1590,21 +1629,47 @@ mod tests {
         }
     }
 
-    /// A `Confirmed` state renders the cumulative COUNTS + the GPU·Alpha / GPU·PRL
-    /// split — and NOTHING else (no number that is a fiat figure).
+    /// A `Confirmed` state renders (1) the CUMULATIVE CREDIT NUMBER as 积分 (V's
+    /// 2026-07-04 directive), (2) the 累计/已折付 split (已折付 0 today), AND (3) the
+    /// accepted-share COUNTS + GPU·Alpha / GPU·PRL split — with NO fiat / `$` / earn
+    /// wording anywhere. The sample confirmed state carries pending 12.5, paid 0 →
+    /// cumulative 12.5 积分.
     #[test]
-    fn credit_line_renders_cumulative_counts_only() {
+    fn credit_line_renders_cumulative_credit_number_and_split() {
         let line = render_credit_line(&confirmed_totals()).expect("a confirmed state renders");
+        // (1) The cumulative credit NUMBER, as 积分, confirmed. pending 12.5 + paid 0 =
+        // 12.5 → rendered to 2dp (fractional) as "12.50 积分".
+        assert!(line.contains("12.50 积分"), "cumulative credit number as 积分: {line}");
+        assert!(line.contains("(confirmed)"), "confirmed marker: {line}");
+        // (2) The 累计/已折付 split: folded 0 (honest — folding gated OFF), pending 12.50.
+        assert!(line.contains("folded 0 积分"), "已折付 = 0 rendered honestly: {line}");
+        assert!(line.contains("pending 12.50 积分"), "待折付 = pending magnitude: {line}");
+        // (3) The accepted-share COUNTS are KEPT (don't drop information).
         assert!(line.contains("credited (cumulative): 873 shares"), "headline count: {line}");
         assert!(line.contains("24h 142"), "24h count: {line}");
         assert!(line.contains("GPU·Alpha 500"), "alpha split: {line}");
         assert!(line.contains("GPU·PRL 373"), "prl split: {line}");
-        // Credit-only honesty: only counts + "credit · 积分 (credit-only)", never fiat/paid/earned.
+        // Credit-only honesty: the credit NUMBER is 积分 only — never fiat / `$` / a
+        // "paid"/"earned"/"payout" English word in ANY of the new strings.
         let lower = line.to_lowercase();
-        for forbidden in ["$", "usd", "fiat", "paid", "earned", "已发放"] {
+        for forbidden in ["$", "usd", "fiat", "paid", "earned", "payout", "已发放"] {
             assert!(!lower.contains(forbidden), "credit line leaked `{forbidden}`: {line}");
         }
         assert!(line.contains(&reward_credit()));
+    }
+
+    /// The 已折付 (folded) split renders HONESTLY as `0` today (folding gated OFF) — a
+    /// real measured zero, never omitted, never a fabricated non-zero.
+    #[test]
+    fn credit_line_folded_is_honest_zero_today() {
+        let line = render_credit_line(&confirmed_totals()).expect("confirmed renders");
+        assert!(line.contains("folded 0 积分"), "已折付 renders 0 today: {line}");
+        // A whole number renders as an integer (no ".00"), a fractional to 2dp.
+        assert_eq!(fmt_credit_points(12.5), "12.50", "fractional → 2dp");
+        assert_eq!(fmt_credit_points(234.0), "234", "whole → integer");
+        assert_eq!(fmt_credit_points(0.0), "0", "zero → 0");
+        assert_eq!(fmt_credit_points(-3.0), "0", "negative clamps to 0");
+        assert_eq!(fmt_credit_points(f64::NAN), "0", "NaN clamps to 0");
     }
 
     // ── Piece 6: credited-vs-raw divergence note ────────────────────────────────
@@ -1654,7 +1719,13 @@ mod tests {
         // Confirmed but credited > 0 → no divergence, no note.
         let credited = CreditState::Confirmed {
             score: CreditScore::new(0.0),
-            totals: CreditTotals { accepted_total: 50, accepted_24h: 12, lanes: vec![] },
+            totals: CreditTotals {
+                accepted_total: 50,
+                accepted_24h: 12,
+                pending_credit: 0.0,
+                paid_credit: 0.0,
+                lanes: vec![],
+            },
         };
         assert!(render_credited_vs_raw_note(&hashing, &credited).is_none(), "credited>0 → quiet");
 

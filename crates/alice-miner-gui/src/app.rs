@@ -1850,6 +1850,8 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             totals: CreditTotals {
                 accepted_total: 873,
                 accepted_24h: 142,
+                pending_credit: 12.56,
+                paid_credit: 0.0,
                 lanes: vec![
                     LaneCredit {
                         key: alice_miner_core::LANE_KEY_GPU_ALPHA.into(),

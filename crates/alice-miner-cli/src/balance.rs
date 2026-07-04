@@ -396,6 +396,8 @@ mod tests {
             totals: CreditTotals {
                 accepted_total: total,
                 accepted_24h: h24,
+                pending_credit: 0.0,
+                paid_credit: 0.0,
                 lanes: vec![],
             },
         }

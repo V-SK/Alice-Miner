@@ -218,22 +218,30 @@ pub struct LaneCredit {
 }
 
 /// **Source B cumulative totals** — the server-confirmed accepted-share COUNTS for
-/// this address, across all lanes plus the 24h window plus the per-lane breakdown.
+/// this address (across all lanes + the 24h window + the per-lane breakdown) PLUS the
+/// cumulative CREDIT-POINT (积分) magnitudes the dashboard now shows.
 ///
-/// **CREDIT-ONLY BY CONSTRUCTION:** every field is a non-negative integer COUNT of
-/// accepted shares (or a per-lane breakdown of the same). There is deliberately NO
-/// fiat / payout / `$` field here — the `pending_alice` / `paid_alice` summary
-/// fields are intentionally NOT read into this type (they are guarded separately by
-/// the envelope's `paid_acu`-zero check, and the credit-only `pending_alice` magnitude
-/// is carried opaquely by [`CreditScore`], never rendered as a number). The UI renders
-/// these counts directly ("N shares · GPU·Alpha M / GPU·PRL K"), which is honest:
-/// they are SHARE COUNTS, not money.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// **CREDIT-ONLY BY CONSTRUCTION:** the `accepted_*` fields are non-negative integer
+/// accepted-share COUNTS; the `pending_credit` / `paid_credit` fields are the
+/// credit-point magnitudes (待折付 / 已折付) from the read-model summary. Per V's
+/// 2026-07-04 directive these ARE now surfaced — but ONLY ever as 积分 (credit
+/// points), NEVER as `$` / fiat / an ALICE-token / earnings claim, and only after the
+/// envelope's `paid_acu`-zero + payout/live-reward gates all passed (a `paid_acu != "0"`
+/// response is still DROPPED whole, counts and credit alike). `Eq`/`Hash` were dropped
+/// from the derive because the two credit magnitudes are `f64` (they compare with
+/// `PartialEq`, which is all the UI/tests need).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CreditTotals {
     /// Cumulative accepted-share COUNT across all lanes (server-confirmed).
     pub accepted_total: u64,
     /// Accepted-share COUNT in the last 24h (server-confirmed).
     pub accepted_24h: u64,
+    /// Cumulative PENDING credit points (待折付), from `summary.pending_alice`. A
+    /// credit-point magnitude — NEVER money. `0.0` in phase-J is a real measured zero.
+    pub pending_credit: f64,
+    /// Cumulative PAID/folded credit points (已折付), from `summary.paid_alice`. A
+    /// credit-point magnitude — NEVER money. `0.0` today (folding gated OFF).
+    pub paid_credit: f64,
     /// Per-lane cumulative accepted-share COUNT breakdown (display order from server).
     pub lanes: Vec<LaneCredit>,
 }
@@ -248,6 +256,15 @@ impl CreditTotals {
             .find(|l| l.key == key)
             .map(|l| l.accepted)
             .unwrap_or(0)
+    }
+
+    /// The CUMULATIVE CREDIT (积分) = pending (待折付) + paid/folded (已折付). This is
+    /// the headline credit-point number V's directive requires the dashboard to show.
+    /// A credit-point magnitude, NEVER money. Non-finite inputs are treated as `0`.
+    pub fn cumulative_credit(&self) -> f64 {
+        let p = if self.pending_credit.is_finite() { self.pending_credit } else { 0.0 };
+        let f = if self.paid_credit.is_finite() { self.paid_credit } else { 0.0 };
+        p + f
     }
 
     /// Whether the server has confirmed any accepted shares at all for this address.
@@ -311,8 +328,10 @@ pub enum CreditState {
     /// that a public per-address endpoint exists). The `score` is the credit-only
     /// `pending_alice` magnitude ([`CreditScore`] has no fiat Display); `totals`
     /// carries the server-confirmed cumulative accepted-share COUNTS (across lanes +
-    /// 24h + per-lane breakdown). Reached only after the envelope's `paid_acu` was
-    /// verified `"0"` and the payout/live-reward gates read off.
+    /// 24h + per-lane breakdown) AND the cumulative CREDIT-POINT (积分) magnitudes
+    /// (待折付 / 已折付) the dashboard now renders (V's 2026-07-04 directive) — as 积分,
+    /// never money. Reached only after the envelope's `paid_acu` was verified `"0"`
+    /// and the payout/live-reward gates read off.
     Confirmed {
         score: CreditScore,
         totals: CreditTotals,
@@ -395,14 +414,23 @@ pub struct CreditEnvelope {
     pub lanes: Vec<LaneEnvelope>,
 }
 
-/// The credit-side summary fields of the read-model. `pending_alice` is the
-/// credit accrued-but-not-paid total (phase-J keeps it as pending credit); the
-/// `accepted_shares_*` are the cumulative server-confirmed COUNTS (credit-only).
+/// The credit-side summary fields of the read-model. `pending_alice` is the credit
+/// accrued-but-not-yet-folded total and `paid_alice` the already-folded ("已折付")
+/// total — together they are the CUMULATIVE CREDIT (积分) the dashboard now shows
+/// as a credit-point number (V's 2026-07-04 directive; see [`CreditTotals`]). Both
+/// are credit points, NEVER currency/`$`/an ALICE-token claim. The `accepted_shares_*`
+/// are the cumulative server-confirmed accepted-share COUNTS (credit-only).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreditSummary {
-    /// Credit accrued and pending (NOT cash; never rendered as a number/`$`).
+    /// Credit accrued and pending (待折付). A credit-point magnitude — NEVER cash/`$`.
     #[serde(default)]
     pub pending_alice: Option<f64>,
+    /// Credit already folded/paid (已折付). A credit-point magnitude — NEVER cash/`$`.
+    /// Phase-J keeps this `0` (folding gated OFF); the parser also independently drops
+    /// any envelope whose `paid_acu != "0"`, so a non-zero here can only be a real,
+    /// clean credit fold, never a payout leak.
+    #[serde(default)]
+    pub paid_alice: Option<f64>,
     /// Cumulative accepted-share COUNT across all lanes (server-confirmed).
     #[serde(default)]
     pub accepted_shares_total: Option<u64>,
@@ -466,6 +494,15 @@ pub fn parse_credit_envelope(body: &str) -> CreditState {
     // → 0 counts (a perfectly valid confirmed-but-zero state — a REAL server 0).
     let summary = env.summary;
     let raw = summary.as_ref().and_then(|s| s.pending_alice).unwrap_or(0.0);
+    // The cumulative credit-point magnitudes (待折付 / 已折付). Absent → a real 0.
+    // A negative/non-finite server value is clamped to 0 (credit points are never
+    // negative; a NaN must never poison the cumulative sum).
+    let clamp_credit = |v: Option<f64>| match v {
+        Some(x) if x.is_finite() && x > 0.0 => x,
+        _ => 0.0,
+    };
+    let pending_credit = clamp_credit(summary.as_ref().and_then(|s| s.pending_alice));
+    let paid_credit = clamp_credit(summary.as_ref().and_then(|s| s.paid_alice));
     let accepted_total = summary
         .as_ref()
         .and_then(|s| s.accepted_shares_total)
@@ -488,7 +525,13 @@ pub fn parse_credit_envelope(body: &str) -> CreditState {
         .collect();
     CreditState::Confirmed {
         score: CreditScore::new(raw),
-        totals: CreditTotals { accepted_total, accepted_24h, lanes },
+        totals: CreditTotals {
+            accepted_total,
+            accepted_24h,
+            pending_credit,
+            paid_credit,
+            lanes,
+        },
     }
 }
 
@@ -1268,9 +1311,58 @@ mod tests {
                     .unwrap();
                 assert_eq!(alpha.label, "GPU · Alpha");
                 assert!(totals.has_any());
+                // phase-J: both credit-point magnitudes are 0 (a real server 0), so the
+                // cumulative credit is 0 too.
+                assert_eq!(totals.pending_credit, 0.0);
+                assert_eq!(totals.paid_credit, 0.0);
+                assert_eq!(totals.cumulative_credit(), 0.0);
             }
             other => panic!("expected Confirmed with totals, got {other:?}"),
         }
+    }
+
+    /// V's 2026-07-04 directive: `paid_alice` deserializes into the totals alongside
+    /// `pending_alice`, and the CUMULATIVE CREDIT (积分) = pending (待折付) + paid (已折付).
+    /// Both are credit-point magnitudes, carried on `CreditTotals` — never money. This is
+    /// a clean envelope (`paid_acu == "0"`) with a real, non-zero credit fold, which is
+    /// distinct from a payout (the `paid_acu` gate independently guards that).
+    #[test]
+    fn source_b_deserializes_paid_alice_into_cumulative_credit() {
+        let body = r#"{
+            "found": true,
+            "paid_acu": "0",
+            "live_reward_enabled": false,
+            "payout_executor_enabled": false,
+            "summary": {
+                "pending_alice": 12.5,
+                "paid_alice": 30.0,
+                "accepted_shares_total": 873,
+                "accepted_shares_24h": 142
+            }
+        }"#;
+        match parse_credit_envelope(body) {
+            CreditState::Confirmed { totals, .. } => {
+                assert_eq!(totals.pending_credit, 12.5, "待折付 = pending_alice");
+                assert_eq!(totals.paid_credit, 30.0, "已折付 = paid_alice");
+                // The headline cumulative credit is the sum (42.5 积分).
+                assert_eq!(totals.cumulative_credit(), 42.5);
+            }
+            other => panic!("expected Confirmed, got {other:?}"),
+        }
+    }
+
+    /// The #18 guard is UNCHANGED by the new `paid_alice` field: a `paid_acu != "0"`
+    /// envelope that ALSO carries a `paid_alice` credit fold is still DROPPED whole —
+    /// the credit magnitudes are NOT surfaced through the new fields either.
+    #[test]
+    fn source_b_paid_acu_violation_drops_paid_alice_too() {
+        let body = r#"{"found":true,"paid_acu":"5.0",
+            "summary":{"pending_alice":12.5,"paid_alice":30.0,"accepted_shares_total":873}}"#;
+        let state = parse_credit_envelope(body);
+        assert_eq!(state, CreditState::Error { reason: CreditError::PaidAcuNotZero });
+        // No totals on an Error → the dropped credit magnitudes are unreachable.
+        assert!(state.totals().is_none());
+        assert!(!state.has_confirmed_credit());
     }
 
     /// A confirmed-but-zero pending score with a NON-zero accepted-share COUNT is
