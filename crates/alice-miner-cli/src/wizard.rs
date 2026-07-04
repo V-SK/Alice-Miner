@@ -15,9 +15,9 @@
 //!   * **Single-shot + honest.** One fetch, no retry loop — a failure prints the
 //!     reason and returns; the miner re-runs. A tier that isn't `offered_now` is
 //!     DISPLAYED but not selectable (it would never receive a job yet — we say so).
-//!   * **Credit-only.** Nothing here prints or implies an earning. M3 wires the
-//!     actual single-GPU serve spawn; this wizard only SAVES the choice and says so
-//!     plainly — it never pretends anything is running.
+//!   * **Credit-only.** Nothing here prints or implies an earning. The actual
+//!     single-GPU serve spawn lives in `alice-miner serve` (M3); this wizard only
+//!     SAVES the choice and points at that command — it never auto-starts anything.
 
 use std::io::{IsTerminal as _, Write as _};
 
@@ -478,8 +478,9 @@ fn choice_label(choice: &Choice, _menu: &CapabilityMenu) -> String {
 }
 
 /// Handle a serve-tier choice: show the download confirmation (repo/subpath/size),
-/// ask y/N on STDERR, and on yes persist the choice + print the honest "saved,
-/// starts in an upcoming update" message. On no, an abort line. Returns the exit code.
+/// ask y/N on STDERR, and on yes persist the choice + print the honest "saved — start
+/// serving with `alice-miner serve`" message (M3 wired the actual serve role; the
+/// wizard still auto-starts nothing). On no, an abort line. Returns the exit code.
 fn act_serve(center_url: &str, opt: &ServeOption) -> i32 {
     eprintln!(
         "\n{}",
@@ -535,6 +536,11 @@ fn act_serve(center_url: &str, opt: &ServeOption) -> i32 {
         repo_id: Some(opt.repo_id.clone()),
         revision: Some(opt.revision.clone()),
         artifact_subpath: Some(opt.artifact_subpath.clone()),
+        // The wizard records the MODEL choice only; the worker checkout dir + python
+        // are resolved by `alice-miner serve` (flag / env / its own saved fields), so
+        // it never overwrites them here.
+        worker_dir: None,
+        python: None,
     };
     match serve_config::save(&cfg) {
         Ok(path) => {
@@ -555,13 +561,14 @@ fn act_serve(center_url: &str, opt: &ServeOption) -> i32 {
             );
         }
     }
-    // HONEST: the actual single-GPU serve spawn lands in an upcoming update. We do
-    // NOT pretend anything is running now.
+    // HONEST: the single-GPU serve role now EXISTS (`alice-miner serve`). The wizard
+    // still does not auto-start anything — it saved the choice and points at the
+    // command. Credit-only: this only tells the user how to begin, never an earning.
     println!(
         "{}",
         tr!(
-            "single-GPU serving starts in an upcoming update — your selection is saved and will be used then",
-            "单卡服务模式将在近期更新中开启——你的选择已保存,届时自动使用"
+            "selection saved — start serving with: alice-miner serve",
+            "选择已保存——运行 alice-miner serve 开始服务"
         )
     );
     EXIT_OK

@@ -49,6 +49,16 @@ pub struct ServeConfig {
     /// The file within the repo (e.g. the `.gguf` name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_subpath: Option<String>,
+    /// Path to the `alice-acp-minerai` worker checkout the `serve` role spawns the
+    /// Python worker_client from (must contain `src/alice_acp/worker_client/__main__.py`).
+    /// Set by `alice-miner serve` on a successful run so a bare re-run replays it; the
+    /// wizard never sets it (the wizard only records the model choice, not the checkout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_dir: Option<String>,
+    /// Path to the python3 interpreter the `serve` role runs the worker_client with
+    /// (default: `python3`). Saved by `alice-miner serve` for re-runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<String>,
 }
 
 /// Resolve the config path: `<identity_dir>/serve_config.json`. Honors
@@ -79,6 +89,17 @@ pub fn load() -> ServeConfig {
         Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
         Err(_) => ServeConfig::default(),
     }
+}
+
+/// The directory the `serve` role writes the Python worker's stdout/stderr logs to:
+/// `<data_local_dir>/AliceMiner/serve-logs/` (created on demand). DELIBERATELY
+/// outside the `~/.alice` keystore root — a verbose worker log must never sit next
+/// to a key (mirrors [`crate::ai_config::ai_log_dir`]). Falls back to
+/// `<identity_dir>/serve-logs` only if no OS data dir is found.
+pub fn serve_log_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .map(|b| b.join("AliceMiner").join("serve-logs"))
+        .unwrap_or_else(|| identity_dir().join("serve-logs"))
 }
 
 /// Persist the serve choice atomically (temp + rename). PUBLIC data; written when
@@ -145,6 +166,8 @@ mod tests {
                 repo_id: Some("v102ss/Alice-Qwen3-4B-Instruct-2507-Heretic-Light-GGUF".into()),
                 revision: Some("aa4bf90e83b7acb4fb78881186e7bd623bfc004b".into()),
                 artifact_subpath: None,
+                worker_dir: Some("/opt/alice-acp-minerai".into()),
+                python: Some("python3".into()),
             };
             let path = save(&cfg).expect("save");
             assert!(path.is_file());
@@ -156,6 +179,9 @@ mod tests {
                 !raw.contains("artifact_subpath"),
                 "unset artifact_subpath omitted: {raw}"
             );
+            // The M3 fields the serve role adds round-trip when set.
+            assert!(raw.contains("worker_dir"), "worker_dir persisted: {raw}");
+            assert!(raw.contains("python"), "python persisted: {raw}");
             assert!(raw.contains("\"schema\": 1"));
         });
     }
@@ -165,6 +191,33 @@ mod tests {
         with_temp_id_dir(|| {
             std::fs::write(serve_config_path(), b"{ not json").unwrap();
             assert_eq!(load(), ServeConfig::default());
+        });
+    }
+
+    #[test]
+    fn log_dir_is_outside_the_keystore_root() {
+        // The worker log dir must not live under ~/.alice (or the test id dir) when an
+        // OS data dir exists — a verbose worker log must never share the keystore dir.
+        if dirs::data_local_dir().is_some() {
+            let log = serve_log_dir();
+            assert!(log.ends_with("AliceMiner/serve-logs"));
+        }
+    }
+
+    #[test]
+    fn config_written_before_m3_still_loads() {
+        // Forward-compat: a serve_config.json written by the M2 wizard (no worker_dir /
+        // python keys) still loads — the new fields default to None.
+        with_temp_id_dir(|| {
+            std::fs::write(
+                serve_config_path(),
+                br#"{"schema":1,"center_url":"https://api.aliceprotocol.org","tier":"alice_lite_4b","runtime":"cuda"}"#,
+            )
+            .unwrap();
+            let cfg = load();
+            assert_eq!(cfg.tier.as_deref(), Some("alice_lite_4b"));
+            assert!(cfg.worker_dir.is_none());
+            assert!(cfg.python.is_none());
         });
     }
 }

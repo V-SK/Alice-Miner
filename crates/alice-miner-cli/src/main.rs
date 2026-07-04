@@ -54,6 +54,7 @@ mod fleet;
 mod logo;
 mod menu;
 mod pidfile;
+mod serve;
 mod setup;
 mod train;
 mod tui;
@@ -290,6 +291,32 @@ enum Command {
         gracefully. Credit-only (积分): the train role trains for credit; it shows no hashrate and no\n\
         earnings. Re-runnable: resolved flags are saved so a bare `alice-miner train` replays them.")]
     Train(TrainArgs),
+
+    /// Serve one model on THIS single GPU: run the consumer pull-serve worker.
+    #[command(long_about = "Run this single GPU as a CONSUMER serving worker. This spawns the local\n\
+        Python acp worker_client (`python -m alice_acp.worker_client`), which registers to the Alice\n\
+        gateway, long-polls for chat jobs, runs the model on your GPU, and submits the completions.\n\
+        OUTBOUND-only: unlike the shard-stage `ai` role there is NO public port to open — the worker\n\
+        dials the gateway; nothing dials it. Usually you pick the model first with\n\
+        `alice-miner ai --menu`, which saves the choice this command replays.\n\
+        \n\
+        --center-url <URL>    the acp gateway base URL (default: the production gateway)\n\
+        --worker-dir <DIR>    path to your alice-acp-minerai checkout (must contain\n\
+                              src/alice_acp/worker_client/__main__.py; also honored: ALICE_ACP_WORKER_PATH)\n\
+        --python <PATH>       the python3 interpreter to run the worker (default: python3; needs 3.11+)\n\
+        --tier <CLASS>        the model class to serve (default: the wizard's saved choice)\n\
+        --runtime <FAMILY>    the serving runtime (default: cuda / the saved choice)\n\
+        --auto                self-provision: probe VRAM, pick+download the largest fitting tier\n\
+        --free-memory-gb <N>  system memory to advertise (default: auto-detect)\n\
+        --vram-gb <GB>        free VRAM hint for --auto (default: auto-detect via nvidia-smi)\n\
+        --cache-root <DIR>    weights cache root (default: ~/.cache/alice/local-models)\n\
+        --max-output-tokens <N>  per-completion output cap (default: 256)\n\
+        \n\
+        Ctrl-C stops gracefully (the worker subprocess is killed). Credit-only (积分): the serve role\n\
+        serves inference for credit; it shows no hashrate and no earnings. The PoP signer, when the\n\
+        gateway requires it, comes ONLY from the ALICE_WORKER_POP_SECRET_URI env var (never argv).\n\
+        Re-runnable: resolved flags are saved so a bare `alice-miner serve` replays them.")]
+    Serve(ServeArgs),
 
     /// Set or show the UI language (`en` / `zh`), persisted for later runs.
     #[command(long_about = "Set or show the UI language for the headless CLI, persisted to\n\
@@ -698,6 +725,48 @@ struct TrainArgs {
 }
 
 #[derive(clap::Args)]
+struct ServeArgs {
+    /// The acp gateway base URL the worker registers/pulls/submits against (https://
+    /// only). Default: the saved serve/ai center, else the production gateway. Saved for re-runs.
+    #[arg(long, value_name = "URL")]
+    center_url: Option<String>,
+    /// Path to your alice-acp-minerai checkout (must contain
+    /// src/alice_acp/worker_client/__main__.py). Also honored via ALICE_ACP_WORKER_PATH.
+    /// Required (via flag, env, or a prior saved run). Saved for re-runs.
+    #[arg(long, value_name = "DIR")]
+    worker_dir: Option<String>,
+    /// The python3 interpreter used to run the worker (default: `python3`; needs 3.11+).
+    #[arg(long, value_name = "PATH")]
+    python: Option<String>,
+    /// The model class to serve (e.g. `alice_lite_4b`). Default: the tier the
+    /// `alice-miner ai --menu` wizard saved. Omit both this and a saved tier to
+    /// self-provision (equivalent to --auto).
+    #[arg(long, value_name = "CLASS")]
+    tier: Option<String>,
+    /// The serving runtime family (e.g. `cuda`). Default: the saved runtime, else `cuda`.
+    #[arg(long, value_name = "FAMILY")]
+    runtime: Option<String>,
+    /// Self-provision: probe GPU class + VRAM, pick + DOWNLOAD the largest fitting
+    /// tier, and advertise every fitting tier (the worker's --auto-vram). Forces this
+    /// even when a tier is saved/flagged.
+    #[arg(long)]
+    auto: bool,
+    /// System memory (GB) to advertise (the route memory gate). Default: auto-detect.
+    #[arg(long, value_name = "GB")]
+    free_memory_gb: Option<u32>,
+    /// Free VRAM (GB) hint for --auto self-provisioning. Default: auto-detect via
+    /// nvidia-smi. Ignored when serving a fixed tier.
+    #[arg(long, value_name = "GB")]
+    vram_gb: Option<f64>,
+    /// Weights cache root. Default: the worker's own `~/.cache/alice/local-models`.
+    #[arg(long, value_name = "DIR")]
+    cache_root: Option<String>,
+    /// Per-completion output-token cap (default: 256).
+    #[arg(long, value_name = "N")]
+    max_output_tokens: Option<u32>,
+}
+
+#[derive(clap::Args)]
 struct LangArgs {
     /// The language to switch to: `en` (English) or `zh` (中文). Omit to just print
     /// the current language.
@@ -728,6 +797,7 @@ fn main() {
         Some(Command::Setup(args)) => setup::run(args.into(), no_color),
         Some(Command::Ai(args)) => cmd_ai(args),
         Some(Command::Train(args)) => cmd_train(args),
+        Some(Command::Serve(args)) => cmd_serve(args),
         Some(Command::Lang(args)) => cmd_lang(args),
         Some(Command::Balance(args)) => balance::run(args),
         Some(Command::Update(args)) => update::run(args),
@@ -820,8 +890,11 @@ fn command_allows_prompt(command: Option<&Command>) -> bool {
         // `update`: the interactive apply already confirms; the terminal-line prompt
         // for language would clash with its own prompt — skip the pre-prompt.
         Some(Command::Update(_)) => false,
-        // setup / ai / train: interactive-friendly → allow the stderr line prompt.
-        Some(Command::Setup(_)) | Some(Command::Ai(_)) | Some(Command::Train(_)) => true,
+        // setup / ai / train / serve: interactive-friendly → allow the stderr line prompt.
+        Some(Command::Setup(_))
+        | Some(Command::Ai(_))
+        | Some(Command::Train(_))
+        | Some(Command::Serve(_)) => true,
         // Bare-binary: the interactive MENU owns the first-run language pick (a nicer
         // TUI chooser), so DON'T fire the stderr line prompt on the way in. The menu's
         // fallback (non-TTY) path prints help, which needs no language pick.
@@ -1310,6 +1383,37 @@ fn cmd_train(args: TrainArgs) -> i32 {
         allow_cpu: args.allow_cpu,
     };
     train::run(flags, unlock)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// serve (consumer single-GPU serving worker)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `serve`: run this single GPU as a CONSUMER serving worker — spawn + supervise the
+/// local Python acp worker_client (register → pull → serve → submit). Takes NO
+/// password: the worker's register/submit need no wallet SIGNATURE from us today (its
+/// PoP signer is env-driven via ALICE_WORKER_POP_SECRET_URI and currently off), so
+/// serve never unlocks the keystore. Credit-only; READ-ONLY on the identity (watch-only
+/// is fine). Outbound-only: no public port, unlike the shard-stage `ai` role.
+fn cmd_serve(args: ServeArgs) -> i32 {
+    // Non-blocking startup version check (serve has no `--json` toggle, so the banner
+    // is allowed; it never blocks or delays the worker). Opt out with
+    // ALICE_MINER_NO_UPDATE_CHECK=1. See `update::startup_banner`.
+    update::startup_banner(false);
+
+    let flags = serve::ServeFlags {
+        center_url: args.center_url,
+        worker_dir: args.worker_dir,
+        python: args.python,
+        tier: args.tier,
+        runtime: args.runtime,
+        free_memory_gb: args.free_memory_gb,
+        vram_gb: args.vram_gb,
+        cache_root: args.cache_root,
+        auto: args.auto,
+        max_output_tokens: args.max_output_tokens,
+    };
+    serve::run(flags)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2571,6 +2675,39 @@ mod tests {
             Cli::try_parse_from(["alice-miner", "doctor", "--ai", "--train"]).is_err(),
             "--ai and --train are mutually exclusive"
         );
+
+        // serve: bare defaults are all None/false; full flags parse to the expected shape.
+        let cli = Cli::try_parse_from(["alice-miner", "serve"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Serve(a) => {
+                assert!(a.center_url.is_none() && a.worker_dir.is_none() && a.tier.is_none());
+                assert!(!a.auto);
+                assert!(a.free_memory_gb.is_none() && a.vram_gb.is_none());
+            }
+            _ => panic!("expected serve"),
+        }
+        let cli = Cli::try_parse_from([
+            "alice-miner", "serve", "--center-url", "https://api.aliceprotocol.org",
+            "--worker-dir", "/opt/acp", "--python", "python3.11", "--tier", "alice_lite_4b",
+            "--runtime", "cuda", "--auto", "--free-memory-gb", "48", "--vram-gb", "24",
+            "--cache-root", "/data/cache", "--max-output-tokens", "512",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Serve(a) => {
+                assert_eq!(a.center_url.as_deref(), Some("https://api.aliceprotocol.org"));
+                assert_eq!(a.worker_dir.as_deref(), Some("/opt/acp"));
+                assert_eq!(a.python.as_deref(), Some("python3.11"));
+                assert_eq!(a.tier.as_deref(), Some("alice_lite_4b"));
+                assert_eq!(a.runtime.as_deref(), Some("cuda"));
+                assert!(a.auto);
+                assert_eq!(a.free_memory_gb, Some(48));
+                assert_eq!(a.vram_gb, Some(24.0));
+                assert_eq!(a.cache_root.as_deref(), Some("/data/cache"));
+                assert_eq!(a.max_output_tokens, Some(512));
+            }
+            _ => panic!("expected serve"),
+        }
     }
 
     /// Mutually-exclusive identity flags are rejected by clap (e.g. --create with
