@@ -1052,6 +1052,14 @@ fn run_menu_action(action: menu::MenuAction, no_color: bool) -> i32 {
         // user saved on a prior `train` run replays; a first run without a saved
         // trainer dir fails closed with the exact flag to pass — never a fake run).
         menu::MenuAction::Training => cmd_train(train_args_default()),
+        // AI participation: the M2 wizard (`alice-miner ai --menu`). It detects the
+        // hardware, asks the center what this machine can do, and prints the serve /
+        // shard / training options — the same anonymous menu flow the `ai --menu`
+        // subcommand runs. `None` center_url lets the wizard resolve it from the saved
+        // AiConfig / the production default itself. It signs nothing, so no unlock is
+        // needed to look. The menu TUI is already torn down here, so the wizard's
+        // line-prompts get a normal terminal (exactly like Status / Doctor above).
+        menu::MenuAction::AiParticipate => wizard::run(None),
         menu::MenuAction::Quit => EXIT_OK,
     }
 }

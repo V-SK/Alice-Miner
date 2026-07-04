@@ -57,6 +57,10 @@ pub enum MenuAction {
     Update,
     /// [7] Training — the RLVR training worker (`main.rs` runs the `train` role).
     Training,
+    /// [8] AI participation — the M2 wizard (`main.rs` runs `wizard::run`): detect the
+    /// hardware, ask the center, and show what AI work this machine can do (serve /
+    /// shard / training). Appended after Training so items 1-7/0 keep their keys.
+    AiParticipate,
     /// [0] Quit (also chosen on q / Esc / Ctrl-C, or when the terminal can't go raw).
     Quit,
 }
@@ -78,6 +82,7 @@ const ITEMS: &[Item] = &[
     Item { action: MenuAction::Doctor, key: '5' },
     Item { action: MenuAction::Update, key: '6' },
     Item { action: MenuAction::Training, key: '7' },
+    Item { action: MenuAction::AiParticipate, key: '8' },
     Item { action: MenuAction::Quit, key: '0' },
 ];
 
@@ -91,6 +96,7 @@ fn item_label(a: MenuAction) -> String {
         MenuAction::Doctor => tr!("Doctor + self-repair", "诊断与自修复").to_string(),
         MenuAction::Update => tr!("Check for updates", "检查更新").to_string(),
         MenuAction::Training => tr!("Training", "训练").to_string(),
+        MenuAction::AiParticipate => tr!("AI Participation", "AI 参与").to_string(),
         MenuAction::Quit => tr!("Quit", "退出").to_string(),
     }
 }
@@ -119,6 +125,11 @@ fn item_hint(a: MenuAction) -> String {
         MenuAction::Training => {
             tr!("solve RLVR coding tasks for credit (积分)", "为积分解决 RLVR 编码任务").to_string()
         }
+        MenuAction::AiParticipate => tr!(
+            "see what AI work this machine can do (serve / shard / training) — detect hardware and choose",
+            "看看这台机器能参与哪些 AI 工作(服务/分片/训练)——检测硬件并选择"
+        )
+        .to_string(),
         MenuAction::Quit => tr!("exit alice-miner", "退出 alice-miner").to_string(),
     }
 }
@@ -347,7 +358,7 @@ fn draw_menu(f: &mut Frame, sel: usize) {
         Span::styled(format!(" {}  ", tr!("move", "移动")), Style::default().fg(Color::DarkGray)),
         Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Cyan)),
         Span::styled(format!(" {}  ", tr!("select", "选择")), Style::default().fg(Color::DarkGray)),
-        Span::styled(" 1-7 ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(" 1-8 ", Style::default().fg(Color::Black).bg(Color::Cyan)),
         Span::styled(format!(" {}  ", tr!("jump", "跳转")), Style::default().fg(Color::DarkGray)),
         Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Cyan)),
         Span::styled(format!(" {}", tr!("quit", "退出")), Style::default().fg(Color::DarkGray)),
@@ -419,11 +430,12 @@ mod tests {
         set_lang(Lang::En);
     }
 
-    /// The item keys are the documented selectors (1-6 then 0 for quit), unique.
+    /// The item keys are the documented selectors (1-8 then 0 for quit), unique. The
+    /// AI-participation item is APPENDED at '8' so items 1-7 and quit keep their keys.
     #[test]
     fn item_keys_are_expected_and_unique() {
         let keys: Vec<char> = ITEMS.iter().map(|i| i.key).collect();
-        assert_eq!(keys, vec!['1', '2', '3', '4', '5', '6', '7', '0']);
+        assert_eq!(keys, vec!['1', '2', '3', '4', '5', '6', '7', '8', '0']);
         let mut sorted = keys.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -437,7 +449,32 @@ mod tests {
         assert_eq!(find('1'), Some(MenuAction::StartMining));
         assert_eq!(find('3'), Some(MenuAction::Balance));
         assert_eq!(find('6'), Some(MenuAction::Update));
+        assert_eq!(find('7'), Some(MenuAction::Training));
+        assert_eq!(find('8'), Some(MenuAction::AiParticipate));
         assert_eq!(find('0'), Some(MenuAction::Quit));
+    }
+
+    /// The AI-participation item maps to its own label/hint arms (both languages), and
+    /// the hint is credit-only honest — it never promises an earning.
+    #[test]
+    fn ai_participate_label_and_hint_are_honest_both_languages() {
+        let _g = lang_lock();
+        set_lang(Lang::En);
+        let label = item_label(MenuAction::AiParticipate);
+        let hint = item_hint(MenuAction::AiParticipate);
+        assert_eq!(label, "AI Participation");
+        assert!(hint.contains("serve / shard / training"), "hint names the modes: {hint}");
+        // Credit-only honesty: no earning language in either the label or the hint.
+        for surface in [&label, &hint] {
+            let low = surface.to_ascii_lowercase();
+            for bad in ["earn", "reward", "payout", "paid", "$"] {
+                assert!(!low.contains(bad), "must not promise earnings ({bad:?}): {surface}");
+            }
+        }
+        set_lang(Lang::Zh);
+        assert_eq!(item_label(MenuAction::AiParticipate), "AI 参与");
+        assert!(!item_hint(MenuAction::AiParticipate).is_empty(), "zh hint present");
+        set_lang(Lang::En);
     }
 
     /// A selected option line carries the brand marker + the hint; an unselected one

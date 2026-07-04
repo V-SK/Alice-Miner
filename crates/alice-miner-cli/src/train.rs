@@ -493,6 +493,11 @@ pub fn run(flags: TrainFlags, unlock_password: Option<Zeroizing<String>>) -> i32
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
+            // On an interactive terminal, add a SHORT bilingual explainer of what the
+            // training role needs (mirrors the ai role's hint block). We only PRINT it
+            // — the command still fails closed with the SAME exit code; the human
+            // explanation is additive. Non-TTY output stays byte-identical.
+            print_train_setup_hint();
             return EXIT_USAGE;
         }
     };
@@ -1033,6 +1038,48 @@ pub fn train_log_dir_display() -> String {
     train_config::train_log_dir().display().to_string()
 }
 
+/// The bilingual "how to configure the train role" explainer lines (each already the
+/// language-resolved `tr!` string). PURE (no I/O, no TTY check) so the honest,
+/// credit-only wording is unit-testable. Printed by [`print_train_setup_hint`] only on
+/// an interactive terminal, AFTER the `resolve_config` error — it explains, it does not
+/// change the fail-closed outcome.
+fn train_setup_hint_lines() -> Vec<String> {
+    vec![
+        tr!(
+            "the train role needs --trainer-dir <checkout>: the RLVR generation harness \
+             containing run_m0.py + code_exec.py (the miner never sees the hidden tests).",
+            "train 角色需要 --trainer-dir <检出目录>:即包含 run_m0.py 与 code_exec.py 的 RLVR \
+             生成 harness 检出(矿工永远看不到隐藏测试)。"
+        )
+        .to_string(),
+        tr!(
+            "training generation needs an NVIDIA GPU (recommended ≥24 GB VRAM, advisory) — \
+             or pass --allow-cpu for a small smoke test.",
+            "训练生成需要 NVIDIA 显卡(建议 ≥24 GB 显存,仅供参考)——\
+             或加 --allow-cpu 进行小规模冒烟测试。"
+        )
+        .to_string(),
+        tr!(
+            "not sure what this machine can do? run `alice-miner ai --menu` to browse the \
+             participation options (serve / shard / training).",
+            "不确定这台机器能做什么?运行 `alice-miner ai --menu` 浏览参与选项(服务/分片/训练)。"
+        )
+        .to_string(),
+    ]
+}
+
+/// Print the training-setup explainer, but ONLY on an interactive terminal (stdin AND
+/// stdout are TTYs). On a pipe / non-TTY this is a no-op so the machine-readable output
+/// stays byte-identical. The lines come from the pure [`train_setup_hint_lines`].
+fn print_train_setup_hint() {
+    use std::io::IsTerminal as _;
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        for line in train_setup_hint_lines() {
+            eprintln!("{line}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1294,6 +1341,37 @@ mod tests {
         assert!(s.device == "cpu" || s.device == "cuda", "device resolved: {}", s.device);
         assert!(s.allow_cpu);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn train_setup_hint_names_the_requirements_and_is_credit_only() {
+        use alice_miner_core::i18n::{self, Lang};
+        // Serialize on the process-global language like the other lang-sensitive tests.
+        static LANG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LANG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        i18n::set_lang(Lang::En);
+        let joined = train_setup_hint_lines().join("\n");
+        // Names the exact requirement surface: the flag + the two harness files.
+        assert!(joined.contains("--trainer-dir"), "names the flag: {joined}");
+        assert!(joined.contains("run_m0.py"), "names run_m0.py: {joined}");
+        assert!(joined.contains("code_exec.py"), "names code_exec.py: {joined}");
+        // The GPU gate (advisory ≥24 GB) + the participation-menu pointer.
+        assert!(joined.contains("NVIDIA"), "names the GPU requirement: {joined}");
+        assert!(joined.contains("24 GB"), "names the advisory VRAM floor: {joined}");
+        assert!(joined.contains("alice-miner ai --menu"), "points at the menu: {joined}");
+        // Credit-only honesty: no earning language anywhere in the explainer.
+        let low = joined.to_ascii_lowercase();
+        for bad in ["earn", "reward", "payout", "paid", "hashrate", "$"] {
+            assert!(!low.contains(bad), "must not promise earnings ({bad:?}): {joined}");
+        }
+        // Both languages produce three non-empty lines (no missing translation).
+        for lang in [Lang::En, Lang::Zh] {
+            i18n::set_lang(lang);
+            let lines = train_setup_hint_lines();
+            assert_eq!(lines.len(), 3, "three explainer lines for {lang:?}");
+            assert!(lines.iter().all(|l| !l.trim().is_empty()), "no empty line for {lang:?}");
+        }
+        i18n::set_lang(Lang::En);
     }
 
     #[test]
