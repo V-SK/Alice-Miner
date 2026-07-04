@@ -32,6 +32,7 @@ pub use alice_supervise;
 
 pub mod ai_config;
 pub mod binaries;
+pub mod capability_menu;
 pub mod dashboard;
 pub mod detect;
 pub mod endpoint;
@@ -42,6 +43,7 @@ pub mod keyring;
 pub mod lane;
 pub mod pop;
 pub mod prl_payout;
+pub mod serve_config;
 pub mod service;
 pub mod settings;
 pub mod shard;

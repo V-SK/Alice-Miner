@@ -547,6 +547,20 @@ pub fn run(flags: AiFlags, unlock_password: Option<Zeroizing<String>>) -> i32 {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
+            // On an interactive terminal, hint at the participation menu (which
+            // detects the hardware and shows what this machine can do). We only
+            // PRINT the hint — never auto-launch the wizard — so `run` stays
+            // non-interactive + testable; the user opts in by re-running.
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                eprintln!(
+                    "{}",
+                    tr!(
+                        "run `alice-miner ai --menu` to see what this machine can do",
+                        "运行 `alice-miner ai --menu` 查看这台机器能做什么"
+                    )
+                );
+            }
             return EXIT_USAGE;
         }
     };

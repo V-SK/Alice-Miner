@@ -58,6 +58,7 @@ mod setup;
 mod train;
 mod tui;
 mod update;
+mod wizard;
 
 // ── Exit codes ──────────────────────────────────────────────────────────────
 /// Success.
@@ -595,6 +596,11 @@ struct SetupArgs {
 
 #[derive(clap::Args)]
 struct AiArgs {
+    /// Show the AI participation menu (detect hardware → what can this machine do)
+    /// instead of starting the shard stage role. Queries the center's anonymous menu
+    /// endpoint and lets you pick + confirm a way to contribute (credit-only).
+    #[arg(long)]
+    menu: bool,
     /// The acp gateway base URL the stage registers/heartbeats/pulls against
     /// (https:// only). Defaults to the production gateway; saved for re-runs.
     #[arg(long, value_name = "URL")]
@@ -1210,6 +1216,13 @@ fn cmd_ai(args: AiArgs) -> i32 {
     // the banner is allowed; it never blocks or delays the stage). Opt out with
     // ALICE_MINER_NO_UPDATE_CHECK=1. See `update::startup_banner`.
     update::startup_banner(false);
+
+    // `--menu`: the participation wizard (detect → ask the center → pick a way to
+    // contribute). It signs nothing (the menu endpoint is anonymous), so it runs
+    // BEFORE the keystore-unlock resolution below — no password is needed to look.
+    if args.menu {
+        return wizard::run(args.center_url.clone());
+    }
 
     // The register/heartbeat PoP needs the sr25519 signing key, so a keystore-backed
     // identity needs its unlock. Resolve it up front (stdin / flag / prompt); a
