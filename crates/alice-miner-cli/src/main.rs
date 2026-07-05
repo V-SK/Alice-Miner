@@ -2012,6 +2012,11 @@ fn cmd_start_with_unlock(
     // a TERMINAL `--json` Snapshot carrying a machine reason when the lane never
     // reached Running — so a CI/harness gets a signal beyond exit 0.
     let mut last_snapshot: Option<Snapshot> = None;
+    // v0.6.0 upgrade gate: once the read API tells us this build is below its minimum
+    // supported version, we print a clear one-time CTA and mark a non-zero exit so
+    // automation notices (we do NOT force-stop an active miner mid-share — the operator
+    // sees the CTA + non-zero exit and updates).
+    let mut printed_upgrade_notice = false;
 
     loop {
         match engine.recv_timeout(Duration::from_millis(500)) {
@@ -2020,6 +2025,32 @@ fn cmd_start_with_unlock(
                     .lock()
                     .map(|c| c.clone())
                     .unwrap_or(alice_miner_core::CreditState::NotExposed);
+                // v0.6.0 upgrade gate: if the read API reports this build is below its
+                // minimum supported version, print a clear upgrade CTA ONCE and mark a
+                // non-zero exit. Human path prints the CTA; --json path skips the CTA
+                // (the JSON stream stays a stable schema) but still exits non-zero.
+                if let Some((min_supported, download_url)) = credit.upgrade_required() {
+                    if !printed_upgrade_notice {
+                        printed_upgrade_notice = true;
+                        if !args.json && tui.is_none() {
+                            eprintln!(
+                                "{}",
+                                tr!(
+                                    format!(
+                                        "⚠ This client is out of date. The network now requires \
+                                         v{min_supported} or newer to confirm your credit. Please \
+                                         update: {download_url}"
+                                    ),
+                                    format!(
+                                        "⚠ 客户端版本过旧。网络现在要求 v{min_supported} 或更高版本才能\
+                                         确认积分。请更新:{download_url}"
+                                    )
+                                )
+                            );
+                        }
+                        exit_code = EXIT_RUNTIME;
+                    }
+                }
                 // Advance detection: a coarse fingerprint of the live activity. When it
                 // changes, the stream advanced (reset the staleness clock); when it
                 // doesn't, `stale_for_s` keeps growing and the chip lights up.

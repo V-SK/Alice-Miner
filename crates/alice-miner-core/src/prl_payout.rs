@@ -374,7 +374,8 @@ fn pending_text_from_envelope(body: &str) -> Option<String> {
         CreditState::Confirming => {
             Some(crate::tr!("awaiting confirmation (confirming)", "等待确认 (confirming)").into())
         }
-        // NotExposed / Error (incl. paid_acu!=0 violation) → fail-open: keep default.
+        // NotExposed / UpgradeRequired / Error (incl. an inconsistent-payout drop) →
+        // fail-open: keep the panel's honest default text.
         _ => None,
     }
 }
@@ -475,14 +476,20 @@ mod tests {
     }
 
     #[test]
-    fn pending_text_from_envelope_paid_acu_violation_fails_open() {
-        // A leaked non-zero paid_acu MUST NOT surface — fail-open to None so the
-        // panel keeps its honest default text (it never shows the value).
+    fn pending_text_from_envelope_inconsistent_payout_fails_open() {
+        // A CONTRADICTORY payout envelope (non-zero paid_acu while the rails read OFF)
+        // MUST NOT surface — fail-open to None so the panel keeps its honest default
+        // text (it never shows the value). This is the retained #18 guard.
         let bad = r#"{"found":true,"paid_acu":"12.5","summary":{"pending_alice":5.0}}"#;
         assert_eq!(pending_text_from_envelope(bad), None);
-        // payout_executor_enabled is also a violation → None.
-        let bad2 = r#"{"found":true,"paid_acu":"0","payout_executor_enabled":true}"#;
-        assert_eq!(pending_text_from_envelope(bad2), None);
+        // v0.6.0 note: a rails-ON envelope with paid_acu "0" is now a LEGITIMATE credit
+        // state (nothing paid yet), so it confirms — but the surfaced text is still
+        // word-only (the honest pending label), NEVER a payout number. Prove no leak.
+        let rails_on = r#"{"found":true,"paid_acu":"0","payout_executor_enabled":true,"summary":{"pending_alice":5.0}}"#;
+        let t = pending_text_from_envelope(rails_on).expect("rails-on/paid-0 confirms credit");
+        assert!(t.contains("credit"));
+        assert!(!t.contains('$'), "still word-only, no fiat leak: {t}");
+        assert!(!t.contains("12") && !t.contains("5.0"), "never a raw number: {t}");
     }
 
     #[test]

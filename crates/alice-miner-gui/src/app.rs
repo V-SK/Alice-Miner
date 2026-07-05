@@ -1863,6 +1863,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
                     },
                 ],
             },
+            payout: None,
         };
         // The cumulative COUNTS are reachable (credit-only) and reconcile in-sync.
         let model = app.dashboard_model();

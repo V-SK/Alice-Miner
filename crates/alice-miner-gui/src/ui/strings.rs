@@ -215,6 +215,28 @@ pub const CREDIT_SYNCING: &str = "syncing… · 同步中";
 /// NON-numeric note. We never hint at any dropped value.
 pub const CREDIT_UNCONFIRMED: &str = "unconfirmed · 待确认";
 
+// ── v0.6.0 real-money PAYOUT sub-panel (Confirmed + live PayoutView) ──────────
+/// Shown ONLY once the server flips real-money payout ON (a self-consistent payout
+/// envelope). Unlike the credit-only counts these ARE real ALICE figures — but only
+/// the server's own settled/paid values, self-verifiable on the explorer.
+pub const CREDIT_PAYOUT_TITLE: &str = "Payout is live · 已开通发放";
+/// Row label for the settled-ALICE figure (finalized accounting).
+pub const CREDIT_PAYOUT_SETTLED_LABEL: &str = "Settled · 已结算";
+/// Row label for the paid-ALICE figure (actually disbursed on-chain).
+pub const CREDIT_PAYOUT_PAID_LABEL: &str = "Paid · 已发放";
+/// The self-verify hint pointing the miner at the on-chain explorer.
+pub const CREDIT_PAYOUT_VERIFY_HINT: &str =
+    "Verify these amounts on-chain in the explorer · 在浏览器链上核对";
+
+// ── v0.6.0 upgrade banner (CreditState::UpgradeRequired) ──────────────────────
+/// The server advertised a minimum client version this build does not meet.
+pub const CREDIT_UPGRADE_TITLE: &str = "Please update to keep mining · 请更新以继续挖矿";
+/// The body prefix — the panel appends the required "vX.Y+" version.
+pub const CREDIT_UPGRADE_BODY: &str =
+    "The network now requires a newer client to confirm your credit. Please update to";
+/// The download call-to-action button label.
+pub const CREDIT_UPGRADE_CTA: &str = "Get the update · 获取更新";
+
 /// The reconciliation badge prefix (the qualitative local-vs-server status).
 pub const RECONCILE_PREFIX: &str = "local vs network";
 
@@ -275,49 +297,80 @@ mod tests {
     /// (extracted by parsing each such line) so the check covers exactly the
     /// user-facing copy — not the doc-comments / rule names, which legitimately
     /// mention `$` etc. while describing the rule.
+    /// The v0.6.0 payout-aware EXCEPTION set: constants that DELIBERATELY carry a
+    /// positive "paid / settled / 发放" claim because they render ONLY once the server
+    /// has flipped real-money payout ON (a self-consistent payout-live envelope —
+    /// proven by the core `parse_credit_envelope` tests) or when the client is below
+    /// the supported floor. These are the reviewed exception to the credit-only blanket
+    /// ban; every OTHER user string stays fully gated. (They are STILL barred from raw
+    /// fiat tokens `$`/`usd`/`fiat` — see the assertion below.)
+    const PAYOUT_ERA_CONST_PREFIXES: [&str; 2] = ["CREDIT_PAYOUT_", "CREDIT_UPGRADE_"];
+
     #[test]
     fn no_forbidden_reward_tokens_in_user_strings() {
         let src = include_str!("strings.rs");
-        // Extract the body of each `pub const NAME: &str = "BODY";` declaration.
+        // Extract each `pub const NAME: &str = "BODY";` declaration as (name, body).
         // Some declarations wrap the value onto the FOLLOWING line(s); when a
         // `pub const` line carries no quote we keep scanning subsequent lines for
         // the string literal so the scan covers EVERY user-facing constant (a
         // multi-line value must not slip through the honesty gate).
-        let mut literals = String::new();
-        let mut in_const = false; // inside a `pub const` whose literal we still seek
+        let mut consts: Vec<(String, String)> = Vec::new();
+        let mut cur_name: Option<String> = None; // inside a `pub const` whose literal we still seek
         for line in src.lines() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("pub const") {
-                in_const = true;
+                // Parse the NAME between `pub const ` and the `:`.
+                cur_name = trimmed
+                    .strip_prefix("pub const ")
+                    .and_then(|r| r.split(':').next())
+                    .map(|n| n.trim().to_string());
             }
-            if in_const {
+            if cur_name.is_some() {
                 if let Some(open) = line.find('"') {
                     if let Some(close) = line[open + 1..].find('"') {
-                        literals.push_str(&line[open + 1..open + 1 + close]);
-                        literals.push('\n');
-                        in_const = false;
+                        let name = cur_name.take().unwrap();
+                        consts.push((name, line[open + 1..open + 1 + close].to_string()));
                     }
                 }
             }
         }
-        assert!(
-            !literals.is_empty(),
-            "expected to extract at least one string constant"
-        );
+        assert!(!consts.is_empty(), "expected to extract at least one string constant");
+
+        // The blanket-gated corpus = every constant EXCEPT the reviewed payout-era set.
+        let is_payout_era =
+            |name: &str| PAYOUT_ERA_CONST_PREFIXES.iter().any(|p| name.starts_with(p));
+        let gated_literals: String = consts
+            .iter()
+            .filter(|(n, _)| !is_payout_era(n))
+            .map(|(_, b)| format!("{b}\n"))
+            .collect();
+        let literals = gated_literals.clone(); // (the per-line checks below reuse this)
+
         // Case-insensitive scan for the brief's forbidden vocabulary: no fiat,
         // and no positive earnings claim. ("pending / 待发放" is the ONLY way
-        // rewards are described.) Note: the approved contract footer DOES say
-        // "Payout, settlement … stay gated" — that's an honest *negative*
-        // disclosure (these do NOT happen), so `payout`/`settlement` are not
-        // forbidden; only misleading/positive tokens are.
-        let lowered = literals.to_lowercase();
-        // BLANKET-forbidden: fiat + any positive "already-paid/earned" claim. These
-        // can never appear in user copy under any framing.
+        // rewards are described in the credit-only phase.) Note: the approved
+        // contract footer DOES say "Payout, settlement … stay gated" — that's an
+        // honest *negative* disclosure, so `payout`/`settlement` are not forbidden;
+        // only misleading/positive tokens are.
+        let lowered = gated_literals.to_lowercase();
+        // BLANKET-forbidden in the CREDIT-ONLY corpus: fiat + any positive
+        // "already-paid/earned" claim.
         for forbidden in ["$", "usd", "fiat", "paid", "earned", "已发放"] {
             assert!(
                 !lowered.contains(&forbidden.to_lowercase()),
-                "user-facing strings must not contain `{forbidden}` (credit-only honesty gate)"
+                "credit-only user strings must not contain `{forbidden}` (credit-only honesty gate)"
             );
+        }
+        // The payout-era EXCEPTION strings may say "paid"/"settled"/"发放" (payout is
+        // genuinely live when they render) but STILL must never carry a raw fiat token.
+        for (name, body) in consts.iter().filter(|(n, _)| is_payout_era(n)) {
+            let low = body.to_lowercase();
+            for fiat in ["$", "usd", "fiat"] {
+                assert!(
+                    !low.contains(fiat),
+                    "payout-era string `{name}` must not carry a fiat token `{fiat}`: {body:?}"
+                );
+            }
         }
         // CONDITIONALLY-allowed words: `payout`/`settlement` may appear ONLY in a
         // "stay gated" disclosure (an honest *negative*), and `credit` may appear

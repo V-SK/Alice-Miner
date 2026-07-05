@@ -165,6 +165,12 @@ fn credit_value(credit: &CreditState) -> String {
         CreditState::NotExposed => {
             tr!("not exposed yet", "暂未公开").to_string()
         }
+        // The upgrade gate is surfaced by `run` (a clear upgrade CTA + non-zero exit);
+        // here we render a neutral placeholder so the buckets table stays coherent.
+        CreditState::UpgradeRequired { min_supported, .. } => {
+            let label = tr!("update required (v{}+)", "需要升级(v{}+)");
+            format!("— · {}", label.replace("{}", min_supported))
+        }
         CreditState::Error { reason } => {
             format!("— · {}", credit_error_message(reason))
         }
@@ -182,9 +188,13 @@ fn credit_error_message(e: &CreditError) -> String {
         CreditError::Unparseable => {
             tr!("credit response unavailable", "积分响应不可用").to_string()
         }
-        // Deliberately neutral: never hint at the dropped payout number.
-        CreditError::PaidAcuNotZero => {
-            tr!("credit response withheld (payout is off)", "积分响应被保留(发放未开通)").to_string()
+        // Deliberately neutral: a self-contradictory payout envelope (paid_acu present
+        // while the rails read off) — never hint at the dropped number.
+        CreditError::PayoutInconsistent => {
+            tr!("payout response withheld (inconsistent envelope)", "发放响应被保留(信封不一致)").to_string()
+        }
+        CreditError::PayoutImplausible => {
+            tr!("payout response withheld (implausible amount)", "发放响应被保留(金额异常)").to_string()
         }
     }
 }
@@ -336,20 +346,40 @@ fn print_json(address: &str, lookup: &Result<BalanceLookup, String>, alice: &Ali
     println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
 }
 
-/// The credit bucket as JSON (credit-only counts; nulls where not confirmed).
+/// The credit bucket as JSON (credit-only counts; nulls where not confirmed). Once
+/// real-money payout is live the confirmed object ALSO carries a `payout` sub-object
+/// with the honest settled/paid figures (null where the server does not report them).
 fn credit_json(credit: &CreditState) -> serde_json::Value {
     match credit {
-        CreditState::Confirmed { totals, .. } => serde_json::json!({
-            "state": "confirmed",
-            "shares_total": totals.accepted_total,
-            "shares_24h": totals.accepted_24h,
-            "note": "credit-only; converts to ALICE at real-money launch",
-        }),
+        CreditState::Confirmed { totals, payout, .. } => {
+            let payout_json = payout.as_ref().map(|p| {
+                serde_json::json!({
+                    "settled_alice": p.settled_alice,
+                    "paid_alice": p.paid_alice,
+                    "pending_alice": p.pending_alice,
+                    "paid_acu": p.paid_acu_raw,
+                })
+            });
+            serde_json::json!({
+                "state": "confirmed",
+                "shares_total": totals.accepted_total,
+                "shares_24h": totals.accepted_24h,
+                "note": "credit-only; converts to ALICE at real-money launch",
+                // null in the credit-only phase; a real payout object once payout is live.
+                "payout": payout_json,
+            })
+        }
         CreditState::Confirming => serde_json::json!({
             "state": "syncing", "shares_total": null, "shares_24h": null
         }),
         CreditState::NotExposed => serde_json::json!({
             "state": "not_exposed", "shares_total": null, "shares_24h": null
+        }),
+        CreditState::UpgradeRequired { min_supported, download_url } => serde_json::json!({
+            "state": "upgrade_required",
+            "min_supported_version": min_supported,
+            "download_url": download_url,
+            "shares_total": null, "shares_24h": null,
         }),
         CreditState::Error { reason } => serde_json::json!({
             "state": "error", "reason": format!("{reason:?}"), "shares_total": null, "shares_24h": null
@@ -398,6 +428,7 @@ mod tests {
                 accepted_24h: h24,
                 lanes: vec![],
             },
+            payout: None,
         }
     }
 

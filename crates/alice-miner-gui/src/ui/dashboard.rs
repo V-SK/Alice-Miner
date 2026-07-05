@@ -738,7 +738,7 @@ fn credit_panel(ui: &mut egui::Ui, app: &MinerApp) {
                     ui.add_space(10.0);
                     explorer_link(ui);
                 }
-                CreditState::Confirmed { score, totals } => {
+                CreditState::Confirmed { score, totals, payout } => {
                     // CREDIT-ONLY: the `pending_alice` MAGNITUDE (`score`) is never
                     // rendered as a number ($-trap) — it stays "pending · 待发放". What
                     // we DO surface is the cumulative accepted-share COUNTS (counts are
@@ -746,8 +746,19 @@ fn credit_panel(ui: &mut egui::Ui, app: &MinerApp) {
                     // the GPU·Alpha / GPU·PRL split.
                     let _ = score; // deliberately NOT rendered as a number
                     credit_cumulative_panel(ui, totals, app.motion_enabled());
+                    // v0.6.0: once real-money payout is live, show the honest
+                    // settled/paid figures below the counts. In the credit-only phase
+                    // (`payout` is None) nothing extra renders.
+                    if let Some(p) = payout {
+                        ui.add_space(10.0);
+                        credit_payout_panel(ui, p);
+                    }
                     ui.add_space(10.0);
                     explorer_link(ui);
+                }
+                CreditState::UpgradeRequired { min_supported, download_url } => {
+                    // v0.6.0 upgrade banner: the server requires a newer client.
+                    upgrade_banner(ui, min_supported, download_url);
                 }
                 CreditState::Error { reason } => {
                     // A calm, NON-numeric fault note; Source A stays the live UX.
@@ -933,6 +944,78 @@ fn explorer_link(ui: &mut egui::Ui) {
     .corner_radius(9);
     if ui.add(btn).on_hover_text(strings::CREDIT_EXPLORER_URL).clicked() {
         ui.ctx().open_url(egui::OpenUrl::new_tab(strings::CREDIT_EXPLORER_URL));
+    }
+}
+
+/// **v0.6.0 real-money payout sub-panel** (`Confirmed` with a live [`PayoutView`]).
+/// Shows the HONEST settled / paid ALICE figures the server reports (`—` where a
+/// figure is absent), with an explorer self-verify hint. Only ever rendered from a
+/// self-consistent payout envelope (rails on, figures finite & non-negative). The
+/// figures ARE real numbers here — that is the whole point of payout-awareness — but
+/// they are ONLY the server's own settled/paid values, never a fabricated estimate.
+fn credit_payout_panel(ui: &mut egui::Ui, p: &alice_miner_core::PayoutView) {
+    let fmt = |v: Option<f64>| v.map(|x| format!("{x}")).unwrap_or_else(|| "—".to_string());
+    egui::Frame::NONE
+        .fill(THEME.well)
+        .corner_radius(12)
+        .inner_margin(egui::Margin::symmetric(14, 12))
+        .stroke(egui::Stroke::new(1.0, THEME.line_strong))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                widgets::status_dot(ui, Tone::Live.fg(), 8.0, false);
+                ui.add_space(9.0);
+                ui.label(
+                    RichText::new(strings::CREDIT_PAYOUT_TITLE).size(13.0).strong().color(THEME.text),
+                );
+            });
+            ui.add_space(8.0);
+            // settled / paid ALICE — the server's own figures.
+            credit_amount_row(ui, strings::CREDIT_PAYOUT_SETTLED_LABEL, &fmt(p.settled_alice));
+            ui.add_space(4.0);
+            credit_amount_row(ui, strings::CREDIT_PAYOUT_PAID_LABEL, &fmt(p.paid_alice));
+            ui.add_space(9.0);
+            ui.label(RichText::new(strings::CREDIT_PAYOUT_VERIFY_HINT).size(10.5).color(THEME.text3));
+            ui.add_space(6.0);
+            explorer_link(ui);
+        });
+}
+
+/// A single "label … value ALICE" amount row (mono value, right-aligned). Used by the
+/// payout sub-panel; the value is the server's own settled/paid figure (or `—`).
+fn credit_amount_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(12.0).color(THEME.text2));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(widgets::mono(format!("{value} ALICE"), 13.0, THEME.text));
+        });
+    });
+}
+
+/// **v0.6.0 upgrade banner** (`CreditState::UpgradeRequired`). The server advertised a
+/// minimum client version this build does not meet; mining continues but the user must
+/// update to keep participating once payout is live. A warn-toned card + a "get the
+/// update" button that opens the download page.
+fn upgrade_banner(ui: &mut egui::Ui, min_supported: &str, download_url: &str) {
+    let fg = Tone::Warn.fg();
+    ui.horizontal(|ui| {
+        super::icons::show(ui, Icon::Globe, 14.0, fg);
+        ui.add_space(9.0);
+        ui.label(RichText::new(strings::CREDIT_UPGRADE_TITLE).size(13.5).strong().color(THEME.text));
+    });
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(format!("{} v{min_supported}+.", strings::CREDIT_UPGRADE_BODY))
+            .size(12.0)
+            .color(THEME.text2),
+    );
+    ui.add_space(12.0);
+    let btn = egui::Button::new(RichText::new(strings::CREDIT_UPGRADE_CTA).size(12.0).color(THEME.text))
+        .fill(THEME.well)
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 90)))
+        .corner_radius(9);
+    if ui.add(btn).on_hover_text(download_url).clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(download_url.to_string()));
     }
 }
 

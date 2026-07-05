@@ -10,12 +10,21 @@
 //!   snapshots). Hashrate + sparkline + accepted/rejected + accepted% + per-lane
 //!   rows + uptime + connection + failover. This is **what the miner is doing**,
 //!   NOT earnings — every label says *activity*.
-//! * **Source B — server-confirmed *credit*** ([`CreditState`]): a read-only,
-//!   polled view of credit the SERVER has confirmed for this address. It is
-//!   credit-only by type ([`CreditScore`] has **no fiat / payout `Display`**),
-//!   and any response whose envelope's `paid_acu != "0"` is treated as a fault:
-//!   the value is **dropped** and the state flips to [`CreditState::Error`] (the
-//!   #18 red-team "fabricated / leaked payout" guard, enforced in code + tested).
+//! * **Source B — server-confirmed *credit + payout*** ([`CreditState`]): a
+//!   read-only, polled view of what the SERVER has confirmed for this address. The
+//!   credit-only *magnitude* stays credit-only by type ([`CreditScore`] has **no
+//!   fiat / payout `Display`**); the cumulative accepted-share COUNTS render as
+//!   COUNTS. **NEW in v0.6.0 (payout-aware):** once the server flips real-money
+//!   payout ON, its envelope carries a non-zero `paid_acu` *together with* the
+//!   `live_reward_enabled` / `payout_executor_enabled` gates set true. That is a
+//!   HONEST, self-consistent payout envelope: we surface it as real settled/paid
+//!   data ([`PayoutView`]) with an explorer self-verification link — NOT a fault.
+//!   A CONTRADICTORY envelope (non-zero `paid_acu` while the gates read OFF) is
+//!   still dropped as a fault ([`CreditError::PayoutInconsistent`]): a real payout
+//!   must never appear with the rails claiming they are off. This is the v0.6.0
+//!   change that unblocks the server-side real-money flip — v0.5.0 hard-rejected
+//!   ANY non-zero `paid_acu` ("credit response withheld"), which would strand every
+//!   miner the instant payout turned on.
 //!
 //! ── Source-B transport decision (investigated 2026-06-03) ────────────────────
 //! There is **no reachable public, address-keyed credit endpoint today**:
@@ -265,10 +274,17 @@ pub enum CreditError {
     Unreachable,
     /// The response did not parse / had no usable score field.
     Unparseable,
-    /// **The envelope reported `paid_acu != "0"`.** This is a credit-only
-    /// violation: the value is DROPPED and we surface an error rather than ever
-    /// show a non-zero payout figure (the #18 red-team guard).
-    PaidAcuNotZero,
+    /// **A CONTRADICTORY payout envelope.** The envelope reported a non-zero
+    /// `paid_acu` (a real payout) while the `live_reward_enabled` /
+    /// `payout_executor_enabled` gates read OFF — a real payment must never appear
+    /// with the rails claiming they are off. Rather than surface an inconsistent
+    /// number we DROP the whole value and flag the inconsistency (the #18 red-team
+    /// guard, retained: a leaked/fabricated payout — one whose own envelope denies
+    /// the rail is live — is never rendered).
+    PayoutInconsistent,
+    /// **A NEGATIVE / non-finite payout magnitude.** A settled/paid figure that is
+    /// negative or not finite is nonsense; the value is dropped rather than shown.
+    PayoutImplausible,
 }
 
 impl CreditError {
@@ -283,12 +299,62 @@ impl CreditError {
                 "credit response unavailable",
                 "credit response unavailable · 待确认"
             ),
-            // Deliberately neutral — we never hint at the dropped number.
-            CreditError::PaidAcuNotZero => crate::tr!(
-                "credit response withheld (payout is off)",
-                "credit response withheld (payout is off) · 待确认"
+            // Deliberately neutral — we never hint at the dropped number, only that
+            // the envelope was self-contradictory (payout present, rails off).
+            CreditError::PayoutInconsistent => crate::tr!(
+                "payout response withheld (inconsistent envelope)",
+                "payout response withheld (inconsistent envelope) · 待确认"
+            ),
+            CreditError::PayoutImplausible => crate::tr!(
+                "payout response withheld (implausible amount)",
+                "payout response withheld (implausible amount) · 待确认"
             ),
         }
+    }
+}
+
+/// **Source B — a HONEST, self-consistent PAYOUT view (v0.6.0 payout-aware).**
+///
+/// When real-money payout is live the server envelope carries a non-zero `paid_acu`
+/// **together with** the `live_reward_enabled` / `payout_executor_enabled` gates set
+/// true. This struct captures what such an envelope reports so the client can display
+/// it HONESTLY and let the user self-verify on the public explorer:
+///
+///   * `settled_alice` — ALICE credited-and-settled for this address (the amount the
+///     accounting has finalized). `None` when the server does not report it yet.
+///   * `paid_alice` — ALICE actually paid out on-chain (minted / disbursed). `None`
+///     when the server does not report it.
+///   * `pending_alice` — still-accruing credit not yet settled (mirrors the
+///     credit-only magnitude, surfaced here as a companion figure).
+///   * `paid_acu_raw` — the envelope's raw `paid_acu` STRING, kept verbatim so the UI
+///     can show exactly what the server asserted (never re-parsed into fiat/`$`).
+///
+/// Every amount is `Option<f64>`: `None` renders as an honest "—", never a fabricated
+/// 0. This is ONLY ever populated from a self-consistent envelope (payout gates on,
+/// amounts finite & non-negative); a contradictory or implausible envelope is dropped
+/// to [`CreditState::Error`] before a [`PayoutView`] is ever built.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct PayoutView {
+    /// ALICE credited-and-settled for this address (finalized accounting). `None` if
+    /// the server does not report it.
+    pub settled_alice: Option<f64>,
+    /// ALICE actually paid out on-chain (minted / disbursed). `None` if not reported.
+    pub paid_alice: Option<f64>,
+    /// Still-accruing (pending, not yet settled) credit magnitude, surfaced as a
+    /// companion figure. `None` if not reported.
+    pub pending_alice: Option<f64>,
+    /// The envelope's raw `paid_acu` string, kept verbatim (e.g. `"33.5"`). This is
+    /// what the server asserted; the UI shows it as-reported and points the user at
+    /// the explorer to self-verify against the chain.
+    pub paid_acu_raw: String,
+}
+
+impl PayoutView {
+    /// Whether this payout view carries any positive settled/paid figure (i.e. the
+    /// server has actually settled or paid something, not merely turned the rail on).
+    pub fn has_payout(&self) -> bool {
+        self.settled_alice.map(|v| v > 0.0).unwrap_or(false)
+            || self.paid_alice.map(|v| v > 0.0).unwrap_or(false)
     }
 }
 
@@ -311,15 +377,36 @@ pub enum CreditState {
     /// that a public per-address endpoint exists). The `score` is the credit-only
     /// `pending_alice` magnitude ([`CreditScore`] has no fiat Display); `totals`
     /// carries the server-confirmed cumulative accepted-share COUNTS (across lanes +
-    /// 24h + per-lane breakdown). Reached only after the envelope's `paid_acu` was
-    /// verified `"0"` and the payout/live-reward gates read off.
+    /// 24h + per-lane breakdown). `payout` is `None` in the credit-only phase (payout
+    /// gates OFF, `paid_acu == "0"`); it is `Some` ONLY on a self-consistent payout
+    /// envelope (v0.6.0 payout-aware: non-zero `paid_acu` WITH the payout/live-reward
+    /// gates on), carrying the real settled/paid figures for honest display.
     Confirmed {
         score: CreditScore,
         totals: CreditTotals,
+        /// The real settled/paid payout view — `Some` only once the server flipped
+        /// real-money payout ON (self-consistent envelope). `None` in the credit-only
+        /// phase. The counts in `totals` still render; when `Some`, the UI ALSO shows
+        /// the settled/paid figures + an explorer self-verify link.
+        #[serde(default)]
+        payout: Option<PayoutView>,
     },
-    /// A poll failed (unreachable / unparseable / **paid_acu != "0"** → value
-    /// dropped). The UI shows a calm, non-numeric note and keeps Source A as the
-    /// live UX.
+    /// **v0.6.0 upgrade gate.** The server's envelope advertised a
+    /// `min_supported_version` this build does not meet (or returned the
+    /// `client_below_min_supported` reason_code). The client must upgrade to keep
+    /// participating: the CLI prints a clear "please upgrade to vX.Y (download)" and
+    /// exits non-zero; the GUI shows an upgrade banner. A MISSING `min_supported_version`
+    /// (v0.5.0 semantics) never yields this state — it is fully additive.
+    UpgradeRequired {
+        /// The minimum client version the server will accept (e.g. `"0.6.0"`).
+        min_supported: String,
+        /// Where to get the newer client (the public releases page). May be empty if
+        /// the server did not include one; the UI falls back to [`RELEASES_PAGE_DEFAULT`].
+        download_url: String,
+    },
+    /// A poll failed (unreachable / unparseable / **contradictory or implausible
+    /// payout envelope** → value dropped). The UI shows a calm, non-numeric note and
+    /// keeps Source A as the live UX.
     Error { reason: CreditError },
 }
 
@@ -330,7 +417,7 @@ impl CreditState {
     pub fn has_confirmed_credit(&self) -> bool {
         matches!(
             self,
-            CreditState::Confirmed { score, totals }
+            CreditState::Confirmed { score, totals, .. }
                 if score.is_some_credit() || totals.has_any()
         )
     }
@@ -341,6 +428,28 @@ impl CreditState {
     pub fn totals(&self) -> Option<&CreditTotals> {
         match self {
             CreditState::Confirmed { totals, .. } => Some(totals),
+            _ => None,
+        }
+    }
+
+    /// The real settled/paid [`PayoutView`] when the server has flipped real-money
+    /// payout on (a self-consistent payout envelope). `None` in the credit-only phase
+    /// and in every non-`Confirmed` state — the UI shows nothing rather than a
+    /// fabricated payout.
+    pub fn payout(&self) -> Option<&PayoutView> {
+        match self {
+            CreditState::Confirmed { payout, .. } => payout.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The `(min_supported, download_url)` when this build is below the server's
+    /// advertised floor (the v0.6.0 upgrade gate). `None` otherwise.
+    pub fn upgrade_required(&self) -> Option<(&str, &str)> {
+        match self {
+            CreditState::UpgradeRequired { min_supported, download_url } => {
+                Some((min_supported.as_str(), download_url.as_str()))
+            }
             _ => None,
         }
     }
@@ -365,42 +474,66 @@ pub const LANE_KEY_GPU_PRL: &str = "main_pool_gpu_prl";
 pub const LANE_KEY_GPU_ALPHA: &str = "main_pool_gpu_alpha";
 
 /// The credit-bearing part of an `alice-read-model-v2` `miner-lookup` response.
-/// Only the fields Source B needs: the credit-only envelope guards + the
-/// confirmed score (`summary.pending_alice`, carried opaquely) + the cumulative
-/// accepted-share COUNTS (`summary.accepted_shares_total` / `_24h` + the per-lane
-/// `lanes[]` breakdown). Unknown fields are ignored (the live payload carries much
-/// more — timeseries, workers, payout_history, etc.).
+/// Only the fields Source B needs: the payout gates + the confirmed score
+/// (`summary.pending_alice`, carried opaquely) + the cumulative accepted-share
+/// COUNTS (`summary.accepted_shares_total` / `_24h` + the per-lane `lanes[]`
+/// breakdown) + the v0.6.0 payout figures + the upgrade-gate fields. Unknown fields
+/// are ignored (the live payload carries much more — timeseries, workers,
+/// payout_history, etc.); every new field here is ADDITIVE (a v0.5.0-era server that
+/// omits them parses identically).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreditEnvelope {
-    /// `paid_acu` MUST be the string `"0"`; anything else is a credit-only
-    /// violation handled by [`parse_credit_envelope`] (value dropped → error).
+    /// The settled ACU count. `"0"` in the credit-only phase; a non-zero value is a
+    /// real payout, which [`parse_credit_envelope`] surfaces (v0.6.0) ONLY when the
+    /// payout gates are also on (else it is a contradictory envelope → dropped).
     #[serde(default)]
     pub paid_acu: Option<String>,
-    /// Payout executor must stay disabled (phase-J). Defaults to `false` (absent =
-    /// off) — a `true` is treated as a violation.
+    /// Whether the payout executor is live. `false` in the credit-only phase; a `true`
+    /// (together with a non-zero `paid_acu`) marks a self-consistent payout envelope.
     #[serde(default)]
     pub payout_executor_enabled: bool,
-    /// Live reward must stay disabled (phase-J). Same treatment as above.
+    /// Whether real reward minting is live. Same role as `payout_executor_enabled`:
+    /// either gate being on makes a non-zero `paid_acu` a HONEST payout (v0.6.0).
     #[serde(default)]
     pub live_reward_enabled: bool,
     /// Whether the address was found at all.
     #[serde(default)]
     pub found: bool,
-    /// The credit-side summary (pending credit total + cumulative COUNTS). Optional.
+    /// The credit-side summary (pending credit total + cumulative COUNTS + the v0.6.0
+    /// settled/paid figures). Optional.
     #[serde(default)]
     pub summary: Option<CreditSummary>,
     /// The per-lane cumulative accepted-share COUNT breakdown. Optional / fail-closed
     /// (absent => no lane split, just the summary totals).
     #[serde(default)]
     pub lanes: Vec<LaneEnvelope>,
+    /// **v0.6.0 upgrade gate (additive).** The minimum client version the server will
+    /// accept. When present and this build is below it, the client surfaces
+    /// [`CreditState::UpgradeRequired`]. Absent (the v0.5.0-era default) = no gate.
+    #[serde(default)]
+    pub min_supported_version: Option<String>,
+    /// **v0.6.0 upgrade gate (additive).** Where to download a supported client, echoed
+    /// into [`CreditState::UpgradeRequired`]. Absent → the UI uses [`RELEASES_PAGE_DEFAULT`].
+    #[serde(default)]
+    pub client_download_url: Option<String>,
+    /// **v0.6.0 (additive).** A top-level reason_code. The only one Source B acts on is
+    /// `client_below_min_supported` (→ [`CreditState::UpgradeRequired`], even if
+    /// `min_supported_version` was omitted); all others are ignored here (the read API
+    /// surfaces them elsewhere).
+    #[serde(default)]
+    pub reason_code: Option<String>,
 }
 
 /// The credit-side summary fields of the read-model. `pending_alice` is the
-/// credit accrued-but-not-paid total (phase-J keeps it as pending credit); the
-/// `accepted_shares_*` are the cumulative server-confirmed COUNTS (credit-only).
+/// credit accrued-but-not-paid total (credit-only phase keeps it as pending credit);
+/// the `accepted_shares_*` are the cumulative server-confirmed COUNTS (credit-only);
+/// `settled_alice` / `paid_alice` are the v0.6.0 real-payout figures (0.0 until the
+/// server flips payout on).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreditSummary {
-    /// Credit accrued and pending (NOT cash; never rendered as a number/`$`).
+    /// Credit accrued and pending (NOT cash; never rendered as a number/`$` while in
+    /// the credit-only phase — carried opaquely by [`CreditScore`]). Surfaced as a
+    /// companion figure inside a [`PayoutView`] once payout is live.
     #[serde(default)]
     pub pending_alice: Option<f64>,
     /// Cumulative accepted-share COUNT across all lanes (server-confirmed).
@@ -409,6 +542,14 @@ pub struct CreditSummary {
     /// Accepted-share COUNT in the last 24h (server-confirmed).
     #[serde(default)]
     pub accepted_shares_24h: Option<u64>,
+    /// **v0.6.0.** ALICE credited-and-settled (finalized accounting). `0.0`/absent in
+    /// the credit-only phase; a real figure once payout is live.
+    #[serde(default)]
+    pub settled_alice: Option<f64>,
+    /// **v0.6.0.** ALICE actually paid out on-chain (minted / disbursed). `0.0`/absent
+    /// in the credit-only phase; a real figure once payout is live.
+    #[serde(default)]
+    pub paid_alice: Option<f64>,
 }
 
 /// One element of the read-model's `lanes[]` array — the credit-only fields the
@@ -425,35 +566,137 @@ pub struct LaneEnvelope {
     pub accepted: Option<u64>,
 }
 
+/// The public releases page — the fallback download target for the v0.6.0 upgrade
+/// gate when the server's envelope advertises `min_supported_version` but no explicit
+/// `client_download_url`. Mirrors the GUI/updater `RELEASES_PAGE`.
+pub const RELEASES_PAGE_DEFAULT: &str =
+    "https://github.com/V-SK/alice-miner/releases/latest";
+
+/// The top-level reason_code the server sends when this client is below its accepted
+/// floor. Source B maps it to [`CreditState::UpgradeRequired`] even when
+/// `min_supported_version` is omitted.
+pub const REASON_CLIENT_BELOW_MIN: &str = "client_below_min_supported";
+
+/// This client's own semantic version (the crate version), used to evaluate the
+/// server's `min_supported_version` floor. Bumping the workspace version bumps this.
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The HTTP header carrying the PRODUCT-level client version token (distinct from the
+/// transport-specific `User-Agent`). v0.6.0+ always sends it on the read-API poll; the
+/// server floors on it, and its ABSENCE distinguishes the pre-0.6.0 (non-payout-aware)
+/// fleet from the payout-aware one.
+pub const CLIENT_PRODUCT_HEADER: &str = "X-Alice-Client";
+
+/// The value of [`CLIENT_PRODUCT_HEADER`] — `alice-miner/<version>` (e.g.
+/// `alice-miner/0.6.0`). A stable product token the server's fleet floor keys off.
+pub const CLIENT_PRODUCT_UA: &str = concat!("alice-miner/", env!("CARGO_PKG_VERSION"));
+
+/// Compare two dotted numeric versions (`MAJOR.MINOR.PATCH`, extra components and a
+/// `-pre`/`+build` suffix ignored). Returns `true` iff `current >= min_required`. A
+/// component that does not parse is treated as `0`. Deliberately tiny (no semver dep)
+/// — the same discipline `alice-release::meets_min` uses.
+fn version_meets_min(current: &str, min_required: &str) -> bool {
+    fn parts(v: &str) -> [u64; 3] {
+        // Strip a build/pre suffix, then take the first three dotted numeric parts.
+        let core = v.trim().split(['-', '+']).next().unwrap_or("");
+        let mut out = [0u64; 3];
+        for (i, p) in core.split('.').take(3).enumerate() {
+            out[i] = p.trim().parse().unwrap_or(0);
+        }
+        out
+    }
+    parts(current) >= parts(min_required)
+}
+
+/// If the envelope demands a newer client than this build, return the
+/// [`CreditState::UpgradeRequired`] to surface; else `None`. Fires when EITHER the
+/// top-level `reason_code` is [`REASON_CLIENT_BELOW_MIN`] OR a present
+/// `min_supported_version` this build does not meet. A MISSING/empty
+/// `min_supported_version` with no such reason_code = no gate (v0.5.0 semantics).
+fn upgrade_gate(env: &CreditEnvelope) -> Option<CreditState> {
+    let explicit = env.reason_code.as_deref() == Some(REASON_CLIENT_BELOW_MIN);
+    let floor = env
+        .min_supported_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let below_floor = floor.map(|f| !version_meets_min(CLIENT_VERSION, f)).unwrap_or(false);
+    if explicit || below_floor {
+        let min_supported = floor.unwrap_or(CLIENT_VERSION).to_string();
+        let download_url = env
+            .client_download_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(RELEASES_PAGE_DEFAULT)
+            .to_string();
+        return Some(CreditState::UpgradeRequired { min_supported, download_url });
+    }
+    None
+}
+
+/// Build the v0.6.0 [`PayoutView`] from a self-consistent payout envelope: the raw
+/// `paid_acu` string plus the settled/paid/pending figures. Returns `Err` with the
+/// [`CreditError`] to surface if any reported figure is implausible (negative /
+/// non-finite) — a real settlement is never negative, so we drop rather than show it.
+fn build_payout_view(
+    paid_acu_raw: &str,
+    summary: Option<&CreditSummary>,
+) -> Result<PayoutView, CreditError> {
+    // Any figure the server reports must be finite & non-negative to be shown.
+    let sane = |v: Option<f64>| -> Result<Option<f64>, CreditError> {
+        match v {
+            None => Ok(None),
+            Some(x) if x.is_finite() && x >= 0.0 => Ok(Some(x)),
+            Some(_) => Err(CreditError::PayoutImplausible),
+        }
+    };
+    Ok(PayoutView {
+        settled_alice: sane(summary.and_then(|s| s.settled_alice))?,
+        paid_alice: sane(summary.and_then(|s| s.paid_alice))?,
+        pending_alice: sane(summary.and_then(|s| s.pending_alice))?,
+        paid_acu_raw: paid_acu_raw.trim().to_string(),
+    })
+}
+
 /// Parse a read-model `miner-lookup` JSON body into a [`CreditState`],
-/// **enforcing the credit-only invariants in code**:
+/// **payout-aware (v0.6.0) while keeping the honest-envelope guards**:
 ///
-///   1. If the envelope's `paid_acu` is present and `!= "0"`, OR a payout/live
-///      reward gate reads `true`, the response is a credit-only violation: the
-///      score is **DROPPED** and we return [`CreditState::Error`] with
-///      [`CreditError::PaidAcuNotZero`] — we NEVER surface the value.
+///   0. **Upgrade gate:** if the envelope demands a newer client (its
+///      `min_supported_version` exceeds this build, or `reason_code ==
+///      client_below_min_supported`) → [`CreditState::UpgradeRequired`]. A missing
+///      field = no gate (v0.5.0 semantics, fully additive).
+///   1. **Payout consistency:** a non-zero `paid_acu` is a REAL payout ONLY when the
+///      `live_reward_enabled` / `payout_executor_enabled` gates are also on. A
+///      non-zero `paid_acu` with the gates OFF is a CONTRADICTORY envelope: the whole
+///      value is **DROPPED** → [`CreditError::PayoutInconsistent`] (the #18 guard,
+///      retained — a real payment must never claim the rails are off).
 ///   2. A missing/`null` `paid_acu` is treated as the safe `"0"` (absence = off).
-///   3. `found: false` → [`CreditState::Confirming`] (the address simply has no
-///      confirmation yet — not an error).
-///   4. Otherwise the credit-only `pending_alice` becomes a [`CreditScore`].
+///   3. `found: false` → [`CreditState::Confirming`] (no confirmation yet — not an error).
+///   4. Otherwise: the credit-only `pending_alice` becomes a [`CreditScore`], the
+///      cumulative COUNTS are surfaced, and — WHEN payout is live — a [`PayoutView`]
+///      carries the real settled/paid figures for honest display + explorer self-verify.
 ///
-/// This is the function the fast-follow [`PoolStatsClient`] would call on each
-/// poll; today it is exercised by tests + ready for the live flip.
+/// This is the function the [`PoolStatsClient`] calls on each poll.
 pub fn parse_credit_envelope(body: &str) -> CreditState {
     let env: CreditEnvelope = match serde_json::from_str(body) {
         Ok(e) => e,
         Err(_) => return CreditState::Error { reason: CreditError::Unparseable },
     };
-    // (1) Credit-only gate: paid_acu must read "0"; payout/live-reward must be off.
-    // ANY of these failing → DROP the value, surface an error. This is the single
-    // most important line of the milestone (the fabricated/leaked-payout guard).
-    let paid_acu_ok = match env.paid_acu.as_deref() {
-        // Absent → treated as "0" (fail-safe: absence = off).
-        None => true,
-        Some(s) => s.trim() == "0",
-    };
-    if !paid_acu_ok || env.payout_executor_enabled || env.live_reward_enabled {
-        return CreditState::Error { reason: CreditError::PaidAcuNotZero };
+    // (0) Upgrade gate — checked first so a below-floor client is told to update
+    // regardless of the rest of the payload.
+    if let Some(upgrade) = upgrade_gate(&env) {
+        return upgrade;
+    }
+    // (1) Payout consistency. paid_acu != "0" is a REAL payout only if the payout
+    // rails are on; a non-zero paid_acu with the rails OFF is a self-contradictory
+    // envelope → DROP the value (the retained #18 guard).
+    let paid_acu_raw = env.paid_acu.as_deref().unwrap_or("0");
+    let paid_acu_zero = paid_acu_raw.trim() == "0";
+    let payout_live = env.payout_executor_enabled || env.live_reward_enabled;
+    if !paid_acu_zero && !payout_live {
+        // Non-zero payout while the rails claim OFF — inconsistent, never render it.
+        return CreditState::Error { reason: CreditError::PayoutInconsistent };
     }
     // (3) Not found yet → just "confirming" (no error, no number). A MISSING/absent
     // address is "confirming", NOT a fabricated zero — the UI shows "syncing", never 0.
@@ -486,9 +729,21 @@ pub fn parse_credit_envelope(body: &str) -> CreditState {
             Some(LaneCredit { key, label, accepted })
         })
         .collect();
+    // v0.6.0: when payout is live (self-consistent: non-zero paid_acu WITH the rails
+    // on), attach the real settled/paid figures. In the credit-only phase (paid_acu
+    // "0", rails off) payout stays None. An implausible figure drops the whole read.
+    let payout = if !paid_acu_zero && payout_live {
+        match build_payout_view(paid_acu_raw, summary.as_ref()) {
+            Ok(view) => Some(view),
+            Err(reason) => return CreditState::Error { reason },
+        }
+    } else {
+        None
+    };
     CreditState::Confirmed {
         score: CreditScore::new(raw),
         totals: CreditTotals { accepted_total, accepted_24h, lanes },
+        payout,
     }
 }
 
@@ -651,9 +906,11 @@ impl PoolStatsClient {
         self.in_flight = false;
         let state = parse_credit_envelope(body);
         match &state {
-            // A credit-only violation or unparseable body counts as a failure for
+            // A payout inconsistency or unparseable body counts as a failure for
             // backoff purposes (we keep trying, slower) but the surfaced state is
-            // the honest error, not a stale value.
+            // the honest error, not a stale value. An UpgradeRequired is a DEFINITIVE
+            // server answer (not a transient fault) → it resets backoff like a success
+            // (no point hammering; the UI now tells the user to update).
             CreditState::Error { .. } => self.consecutive_failures = self.consecutive_failures.saturating_add(1),
             _ => self.consecutive_failures = 0,
         }
@@ -751,6 +1008,11 @@ fn http_get_credit(url: &str) -> Result<String, String> {
         .build();
     let resp = agent
         .get(url)
+        // A stable, PRODUCT-level client version token (distinct from the
+        // transport-specific User-Agent). v0.6.0+ always sends this; the server's
+        // min-supported floor keys off it (and the very ABSENCE of this header marks a
+        // pre-0.6.0 fleet that predates payout-awareness). See `CLIENT_PRODUCT_HEADER`.
+        .set(CLIENT_PRODUCT_HEADER, CLIENT_PRODUCT_UA)
         .call()
         .map_err(|e| format!("GET {url}: {e}"))?;
     let mut buf = Vec::new();
@@ -935,19 +1197,23 @@ impl Reconciliation {
     pub fn derive(activity: &LocalActivity, credit: &CreditState) -> Self {
         let active = activity.is_active();
         match (active, credit) {
-            (false, CreditState::Confirmed { score, totals })
+            (false, CreditState::Confirmed { score, totals, .. })
                 if score.is_some_credit() || totals.has_any() =>
             {
                 Reconciliation::ConfirmedIdle
             }
             (false, _) => Reconciliation::Idle,
-            (true, CreditState::Confirmed { score, totals })
+            (true, CreditState::Confirmed { score, totals, .. })
                 if score.is_some_credit() || totals.has_any() =>
             {
                 Reconciliation::InSync
             }
             (true, CreditState::Confirming) => Reconciliation::Confirming,
-            (true, CreditState::Error { .. }) => Reconciliation::Unconfirmed,
+            // An upgrade-required or a faulted read both leave the server credit
+            // unconfirmed from the badge's point of view (Source A stays the live UX).
+            (true, CreditState::Error { .. }) | (true, CreditState::UpgradeRequired { .. }) => {
+                Reconciliation::Unconfirmed
+            }
             // Confirmed-but-zero, or NotExposed, while active → activity is flowing
             // but there's no server number to reconcile against.
             (true, _) => Reconciliation::ActivityOnly,
@@ -1120,14 +1386,52 @@ mod tests {
         assert!(a.accepted_ratio().is_none());
     }
 
-    // ── Source B — the credit-only guards (the heart of M5) ────────────────────
+    // ── Source B — the payout-aware guards (v0.6.0; the heart of the P3a change) ─
 
-    /// THE #18 RED-TEAM GUARD: a response with `paid_acu != "0"` must flip to
-    /// `Error(PaidAcuNotZero)` and the value must be DROPPED (never surfaced).
+    /// **v0.6.0 payout-aware, the load-bearing change.** A CONSISTENT payout envelope
+    /// — non-zero `paid_acu` WITH the `live_reward_enabled` / `payout_executor_enabled`
+    /// gates on — is a REAL payout that must be surfaced (settled/paid figures on the
+    /// `Confirmed` state), NOT dropped. v0.5.0 hard-rejected this as a violation
+    /// ("credit response withheld") and would have stranded every miner the instant
+    /// payout turned on. This test proves the strand trap is gone.
     #[test]
-    fn source_b_paid_acu_not_zero_flips_to_error_and_drops_value() {
-        // A response that "looks credited" but reports a non-zero payout. Even
-        // though it carries a juicy pending_alice, we must NOT confirm it.
+    fn source_b_consistent_payout_envelope_surfaces_settled_and_paid() {
+        // The server flipped real-money payout ON: paid_acu non-zero AND the rails on.
+        let body = r#"{
+            "ok": true,
+            "found": true,
+            "contract_version": "alice-read-model-v2",
+            "paid_acu": "33.5",
+            "live_reward_enabled": true,
+            "payout_executor_enabled": true,
+            "summary": {
+                "pending_alice": 4.0,
+                "settled_alice": 33.5,
+                "paid_alice": 30.0,
+                "accepted_shares_total": 873,
+                "accepted_shares_24h": 142
+            }
+        }"#;
+        let state = parse_credit_envelope(body);
+        // It is CONFIRMED (not an error), carries the counts, AND carries a payout view.
+        let payout = state.payout().expect("a consistent payout envelope surfaces a PayoutView");
+        assert_eq!(payout.paid_acu_raw, "33.5");
+        assert_eq!(payout.settled_alice, Some(33.5));
+        assert_eq!(payout.paid_alice, Some(30.0));
+        assert_eq!(payout.pending_alice, Some(4.0));
+        assert!(payout.has_payout(), "a positive settled/paid figure means a real payout");
+        // The cumulative COUNTS still render alongside the payout.
+        let totals = state.totals().expect("confirmed carries totals");
+        assert_eq!(totals.accepted_total, 873);
+        assert_eq!(totals.accepted_24h, 142);
+    }
+
+    /// THE RETAINED #18 GUARD: a CONTRADICTORY payout envelope — non-zero `paid_acu`
+    /// while the payout rails read OFF — is still a fault: the whole value is DROPPED.
+    /// A real payment must never appear with the rails claiming they are off.
+    #[test]
+    fn source_b_inconsistent_payout_is_dropped() {
+        // paid_acu non-zero but BOTH gates off → self-contradictory → dropped.
         let body = r#"{
             "ok": true,
             "found": true,
@@ -1135,29 +1439,41 @@ mod tests {
             "paid_acu": "12.5",
             "live_reward_enabled": false,
             "payout_executor_enabled": false,
-            "summary": { "pending_alice": 999.0 }
+            "summary": { "pending_alice": 999.0, "settled_alice": 12.5 }
         }"#;
         let state = parse_credit_envelope(body);
-        assert_eq!(state, CreditState::Error { reason: CreditError::PaidAcuNotZero });
-        // And crucially: the dropped value is NOT reachable from the state.
+        assert_eq!(state, CreditState::Error { reason: CreditError::PayoutInconsistent });
+        // The dropped value is NOT reachable from the state.
         assert!(!state.has_confirmed_credit());
+        assert!(state.payout().is_none());
     }
 
-    /// A `payout_executor_enabled:true` (or `live_reward_enabled:true`) envelope is
-    /// equally a credit-only violation → drop + error.
+    /// The payout rails on but with `paid_acu:"0"` (rails armed, nothing settled yet)
+    /// is a perfectly consistent CREDIT state — no PayoutView (nothing paid), no error.
     #[test]
-    fn source_b_payout_executor_on_is_a_violation() {
+    fn source_b_rails_armed_but_zero_paid_is_credit_no_payout() {
         for body in [
-            r#"{"found":true,"paid_acu":"0","payout_executor_enabled":true,"summary":{"pending_alice":5.0}}"#,
-            r#"{"found":true,"paid_acu":"0","live_reward_enabled":true,"summary":{"pending_alice":5.0}}"#,
+            r#"{"found":true,"paid_acu":"0","payout_executor_enabled":true,"summary":{"pending_alice":5.0,"accepted_shares_total":10}}"#,
+            r#"{"found":true,"paid_acu":"0","live_reward_enabled":true,"summary":{"pending_alice":5.0,"accepted_shares_total":10}}"#,
         ] {
             let state = parse_credit_envelope(body);
-            assert_eq!(
-                state,
-                CreditState::Error { reason: CreditError::PaidAcuNotZero },
-                "a live payout/reward gate must drop the value: {body}"
+            assert!(
+                matches!(state, CreditState::Confirmed { .. }),
+                "rails on + paid_acu 0 is a valid credit state (nothing paid yet): {body}"
             );
+            assert!(state.payout().is_none(), "no payout when nothing has settled: {body}");
         }
+    }
+
+    /// A CONSISTENT payout envelope with an IMPLAUSIBLE (negative) figure is dropped —
+    /// a real settlement is never negative, so we refuse to render it.
+    #[test]
+    fn source_b_implausible_payout_amount_is_dropped() {
+        let body = r#"{"found":true,"paid_acu":"5","payout_executor_enabled":true,
+            "summary":{"settled_alice":-1.0,"paid_alice":5.0}}"#;
+        let state = parse_credit_envelope(body);
+        assert_eq!(state, CreditState::Error { reason: CreditError::PayoutImplausible });
+        assert!(state.payout().is_none());
     }
 
     /// A clean `paid_acu:"0"`, found, phase-J envelope parses to a credit-only
@@ -1178,11 +1494,12 @@ mod tests {
             "summary": { "pending_alice": 0.0, "accepted_shares_total": 1284902 }
         }"#;
         match parse_credit_envelope(body) {
-            CreditState::Confirmed { score, totals } => {
-                // pending_alice was 0.0 (phase-J normal empty state) → a valid
-                // confirmed-but-zero score.
+            CreditState::Confirmed { score, totals, payout } => {
+                // credit-only phase (paid_acu "0", rails off): pending_alice 0.0 →
+                // a valid confirmed-but-zero score, and NO payout view.
                 assert_eq!(score.raw(), 0.0);
                 assert!(!score.is_some_credit());
+                assert!(payout.is_none(), "credit-only phase carries no payout view");
                 // The cumulative accepted-share COUNT is parsed from the summary.
                 assert_eq!(totals.accepted_total, 1_284_902);
             }
@@ -1244,8 +1561,8 @@ mod tests {
             "payout_history": []
         }"#;
         match parse_credit_envelope(body) {
-            CreditState::Confirmed { score, totals } => {
-                // phase-J: pending_alice is 0 (a real server 0, not fabricated).
+            CreditState::Confirmed { score, totals, .. } => {
+                // credit-only phase: pending_alice is 0 (a real server 0, not fabricated).
                 assert_eq!(score.raw(), 0.0);
                 // The cumulative + 24h COUNTS are parsed verbatim.
                 assert_eq!(totals.accepted_total, 873);
@@ -1355,29 +1672,31 @@ mod tests {
         assert!(!b.credit.has_confirmed_credit());
     }
 
-    /// THE #18 GUARD over the balance view: a `paid_acu != "0"` envelope drops the
-    /// credit bucket to `Error` (no COUNT surfaced) EVEN as the PRL section parses —
-    /// the credit-only violation is never laundered through the balance path.
+    /// THE RETAINED #18 GUARD over the balance view: a CONTRADICTORY payout envelope
+    /// (non-zero `paid_acu` with the payout rails OFF) drops the credit bucket to
+    /// `Error` (no COUNT surfaced) EVEN as the PRL section parses — an inconsistent
+    /// payout is never laundered through the balance path.
     #[test]
-    fn balance_paid_acu_violation_drops_credit_bucket() {
+    fn balance_inconsistent_payout_drops_credit_bucket() {
         let body = r#"{"found":true,"paid_acu":"9.9",
             "summary":{"pending_alice":9.0,"accepted_shares_total":1000,"accepted_shares_24h":50},
             "prl_subsidy":{"bound":true,"rebate_pct":15,"algorithms":[{"status":"accruing"}]}}"#;
         let b = parse_balance_lookup(body);
-        assert_eq!(b.credit, CreditState::Error { reason: CreditError::PaidAcuNotZero });
-        assert!(b.credit.totals().is_none(), "no count surfaced on a violation");
+        assert_eq!(b.credit, CreditState::Error { reason: CreditError::PayoutInconsistent });
+        assert!(b.credit.totals().is_none(), "no count surfaced on an inconsistent envelope");
     }
 
-    /// THE #18 GUARD over the FULL count model: a `paid_acu != "0"` envelope that ALSO
-    /// carries cumulative counts + a lane split is dropped to `Error` — the COUNTS are
-    /// NOT surfaced either (the whole confirmed value, counts included, is dropped).
+    /// THE RETAINED #18 GUARD over the FULL count model: a CONTRADICTORY payout envelope
+    /// (non-zero `paid_acu`, rails OFF) that ALSO carries cumulative counts + a lane
+    /// split is dropped to `Error` — the COUNTS are NOT surfaced either (the whole
+    /// inconsistent value, counts included, is dropped).
     #[test]
-    fn source_b_paid_acu_violation_drops_counts_too() {
+    fn source_b_inconsistent_payout_drops_counts_too() {
         let body = r#"{"found":true,"paid_acu":"3.5",
             "summary":{"pending_alice":9.0,"accepted_shares_total":1000,"accepted_shares_24h":50},
             "lanes":[{"key":"main_pool_gpu_alpha","label":"GPU · Alpha","accepted":1000}]}"#;
         let state = parse_credit_envelope(body);
-        assert_eq!(state, CreditState::Error { reason: CreditError::PaidAcuNotZero });
+        assert_eq!(state, CreditState::Error { reason: CreditError::PayoutInconsistent });
         // The dropped counts are NOT reachable from the state (no totals on Error).
         assert!(state.totals().is_none());
         assert!(!state.has_confirmed_credit());
@@ -1481,6 +1800,7 @@ mod tests {
                 &CreditState::Confirmed {
                     score: CreditScore::new(5.0),
                     totals: CreditTotals::default(),
+                    payout: None,
                 }
             ),
             Reconciliation::InSync
@@ -1498,6 +1818,7 @@ mod tests {
             &CreditState::Confirmed {
                 score: CreditScore::new(5.0),
                 totals: CreditTotals::default(),
+                payout: None,
             },
         );
         assert_eq!(r, Reconciliation::ConfirmedIdle);
@@ -1607,16 +1928,105 @@ mod tests {
         assert_eq!(c.next_poll_in_secs(0.0).unwrap(), CREDIT_POLL_BASE_SECS);
     }
 
-    /// A `paid_acu != "0"` body delivered through the client (not just the bare
-    /// parser) still drops the value AND counts as a failure for backoff.
+    /// A CONTRADICTORY payout body (non-zero `paid_acu`, rails OFF) delivered through
+    /// the client (not just the bare parser) still drops the value AND counts as a
+    /// failure for backoff.
     #[test]
-    fn client_complete_drops_nonzero_paid_acu_and_backs_off() {
+    fn client_complete_drops_inconsistent_payout_and_backs_off() {
         let mut c = PoolStatsClient::public_read_model("https://x/read");
         c.begin_poll();
         let state = c.complete(r#"{"found":true,"paid_acu":"7","summary":{"pending_alice":9.0}}"#);
-        assert_eq!(state, CreditState::Error { reason: CreditError::PaidAcuNotZero });
+        assert_eq!(state, CreditState::Error { reason: CreditError::PayoutInconsistent });
         assert!(!state.has_confirmed_credit());
         assert_eq!(c.consecutive_failures(), 1);
+    }
+
+    /// A CONSISTENT payout body (non-zero `paid_acu` WITH the rails on) delivered
+    /// through the client is CONFIRMED with a payout view — and does NOT count as a
+    /// failure (backoff resets), because it is a healthy, real response.
+    #[test]
+    fn client_complete_accepts_consistent_payout_and_resets_backoff() {
+        let mut c = PoolStatsClient::public_read_model("https://x/read");
+        // Prime a failure so we can prove a consistent payout resets backoff.
+        c.begin_poll();
+        c.fail();
+        assert_eq!(c.consecutive_failures(), 1);
+        c.begin_poll();
+        let state = c.complete(
+            r#"{"found":true,"paid_acu":"33.5","payout_executor_enabled":true,
+                "summary":{"settled_alice":33.5,"paid_alice":30.0}}"#,
+        );
+        assert!(state.payout().is_some(), "a consistent payout is surfaced through the client");
+        assert_eq!(c.consecutive_failures(), 0, "a healthy payout read resets backoff");
+    }
+
+    // ── v0.6.0 upgrade gate + version helper ────────────────────────────────────
+
+    /// The dotted-version comparator: current-meets-min semantics, suffix-tolerant.
+    #[test]
+    fn version_meets_min_compares_dotted_parts() {
+        assert!(version_meets_min("0.6.0", "0.6.0"));
+        assert!(version_meets_min("0.6.1", "0.6.0"));
+        assert!(version_meets_min("1.0.0", "0.6.0"));
+        assert!(!version_meets_min("0.5.0", "0.6.0"));
+        assert!(!version_meets_min("0.5.9", "0.6.0"));
+        // Suffix + build metadata are ignored (only MAJOR.MINOR.PATCH compare).
+        assert!(version_meets_min("0.6.0-rc1", "0.6.0"));
+        assert!(version_meets_min("0.6.0+ci.7", "0.6.0"));
+        // A non-numeric component degrades to 0 rather than panicking.
+        assert!(!version_meets_min("garbage", "0.1.0"));
+    }
+
+    /// A `min_supported_version` this build does NOT meet flips to `UpgradeRequired`
+    /// with the server's floor + download URL. (Uses a far-future floor so the test is
+    /// robust to the crate's actual version.)
+    #[test]
+    fn upgrade_gate_fires_when_below_min_supported() {
+        let body = r#"{
+            "found": true, "paid_acu": "0",
+            "min_supported_version": "999.0.0",
+            "client_download_url": "https://example.test/download"
+        }"#;
+        let state = parse_credit_envelope(body);
+        let (min, url) = state.upgrade_required().expect("below-floor → UpgradeRequired");
+        assert_eq!(min, "999.0.0");
+        assert_eq!(url, "https://example.test/download");
+    }
+
+    /// The top-level `client_below_min_supported` reason_code forces `UpgradeRequired`
+    /// EVEN when `min_supported_version` is omitted; the download URL falls back to the
+    /// public releases page.
+    #[test]
+    fn upgrade_gate_fires_on_reason_code_without_min_field() {
+        let body = r#"{"found":true,"paid_acu":"0","reason_code":"client_below_min_supported"}"#;
+        let state = parse_credit_envelope(body);
+        let (_min, url) = state.upgrade_required().expect("reason_code → UpgradeRequired");
+        assert_eq!(url, RELEASES_PAGE_DEFAULT, "falls back to the releases page");
+    }
+
+    /// A MISSING `min_supported_version` and no such reason_code = NO gate (the v0.5.0
+    /// semantics, fully additive) — a clean envelope confirms as normal.
+    #[test]
+    fn upgrade_gate_absent_field_is_no_gate() {
+        let body = r#"{"found":true,"paid_acu":"0","summary":{"accepted_shares_total":5}}"#;
+        let state = parse_credit_envelope(body);
+        assert!(state.upgrade_required().is_none());
+        assert!(matches!(state, CreditState::Confirmed { .. }));
+    }
+
+    /// A floor this build DOES meet (0.0.0) never gates.
+    #[test]
+    fn upgrade_gate_met_floor_does_not_fire() {
+        let body = r#"{"found":true,"paid_acu":"0","min_supported_version":"0.0.0"}"#;
+        assert!(parse_credit_envelope(body).upgrade_required().is_none());
+    }
+
+    /// The product-token constant is `alice-miner/<version>` — the stable fleet token
+    /// the server floors on (and whose absence marks the pre-0.6.0 fleet).
+    #[test]
+    fn client_product_ua_is_versioned_product_token() {
+        assert!(CLIENT_PRODUCT_UA.starts_with("alice-miner/"));
+        assert_eq!(CLIENT_PRODUCT_UA, format!("alice-miner/{CLIENT_VERSION}"));
     }
 
     #[test]

@@ -898,6 +898,8 @@ fn pose_dashboard_m5_confirmed(app: &mut MinerApp) {
                 },
             ],
         },
+        // Credit-only phase in this pose (payout not yet live).
+        payout: None,
     };
 }
 

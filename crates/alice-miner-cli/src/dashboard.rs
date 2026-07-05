@@ -719,12 +719,20 @@ pub fn render_credit_line(credit: &CreditState) -> Option<String> {
             tr!("credited (cumulative)", "已计入(累计)"),
             tr!("syncing… (credit-only)", "同步中 (credit-only)")
         )),
+        // The upgrade gate: a calm one-liner pointing at the newer client. (The
+        // headless `start` loop surfaces the full CTA separately; this keeps the
+        // status block coherent.)
+        CreditState::UpgradeRequired { min_supported, download_url } => Some(format!(
+            "    {}: {} v{min_supported}+ · {download_url}\n",
+            tr!("credited (cumulative)", "已计入(累计)"),
+            tr!("update required —", "需要升级 —"),
+        )),
         CreditState::Error { reason } => Some(format!(
             "    {}: — · {} (credit-only)\n",
             tr!("credited (cumulative)", "已计入(累计)"),
             reason.message()
         )),
-        CreditState::Confirmed { totals, .. } => {
+        CreditState::Confirmed { totals, payout, .. } => {
             let alpha = totals.accepted_for_lane(LANE_KEY_GPU_ALPHA);
             let prl = totals.accepted_for_lane(LANE_KEY_GPU_PRL);
             // The GPU·Alpha / GPU·PRL split is shown only when the server reports
@@ -734,7 +742,7 @@ pub fn render_credit_line(credit: &CreditState) -> Option<String> {
             } else {
                 String::new()
             };
-            Some(format!(
+            let mut line = format!(
                 "    {}: {} {} (24h {}){} · {}\n",
                 tr!("credited (cumulative)", "已计入(累计)"),
                 totals.accepted_total,
@@ -742,9 +750,38 @@ pub fn render_credit_line(credit: &CreditState) -> Option<String> {
                 totals.accepted_24h,
                 split,
                 reward_credit(),
-            ))
+            );
+            // v0.6.0: once real-money payout is live, append an honest settled/paid
+            // line with the explorer self-verify hint. In the credit-only phase
+            // (`payout` is None) nothing extra is shown.
+            if let Some(p) = payout {
+                line.push_str(&render_payout_line(p));
+            }
+            Some(line)
         }
     }
+}
+
+/// The public explorer deep-link (PUBLIC apex — never an internal/core host). The
+/// GUI keeps its own copy in `ui::strings`; the CLI presentation layer is deliberately
+/// separate, so the same canonical URL is restated here for the payout self-verify hint.
+const EXPLORER_URL: &str = "https://aliceprotocol.org/explorer.html";
+
+/// Render the v0.6.0 real-money **payout** line for a confirmed, payout-live state:
+/// the settled / paid ALICE figures (as reported by the server; `—` where absent),
+/// plus the explorer self-verify link so the miner can confirm against the chain.
+/// This is only ever called with a [`PayoutView`] built from a self-consistent
+/// envelope (payout rails on, figures finite & non-negative).
+fn render_payout_line(p: &alice_miner_core::PayoutView) -> String {
+    let fmt = |v: Option<f64>| v.map(|x| format!("{x}")).unwrap_or_else(|| "—".to_string());
+    format!(
+        "    {}: settled {} · paid {} ALICE · {} {}\n",
+        tr!("payout (live)", "发放(已开通)"),
+        fmt(p.settled_alice),
+        fmt(p.paid_alice),
+        tr!("verify on explorer:", "在浏览器核对:"),
+        EXPLORER_URL,
+    )
 }
 
 /// The warm-up an uptime must pass before a 0-credited / hashing-but-not-landing
@@ -1587,6 +1624,7 @@ mod tests {
                     },
                 ],
             },
+            payout: None,
         }
     }
 
@@ -1621,6 +1659,7 @@ mod tests {
         let zero_credited = CreditState::Confirmed {
             score: CreditScore::new(0.0),
             totals: CreditTotals::default(), // accepted_24h = 0
+            payout: None,
         };
         let note = render_credited_vs_raw_note(&s, &zero_credited).expect("divergence note");
         assert!(note.contains("credited 0 < raw"), "names the divergence: {note}");
@@ -1655,6 +1694,7 @@ mod tests {
         let credited = CreditState::Confirmed {
             score: CreditScore::new(0.0),
             totals: CreditTotals { accepted_total: 50, accepted_24h: 12, lanes: vec![] },
+            payout: None,
         };
         assert!(render_credited_vs_raw_note(&hashing, &credited).is_none(), "credited>0 → quiet");
 
@@ -1664,6 +1704,7 @@ mod tests {
         let zero = CreditState::Confirmed {
             score: CreditScore::new(0.0),
             totals: CreditTotals::default(),
+            payout: None,
         };
         assert!(render_credited_vs_raw_note(&warming, &zero).is_none(), "warm-up → quiet");
 
@@ -1681,6 +1722,7 @@ mod tests {
         let zero = CreditState::Confirmed {
             score: CreditScore::new(0.0),
             totals: CreditTotals::default(),
+            payout: None,
         };
         let line = render_credit_line(&zero).expect("confirmed-zero renders");
         assert!(line.contains("credited (cumulative): 0 shares"), "real 0: {line}");
@@ -1704,10 +1746,11 @@ mod tests {
         assert!(!err.contains("shares"), "no count on an errored fetch: {err}");
     }
 
-    /// The dropped-value guard at the RENDER layer: a `paid_acu != "0"` envelope
-    /// parsed through the client lands as `Error` and the render shows NO number.
+    /// The dropped-value guard at the RENDER layer: a CONTRADICTORY payout envelope
+    /// (non-zero `paid_acu`, rails OFF) parsed through the client lands as `Error` and
+    /// the render shows NO number.
     #[test]
-    fn credit_line_drops_paid_acu_violation() {
+    fn credit_line_drops_inconsistent_payout() {
         let state = alice_miner_core::dashboard::parse_credit_envelope(
             r#"{"found":true,"paid_acu":"9.9","summary":{"pending_alice":5.0,"accepted_shares_total":1000}}"#,
         );
@@ -1716,9 +1759,44 @@ mod tests {
         assert!(!line.contains("1000"), "dropped count must not render: {line}");
         assert!(!line.contains("shares"), "no count on a withheld response: {line}");
         let lower = line.to_lowercase();
-        for forbidden in ["$", "paid", "earned", "9.9", "5.0"] {
+        for forbidden in ["$", "earned", "9.9", "5.0"] {
             assert!(!lower.contains(forbidden), "withheld value leaked `{forbidden}`: {line}");
         }
+    }
+
+    /// v0.6.0 payout-aware render: a CONSISTENT payout envelope (non-zero `paid_acu`
+    /// WITH the rails on) renders the credit counts AND an honest settled/paid line
+    /// with the explorer self-verify link — the real numbers ARE shown (that is the
+    /// point of payout-awareness), but only the server's own settled/paid figures.
+    #[test]
+    fn credit_line_renders_live_payout() {
+        let state = alice_miner_core::dashboard::parse_credit_envelope(
+            r#"{"found":true,"paid_acu":"33.5","payout_executor_enabled":true,
+                "summary":{"settled_alice":33.5,"paid_alice":30.0,"accepted_shares_total":873,"accepted_shares_24h":142}}"#,
+        );
+        let line = render_credit_line(&state).unwrap();
+        // The credit counts still render.
+        assert!(line.contains("873"), "counts still render alongside payout: {line}");
+        // The payout line surfaces the server's settled/paid ALICE figures.
+        assert!(line.contains("settled 33.5"), "settled figure shown: {line}");
+        assert!(line.contains("paid 30"), "paid figure shown: {line}");
+        // And points the miner at the explorer to self-verify.
+        assert!(line.contains(EXPLORER_URL), "explorer self-verify link present: {line}");
+    }
+
+    /// v0.6.0 upgrade gate render: an `UpgradeRequired` state renders a clear
+    /// "update required" line naming the minimum version + download URL — never a count.
+    #[test]
+    fn credit_line_renders_upgrade_required() {
+        let state = alice_miner_core::dashboard::parse_credit_envelope(
+            r#"{"found":true,"paid_acu":"0","min_supported_version":"999.0.0",
+                "client_download_url":"https://example.test/dl"}"#,
+        );
+        let line = render_credit_line(&state).unwrap();
+        assert!(line.to_lowercase().contains("update required"), "names the gate: {line}");
+        assert!(line.contains("999.0.0"), "names the required version: {line}");
+        assert!(line.contains("https://example.test/dl"), "names the download URL: {line}");
+        assert!(!line.contains("shares"), "no count on an upgrade gate: {line}");
     }
 
     // ── Piece 3: the 15% PRL 返还 (credit-only) dashboard line ──────────────────

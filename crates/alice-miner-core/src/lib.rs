@@ -71,8 +71,8 @@ pub(crate) static IDENTITY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::ne
 pub use dashboard::{
     fetch_balance_lookup, parse_balance_lookup, BalanceLookup, CreditError, CreditScore,
     CreditSource, CreditState, CreditTotals, DashboardModel, LaneActivity, LaneCredit,
-    LocalActivity, PoolStatsClient, PrlRebateView, Reconciliation, ENV_CHAIN_RPC_URL,
-    LANE_KEY_GPU_ALPHA, LANE_KEY_GPU_PRL,
+    LocalActivity, PayoutView, PoolStatsClient, PrlRebateView, Reconciliation, CLIENT_PRODUCT_UA,
+    CLIENT_VERSION, ENV_CHAIN_RPC_URL, LANE_KEY_GPU_ALPHA, LANE_KEY_GPU_PRL, RELEASES_PAGE_DEFAULT,
 };
 pub use detect::capability::{CapabilityProfile, LaneSupport, LaneViability};
 pub use detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
