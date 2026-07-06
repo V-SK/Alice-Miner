@@ -281,8 +281,10 @@ pub fn ensure_cached_engine_with_progress(
         }
     })?;
 
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("cannot create engine cache {}: {e}", dir.display()))?;
+    ensure_cache_dir(&dir)?;
+    // Opportunistically clear any stale rename-aside / partial files a previous
+    // (esp. Windows, running-exe) install may have left behind.
+    sweep_stale_installs(&dir);
 
     // Fetch + verify ENTIRELY before touching the destination path.
     let verified_bytes = match spec {
@@ -315,6 +317,49 @@ pub fn ensure_cached_engine_with_progress(
         format!("{e}\n(the freshly-installed engine failed re-verification; removed)")
     })?;
     Ok(dest)
+}
+
+/// Idempotently ensure the engine cache directory exists.
+///
+/// `std::fs::create_dir_all` is *supposed* to be a no-op when the directory is
+/// already present, but on Windows it can still surface `ERROR_ALREADY_EXISTS`
+/// (os error 183) — e.g. a benign race where a concurrent miner process created
+/// the same tree between our existence check and the syscall, or a quirk of the
+/// Win32 `CreateDirectory` path. A real Windows tester hit exactly this:
+/// `cannot create engine cache C:\Users\...\AppData\Local\AliceMiner\engines\
+/// x86_64-pc-windows-msvc` — even though the directory was already there. Treat
+/// "it already exists as a directory" as success (which is what the caller
+/// wanted), and only fail when the path is genuinely unusable: it exists as a
+/// FILE (a component collision), or `create_dir_all` failed for another reason
+/// AND the directory still isn't there afterwards.
+fn ensure_cache_dir(dir: &Path) -> Result<(), String> {
+    match std::fs::create_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Post-condition check: regardless of the error, if a directory now
+            // exists at `dir` the goal is met. `metadata` follows symlinks, so a
+            // symlink-to-directory also counts (the per-user cache is trusted; the
+            // download path itself uses O_EXCL for defence-in-depth).
+            match std::fs::metadata(dir) {
+                Ok(meta) if meta.is_dir() => Ok(()),
+                Ok(_) => Err(match crate::i18n::lang() {
+                    // A non-directory (a file) sits where the cache dir must be.
+                    // create_dir_all can't fix this; the user must remove it.
+                    crate::i18n::Lang::En => format!(
+                        "cannot create engine cache {}: a file already exists at that path \
+                         (remove or rename it, then start mining again).",
+                        dir.display()
+                    ),
+                    crate::i18n::Lang::Zh => format!(
+                        "无法创建引擎缓存 {}:该路径上已存在一个同名文件\
+                         (请删除或重命名后再开始挖矿)。",
+                        dir.display()
+                    ),
+                }),
+                Err(_) => Err(format!("cannot create engine cache {}: {e}", dir.display())),
+            }
+        }
+    }
 }
 
 /// Verify `bytes` hash to the expected lowercase-hex SHA-256, or a clear error
@@ -441,11 +486,79 @@ fn cache_install_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), Str
             .output();
     }
 
-    std::fs::rename(&tmp, dest).map_err(|e| {
+    install_rename(dir, &tmp, dest).inspect_err(|_e| {
         let _ = std::fs::remove_file(&tmp);
-        format!("installing engine to {}: {e}", dest.display())
     })?;
     Ok(())
+}
+
+/// Rename the verified temp file over `dest` atomically, tolerating the Windows
+/// "the destination .exe is currently running" case.
+///
+/// On Unix `rename(2)` replaces an in-use binary transparently (the running
+/// process keeps its open inode), so a single rename is enough. On Windows a
+/// plain `MoveFileEx(REPLACE_EXISTING)` over a `.exe` that is currently executing
+/// fails with `ERROR_ACCESS_DENIED` (5) or `ERROR_SHARING_VIOLATION` (32) — which
+/// is exactly what happens if a previous mining run left the engine process alive
+/// (or a scanner has the file open) while we try to refresh it. Windows *does*
+/// allow renaming a running `.exe` to a NEW name, so we fall back to the classic
+/// rename-aside dance: move the locked `dest` out of the way to a unique
+/// `.old-*` name, then move our fresh binary into `dest`. The stale aside file is
+/// deleted best-effort (it may still be locked by the running process; it will be
+/// removable after that process exits, and `sweep_stale_installs` mops it up).
+fn install_rename(dir: &Path, tmp: &Path, dest: &Path) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ASIDE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    // Fast path: works when dest is absent, or present-and-not-locked (Unix
+    // always; Windows when no process holds the old binary open).
+    match std::fs::rename(tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(_e) if dest.exists() => {
+            // Move the (possibly running/locked) current binary aside, then retry.
+            let base = dest.file_name().and_then(|n| n.to_str()).unwrap_or("engine");
+            let aside = dir.join(format!(
+                ".{base}.old-{}-{}",
+                std::process::id(),
+                ASIDE_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::rename(dest, &aside).map_err(|e| {
+                format!(
+                    "installing engine to {}: could not move the existing binary aside \
+                     (is it still running? stop mining and retry): {e}",
+                    dest.display()
+                )
+            })?;
+            // With dest now free, the fresh binary can take its place.
+            if let Err(e) = std::fs::rename(tmp, dest) {
+                // Roll back so we don't leave the lane with NO binary at all.
+                let _ = std::fs::rename(&aside, dest);
+                return Err(format!("installing engine to {}: {e}", dest.display()));
+            }
+            // Best-effort cleanup; a still-locked aside file is swept later.
+            let _ = std::fs::remove_file(&aside);
+            Ok(())
+        }
+        Err(e) => Err(format!("installing engine to {}: {e}", dest.display())),
+    }
+}
+
+/// Best-effort removal of stale `.old-*` / `.partial-*` files left in the engine
+/// cache dir by a previous install (e.g. a Windows rename-aside whose original
+/// process was still running at cleanup time). Never fails the caller — a file we
+/// still can't delete is simply left for the next sweep. Call opportunistically.
+pub fn sweep_stale_installs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Our temp artifacts are always dot-prefixed with these infixes.
+        if name.starts_with('.') && (name.contains(".old-") || name.contains(".partial-")) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Compute the lowercase-hex SHA-256 of a file on disk (streamed via the audited
@@ -1294,5 +1407,107 @@ mod tests {
         let plain = read_error_message(path, &std::io::Error::from_raw_os_error(2));
         assert!(plain.contains("for integrity check"), "plain path: {plain}");
         assert!(!plain.contains("Add-MpPreference"), "no AV noise for a normal error");
+    }
+
+    /// A unique scratch dir under the OS temp root (never the real cache).
+    fn scratch(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "alice-eng-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// `ensure_cache_dir` creates the tree AND is idempotent — a second call on an
+    /// already-existing directory succeeds (this is the os-error-183 case: on
+    /// Windows `create_dir_all` can report ERROR_ALREADY_EXISTS even though the dir
+    /// is right there; we must treat "already a directory" as success).
+    #[test]
+    fn ensure_cache_dir_is_idempotent() {
+        let dir = scratch("mkidem").join("engines").join("x86_64-pc-windows-msvc");
+        ensure_cache_dir(&dir).expect("first create");
+        assert!(dir.is_dir());
+        // Second call: the directory already exists → must still be Ok, never the
+        // "cannot create engine cache" error the Windows tester saw.
+        ensure_cache_dir(&dir).expect("idempotent second create");
+        let root = dir.ancestors().nth(2).unwrap().to_path_buf();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// If a FILE sits where the cache directory must be, `ensure_cache_dir` returns
+    /// a clear, actionable error (not a silent success, not a raw OS string).
+    #[test]
+    fn ensure_cache_dir_reports_file_collision() {
+        let base = scratch("mkfile");
+        std::fs::create_dir_all(&base).unwrap();
+        let clash = base.join("engines");
+        std::fs::write(&clash, b"not a dir").unwrap();
+        let err = ensure_cache_dir(&clash).expect_err("a file where the dir must be must fail");
+        assert!(
+            err.contains("a file already exists") || err.contains("同名文件"),
+            "clear file-collision message, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `install_rename` replaces an EXISTING destination binary — the core of the
+    /// Windows running-exe fix. We can't lock a file the way a running .exe does on
+    /// this (macOS) host, but we can prove the replace path installs the new bytes
+    /// and leaves no stale `.old-*`/`.partial-*` behind on a normal filesystem.
+    #[test]
+    fn install_rename_replaces_existing_destination() {
+        let dir = scratch("replace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("SRBMiner-MULTI");
+        std::fs::write(&dest, b"OLD ENGINE").unwrap();
+
+        let tmp = dir.join(".SRBMiner-MULTI.partial-test");
+        std::fs::write(&tmp, b"NEW ENGINE").unwrap();
+
+        install_rename(&dir, &tmp, &dest).expect("replace existing");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"NEW ENGINE", "dest holds the new bytes");
+        assert!(!tmp.exists(), "temp consumed by the rename");
+
+        // No stale artifacts left (the fast path handled it; even if it took the
+        // aside path, cleanup + sweep would clear it).
+        sweep_stale_installs(&dir);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.contains(".old-") || n.contains(".partial-")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "no stale .old-/.partial- files: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sweep_stale_installs` removes dot-prefixed `.old-*` / `.partial-*` cruft but
+    /// leaves the real engine binary and unrelated files untouched.
+    #[test]
+    fn sweep_stale_installs_only_removes_our_temps() {
+        let dir = scratch("sweep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = dir.join("xmrig");
+        let stale_old = dir.join(".xmrig.old-1234-0");
+        let stale_partial = dir.join(".xmrig.partial-1234-0");
+        let unrelated = dir.join("readme.txt");
+        for (p, c) in [
+            (&engine, b"real".as_slice()),
+            (&stale_old, b"old"),
+            (&stale_partial, b"part"),
+            (&unrelated, b"keep"),
+        ] {
+            std::fs::write(p, c).unwrap();
+        }
+        sweep_stale_installs(&dir);
+        assert!(engine.exists(), "real engine kept");
+        assert!(unrelated.exists(), "unrelated file kept");
+        assert!(!stale_old.exists(), ".old- swept");
+        assert!(!stale_partial.exists(), ".partial- swept");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
