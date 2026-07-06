@@ -1002,6 +1002,7 @@ fn http_get_credit(url: &str) -> Result<String, String> {
         return Err(format!("refusing non-https read-api url: {url}"));
     }
     let agent = ureq::AgentBuilder::new()
+        .tls_config(alice_release::tls::os_trust_config()) // OS trust store (Windows UnknownIssuer fix)
         .timeout_connect(CREDIT_HTTP_TIMEOUT)
         .timeout_read(CREDIT_HTTP_TIMEOUT)
         .user_agent(concat!("alice-miner-credit/", env!("CARGO_PKG_VERSION")))

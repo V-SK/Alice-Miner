@@ -113,6 +113,175 @@ const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 
 // ────────────────────────────────────────────────────────────────────────────
+// OS trust-store TLS — the single source of truth for every ureq agent in the
+// whole miner (this crate + `alice-miner-core`).
+// ────────────────────────────────────────────────────────────────────────────
+pub mod tls {
+    //! Build the shared rustls client config that validates server certificates
+    //! against the **operating-system trust store** instead of ureq's baked-in
+    //! Mozilla `webpki-roots` snapshot.
+    //!
+    //! Why this exists — the Windows `UnknownIssuer` bug: on machines behind an
+    //! antivirus HTTPS-scanner or corporate SSL-inspection proxy, TLS is
+    //! terminated by a middlebox that re-signs traffic with a private root CA.
+    //! That CA is installed into the Windows system cert store (so browsers and
+    //! the OS trust it), but ureq's default rustls config only trusts the
+    //! Mozilla bundle, so every HTTPS GET fails with
+    //! `invalid peer certificate: UnknownIssuer`. Delegating verification to the
+    //! platform verifier (Windows CryptoAPI / macOS SecTrust / Linux native
+    //! roots) makes the miner trust exactly what the OS already trusts.
+    //!
+    //! Attach the returned config to any agent with
+    //! `ureq::AgentBuilder::new().tls_config(alice_release::tls::os_trust_config())`.
+    //! `https_only(true)` and the transport downgrade guards are unchanged — this
+    //! only swaps *which* roots verify the peer, never whether TLS is required.
+
+    use std::sync::Arc;
+    // Use ureq's re-exported rustls so we build a `ClientConfig` of the exact type
+    // ureq's `tls_config()` expects — no second rustls version is linked.
+    use ureq::rustls;
+
+    use rustls_platform_verifier::BuilderVerifierExt;
+
+    // Build the config once and share it: constructing the platform verifier can
+    // touch the OS keychain/cert store, so we do it lazily and cache the Arc.
+    static OS_TRUST_CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> =
+        std::sync::OnceLock::new();
+
+    /// The process-wide rustls client config that verifies peers against the OS
+    /// trust store. Cheap to clone (it is an `Arc`). Pass straight to
+    /// `AgentBuilder::tls_config`.
+    pub fn os_trust_config() -> Arc<rustls::ClientConfig> {
+        OS_TRUST_CONFIG.get_or_init(build_os_trust_config).clone()
+    }
+
+    fn build_os_trust_config() -> Arc<rustls::ClientConfig> {
+        // Pin the *ring* provider explicitly (ureq's own default does the same)
+        // so this never depends on a process-wide default crypto provider having
+        // been installed — that would make the first HTTPS call panic on some
+        // link configurations.
+        let config = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+        // Safety: the *ring* default provider always configures ciphersuites
+        // compatible with both TLS 1.2 and TLS 1.3.
+        .expect("ring provider supports TLS 1.2 + 1.3")
+        // Delegate chain validation to the OS verifier (honors the corporate /
+        // AV inspection CA that lives in the system trust store).
+        .with_platform_verifier()
+        .with_no_client_auth();
+        Arc::new(config)
+    }
+
+    /// The canonical HTTPS host the miner must reach: engine downloads and the
+    /// signed update manifest both live on GitHub, so a TLS-trust failure here is
+    /// the exact failure the engine download / self-update would hit.
+    pub const PREFLIGHT_URL: &str = "https://github.com/";
+
+    /// Classification of a TLS-trust preflight against an HTTPS host.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum PreflightOutcome {
+        /// The TLS handshake completed and the peer certificate verified against
+        /// the OS trust store. (Any HTTP status counts — we only care that TLS
+        /// itself succeeded.)
+        Ok,
+        /// The peer certificate could NOT be verified — the classic Windows
+        /// `UnknownIssuer`. Almost always an AV HTTPS-scanner / corporate SSL
+        /// inspection proxy whose root CA is not in (this build's view of) the
+        /// trust store. Carries the raw error for the report.
+        TlsUntrusted(String),
+        /// A non-TLS transport failure (DNS, connect refused, timeout, offline).
+        /// Not a trust problem — surfaced separately so we don't cry wolf.
+        Network(String),
+    }
+
+    /// Classify a ureq error string into a [`PreflightOutcome`] variant. Split out
+    /// (string-based, cross-rustls-version) so it can be unit-tested without a
+    /// network. A rustls chain-validation failure surfaces through ureq as a
+    /// connection error whose message contains the rustls `CertificateError`
+    /// (e.g. `invalid peer certificate: UnknownIssuer`).
+    pub fn classify_preflight_error(msg: &str) -> PreflightOutcome {
+        let low = msg.to_ascii_lowercase();
+        let looks_like_cert = low.contains("unknownissuer")
+            || low.contains("invalid peer certificate")
+            || low.contains("invalidcertificate")
+            || (low.contains("certificate") && !low.contains("timed out"))
+            || low.contains("certerror")
+            || low.contains("tls connection init failed");
+        if looks_like_cert {
+            PreflightOutcome::TlsUntrusted(msg.to_string())
+        } else {
+            PreflightOutcome::Network(msg.to_string())
+        }
+    }
+
+    /// Perform a live TLS-trust preflight against `url` (HTTPS) using the OS trust
+    /// store, with a short timeout. Returns how it went so the caller (`doctor`)
+    /// can print a clear, actionable message on an `UnknownIssuer` instead of a
+    /// bare "network error". Diagnostic only — reads nothing sensitive, follows no
+    /// redirect body (we care only about the handshake).
+    pub fn preflight(url: &str, timeout: std::time::Duration) -> PreflightOutcome {
+        let agent = ureq::AgentBuilder::new()
+            .tls_config(os_trust_config())
+            .timeout_connect(timeout)
+            .timeout_read(timeout)
+            .https_only(true)
+            .user_agent(concat!("alice-miner-doctor/", env!("CARGO_PKG_VERSION")))
+            .build();
+        match agent.get(url).call() {
+            // 2xx/3xx — handshake + verification succeeded.
+            Ok(_) => PreflightOutcome::Ok,
+            // A non-2xx HTTP *status* still proves TLS verified (we reached the app
+            // layer). Trust is fine.
+            Err(ureq::Error::Status(_, _)) => PreflightOutcome::Ok,
+            // A transport error: could be TLS-trust (UnknownIssuer) or plain
+            // network. Classify by the message.
+            Err(e @ ureq::Error::Transport(_)) => classify_preflight_error(&e.to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn os_trust_config_builds_and_is_cached() {
+            // Must not panic (provider present, verifier constructible) and must
+            // return the same cached Arc on repeat calls.
+            let a = os_trust_config();
+            let b = os_trust_config();
+            assert!(Arc::ptr_eq(&a, &b), "config should be cached, not rebuilt");
+        }
+
+        #[test]
+        fn classify_flags_unknown_issuer_as_tls_untrusted() {
+            // The exact string a Windows box behind an SSL-inspection proxy sees.
+            let msg = "GET https://github.com/: Connection Failed: tls connection init \
+                       failed: invalid peer certificate: UnknownIssuer";
+            match classify_preflight_error(msg) {
+                PreflightOutcome::TlsUntrusted(_) => {}
+                other => panic!("UnknownIssuer must be TlsUntrusted, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn classify_flags_plain_network_as_network() {
+            for msg in [
+                "GET https://github.com/: Connection Failed: connect: Connection refused",
+                "GET https://github.com/: Dns Failed: failed to lookup address",
+                "GET https://github.com/: Connection Failed: timed out reading response",
+            ] {
+                match classify_preflight_error(msg) {
+                    PreflightOutcome::Network(_) => {}
+                    other => panic!("network error must be Network, got {other:?} for {msg}"),
+                }
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Manifest types — MUST stay byte-compatible with the signer (the signature is
 // over the exact serialized bytes of `latest.json`).
 // ────────────────────────────────────────────────────────────────────────────
@@ -381,6 +550,9 @@ pub fn evaluate(manifest: Manifest, current: &str) -> CheckOutcome {
 
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
+        // Verify against the OS trust store, not ureq's Mozilla-only default, so
+        // corporate/AV SSL-inspection CAs are honored (Windows UnknownIssuer fix).
+        .tls_config(tls::os_trust_config())
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(MANIFEST_READ_TIMEOUT)
         // Defense-in-depth: refuse plain-HTTP (incl. an http:// redirect target).
@@ -495,6 +667,7 @@ pub fn download_and_verify(artifact: &Artifact) -> Result<Vec<u8>> {
         )));
     }
     let agent = ureq::AgentBuilder::new()
+        .tls_config(tls::os_trust_config()) // OS trust store (Windows UnknownIssuer fix)
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(DOWNLOAD_READ_TIMEOUT)
         .https_only(true) // see agent(): TLS-only download path
@@ -524,6 +697,7 @@ pub fn https_get_capped(url: &str, cap_bytes: u64) -> std::result::Result<Vec<u8
         ));
     }
     let agent = ureq::AgentBuilder::new()
+        .tls_config(tls::os_trust_config()) // OS trust store (Windows UnknownIssuer fix)
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(DOWNLOAD_READ_TIMEOUT)
         .https_only(true) // never silently downgrade off TLS

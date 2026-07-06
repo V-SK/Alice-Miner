@@ -113,6 +113,9 @@ pub fn stage_route(center_url: &str, leaf: &str) -> Result<String, String> {
 
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
+        // Verify against the OS trust store, not ureq's Mozilla-only default, so
+        // corporate/AV SSL-inspection CAs are honored (Windows UnknownIssuer fix).
+        .tls_config(alice_release::tls::os_trust_config())
         .timeout_connect(HTTP_TIMEOUT)
         .timeout_read(HTTP_TIMEOUT)
         .user_agent(concat!("alice-miner-ai/", env!("CARGO_PKG_VERSION")))
@@ -410,6 +413,7 @@ pub fn probe_center_health(center_url: &str) -> Result<String, String> {
     let base = center_url.strip_suffix('/').unwrap_or(center_url);
     let health = format!("{base}/health");
     let agent = ureq::AgentBuilder::new()
+        .tls_config(alice_release::tls::os_trust_config()) // OS trust store (Windows UnknownIssuer fix)
         .timeout_connect(Duration::from_secs(5))
         .timeout_read(Duration::from_secs(5))
         .user_agent(concat!("alice-miner-ai/", env!("CARGO_PKG_VERSION")))

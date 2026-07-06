@@ -22,3 +22,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10.8"
 ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }
+
+# OS trust-store TLS verification. ureq's default rustls config trusts ONLY the
+# baked-in Mozilla `webpki-roots` bundle, which ignores the OS trust store where a
+# corporate SSL-inspection / antivirus HTTPS-scanning proxy installs its own root
+# CA. On such Windows machines every HTTPS GET (engine download, dashboard, enroll)
+# fails with `invalid peer certificate: UnknownIssuer`. Routing every ureq agent
+# through the platform verifier delegates chain validation to the OS (Windows
+# CryptoAPI / macOS SecTrust / Linux native roots) so the inspection CA is honored
+# exactly as the browser/OS already trusts it. See `tls::os_trust_config`. Pinned
+# to the SAME rustls (via ureq's re-export) so no second rustls is linked.
+rustls-platform-verifier = "0.5"

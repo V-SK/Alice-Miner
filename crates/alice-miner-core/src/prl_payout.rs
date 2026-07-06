@@ -339,6 +339,7 @@ fn miner_lookup_url(alice_address: &str) -> Result<String, String> {
 fn fetch_pending_text(alice_address: &str) -> Option<String> {
     let url = miner_lookup_url(alice_address).ok()?;
     let agent = ureq::AgentBuilder::new()
+        .tls_config(alice_release::tls::os_trust_config()) // OS trust store (Windows UnknownIssuer fix)
         .timeout_connect(LOOKUP_TIMEOUT)
         .timeout_read(LOOKUP_TIMEOUT)
         .user_agent(concat!("alice-miner-prl-payout/", env!("CARGO_PKG_VERSION")))

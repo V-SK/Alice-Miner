@@ -229,6 +229,9 @@ fn is_safe_host(host: &str) -> bool {
 
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
+        // Verify against the OS trust store, not ureq's Mozilla-only default, so
+        // corporate/AV SSL-inspection CAs are honored (Windows UnknownIssuer fix).
+        .tls_config(alice_release::tls::os_trust_config())
         .timeout_connect(HTTP_TIMEOUT)
         .timeout_read(HTTP_TIMEOUT)
         .user_agent(concat!("alice-miner-pop/", env!("CARGO_PKG_VERSION")))
