@@ -165,6 +165,7 @@ pub fn run_checks(lane: Lane, cap: &CapabilityProfile) -> Vec<Check> {
         check_engine(lane),
         check_keyring(lane),
         check_relay(lane),
+        check_tls_trust(),
     ];
     checks.extend(platform_guardrails());
     checks
@@ -455,6 +456,65 @@ fn check_relay(lane: Lane) -> Check {
             tr!(
                 "check your network / firewall (the stratum port must be reachable outbound); a VPN or captive portal can block it",
                 "请检查网络 / 防火墙(stratum 端口必须可出站访问);VPN 或强制门户网络可能会拦截它"
+            ),
+        ),
+    }
+}
+
+/// TLS-trust preflight: actually complete an HTTPS handshake to the engine-download
+/// host (GitHub) using the OS trust store. This is the check that turns the field
+/// bug "engine download fails with `invalid peer certificate: UnknownIssuer`" into a
+/// plain-English diagnosis. On a machine behind an antivirus HTTPS-scanner or a
+/// corporate SSL-inspection proxy, TLS is re-signed by a private root CA; if that CA
+/// isn't honored, the handshake fails here exactly as the download would. We name the
+/// likely cause and the fix instead of a bare "network error". An OFFLINE box (plain
+/// transport failure) is only a WARN — that's not a trust problem.
+fn check_tls_trust() -> Check {
+    use alice_miner_core::alice_release::tls::{self, PreflightOutcome};
+    const NAME: &str = "TLS trust (engine download)";
+    let host = tls::PREFLIGHT_URL;
+    match tls::preflight(host, Duration::from_secs(8)) {
+        PreflightOutcome::Ok => Check::pass(
+            NAME,
+            format!(
+                "{} {host}",
+                tr!(
+                    "HTTPS certificate verified against the OS trust store for",
+                    "已针对系统证书库验证 HTTPS 证书:"
+                )
+            ),
+        ),
+        // The load-bearing case: the cert chain did NOT verify. Almost always an
+        // AV HTTPS-scanner / corporate SSL-inspection proxy whose root CA the miner
+        // isn't trusting. FAIL with the exact cause + how to fix it.
+        PreflightOutcome::TlsUntrusted(err) => Check::fail(
+            NAME,
+            format!(
+                "{} {host}: {err}",
+                tr!(
+                    "the HTTPS certificate could NOT be verified for",
+                    "无法验证以下地址的 HTTPS 证书:"
+                )
+            ),
+            tr!(
+                "this is almost always antivirus HTTPS-scanning or a corporate SSL-inspection proxy re-signing traffic with its own root CA (the `UnknownIssuer` error). This build now validates against the OS trust store, so: (1) make sure the inspection root CA is installed in the SYSTEM certificate store (Windows: certlm.msc → Trusted Root Certification Authorities); (2) if you use a proxy, allow github.com / objects.githubusercontent.com through it; (3) or, on a managed machine, ask IT to exempt the Alice miner from HTTPS inspection. If none apply and the site is really untrusted, do NOT bypass — report it.",
+                "这几乎总是杀毒软件的 HTTPS 扫描或公司的 SSL 检查代理用自己的根 CA 重新签名流量(即 `UnknownIssuer` 错误)。本版本现在会针对系统证书库校验,因此:(1) 确认检查用的根 CA 已安装到\"系统\"证书库(Windows:certlm.msc →\"受信任的根证书颁发机构\");(2) 若使用代理,请在代理中放行 github.com / objects.githubusercontent.com;(3) 或在受管设备上请 IT 将 Alice 矿工排除在 HTTPS 检查之外。若都不适用且该站点确实不可信,请勿绕过,应上报。"
+            ),
+        ),
+        // Offline / DNS / connect-refused — not a trust issue. WARN (the engine may
+        // already be cached; start will retry when the network returns).
+        PreflightOutcome::Network(err) => Check::warn(
+            NAME,
+            format!(
+                "{} {host}: {err}",
+                tr!(
+                    "could not reach the engine-download host to test TLS trust",
+                    "无法连接引擎下载主机以测试 TLS 信任:"
+                )
+            ),
+            tr!(
+                "this is a network reachability problem, not a certificate problem — check your connection / firewall / proxy. If the engine is already cached, mining still works offline; the download (and this test) will succeed once the network is back.",
+                "这是网络可达性问题,而非证书问题 — 请检查你的连接 / 防火墙 / 代理。如果引擎已缓存,离线也能挖矿;网络恢复后下载(及此项检测)即可成功。"
             ),
         ),
     }
@@ -1412,6 +1472,7 @@ mod tests {
         assert!(names.contains(&"engine"));
         assert!(names.contains(&"keyring (background GPU)"));
         assert!(names.contains(&"relay reachability"));
+        assert!(names.contains(&"TLS trust (engine download)"));
         // Every check has a non-empty detail, and any non-Pass/Skip carries a fix.
         for c in &checks {
             assert!(!c.detail.is_empty(), "{} has no detail", c.name);
@@ -1457,6 +1518,36 @@ mod tests {
         // PRL lane: Pass or Warn depending on the box, but NEVER Fail (foreground ok).
         let k = check_keyring(Lane::GpuPrl);
         assert!(matches!(k.status, Status::Pass | Status::Warn), "got {:?}", k.status);
+    }
+
+    /// The TLS-trust preflight always yields a well-formed check: it names the
+    /// area, and if it is not a PASS it carries an actionable fix. On a
+    /// TlsUntrusted outcome the fix must name the AV/SSL-inspection cause; we can't
+    /// force that outcome without a MITM here, so we assert the invariant that holds
+    /// for whatever the box actually returns (Pass on a clean net, Warn if offline,
+    /// Fail behind an untrusted inspection proxy). Never a machine fix-action.
+    #[test]
+    fn tls_trust_check_is_well_formed() {
+        let c = check_tls_trust();
+        assert_eq!(c.name, "TLS trust (engine download)");
+        assert!(!c.detail.is_empty(), "detail present");
+        assert!(matches!(c.status, Status::Pass | Status::Warn | Status::Fail));
+        if matches!(c.status, Status::Fail | Status::Warn) {
+            assert!(!c.fix.is_empty(), "non-pass must carry a fix");
+        }
+        // A cert-trust FAIL must name the actual cause + fix so the user isn't left
+        // with a bare "network error".
+        if c.status == Status::Fail {
+            let low = c.fix.to_ascii_lowercase();
+            assert!(
+                low.contains("ssl-inspection") || low.contains("antivirus") || low.contains("root ca"),
+                "TLS FAIL must explain the AV/SSL-inspection cause: {}",
+                c.fix
+            );
+        }
+        // Never auto-fixable — it's an environment/trust condition, not a file we
+        // can safely rewrite.
+        assert!(c.fix_action.is_none(), "TLS trust must not carry a machine fix");
     }
 
     /// The rendered report (human + json) is CREDIT-ONLY and secret-free: no
