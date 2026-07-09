@@ -207,6 +207,21 @@ pub fn run(cfg: SetupConfig, no_color: bool) -> i32 {
         return EXIT_OK;
     }
 
+    // A one-line difficulty explainer — takes "difficulty" out of the miner's
+    // mental model before the first run. The server auto-matches the workload to
+    // the device (vardiff on XMR/LTC, fixed on PRL — one sentence either way); a
+    // miner's share tracks hashpower over a rolling ~24h average, not raw submitted
+    // shares, so an occasional stale/rejected share doesn't change what they earn.
+    println!(
+        "\n{}",
+        tr!(
+            "No difficulty to set — the server matches the workload to your device automatically. \
+Your reward tracks your share of hashpower (a rolling ~24h average), not how many shares you submit.",
+            "无需设置难度 —— 服务端会自动把工作量匹配到你的设备。\
+你的奖励取决于你的算力份额(近 24 小时滚动平均),而不是你提交了多少 share。"
+        )
+    );
+
     // (5) Start (or stop here) + (6) point at the live dashboard.
     match start_choice(&cfg) {
         StartChoice::No => {

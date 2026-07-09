@@ -32,6 +32,18 @@ pub const FOOTER_LINE_2: &str = "Payout, settlement & on-chain transfer stay gat
 /// The "hashing" sub-label shown under the live hashrate number while mining.
 pub const HASHING_SUB: &str = "hashing · 待发放";
 
+/// The difficulty explainer — one honest line that removes "difficulty" from the
+/// miner's mental model. There is nothing to configure: the server matches the
+/// workload to the device automatically (vardiff on XMR/LTC, a fixed difficulty
+/// on PRL — one sentence for the miner either way), and a contributor's share
+/// tracks hashpower, not raw submitted-share count. Number-free + reward-neutral
+/// (no `$`/`paid`/`earned`), so it clears the honesty gate. Bilingual.
+pub const DIFFICULTY_EXPLAINER: &str =
+    "No difficulty to set — Alice matches the workload to your device automatically. \
+     Your share tracks your hashpower, not how many shares you submit. \
+     · 无需设置难度 —— Alice 会自动把工作量匹配到你的设备;你的份额取决于你的算力,\
+     而非你提交了多少 share。";
+
 /// Idle hero CTA + its sub-line.
 pub const CTA_START: &str = "START";
 pub const CTA_START_SUB: &str = "press to begin · 点击开始";
