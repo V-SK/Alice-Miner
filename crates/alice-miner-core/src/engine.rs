@@ -38,6 +38,28 @@ fn alpha_pop_disabled() -> bool {
         .map(|v| v.trim() == "0")
         .unwrap_or(false)
 }
+
+/// Whether the CPU-XMR lane must prove possession of the reward Alice key before it
+/// is credited: `ALICE_XMR_REQUIRE_POP=1` (any of `1`/`true`/`yes`/`on`). **Default
+/// OFF** — this MIRRORS the transport gate `ALICE_ACP_STRATUM_REQUIRE_POP` (also
+/// default OFF): a stock xmrig cannot fetch+sign a challenge, so a client that turns
+/// PoP on before the transport does (or vice-versa) must NOT hard-break the lane.
+/// The two flags are flipped together at the announcement-arming window.
+///
+/// WHY THE CLIENT NEEDS A FLAG AT ALL. xmrig speaks only stock stratum (`-u`/`-p`)
+/// and cannot do an HTTP challenge round-trip itself. So the *client process* fetches
+/// the challenge, signs it with the wallet key, and enrolls the `(address, device)`
+/// pair OUT OF BAND into the transport's OOB allowlist (`/m4/verify`) — exactly the
+/// GPU-Alpha pattern (which keeps the miner's `-p x` and relies on the OOB allowlist +
+/// a refresh task). With the flag OFF this whole path is skipped and the XMR lane is
+/// byte-for-byte its pre-PoP self (`-p x`, no key needed, address-only).
+fn xmr_pop_required() -> bool {
+    std::env::var("ALICE_XMR_REQUIRE_POP")
+        .map(|v| {
+            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
 use crate::supervise::LaneSupervisor;
 
 /// How a [`Command::Identity`] establishes the reward identity.
@@ -520,7 +542,17 @@ fn worker_loop(rt: Arc<Runtime>, cmd_rx: Receiver<Command>, evt_tx: Sender<Event
                 // (GpuPrl OR GpuAlpha), and for a dual-mine whose GPU partner is a
                 // pearlhash lane (anything but an explicit RVN selection). One shared
                 // rule with the GUI modal + CLI prompt so the three can never drift.
-                let prl_in_play = lane.start_needs_unlock(dual);
+                // The signing key is needed when EITHER a pearlhash lane will run
+                // (GPU-PRL / GPU-Alpha, single or as a dual partner) OR the CPU-XMR
+                // lane will run with PoP enabled (`ALICE_XMR_REQUIRE_POP=1`). The XMR
+                // lane runs whenever XMR is the selection OR a dual run is requested
+                // (dual always pairs CPU-XMR with a GPU lane), so a dual run keyed on a
+                // pearlhash partner already unlocks — the extra XMR clause only matters
+                // for a SINGLE `--lane xmr` start under the PoP flag. Default OFF ⇒ this
+                // clause is inert and the XMR lane stays address-only.
+                let xmr_will_run = lane == Lane::Xmr || dual;
+                let xmr_pop_in_play = xmr_will_run && xmr_pop_required();
+                let prl_in_play = lane.start_needs_unlock(dual) || xmr_pop_in_play;
                 let secrets = if prl_in_play {
                     match resolve_prl_secrets(unlock_password.as_deref()) {
                         Ok(s) => Some(s),
@@ -744,8 +776,21 @@ fn start_run(
         let xmr_threads = dual_xmr_threads(cores);
         // CPU-XMR ignores GPU selection (pass All); the GPU partner (PRL mainline,
         // or RVN if explicitly selected) honors it and is threaded its PoP `secrets`.
-        let (xmr_sup, _) =
-            start_one_lane(Lane::Xmr, address, Some(xmr_threads), None, &GpuSelection::All)?;
+        // XMR-lane PoP (`ALICE_XMR_REQUIRE_POP=1`, default OFF) also needs the signing
+        // key: thread a clone into the XMR lane in that case (the GPU partner keeps its
+        // own clone below). With the flag OFF the XMR lane stays address-only (`None`).
+        let xmr_secrets = if xmr_pop_required() {
+            secrets.clone()
+        } else {
+            None
+        };
+        let (xmr_sup, _) = start_one_lane(
+            Lane::Xmr,
+            address,
+            Some(xmr_threads),
+            xmr_secrets,
+            &GpuSelection::All,
+        )?;
         let (gpu_sup, prl_enroll) = match start_one_lane(gpu_lane, address, None, secrets, gpus) {
             Ok(s) => s,
             Err(e) => {
@@ -829,17 +874,60 @@ fn start_one_lane(
     // engine is picked up; the honesty invariant holds (relay-only endpoints).
     let addr_for_rebuild = address.clone();
     let rebuild: crate::supervise::RebuildFn = match lane {
-        Lane::Xmr => Arc::new(move |eps: &[Endpoint]| {
-            let program =
-                crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::CpuXmr)?;
-            let p = xmr::build_miner_launch_plan_with_endpoints(
-                program,
-                &addr_for_rebuild,
-                eps,
-                threads_override,
-            )?;
-            Ok((p.program, p.args))
-        }),
+        Lane::Xmr => {
+            // XMR-lane PoP (mirror of GPU-Alpha's OOB pattern). xmrig speaks only
+            // stock stratum and cannot fetch+sign a challenge itself, so when PoP is
+            // enabled (`ALICE_XMR_REQUIRE_POP=1`, default OFF) the CLIENT does the M4
+            // handshake OUT OF BAND on every (re)build — including a Layer-B failover
+            // to a different region — and enrolls the `(address, device)` pair into the
+            // transport's OOB allowlist (`/m4/verify`). The miner's own `-p` stays the
+            // conventional `x`: the relay authorizes the token-less wallet login because
+            // the pair is already PoP-proven on the allowlist. `secrets` is threaded in
+            // (Some only when the Start handler unlocked the key for this run); a missing
+            // key with PoP required is a programming error (the handler guarantees it).
+            let xmr_pop = xmr_pop_required();
+            let secrets_xmr = secrets.clone();
+            let addr_xmr = addr_for_rebuild.clone();
+            Arc::new(move |eps: &[Endpoint]| {
+                if xmr_pop {
+                    let Some(active) = eps.first() else {
+                        return Err("xmr launch plan needs at least one endpoint".into());
+                    };
+                    let Some(secrets) = secrets_xmr.as_ref() else {
+                        return Err(
+                            "internal: XMR lane started with PoP required but no unlocked \
+                             signing key"
+                                .into(),
+                        );
+                    };
+                    // device_id == the stratum worker suffix the login presents, so the
+                    // OOB allowlist key `(address, device_id)` matches what `mining.authorize`
+                    // is checked against (the same contract the pearlhash lanes use).
+                    let device_id = xmr::derive_worker_id(&addr_xmr)?;
+                    // Region-bound OOB enroll: the token is minted+verified against the
+                    // ACTIVE endpoint's host (control plane `https://<host>/m4/challenge`,
+                    // port-free). A failure fails the build closed — under the relay's
+                    // REQUIRE_POP a token-less, un-enrolled login earns nothing, so there is
+                    // no point launching xmrig without the allowlist entry in place.
+                    let _token = crate::pop::establish_pop(
+                        &active.host,
+                        &addr_xmr,
+                        &device_id,
+                        secrets,
+                        None,
+                    )?;
+                }
+                let program =
+                    crate::binaries::resolve_miner_binary(crate::binaries::MinerKind::CpuXmr)?;
+                let p = xmr::build_miner_launch_plan_with_endpoints(
+                    program,
+                    &addr_for_rebuild,
+                    eps,
+                    threads_override,
+                )?;
+                Ok((p.program, p.args))
+            })
+        }
         Lane::GpuRvn => {
             let gpus_rvn = gpus.clone();
             Arc::new(move |eps: &[Endpoint]| {
@@ -1001,6 +1089,19 @@ fn start_one_lane(
                 spawn_pop_refresh_task(sup.clone(), address.clone(), secrets);
             }
             prl_enroll = Some(status);
+        }
+    } else if lane == Lane::Xmr && xmr_pop_required() {
+        // XMR-lane PoP refresh (mirror of the pearlhash lanes' T4-item-5 task). The
+        // transport drops a proven (address, device) from its OOB allowlist after the
+        // OOB TTL (short-TTL in-memory path, or the durable 7d store) without a
+        // re-verify; the refresh task re-runs the OOB handshake for the lane's CURRENT
+        // region before the TTL lapses so a long-running xmrig is never silently
+        // de-credited. Only when PoP is enabled AND the key was unlocked (the Start
+        // handler guarantees `secrets` is Some in that case); otherwise the XMR lane is
+        // address-only and there is no allowlist entry to refresh. No payout-enroll for
+        // XMR (it is not a 15%-PRL lane), so no `prl_enroll` status is produced here.
+        if let Some(secrets) = secrets {
+            spawn_pop_refresh_task(sup.clone(), address.clone(), secrets);
         }
     }
     Ok((sup, prl_enroll))
@@ -1699,5 +1800,90 @@ mod tests {
         std::env::remove_var("ALICE_MINER_GPU_BIN");
         std::env::remove_var(crate::binaries::ALLOW_UNVERIFIED_ENV);
         let _ = std::fs::remove_file(&stub);
+    }
+
+    // ── XMR-lane PoP gate (subtask C6) ──────────────────────────────────────────
+    // Process env is global and cargo runs tests on parallel threads; serialize
+    // every test that mutates ALICE_XMR_REQUIRE_POP through one lock so two tests
+    // can never observe each other's mid-flight override.
+    static XMR_POP_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_xmr_pop_env(value: Option<&str>, f: impl FnOnce()) {
+        let _g = XMR_POP_ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("ALICE_XMR_REQUIRE_POP").ok();
+        match value {
+            Some(v) => std::env::set_var("ALICE_XMR_REQUIRE_POP", v),
+            None => std::env::remove_var("ALICE_XMR_REQUIRE_POP"),
+        }
+        f();
+        match prev {
+            Some(v) => std::env::set_var("ALICE_XMR_REQUIRE_POP", v),
+            None => std::env::remove_var("ALICE_XMR_REQUIRE_POP"),
+        }
+    }
+
+    #[test]
+    fn xmr_pop_required_defaults_off_and_reads_the_flag() {
+        // DEFAULT OFF (unset) — mirrors the transport gate default, so a client that
+        // upgrades before the transport flips PoP never hard-breaks the XMR lane.
+        with_xmr_pop_env(None, || assert!(!xmr_pop_required()));
+        // The truthy set matches the codebase convention {1,true,yes,on} (case-insensitive).
+        for on in ["1", "true", "TRUE", "yes", "On"] {
+            with_xmr_pop_env(Some(on), || {
+                assert!(xmr_pop_required(), "`{on}` should enable XMR PoP")
+            });
+        }
+        // Everything else (incl. the explicit off values / garbage) leaves it OFF —
+        // a typo can never silently enable PoP and lock a stock rig out.
+        for off in ["0", "false", "no", "off", "", "  ", "garbage"] {
+            with_xmr_pop_env(Some(off), || {
+                assert!(!xmr_pop_required(), "`{off}` must NOT enable XMR PoP")
+            });
+        }
+    }
+
+    /// The signing key is unlocked for an XMR start IFF XMR PoP is required (else the
+    /// XMR lane stays address-only). This is the `prl_in_play` decision the Start
+    /// handler makes; assert it directly against the gate so the key-unlock and the
+    /// lane's OOB handshake can never drift (a PoP-on lane with no key would fail the
+    /// rebuild closed). GPU/pearlhash lanes are covered by `start_needs_unlock` tests.
+    #[test]
+    fn single_xmr_start_unlocks_key_only_when_pop_required() {
+        let lane = Lane::Xmr;
+        let dual = false;
+        with_xmr_pop_env(None, || {
+            let xmr_pop_in_play = (lane == Lane::Xmr || dual) && xmr_pop_required();
+            let prl_in_play = lane.start_needs_unlock(dual) || xmr_pop_in_play;
+            assert!(!prl_in_play, "XMR is address-only with PoP OFF");
+        });
+        with_xmr_pop_env(Some("1"), || {
+            let xmr_pop_in_play = (lane == Lane::Xmr || dual) && xmr_pop_required();
+            let prl_in_play = lane.start_needs_unlock(dual) || xmr_pop_in_play;
+            assert!(prl_in_play, "XMR needs the key with PoP ON");
+        });
+    }
+
+    /// A dual-mine run always pairs CPU-XMR with a GPU lane, so the GPU partner's
+    /// unlock already keys it; the XMR-PoP clause must not REGRESS a dual run's
+    /// unlock (it stays ON regardless of the XMR flag) — and turning XMR PoP on for a
+    /// dual whose partner is address-only RVN still unlocks (for the XMR leg).
+    #[test]
+    fn dual_run_unlock_is_stable_under_xmr_pop_flag() {
+        // CPU-XMR selection → PRL partner already unlocks; XMR flag is orthogonal.
+        with_xmr_pop_env(None, || {
+            assert!(Lane::Xmr.start_needs_unlock(true));
+        });
+        // Explicit RVN dual partner is address-only (no unlock) with XMR PoP OFF …
+        with_xmr_pop_env(None, || {
+            let lane = Lane::GpuRvn;
+            let xmr_pop_in_play = (lane == Lane::Xmr || true) && xmr_pop_required();
+            assert!(!(lane.start_needs_unlock(true) || xmr_pop_in_play));
+        });
+        // … but with XMR PoP ON the dual's XMR leg needs the key, so we DO unlock.
+        with_xmr_pop_env(Some("1"), || {
+            let lane = Lane::GpuRvn;
+            let xmr_pop_in_play = (lane == Lane::Xmr || true) && xmr_pop_required();
+            assert!(lane.start_needs_unlock(true) || xmr_pop_in_play);
+        });
     }
 }
