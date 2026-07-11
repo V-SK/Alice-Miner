@@ -1876,13 +1876,17 @@ mod tests {
         // Explicit RVN dual partner is address-only (no unlock) with XMR PoP OFF …
         with_xmr_pop_env(None, || {
             let lane = Lane::GpuRvn;
-            let xmr_pop_in_play = (lane == Lane::Xmr || true) && xmr_pop_required();
+            // A dual run always carries the CPU-XMR leg, so PoP need is driven by
+            // the XMR leg's requirement, independent of the GPU partner lane.
+            let xmr_pop_in_play = xmr_pop_required();
             assert!(!(lane.start_needs_unlock(true) || xmr_pop_in_play));
         });
         // … but with XMR PoP ON the dual's XMR leg needs the key, so we DO unlock.
         with_xmr_pop_env(Some("1"), || {
             let lane = Lane::GpuRvn;
-            let xmr_pop_in_play = (lane == Lane::Xmr || true) && xmr_pop_required();
+            // A dual run always carries the CPU-XMR leg, so PoP need is driven by
+            // the XMR leg's requirement, independent of the GPU partner lane.
+            let xmr_pop_in_play = xmr_pop_required();
             assert!(lane.start_needs_unlock(true) || xmr_pop_in_play);
         });
     }
