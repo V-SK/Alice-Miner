@@ -217,7 +217,7 @@ pub fn apply_style(ctx: &egui::Context) {
     style.visuals.panel_fill = t.bg;
     style.visuals.window_fill = t.surface;
     style.visuals.extreme_bg_color = t.well;
-    style.visuals.window_stroke = Stroke::new(1.0, t.line);
+    style.visuals.window_stroke = Stroke::new(1.0_f32, t.line);
     style.visuals.window_shadow = egui::epaint::Shadow {
         offset: [0, 18],
         blur: 52,
@@ -231,15 +231,15 @@ pub fn apply_style(ctx: &egui::Context) {
         color: Color32::from_rgba_premultiplied(0, 0, 0, 120),
     };
     style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(249, 115, 22, 64);
-    style.visuals.selection.stroke = Stroke::new(1.0, t.brand);
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, t.brand);
     style.visuals.hyperlink_color = t.brand300;
 
     let w = &mut style.visuals.widgets;
     for ws in [&mut w.noninteractive, &mut w.inactive] {
         ws.bg_fill = t.surface2;
         ws.weak_bg_fill = t.surface2;
-        ws.fg_stroke = Stroke::new(1.0, t.text);
-        ws.bg_stroke = Stroke::new(1.0, t.line);
+        ws.fg_stroke = Stroke::new(1.0_f32, t.text);
+        ws.bg_stroke = Stroke::new(1.0_f32, t.line);
         ws.corner_radius = 10.into();
     }
     w.noninteractive.bg_fill = t.surface;
@@ -247,20 +247,20 @@ pub fn apply_style(ctx: &egui::Context) {
 
     w.hovered.bg_fill = t.surface2;
     w.hovered.weak_bg_fill = t.surface2;
-    w.hovered.fg_stroke = Stroke::new(1.0, t.text);
-    w.hovered.bg_stroke = Stroke::new(1.0, t.line_strong);
+    w.hovered.fg_stroke = Stroke::new(1.0_f32, t.text);
+    w.hovered.bg_stroke = Stroke::new(1.0_f32, t.line_strong);
     w.hovered.corner_radius = 10.into();
 
     w.active.bg_fill = t.surface2;
     w.active.weak_bg_fill = t.surface2;
-    w.active.fg_stroke = Stroke::new(1.0, t.text);
-    w.active.bg_stroke = Stroke::new(1.0, t.brand);
+    w.active.fg_stroke = Stroke::new(1.0_f32, t.text);
+    w.active.bg_stroke = Stroke::new(1.0_f32, t.brand);
     w.active.corner_radius = 10.into();
 
     w.open.bg_fill = t.surface2;
     w.open.weak_bg_fill = t.surface2;
-    w.open.fg_stroke = Stroke::new(1.0, t.text);
-    w.open.bg_stroke = Stroke::new(1.0, t.brand);
+    w.open.fg_stroke = Stroke::new(1.0_f32, t.text);
+    w.open.bg_stroke = Stroke::new(1.0_f32, t.brand);
     w.open.corner_radius = 10.into();
 
     ctx.set_global_style(style);

@@ -162,7 +162,7 @@ pub fn alice_core(
         painter.circle_stroke(
             center,
             ring_r,
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 110)),
+            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 0, 0, 110)),
         );
     }
     match mode {
@@ -194,7 +194,7 @@ pub fn alice_core(
             painter.circle_stroke(
                 center,
                 ring_r,
-                Stroke::new(2.0, Color32::from_rgba_unmultiplied(239, 68, 68, 120)),
+                Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(239, 68, 68, 120)),
             );
         }
         HeroMode::Idle => {}
@@ -274,10 +274,10 @@ fn paint_orb(painter: &egui::Painter, center: Pos2, r: f32, resp: &egui::Respons
     painter.circle_stroke(
         center,
         r - 1.0,
-        Stroke::new(1.5, Color32::from_rgba_unmultiplied(249, 115, 22, if resp.hovered() { 64 } else { 30 })),
+        Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(249, 115, 22, if resp.hovered() { 64 } else { 30 })),
     );
     // Crisp outer hairline (the exact silhouette).
-    painter.circle_stroke(center, r, Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 150)));
+    painter.circle_stroke(center, r, Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 0, 0, 150)));
     // Top inner sheen (a bright short arc near the top).
     draw_arc(
         painter,
@@ -285,7 +285,7 @@ fn paint_orb(painter: &egui::Painter, center: Pos2, r: f32, resp: &egui::Respons
         r - 2.5,
         -0.62,
         -0.38,
-        Stroke::new(2.0, Color32::from_rgba_unmultiplied(255, 255, 255, if resp.hovered() { 30 } else { 20 })),
+        Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, if resp.hovered() { 30 } else { 20 })),
     );
     // Bottom inner shadow (a dark short arc near the bottom).
     draw_arc(
@@ -294,7 +294,7 @@ fn paint_orb(painter: &egui::Painter, center: Pos2, r: f32, resp: &egui::Respons
         r - 3.0,
         0.30,
         0.70,
-        Stroke::new(6.0, Color32::from_rgba_unmultiplied(0, 0, 0, 120)),
+        Stroke::new(6.0_f32, Color32::from_rgba_unmultiplied(0, 0, 0, 120)),
     );
 }
 

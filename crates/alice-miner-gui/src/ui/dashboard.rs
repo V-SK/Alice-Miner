@@ -83,7 +83,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
                 .fill(egui::Color32::from_rgba_unmultiplied(tone.fg().r(), tone.fg().g(), tone.fg().b(), 22))
                 .corner_radius(255)
                 .inner_margin(egui::Margin::symmetric(12, 6))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(tone.fg().r(), tone.fg().g(), tone.fg().b(), 80)))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(tone.fg().r(), tone.fg().g(), tone.fg().b(), 80)))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         widgets::status_dot(ui, tone.fg(), 8.0, blink);
@@ -105,7 +105,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     ui.painter().hline(
         ui.available_rect_before_wrap().x_range(),
         ui.cursor().top(),
-        egui::Stroke::new(1.0, THEME.line),
+        egui::Stroke::new(1.0_f32, THEME.line),
     );
     ui.add_space(18.0);
 
@@ -508,7 +508,7 @@ fn lane_row(
         .fill(THEME.surface)
         .corner_radius(14)
         .inner_margin(egui::Margin::symmetric(15, 13))
-        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -568,7 +568,7 @@ fn connection_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
         .fill(THEME.surface)
         .corner_radius(14)
         .inner_margin(egui::Margin::symmetric(16, 15))
-        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::Grid::new("conn-grid")
@@ -619,7 +619,7 @@ fn connection_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 let copy = egui::Button::new(RichText::new("copy address").size(11.0).color(THEME.text3))
                                     .fill(egui::Color32::TRANSPARENT)
-                                    .stroke(egui::Stroke::new(1.0, THEME.line))
+                                    .stroke(egui::Stroke::new(1.0_f32, THEME.line))
                                     .corner_radius(8);
                                 if ui.add(copy).clicked() {
                                     ui.ctx().copy_text(addr.clone());
@@ -657,7 +657,7 @@ fn source_label(ui: &mut egui::Ui, title: &str, caption: &str, tone: Tone) {
         // Trailing rule.
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-        ui.painter().hline(rect.x_range(), rect.center().y, egui::Stroke::new(1.0, THEME.line));
+        ui.painter().hline(rect.x_range(), rect.center().y, egui::Stroke::new(1.0_f32, THEME.line));
     });
 }
 
@@ -678,7 +678,7 @@ fn reconciliation_badge(ui: &mut egui::Ui, recon: Reconciliation) {
         .fill(egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 22))
         .corner_radius(255)
         .inner_margin(egui::Margin::symmetric(11, 6))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 80)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 80)))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 7.0;
@@ -700,7 +700,7 @@ fn credit_panel(ui: &mut egui::Ui, app: &MinerApp) {
         .fill(THEME.surface)
         .corner_radius(14)
         .inner_margin(egui::Margin::symmetric(16, 15))
-        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             match &state {
@@ -788,7 +788,7 @@ fn prl_return_panel(ui: &mut egui::Ui, disp: &alice_miner_core::PrlPayoutDisplay
         .fill(THEME.surface)
         .corner_radius(14)
         .inner_margin(egui::Margin::symmetric(16, 15))
-        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             // Header row: a globe + the PRL currency label + a right-aligned status
@@ -846,7 +846,7 @@ fn status_pill(ui: &mut egui::Ui, tone: Tone, label: &str) {
         .fill(egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 22))
         .corner_radius(255)
         .inner_margin(egui::Margin::symmetric(10, 4))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 70)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 70)))
         .show(ui, |ui| {
             ui.label(RichText::new(label).size(11.0).strong().color(fg));
         });
@@ -859,7 +859,7 @@ fn pending_chip(ui: &mut egui::Ui) {
         .fill(egui::Color32::from_rgba_unmultiplied(THEME.brand.r(), THEME.brand.g(), THEME.brand.b(), 22))
         .corner_radius(255)
         .inner_margin(egui::Margin::symmetric(10, 4))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(THEME.brand.r(), THEME.brand.g(), THEME.brand.b(), 70)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(THEME.brand.r(), THEME.brand.g(), THEME.brand.b(), 70)))
         .show(ui, |ui| {
             ui.label(RichText::new(strings::CREDIT_PENDING_VALUE).size(11.0).strong().color(THEME.brand300));
         });
@@ -940,7 +940,7 @@ fn explorer_link(ui: &mut egui::Ui) {
         RichText::new(strings::CREDIT_EXPLORER_LABEL).size(12.0).color(THEME.text2),
     )
     .fill(THEME.well)
-    .stroke(egui::Stroke::new(1.0, THEME.line_strong))
+    .stroke(egui::Stroke::new(1.0_f32, THEME.line_strong))
     .corner_radius(9);
     if ui.add(btn).on_hover_text(strings::CREDIT_EXPLORER_URL).clicked() {
         ui.ctx().open_url(egui::OpenUrl::new_tab(strings::CREDIT_EXPLORER_URL));
@@ -959,7 +959,7 @@ fn credit_payout_panel(ui: &mut egui::Ui, p: &alice_miner_core::PayoutView) {
         .fill(THEME.well)
         .corner_radius(12)
         .inner_margin(egui::Margin::symmetric(14, 12))
-        .stroke(egui::Stroke::new(1.0, THEME.line_strong))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line_strong))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -1012,7 +1012,7 @@ fn upgrade_banner(ui: &mut egui::Ui, min_supported: &str, download_url: &str) {
     ui.add_space(12.0);
     let btn = egui::Button::new(RichText::new(strings::CREDIT_UPGRADE_CTA).size(12.0).color(THEME.text))
         .fill(THEME.well)
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 90)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 90)))
         .corner_radius(9);
     if ui.add(btn).on_hover_text(download_url).clicked() {
         ui.ctx().open_url(egui::OpenUrl::new_tab(download_url.to_string()));
@@ -1024,7 +1024,7 @@ fn log_panel(ui: &mut egui::Ui, app: &MinerApp) {
         .fill(THEME.well)
         .corner_radius(14)
         .inner_margin(egui::Margin::symmetric(16, 14))
-        .stroke(egui::Stroke::new(1.0, THEME.line_strong))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line_strong))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.set_min_height(60.0);
@@ -1153,7 +1153,7 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                             ui.add_space(8.0);
                             let copy = egui::Button::new(widgets::mono(widgets::shorten(&addr), 12.5, THEME.text))
                                 .fill(THEME.well)
-                                .stroke(egui::Stroke::new(1.0, THEME.line_strong))
+                                .stroke(egui::Stroke::new(1.0_f32, THEME.line_strong))
                                 .corner_radius(9);
                             if ui.add(copy).on_hover_text("Click to copy").clicked() {
                                 ui.ctx().copy_text(addr.clone());
@@ -1177,7 +1177,7 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                             .color(if mining { THEME.text4 } else { THEME.ink_on_brand }),
                     )
                     .fill(if mining { THEME.well } else { THEME.brand })
-                    .stroke(egui::Stroke::new(1.0, if mining { THEME.line_strong } else { THEME.brand }))
+                    .stroke(egui::Stroke::new(1.0_f32, if mining { THEME.line_strong } else { THEME.brand }))
                     .corner_radius(9)
                     .min_size(egui::vec2(0.0, 32.0));
                     if ui.add_enabled(!mining, btn).clicked() {
@@ -1243,7 +1243,7 @@ fn render_background_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                 };
                 let btn = egui::Button::new(RichText::new(label).size(12.5).strong().color(ink))
                     .fill(fill)
-                    .stroke(egui::Stroke::new(1.0, stroke))
+                    .stroke(egui::Stroke::new(1.0_f32, stroke))
                     .corner_radius(9)
                     .min_size(egui::vec2(0.0, 32.0));
                 // Disable the "Turn on" affordance when the selected lane can't be
@@ -1341,7 +1341,7 @@ fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                         .color(if busy { THEME.text4 } else { THEME.ink_on_brand }),
                 )
                 .fill(if busy { THEME.well } else { THEME.brand })
-                .stroke(egui::Stroke::new(1.0, if busy { THEME.line_strong } else { THEME.brand }))
+                .stroke(egui::Stroke::new(1.0_f32, if busy { THEME.line_strong } else { THEME.brand }))
                 .corner_radius(9)
                 .min_size(egui::vec2(0.0, 32.0));
                 if ui.add_enabled(!busy, btn).clicked() {
@@ -1394,7 +1394,7 @@ fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                             .color(THEME.ink_on_brand),
                     )
                     .fill(THEME.brand)
-                    .stroke(egui::Stroke::new(1.0, THEME.brand))
+                    .stroke(egui::Stroke::new(1.0_f32, THEME.brand))
                     .corner_radius(9)
                     .min_size(egui::vec2(0.0, 32.0));
                     if ui.add(btn).clicked() {
@@ -1415,7 +1415,7 @@ fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                             RichText::new("Open releases").size(12.5).strong().color(THEME.text),
                         )
                         .fill(THEME.well)
-                        .stroke(egui::Stroke::new(1.0, THEME.line_strong))
+                        .stroke(egui::Stroke::new(1.0_f32, THEME.line_strong))
                         .corner_radius(9)
                         .min_size(egui::vec2(0.0, 32.0));
                         if ui.add(btn).on_hover_text(RELEASES_PAGE).clicked() {
@@ -1434,7 +1434,7 @@ fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                             RichText::new("Open releases").size(12.5).strong().color(THEME.ink_on_brand),
                         )
                         .fill(THEME.warn)
-                        .stroke(egui::Stroke::new(1.0, THEME.warn))
+                        .stroke(egui::Stroke::new(1.0_f32, THEME.warn))
                         .corner_radius(9)
                         .min_size(egui::vec2(0.0, 32.0));
                         if ui.add(btn).on_hover_text(RELEASES_PAGE).clicked() {
@@ -1468,7 +1468,7 @@ fn lang_seg(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
         RichText::new(label).size(12.0).strong().color(if on { THEME.text } else { THEME.text3 }),
     )
     .fill(if on { THEME.surface3 } else { THEME.well })
-    .stroke(egui::Stroke::new(1.0, if on { THEME.line_strong } else { THEME.line }))
+    .stroke(egui::Stroke::new(1.0_f32, if on { THEME.line_strong } else { THEME.line }))
     .corner_radius(8)
     .min_size(egui::vec2(54.0, 30.0));
     ui.add(btn)
@@ -1478,7 +1478,7 @@ fn panel(ui: &mut egui::Ui, title: &str, icon: Icon, body: impl FnOnce(&mut egui
     egui::Frame::NONE
         .fill(THEME.surface)
         .corner_radius(14)
-        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line))
         .inner_margin(egui::Margin::ZERO)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1501,7 +1501,7 @@ fn panel(ui: &mut egui::Ui, title: &str, icon: Icon, body: impl FnOnce(&mut egui
             ui.painter().hline(
                 ui.available_rect_before_wrap().x_range(),
                 ui.cursor().top(),
-                egui::Stroke::new(1.0, THEME.line),
+                egui::Stroke::new(1.0_f32, THEME.line),
             );
             egui::Frame::NONE
                 .inner_margin(egui::Margin::symmetric(17, 4))
@@ -1594,7 +1594,7 @@ fn prl_payout_row(ui: &mut egui::Ui, app: &mut MinerApp) {
     ui.painter().hline(
         ui.available_rect_before_wrap().x_range(),
         ui.cursor().top(),
-        egui::Stroke::new(1.0, THEME.line),
+        egui::Stroke::new(1.0_f32, THEME.line),
     );
 }
 
@@ -1616,7 +1616,7 @@ fn srow(ui: &mut egui::Ui, title: &str, hint: &str, rhs: impl FnOnce(&mut egui::
     ui.painter().hline(
         ui.available_rect_before_wrap().x_range(),
         ui.cursor().top(),
-        egui::Stroke::new(1.0, THEME.line),
+        egui::Stroke::new(1.0_f32, THEME.line),
     );
 }
 

@@ -180,7 +180,7 @@ pub(crate) fn backup_body(
         .fill(egui::Color32::from_rgba_unmultiplied(245, 158, 11, 26))
         .corner_radius(10)
         .inner_margin(egui::Margin::symmetric(12, 10))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(245, 158, 11, 72)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(245, 158, 11, 72)))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_top(|ui| {
@@ -219,7 +219,7 @@ pub(crate) fn backup_body(
     if ui
         .add(egui::Button::new(RichText::new("Copy all").size(11.5).color(THEME.text3))
             .fill(egui::Color32::TRANSPARENT)
-            .stroke(egui::Stroke::new(1.0, THEME.line))
+            .stroke(egui::Stroke::new(1.0_f32, THEME.line))
             .corner_radius(8))
         .clicked()
     {
@@ -448,7 +448,7 @@ fn word_cell(ui: &mut egui::Ui, width: f32, idx: usize, word: &str) {
         .fill(THEME.well)
         .corner_radius(8)
         .inner_margin(egui::Margin::symmetric(10, 7))
-        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line))
         .show(ui, |ui| {
             // Fixed column width so the three columns are uniform + fill the card.
             ui.set_width((width - 20.0).max(0.0));
@@ -468,11 +468,11 @@ fn confirm_slot(ui: &mut egui::Ui, width: f32, pos: usize, word: Option<&str>) -
     let (fill, stroke, kind) = if filled {
         (
             egui::Color32::from_rgba_unmultiplied(249, 115, 22, 20),
-            egui::Stroke::new(1.0, THEME.line_brand),
+            egui::Stroke::new(1.0_f32, THEME.line_brand),
             egui::StrokeKind::Inside,
         )
     } else {
-        (THEME.well, egui::Stroke::new(1.0, THEME.line_strong), egui::StrokeKind::Inside)
+        (THEME.well, egui::Stroke::new(1.0_f32, THEME.line_strong), egui::StrokeKind::Inside)
     };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 40.0), egui::Sense::click());
     let p = ui.painter_at(rect);
@@ -520,7 +520,7 @@ fn word_chip(ui: &mut egui::Ui, word: &str, used: bool) -> egui::Response {
     };
     let btn = egui::Button::new(text)
         .fill(THEME.surface2)
-        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line))
         .corner_radius(8)
         .min_size(egui::vec2(0.0, 30.0));
     let resp = ui.add_enabled(!used, btn);
@@ -534,7 +534,7 @@ fn word_chip(ui: &mut egui::Ui, word: &str, used: bool) -> egui::Response {
 /// Paint a dashed rounded-rect border (egui has no dashed stroke; we step short
 /// segments around the perimeter). Used for the empty confirm slot.
 fn dashed_rrect(painter: &egui::Painter, rect: egui::Rect, _radius: f32, color: egui::Color32) {
-    let stroke = egui::Stroke::new(1.0, color);
+    let stroke = egui::Stroke::new(1.0_f32, color);
     let dash = 5.0;
     let gap = 4.0;
     let seg = |a: egui::Pos2, b: egui::Pos2| {
@@ -563,7 +563,7 @@ pub(crate) fn variant_button(ui: &mut egui::Ui, icon: Icon, title: &str, badge: 
         .fill(THEME.surface2)
         .corner_radius(12)
         .inner_margin(egui::Margin::symmetric(15, 13))
-        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -580,7 +580,7 @@ pub(crate) fn variant_button(ui: &mut egui::Ui, icon: Icon, title: &str, badge: 
                     egui::Frame::NONE
                         .corner_radius(255)
                         .inner_margin(egui::Margin::symmetric(8, 3))
-                        .stroke(egui::Stroke::new(1.0, THEME.line))
+                        .stroke(egui::Stroke::new(1.0_f32, THEME.line))
                         .show(ui, |ui| {
                             ui.label(RichText::new(badge.to_uppercase()).size(9.5).extra_letter_spacing(0.8).color(THEME.text3));
                         });
@@ -595,7 +595,7 @@ fn seg_button(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
         RichText::new(label).size(12.0).strong().color(if on { THEME.ink_on_brand } else { THEME.text3 }),
     )
     .fill(if on { THEME.brand } else { THEME.well })
-    .stroke(egui::Stroke::new(1.0, if on { THEME.brand } else { THEME.line_strong }))
+    .stroke(egui::Stroke::new(1.0_f32, if on { THEME.brand } else { THEME.line_strong }))
     .corner_radius(8)
     .min_size(egui::vec2(110.0, 32.0));
     ui.add(btn)
@@ -606,10 +606,10 @@ fn divider_or(ui: &mut egui::Ui) {
         let avail = ui.available_width();
         let seg = (avail - 40.0) / 2.0;
         let (r1, _) = ui.allocate_exact_size(egui::vec2(seg, 1.0), egui::Sense::hover());
-        ui.painter().hline(r1.x_range(), r1.center().y, egui::Stroke::new(1.0, THEME.line));
+        ui.painter().hline(r1.x_range(), r1.center().y, egui::Stroke::new(1.0_f32, THEME.line));
         ui.label(RichText::new("or").size(11.0).color(THEME.text4));
         let (r2, _) = ui.allocate_exact_size(egui::vec2(seg, 1.0), egui::Sense::hover());
-        ui.painter().hline(r2.x_range(), r2.center().y, egui::Stroke::new(1.0, THEME.line));
+        ui.painter().hline(r2.x_range(), r2.center().y, egui::Stroke::new(1.0_f32, THEME.line));
     });
 }
 
@@ -620,7 +620,7 @@ fn error(ui: &mut egui::Ui, app: &MinerApp) {
             .fill(egui::Color32::from_rgba_unmultiplied(239, 68, 68, 26))
             .corner_radius(10)
             .inner_margin(egui::Margin::same(12))
-            .stroke(egui::Stroke::new(1.0, THEME.err))
+            .stroke(egui::Stroke::new(1.0_f32, THEME.err))
             .show(ui, |ui| {
                 ui.label(RichText::new(err).size(12.0).color(THEME.err));
             });

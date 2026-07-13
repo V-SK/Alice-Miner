@@ -171,7 +171,7 @@ fn overwrite_confirm(ui: &mut egui::Ui, app: &mut MinerApp, backup_hint: &Option
         .fill(egui::Color32::from_rgba_unmultiplied(245, 158, 11, 26))
         .corner_radius(10)
         .inner_margin(egui::Margin::symmetric(13, 12))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(245, 158, 11, 72)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(245, 158, 11, 72)))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_top(|ui| {
@@ -345,7 +345,7 @@ fn paste(ui: &mut egui::Ui, app: &mut MinerApp) {
         .fill(THEME.well)
         .corner_radius(10)
         .inner_margin(egui::Margin::symmetric(13, 11))
-        .stroke(egui::Stroke::new(1.0, THEME.line_strong))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line_strong))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_top(|ui| {
@@ -384,7 +384,7 @@ fn current_address_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
         .fill(THEME.well)
         .corner_radius(11)
         .inner_margin(egui::Margin::symmetric(13, 11))
-        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
@@ -432,7 +432,7 @@ pub(crate) fn identity_tag(ui: &mut egui::Ui, watch_only: bool) {
         .fill(egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 20))
         .corner_radius(255)
         .inner_margin(egui::Margin::symmetric(9, 3))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 70)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 70)))
         .show(ui, |ui| {
             ui.label(RichText::new(label).size(10.0).strong().color(fg));
         });
@@ -446,7 +446,7 @@ fn backup_dest_panel(ui: &mut egui::Ui, path: &str) {
         .fill(THEME.well)
         .corner_radius(8)
         .inner_margin(egui::Margin::symmetric(11, 8))
-        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
@@ -461,7 +461,7 @@ fn overwrite_recap(ui: &mut egui::Ui, backup_hint: &Option<String>) {
         .fill(egui::Color32::from_rgba_unmultiplied(245, 158, 11, 20))
         .corner_radius(9)
         .inner_margin(egui::Margin::symmetric(11, 9))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(245, 158, 11, 60)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(245, 158, 11, 60)))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_top(|ui| {
@@ -481,7 +481,7 @@ fn warn_banner(ui: &mut egui::Ui, text: &str) {
         .fill(egui::Color32::from_rgba_unmultiplied(245, 158, 11, 24))
         .corner_radius(9)
         .inner_margin(egui::Margin::symmetric(12, 10))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(245, 158, 11, 64)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(245, 158, 11, 64)))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_top(|ui| {
@@ -510,7 +510,7 @@ fn seg_button(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
         RichText::new(label).size(12.0).strong().color(if on { THEME.ink_on_brand } else { THEME.text3 }),
     )
     .fill(if on { THEME.brand } else { THEME.well })
-    .stroke(egui::Stroke::new(1.0, if on { THEME.brand } else { THEME.line_strong }))
+    .stroke(egui::Stroke::new(1.0_f32, if on { THEME.brand } else { THEME.line_strong }))
     .corner_radius(8)
     .min_size(egui::vec2(110.0, 32.0));
     ui.add(btn)
@@ -523,7 +523,7 @@ fn error(ui: &mut egui::Ui, app: &MinerApp) {
             .fill(egui::Color32::from_rgba_unmultiplied(239, 68, 68, 26))
             .corner_radius(10)
             .inner_margin(egui::Margin::same(12))
-            .stroke(egui::Stroke::new(1.0, THEME.err))
+            .stroke(egui::Stroke::new(1.0_f32, THEME.err))
             .show(ui, |ui| {
                 ui.label(RichText::new(err).size(12.0).color(THEME.err));
             });

@@ -112,7 +112,7 @@ fn titlebar(ui_root: &mut egui::Ui, app: &mut MinerApp) {
             egui::Frame::NONE
                 .fill(THEME.titlebar_top)
                 .inner_margin(margin)
-                .stroke(Stroke::new(1.0, THEME.line)),
+                .stroke(Stroke::new(1.0_f32, THEME.line)),
         )
         .show_inside(ui_root, |ui| {
             // The whole bar (minus the interactive widgets) is a window-drag
@@ -186,7 +186,7 @@ fn pill_lane_label(lane: Lane, dual: bool) -> &'static str {
 fn lang_chip(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let btn = egui::Button::new(RichText::new(label).size(11.0).strong().color(THEME.text3))
         .fill(Color32::TRANSPARENT)
-        .stroke(Stroke::new(1.0, THEME.line))
+        .stroke(Stroke::new(1.0_f32, THEME.line))
         .corner_radius(8)
         .min_size(egui::vec2(34.0, 26.0));
     ui.add(btn)
@@ -202,7 +202,7 @@ fn rail(ui_root: &mut egui::Ui, app: &mut MinerApp) {
             egui::Frame::NONE
                 .fill(THEME.rail_top)
                 .inner_margin(egui::Margin { left: 0, right: 0, top: 16, bottom: 14 })
-                .stroke(Stroke::new(1.0, THEME.line)),
+                .stroke(Stroke::new(1.0_f32, THEME.line)),
         )
         .show_inside(ui_root, |ui| {
             ui.vertical_centered(|ui| {
@@ -237,7 +237,7 @@ fn rail(ui_root: &mut egui::Ui, app: &mut MinerApp) {
                     let c = gear.rect.right_top() + egui::vec2(-8.0, 8.0);
                     let p = ui.painter();
                     p.circle_filled(c, 4.5, THEME.brand);
-                    p.circle_stroke(c, 4.5, Stroke::new(1.5, THEME.rail_top));
+                    p.circle_stroke(c, 4.5, Stroke::new(1.5_f32, THEME.rail_top));
                 }
                 if gear.clicked() {
                     app.screen = Screen::Settings;
@@ -264,7 +264,7 @@ fn nav_item(ui: &mut egui::Ui, icon: Icon, active: bool, enabled: bool) -> egui:
         painter.rect_stroke(
             rect,
             CornerRadius::same(12),
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(249, 115, 22, 60)),
+            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(249, 115, 22, 60)),
             egui::epaint::StrokeKind::Inside,
         );
         // Glowing left accent bar.

@@ -93,7 +93,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
             .fill(THEME.surface2)
             .corner_radius(9)
             .inner_margin(egui::Margin::same(6))
-            .stroke(egui::Stroke::new(1.0, THEME.line))
+            .stroke(egui::Stroke::new(1.0_f32, THEME.line))
             .show(ui, |ui| {
                 super::icons::show(ui, Icon::Cpu, 17.0, THEME.text2);
             });
@@ -240,7 +240,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
             let label = if stopping { "Stopping…" } else { "Stop mining" };
             let stop = egui::Button::new(RichText::new(label).size(12.5).color(THEME.text2))
                 .fill(THEME.surface2)
-                .stroke(egui::Stroke::new(1.0, THEME.line))
+                .stroke(egui::Stroke::new(1.0_f32, THEME.line))
                 .corner_radius(255)
                 .min_size(egui::vec2(130.0, 34.0));
             // The button is inert during the stopping grace (non-interactive).
@@ -277,7 +277,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     // ── Honest footer ─────────────────────────────────────────────────────────
     ui.add_space(12.0);
     let r = ui.available_rect_before_wrap();
-    ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0, THEME.line));
+    ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0_f32, THEME.line));
     ui.add_space(10.0);
     footer(ui);
 }
@@ -421,7 +421,7 @@ fn error_banner(ui: &mut egui::Ui, app: &MinerApp) {
     egui::Frame::NONE
         .fill(egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 20))
         .stroke(egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 80),
         ))
         .corner_radius(10)
@@ -536,7 +536,7 @@ fn dual_mine_row(ui: &mut egui::Ui, app: &mut MinerApp) {
             p.rect_stroke(
                 rect,
                 255.0,
-                egui::Stroke::new(1.0, THEME.line),
+                egui::Stroke::new(1.0_f32, THEME.line),
                 egui::epaint::StrokeKind::Inside,
             );
             p.circle_filled(
@@ -569,7 +569,7 @@ fn dual_mine_row(ui: &mut egui::Ui, app: &mut MinerApp) {
             .fill(THEME.well)
             .corner_radius(11)
             .inner_margin(egui::Margin::symmetric(13, 11))
-            .stroke(egui::Stroke::new(1.0, THEME.line_strong))
+            .stroke(egui::Stroke::new(1.0_f32, THEME.line_strong))
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.label(
@@ -588,7 +588,7 @@ fn dual_mine_row(ui: &mut egui::Ui, app: &mut MinerApp) {
                     ui.horizontal(|ui| {
                         let cancel_btn = egui::Button::new(RichText::new("Cancel").size(12.0).color(THEME.text2))
                             .fill(THEME.surface2)
-                            .stroke(egui::Stroke::new(1.0, THEME.line))
+                            .stroke(egui::Stroke::new(1.0_f32, THEME.line))
                             .corner_radius(8)
                             .min_size(egui::vec2(84.0, 30.0));
                         if ui.add(cancel_btn).clicked() {
@@ -643,7 +643,7 @@ fn gpu_selector(ui: &mut egui::Ui, app: &mut MinerApp) {
         .fill(THEME.surface2)
         .corner_radius(12)
         .inner_margin(egui::Margin::symmetric(13, 10))
-        .stroke(egui::Stroke::new(1.0, THEME.line))
+        .stroke(egui::Stroke::new(1.0_f32, THEME.line))
         .show(ui, |ui| {
             ui.set_width(HERO_CARD_W - 64.0);
             // Header: label + the "N of M cards" count.
@@ -706,20 +706,20 @@ fn gpu_row(
                             egui::pos2(c.x - s * 0.24, c.y + s * 0.02),
                             egui::pos2(c.x - s * 0.05, c.y + s * 0.20),
                         ],
-                        egui::Stroke::new(1.8, THEME.ink_on_brand),
+                        egui::Stroke::new(1.8_f32, THEME.ink_on_brand),
                     );
                     p.line_segment(
                         [
                             egui::pos2(c.x - s * 0.05, c.y + s * 0.20),
                             egui::pos2(c.x + s * 0.26, c.y - s * 0.20),
                         ],
-                        egui::Stroke::new(1.8, THEME.ink_on_brand),
+                        egui::Stroke::new(1.8_f32, THEME.ink_on_brand),
                     );
                 } else {
                     p.rect_stroke(
                         rect,
                         4.0,
-                        egui::Stroke::new(1.0, THEME.line_strong),
+                        egui::Stroke::new(1.0_f32, THEME.line_strong),
                         egui::epaint::StrokeKind::Inside,
                     );
                 }
@@ -761,14 +761,14 @@ fn lane_chip(
                     base.to_string(),
                     THEME.text,
                     Some(accent),
-                    egui::Stroke::new(1.0, accent.gamma_multiply(0.8)),
+                    egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.8)),
                 )
             } else {
                 (
                     base.to_string(),
                     THEME.text2,
                     Some(accent.gamma_multiply(0.6)),
-                    egui::Stroke::new(1.0, THEME.line),
+                    egui::Stroke::new(1.0_f32, THEME.line),
                 )
             }
         }
@@ -777,13 +777,13 @@ fn lane_chip(
             format!("{} · coming soon", lane_short(lane)),
             THEME.text4,
             None,
-            egui::Stroke::new(1.0, THEME.line),
+            egui::Stroke::new(1.0_f32, THEME.line),
         ),
         LaneSupport::Unavailable => (
             format!("{} · {}", lane_short(lane), unavailable_tail(lane)),
             THEME.text4,
             None,
-            egui::Stroke::new(1.0, THEME.line),
+            egui::Stroke::new(1.0_f32, THEME.line),
         ),
     };
 

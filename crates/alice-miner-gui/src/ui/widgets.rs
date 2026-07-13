@@ -58,7 +58,7 @@ pub fn status_pill(ui: &mut Ui, tone: Tone, label: &str, blink: bool) -> Respons
         .fill(tint)
         .corner_radius(CornerRadius::same(255))
         .inner_margin(egui::Margin::symmetric(11, 5))
-        .stroke(Stroke::new(1.0, border))
+        .stroke(Stroke::new(1.0_f32, border))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 7.0;
@@ -75,7 +75,7 @@ pub fn chip(ui: &mut Ui, dot: Option<Color32>, text: &str) -> Response {
         .fill(THEME.surface2)
         .corner_radius(CornerRadius::same(255))
         .inner_margin(egui::Margin::symmetric(12, 6))
-        .stroke(Stroke::new(1.0, THEME.line))
+        .stroke(Stroke::new(1.0_f32, THEME.line))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
@@ -123,7 +123,7 @@ pub fn section_label(ui: &mut Ui, text: &str) {
         ui.painter().hline(
             rect.x_range(),
             rect.center().y,
-            Stroke::new(1.0, THEME.line),
+            Stroke::new(1.0_f32, THEME.line),
         );
     });
 }
@@ -149,7 +149,7 @@ pub fn toggle(ui: &mut Ui, on: bool) -> Response {
     };
     p.rect_filled(rect, 255.0, track);
     if !on {
-        p.rect_stroke(rect, 255.0, Stroke::new(1.0, THEME.line_strong), egui::epaint::StrokeKind::Inside);
+        p.rect_stroke(rect, 255.0, Stroke::new(1.0_f32, THEME.line_strong), egui::epaint::StrokeKind::Inside);
     }
     let r = 9.0;
     let cx = if on { rect.right() - 12.0 } else { rect.left() + 12.0 };
@@ -176,7 +176,7 @@ pub fn primary_button(ui: &mut Ui, label: &str, enabled: bool, full: bool) -> Re
 pub fn ghost_button(ui: &mut Ui, label: &str, full: bool) -> Response {
     let mut btn = egui::Button::new(RichText::new(label).size(13.5).color(THEME.text))
         .fill(Color32::TRANSPARENT)
-        .stroke(Stroke::new(1.0, THEME.line_strong))
+        .stroke(Stroke::new(1.0_f32, THEME.line_strong))
         .corner_radius(10);
     if full {
         btn = btn.min_size(Vec2::new(ui.available_width(), 44.0));
@@ -306,7 +306,7 @@ pub fn card<R>(ui: &mut Ui, max_width: f32, inner: impl FnOnce(&mut Ui) -> R) ->
         .fill(t.surface)
         .corner_radius(CornerRadius::same(20))
         .inner_margin(egui::Margin::same(26))
-        .stroke(Stroke::new(1.0, t.line))
+        .stroke(Stroke::new(1.0_f32, t.line))
         .shadow(egui::epaint::Shadow {
             offset: [0, 12],
             blur: 36,
@@ -322,7 +322,7 @@ pub fn card<R>(ui: &mut Ui, max_width: f32, inner: impl FnOnce(&mut Ui) -> R) ->
     ui.painter().hline(
         (top.left() + 20.0)..=(top.right() - 20.0),
         top.top() + 1.0,
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 16)),
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 16)),
     );
     r.inner
 }
@@ -338,7 +338,7 @@ pub fn card_min_h<R>(ui: &mut Ui, width: f32, min_h: f32, inner: impl FnOnce(&mu
         .fill(t.surface)
         .corner_radius(CornerRadius::same(20))
         .inner_margin(egui::Margin::same(26))
-        .stroke(Stroke::new(1.0, t.line))
+        .stroke(Stroke::new(1.0_f32, t.line))
         .shadow(egui::epaint::Shadow {
             offset: [0, 12],
             blur: 36,
@@ -357,7 +357,7 @@ pub fn card_min_h<R>(ui: &mut Ui, width: f32, min_h: f32, inner: impl FnOnce(&mu
     ui.painter().hline(
         (top.left() + 20.0)..=(top.right() - 20.0),
         top.top() + 1.0,
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 16)),
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 16)),
     );
     r.inner
 }
@@ -383,7 +383,7 @@ pub fn stat_card(
         .fill(t.surface2)
         .corner_radius(CornerRadius::same(14))
         .inner_margin(egui::Margin::symmetric(16, 14))
-        .stroke(Stroke::new(1.0, t.line_strong))
+        .stroke(Stroke::new(1.0_f32, t.line_strong))
         .show(ui, |ui| {
             ui.set_width(width);
             ui.set_min_height(min_content_height);
@@ -417,7 +417,7 @@ pub fn stat_card(
         ui.painter().hline(
             r.x_range(),
             r.top() + 1.0,
-            Stroke::new(2.0, c),
+            Stroke::new(2.0_f32, c),
         );
     }
 }

@@ -121,7 +121,7 @@ fn error(ui: &mut egui::Ui, app: &MinerApp) {
             .fill(egui::Color32::from_rgba_unmultiplied(239, 68, 68, 26))
             .corner_radius(10)
             .inner_margin(egui::Margin::same(12))
-            .stroke(egui::Stroke::new(1.0, THEME.err))
+            .stroke(egui::Stroke::new(1.0_f32, THEME.err))
             .show(ui, |ui| {
                 ui.label(RichText::new(err).size(12.0).color(THEME.err));
             });
