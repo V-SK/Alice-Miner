@@ -23,6 +23,12 @@
 //! `chcp 65001` changed anything is itself the proof the bytes were reaching the
 //! console via the code-page path, not `WriteConsoleW`.
 //!
+//! Either way the fix is robust to *both* output paths and does not hinge on any single
+//! explanation of the mojibake: on the byte path (output redirected, a pipe, or console
+//! detection simply not firing) the code page is what decodes our UTF-8 bytes, so setting
+//! it to UTF-8 corrects them; on the `WriteConsoleW` path the code page is irrelevant and
+//! the call is a harmless no-op. It therefore holds whichever path std happens to take.
+//!
 //! [`init_utf8_console`] performs that `chcp 65001` programmatically (via
 //! `SetConsoleOutputCP` / `SetConsoleCP`) at the very first instant of `main`,
 //! before any output. It is a belt-and-braces guarantee: it makes the byte path
