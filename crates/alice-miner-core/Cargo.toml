@@ -56,3 +56,11 @@ keyring = { version = "3", default-features = false, features = [
     "sync-secret-service",
     "crypto-rust",
 ] }
+
+# Windows-only: force the console code page to UTF-8 at CLI startup (see
+# `console::init_utf8_console`) so 中文 output isn't mojibake'd by a legacy OEM
+# code page (cp950/Big5 on 繁中 Windows). Only the console feature — no extra API
+# surface. The version matches the one already resolved in the workspace lockfile
+# (pulled transitively via crossterm/ctrlc), so this adds NO new crate download.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
