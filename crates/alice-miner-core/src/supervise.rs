@@ -68,7 +68,7 @@ const WATCHDOG_TICK: Duration = Duration::from_secs(2);
 /// B commits a failover it probes the candidate region(s) and rotates to the first
 /// REACHABLE one — so it never switches into a dead region and immediately errors
 /// (the exact symptom an external tester hit: auto-switching to an unavailable
-/// US/FI and stopping). Kept short so a genuinely dead lane still fails over
+/// region and stopping). Kept short so a genuinely dead lane still fails over
 /// promptly; if NO candidate answers we fall back to the plain next endpoint (no
 /// worse than the pre-probe behaviour).
 const FAILOVER_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
@@ -865,7 +865,7 @@ enum WatchAction {
 /// change it reads `auto-failover: <from> → <to> (no progress for <N>s)`; for a
 /// locked / single-region plan (nowhere to rotate — we retry the same region) it
 /// reads `region <r> locked — retrying, no auto-failover (…)`. A region relay is
-/// shown by its short tag (us/asia/fi); any other host as `host:port`. Localized.
+/// shown by its short tag (us/asia); any other host as `host:port`. Localized.
 fn failover_status(from: &Endpoint, to: &Endpoint, changed: bool, window: Duration) -> String {
     let secs = window.as_secs();
     if changed {
@@ -884,7 +884,7 @@ fn failover_status(from: &Endpoint, to: &Endpoint, changed: bool, window: Durati
     }
 }
 
-/// A short, honest label for an endpoint: its region tag (us/asia/fi) when the host
+/// A short, honest label for an endpoint: its region tag (us/asia) when the host
 /// is a known region relay, else `host:port`.
 fn region_label(ep: &Endpoint) -> String {
     match crate::lane::gpu_prl::region_tag_for_host(&ep.host) {
@@ -1315,7 +1315,7 @@ fn note_hashrate_progress(g: &mut Inner, hr: f64) {
 
 /// A rise in accepted shares counts as progress (the strongest signal — the lane
 /// is doing real, credited work). A rise ALSO marks the CURRENT endpoint's region as
-/// "last-good": if the active host maps to a region tag (us/asia/fi) that differs
+/// "last-good": if the active host maps to a region tag (us/asia) that differs
 /// from the one already persisted this run, stage it in `pending_good_region` for the
 /// log-pump task to write to `settings.last_good_region` off-lock. Lane-agnostic —
 /// keyed purely by the endpoint host, so the XMR/RVN relay (`hk.aliceprotocol.org`,
@@ -2227,7 +2227,12 @@ mod tests {
 
     #[test]
     fn region_label_prefers_tag_else_host_port() {
-        assert_eq!(region_label(&Endpoint::plaintext("fi.aliceprotocol.org", 3340)), "fi");
+        assert_eq!(region_label(&Endpoint::plaintext("asia.aliceprotocol.org", 3340)), "asia");
+        // `fi` was removed in v0.6.1 → no longer a region relay, so it degrades to host:port.
+        assert_eq!(
+            region_label(&Endpoint::plaintext("fi.aliceprotocol.org", 3340)),
+            "fi.aliceprotocol.org:3340"
+        );
         // A non-region host (an operator override / the XMR relay) shows host:port.
         assert_eq!(
             region_label(&Endpoint::plaintext("hk.aliceprotocol.org", 3333)),

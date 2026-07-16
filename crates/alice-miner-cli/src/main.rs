@@ -444,7 +444,7 @@ struct StartArgs {
     /// `alice-miner detect` (the per-GPU list). Ignored for the CPU-XMR lane.
     #[arg(long, value_name = "IDS")]
     gpus: Option<String>,
-    /// PIN the GPU-PRL region: `us`, `asia`, or `fi`. LOCKS the lane to that region —
+    /// PIN the GPU-PRL region: `us` or `asia`. LOCKS the lane to that region —
     /// it never auto-fails-over to another region; if the region is unreachable it
     /// retries that one and reports a clear error. The choice is REMEMBERED (persisted
     /// to `~/.alice/settings.json`), so later runs stay on it. Pass `--region auto` to
@@ -1779,7 +1779,7 @@ fn cmd_start_with_unlock(
         },
     };
 
-    // D-line region pin: `--region <us|asia|fi>` LOCKS the GPU-PRL lane to a region
+    // D-line region pin: `--region <us|asia>` LOCKS the GPU-PRL lane to a region
     // (persisted, no auto-failover); `--region auto` CLEARS the lock. Persist BEFORE
     // the engine starts (it reads the setting when it builds the region plan). A
     // usage error on an unknown value (never a silent no-op). Omitting the flag keeps
@@ -2294,7 +2294,7 @@ fn resolve_lane(s: &str, cap: &alice_miner_core::CapabilityProfile) -> Result<La
 }
 
 /// Apply `--region <value>` (D-line): validate + PERSIST the GPU-PRL region pin
-/// BEFORE the engine builds its plan. `us`/`asia`/`fi` LOCK the lane to that region
+/// BEFORE the engine builds its plan. `us`/`asia` LOCK the lane to that region
 /// (no auto-failover); `auto`/`off`/`clear`/`none` CLEAR the lock. Returns `Err(exit)`
 /// only on an unknown value (a usage error — never a silent no-op). A persistence
 /// failure (e.g. a read-only home) is a non-fatal warning: the run continues on

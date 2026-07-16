@@ -33,7 +33,7 @@ pub struct Settings {
     /// again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
-    /// A user-PINNED GPU region tag (`"us"` / `"asia"` / `"fi"`), set by
+    /// A user-PINNED GPU region tag (`"us"` / `"asia"`), set by
     /// `start --region <tag>`. When present the GPU-PRL lane LOCKS to this region:
     /// it never auto-fails-over to another region — it only retries this one and
     /// reports a clear error if it stays unreachable. `None` (the default) leaves
@@ -267,12 +267,12 @@ mod tests {
                 br#"{"schema":1,"lang":"zh","future_setting":7}"#,
             )
             .unwrap();
-            save_region_lock("fi").expect("save lock");
-            save_last_good_region("asia").expect("save good");
+            save_region_lock("asia").expect("save lock");
+            save_last_good_region("us").expect("save good");
             let s = load();
             assert_eq!(s.parsed_lang(), Some(Lang::Zh), "lang preserved");
-            assert_eq!(s.region_lock.as_deref(), Some("fi"));
-            assert_eq!(s.last_good_region.as_deref(), Some("asia"));
+            assert_eq!(s.region_lock.as_deref(), Some("asia"));
+            assert_eq!(s.last_good_region.as_deref(), Some("us"));
             let raw = std::fs::read_to_string(settings_path()).unwrap();
             assert!(raw.contains("future_setting"), "unknown field preserved: {raw}");
         });
