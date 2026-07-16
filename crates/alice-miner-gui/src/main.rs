@@ -13,11 +13,16 @@
 //! `alice-wallet/gui/src/main.rs` (~L52).
 
 mod app;
+mod platform;
 mod shot;
 mod ui;
 mod update;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use eframe::egui::IconData;
+use eframe::glow::HasContext;
 
 /// Rasterise the bundled Alice mark SVG into the OS window/dock icon (the exact
 /// `load_icon` the Wallet ships).
@@ -74,17 +79,66 @@ fn main() -> eframe::Result<()> {
         viewport = viewport.with_icon(icon);
     }
 
+    // Pick the rendering backend BEFORE building the window. `glow` (OpenGL) stays
+    // the default for local sessions; a genuine Windows RDP / Terminal Services
+    // session auto-switches to `wgpu` (DX12/DX11 + WARP), which survives remote
+    // desktops where OpenGL paints a solid-white window. Mirror tools (DeskIn /
+    // AnyDesk) aren't flagged as remote by Windows, so those users set
+    // `ALICE_GUI_RENDERER=wgpu` manually — and the live-GL-renderer probe below is
+    // the runtime backstop that still catches them. `ALICE_GUI_RENDERER=glow|wgpu`
+    // overrides. See `platform.rs`.
+    let decision = platform::choose_renderer();
+    platform::log_line(&format!(
+        "launch os={} remote_session={} renderer={} :: {}",
+        std::env::consts::OS,
+        decision.remote,
+        decision.name,
+        decision.reason,
+    ));
+
+    let renderer_name = decision.name;
     let options = eframe::NativeOptions {
         viewport,
+        renderer: decision.renderer,
         ..Default::default()
     };
 
-    eframe::run_native(
+    // Runtime backstop for the mirror-tool case (DeskIn/AnyDesk), which the
+    // remote-session check can't see: if glow comes up on a *software* GL context
+    // (the real white-screen signature), flag it here and surface wgpu guidance
+    // after the window closes. Set only from the glow path; on hardware GPUs it
+    // never fires, so local users are unaffected.
+    let software_gl = Arc::new(AtomicBool::new(false));
+    let software_gl_seen = Arc::new(std::sync::Mutex::new(String::new()));
+    let software_gl_cl = Arc::clone(&software_gl);
+    let software_gl_seen_cl = Arc::clone(&software_gl_seen);
+
+    let result = eframe::run_native(
         "Alice Miner",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             ui::theme::install_fonts(&cc.egui_ctx);
+            // When the glow backend is active, `cc.gl` is `Some`; read GL_RENDERER
+            // and record it in the startup log so a white-screen bug report carries
+            // the smoking gun (e.g. `gl_renderer="GDI Generic"`). If it's a software
+            // rasterizer, mark it so we can advise wgpu once the window closes.
+            if let Some(gl) = cc.gl.as_ref() {
+                // SAFETY: read-only glGetString(GL_RENDERER) on the live context;
+                // no pointers cross the FFI boundary, returns an owned String.
+                let renderer_str = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
+                platform::log_line(&format!("glow gl_renderer={renderer_str:?}"));
+                if platform::is_software_gl_renderer(&renderer_str) {
+                    platform::log_line(&format!(
+                        "WARN software OpenGL renderer ({renderer_str:?}) — window can blank \
+                         over remote desktop; set ALICE_GUI_RENDERER=wgpu"
+                    ));
+                    if let Ok(mut slot) = software_gl_seen_cl.lock() {
+                        *slot = renderer_str;
+                    }
+                    software_gl_cl.store(true, Ordering::SeqCst);
+                }
+            }
             match app::MinerApp::new() {
                 Ok(app) => Ok(Box::new(app)),
                 Err(e) => {
@@ -94,7 +148,39 @@ fn main() -> eframe::Result<()> {
                 }
             }
         }),
-    )
+    );
+
+    // A hard renderer/window init failure returns `Err` here. A white screen is
+    // different: it's a *successful* run (`Ok`) that simply never paints. True
+    // RDP/TS sessions are pre-empted to wgpu above, but mirror tools (DeskIn/…)
+    // aren't flagged as remote — so on the glow path we detected a software GL
+    // context inside the closure and now surface wgpu guidance on the `Ok` path
+    // too. Either way, don't exit silently.
+    match &result {
+        Ok(()) => {
+            platform::log_line("exited cleanly");
+            if software_gl.load(Ordering::SeqCst) {
+                let renderer_str = software_gl_seen
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_default();
+                platform::log_line("software-GL guidance dialog shown");
+                platform::show_error_dialog(
+                    "Alice Miner \u{2014} graphics notice",
+                    &platform::software_gl_message(&renderer_str),
+                );
+            }
+        }
+        Err(e) => {
+            platform::log_line(&format!("run_native failed (renderer={renderer_name}): {e}"));
+            platform::show_error_dialog(
+                "Alice Miner \u{2014} display error",
+                &platform::init_failure_message(renderer_name),
+            );
+        }
+    }
+
+    result
 }
 
 /// A tiny fallback shown only if the engine fails to spawn at launch.
