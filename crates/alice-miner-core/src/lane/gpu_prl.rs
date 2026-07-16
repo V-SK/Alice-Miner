@@ -159,6 +159,47 @@ pub fn region_default_endpoints() -> Vec<Endpoint> {
         .collect()
 }
 
+/// The known region tag for a relay host (`us.aliceprotocol.org` → `"us"`), or
+/// `None` for a host that isn't one of the three region relays (e.g. the XMR/RVN
+/// `hk.aliceprotocol.org` relay, or an operator override host). Port-agnostic, so
+/// it also recognises the GPU-Alpha relays (same hosts on `:3341`). The supervisor
+/// uses this to record the last region that produced an accepted share, purely by
+/// the endpoint host — no lane coupling.
+pub fn region_tag_for_host(host: &str) -> Option<&'static str> {
+    REGION_HOSTS
+        .iter()
+        .find(|(_, h)| *h == host)
+        .map(|(tag, _)| *tag)
+}
+
+/// The relay host for a known region tag (`"asia"` → `asia.aliceprotocol.org`).
+/// Case-insensitive; `None` for an unknown tag. The inverse of
+/// [`region_tag_for_host`].
+pub fn host_for_tag(tag: &str) -> Option<&'static str> {
+    let tag = tag.trim().to_ascii_lowercase();
+    REGION_HOSTS
+        .iter()
+        .find(|(t, _)| *t == tag)
+        .map(|(_, host)| *host)
+}
+
+/// Normalise a caller-supplied region tag to a KNOWN tag (`"  ASIA "` → `"asia"`),
+/// or `None` when it isn't one of the three regions. Used to validate `--region`
+/// input and to sanitise persisted/env values before they steer the plan.
+pub fn normalize_region_tag(tag: &str) -> Option<&'static str> {
+    let tag = tag.trim().to_ascii_lowercase();
+    REGION_HOSTS
+        .iter()
+        .find(|(t, _)| *t == tag)
+        .map(|(t, _)| *t)
+}
+
+/// The default region order (`us`, `asia`, `fi`) as short tags — the canonical
+/// list a UI/CLI shows for `--region <tag>`.
+pub fn region_tags() -> [&'static str; 3] {
+    [REGION_HOSTS[0].0, REGION_HOSTS[1].0, REGION_HOSTS[2].0]
+}
+
 /// Build the validated **SRBMiner pearlhash** launch plan against ONE region
 /// endpoint.
 ///
@@ -359,6 +400,126 @@ fn probe_rtt(host: &str, port: u16) -> Option<Duration> {
 pub fn region_plan_by_rtt() -> EndpointPlan {
     EndpointPlan::new(select_region_endpoints())
         .unwrap_or_else(|_| EndpointPlan::single(default_region_endpoint()))
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Region PERSISTENCE + LOCK (D-line: remember last-good region, lock a region)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// How the region primary was resolved for a run — the pure decision, testable
+/// without touching settings / env / the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegionDecision {
+    /// A user pin (`start --region <tag>`): LOCK to this region. The plan is a
+    /// SINGLE endpoint so Layer B can never rotate away — it only retries this
+    /// region and reports a clear error if it stays unreachable.
+    Locked(&'static str),
+    /// Start with this region as the primary but keep the full set (auto-failover
+    /// stays available). Sourced from the `ALICE_GPU_RELAY_REGION` operator env or
+    /// the remembered last-good region.
+    PreferHead(&'static str),
+    /// No pin and no hint → the existing lowest-RTT probe order.
+    Probe,
+}
+
+/// The pure region decision (D-line). Precedence, highest first:
+///   1. `lock` — a user pin (`--region <tag>` → `settings.region_lock`). LOCKS.
+///   2. `env`  — the `ALICE_GPU_RELAY_REGION` operator override. Prefers-head
+///      (unchanged legacy behaviour: reorder, keep the full set).
+///   3. `last_good` — the remembered last region that landed an accepted share.
+///      Prefers-head so a restart resumes where it was working.
+///   4. otherwise → [`RegionDecision::Probe`] (the conservative default — zero
+///      surprise for a user with no pin and no history).
+///
+/// Each input is validated with [`normalize_region_tag`]; an unknown/empty value
+/// is ignored (falls through), so a garbage persisted/env value never wedges the
+/// lane.
+pub fn decide_region(
+    lock: Option<&str>,
+    env: Option<&str>,
+    last_good: Option<&str>,
+) -> RegionDecision {
+    if let Some(tag) = lock.and_then(normalize_region_tag) {
+        return RegionDecision::Locked(tag);
+    }
+    if let Some(tag) = env.and_then(normalize_region_tag) {
+        return RegionDecision::PreferHead(tag);
+    }
+    if let Some(tag) = last_good.and_then(normalize_region_tag) {
+        return RegionDecision::PreferHead(tag);
+    }
+    RegionDecision::Probe
+}
+
+/// The full region set (all three relays) reordered so `tag` is the primary
+/// (cursor-0), the rest following in the default `us, asia, fi` order. Deterministic
+/// (no probe) — used for the prefer-head decision so a restart resumes on the
+/// remembered/forced region immediately, while auto-failover to the others stays
+/// available.
+pub fn head_first_endpoints(tag: &str) -> Vec<Endpoint> {
+    let defaults = region_default_endpoints();
+    match REGION_HOSTS.iter().position(|(t, _)| Some(*t) == normalize_region_tag(tag)) {
+        Some(idx) => {
+            let mut ordered = vec![defaults[idx].clone()];
+            ordered.extend(
+                defaults
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != idx)
+                    .map(|(_, e)| e.clone()),
+            );
+            ordered
+        }
+        // Unknown tag → the plain default order (caller should have validated).
+        None => defaults,
+    }
+}
+
+/// Read the `ALICE_GPU_RELAY_REGION` operator env as a KNOWN region tag (or `None`).
+fn env_region_tag() -> Option<&'static str> {
+    std::env::var(ENV_REGION).ok().as_deref().and_then(normalize_region_tag)
+}
+
+/// Build the GPU-PRL [`EndpointPlan`] applying the D-line region policy: a user
+/// region LOCK (single region, no auto-failover), else the operator env / remembered
+/// last-good region as the primary (full set, auto-failover kept), else the
+/// lowest-RTT probe. Reads the persisted [`crate::settings`] (`region_lock`,
+/// `last_good_region`) + the `ALICE_GPU_RELAY_REGION` env. The ONE call the engine
+/// uses for this lane.
+pub fn region_plan() -> EndpointPlan {
+    let s = crate::settings::load();
+    region_plan_from(
+        s.region_lock.as_deref(),
+        env_region_tag(),
+        s.last_good_region.as_deref(),
+    )
+}
+
+/// [`region_plan`] with the three inputs passed explicitly (so it is unit-testable
+/// without settings/env). Maps the pure [`decide_region`] to a concrete plan.
+pub fn region_plan_from(
+    lock: Option<&str>,
+    env: Option<&str>,
+    last_good: Option<&str>,
+) -> EndpointPlan {
+    match decide_region(lock, env, last_good) {
+        RegionDecision::Locked(tag) => {
+            // Single-region plan: `can_failover()` is false, so Layer B retries THIS
+            // region in place (bounded by the restart budget) and never rotates away.
+            let host = host_for_tag(tag).unwrap_or(REGION_HOSTS[0].1);
+            EndpointPlan::single(Endpoint::plaintext(host, GPU_RELAY_PORT))
+        }
+        RegionDecision::PreferHead(tag) => EndpointPlan::new(head_first_endpoints(tag))
+            .unwrap_or_else(|_| EndpointPlan::single(default_region_endpoint())),
+        RegionDecision::Probe => region_plan_by_rtt(),
+    }
+}
+
+/// Whether the resolved region policy is a LOCK (no auto-failover). A thin read over
+/// the same inputs [`region_plan`] uses — the CLI banner + status labeling use it to
+/// tell the user "locked to X" vs "auto (nearest)". Pure over its args.
+pub fn is_region_locked(lock: Option<&str>, env: Option<&str>, last_good: Option<&str>) -> bool {
+    matches!(decide_region(lock, env, last_good), RegionDecision::Locked(_))
 }
 
 /// The US-first default region endpoint (the ultimate fallback head).
@@ -707,6 +868,105 @@ mod tests {
             Some(v) => std::env::set_var(ENV_REGION, v),
             None => std::env::remove_var(ENV_REGION),
         }
+    }
+
+    // ── D-line: region persistence + lock (pure decision, no network) ──────────
+
+    #[test]
+    fn region_tag_host_round_trip() {
+        assert_eq!(region_tag_for_host("us.aliceprotocol.org"), Some("us"));
+        assert_eq!(region_tag_for_host("asia.aliceprotocol.org"), Some("asia"));
+        assert_eq!(region_tag_for_host("fi.aliceprotocol.org"), Some("fi"));
+        // The XMR/RVN relay is NOT a region relay → None (so last-good never records it).
+        assert_eq!(region_tag_for_host("hk.aliceprotocol.org"), None);
+        assert_eq!(host_for_tag("ASIA"), Some("asia.aliceprotocol.org"));
+        assert_eq!(host_for_tag("  fi "), Some("fi.aliceprotocol.org"));
+        assert_eq!(host_for_tag("atlantis"), None);
+        assert_eq!(normalize_region_tag(" US "), Some("us"));
+        assert_eq!(normalize_region_tag("mars"), None);
+        assert_eq!(region_tags(), ["us", "asia", "fi"]);
+    }
+
+    #[test]
+    fn decide_region_precedence_lock_env_lastgood_probe() {
+        // Lock wins over everything.
+        assert_eq!(
+            decide_region(Some("asia"), Some("us"), Some("fi")),
+            RegionDecision::Locked("asia")
+        );
+        // No lock → env override (prefer-head, keeps full set).
+        assert_eq!(
+            decide_region(None, Some("us"), Some("fi")),
+            RegionDecision::PreferHead("us")
+        );
+        // No lock, no env → remembered last-good.
+        assert_eq!(
+            decide_region(None, None, Some("fi")),
+            RegionDecision::PreferHead("fi")
+        );
+        // Nothing → probe (the conservative default: zero surprise).
+        assert_eq!(decide_region(None, None, None), RegionDecision::Probe);
+        // A garbage value at any tier is ignored (falls through) — never wedges.
+        assert_eq!(
+            decide_region(Some("mars"), None, Some("asia")),
+            RegionDecision::PreferHead("asia")
+        );
+        assert_eq!(decide_region(Some(""), Some("   "), None), RegionDecision::Probe);
+    }
+
+    #[test]
+    fn head_first_endpoints_puts_tag_first_keeps_full_set() {
+        let eps = head_first_endpoints("asia");
+        assert_eq!(eps.len(), 3, "full set retained (failover still possible)");
+        assert_eq!(eps[0].host, "asia.aliceprotocol.org");
+        assert!(eps.iter().all(|e| e.port == GPU_RELAY_PORT));
+        for (_, host) in REGION_HOSTS {
+            assert!(eps.iter().any(|e| e.host == host), "missing {host}");
+        }
+        // An unknown tag degrades to the plain default order (no panic, non-empty).
+        let d = head_first_endpoints("atlantis");
+        assert_eq!(d.len(), 3);
+        assert_eq!(d[0].host, "us.aliceprotocol.org");
+    }
+
+    #[test]
+    fn region_plan_from_lock_is_single_region_no_failover() {
+        let plan = region_plan_from(Some("asia"), None, None);
+        assert_eq!(plan.len(), 1, "a lock pins ONE region");
+        assert!(!plan.can_failover(), "a locked region never auto-fails-over");
+        assert_eq!(plan.current().host, "asia.aliceprotocol.org");
+        assert_eq!(plan.current().port, GPU_RELAY_PORT);
+        assert!(is_region_locked(Some("asia"), None, None));
+    }
+
+    #[test]
+    fn region_plan_from_last_good_prefers_head_keeps_failover() {
+        // Remembered last-good = asia, no lock, no env → asia primary, full set.
+        let plan = region_plan_from(None, None, Some("asia"));
+        assert_eq!(plan.len(), 3);
+        assert!(plan.can_failover(), "prefer-head keeps auto-failover available");
+        assert_eq!(plan.current().host, "asia.aliceprotocol.org");
+        assert!(!is_region_locked(None, None, Some("asia")));
+    }
+
+    #[test]
+    fn region_plan_from_env_override_prefers_head() {
+        // The operator env keeps its legacy meaning: reorder head, keep full set.
+        let plan = region_plan_from(None, Some("fi"), Some("asia"));
+        assert_eq!(plan.len(), 3);
+        assert!(plan.can_failover());
+        assert_eq!(plan.current().host, "fi.aliceprotocol.org", "env beats last-good");
+    }
+
+    #[test]
+    fn conservative_default_no_lock_no_history_is_probe() {
+        // Requirement ④: with no `--region` pin and no remembered region, the
+        // decision is the existing lowest-RTT Probe (the full failover-capable set —
+        // proven by `region_plan_by_rtt_is_relay_only_full_set`). Zero surprise: a
+        // user who never touched region behaviour keeps the exact prior behaviour.
+        // (Asserted at the pure-decision layer so no live network probe runs here.)
+        assert_eq!(decide_region(None, None, None), RegionDecision::Probe);
+        assert!(!is_region_locked(None, None, None));
     }
 
     #[test]

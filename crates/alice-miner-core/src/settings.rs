@@ -33,6 +33,22 @@ pub struct Settings {
     /// again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
+    /// A user-PINNED GPU region tag (`"us"` / `"asia"` / `"fi"`), set by
+    /// `start --region <tag>`. When present the GPU-PRL lane LOCKS to this region:
+    /// it never auto-fails-over to another region — it only retries this one and
+    /// reports a clear error if it stays unreachable. `None` (the default) leaves
+    /// the lane on auto-failover. Cleared by `--region auto`. A value this build
+    /// doesn't recognise as a region tag is treated as "no lock" (never an error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_lock: Option<String>,
+    /// The last region tag that produced an ACCEPTED share this machine (recorded
+    /// automatically by the supervisor). On a fresh (unlocked) start the GPU-PRL
+    /// lane prefers this region as its primary — so a restart resumes on the region
+    /// that was actually working, instead of re-probing and possibly landing on a
+    /// slower/unreachable one. Purely a hint: auto-failover still applies. `None`
+    /// until the first accepted share on a region relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_good_region: Option<String>,
     /// Any settings keys this build does not know about, preserved verbatim so a
     /// round-trip through an older binary never drops a newer field.
     #[serde(flatten)]
@@ -102,6 +118,34 @@ pub fn save(settings: &Settings) -> Result<PathBuf, String> {
 pub fn save_lang(lang: Lang) -> Result<PathBuf, String> {
     let mut settings = load();
     settings.lang = Some(lang.code().to_string());
+    save(&settings)
+}
+
+/// Persist ONLY the region lock (`start --region <tag>`), merging over whatever
+/// else is on disk. Setting a lock pins the GPU-PRL lane to `tag` (no
+/// auto-failover). Returns the path written.
+pub fn save_region_lock(tag: &str) -> Result<PathBuf, String> {
+    let mut settings = load();
+    settings.region_lock = Some(tag.to_string());
+    save(&settings)
+}
+
+/// Clear the region lock (`start --region auto`), merging over whatever else is on
+/// disk. After this the GPU-PRL lane is back on auto-failover. Returns the path
+/// written.
+pub fn clear_region_lock() -> Result<PathBuf, String> {
+    let mut settings = load();
+    settings.region_lock = None;
+    save(&settings)
+}
+
+/// Record the last region that produced an ACCEPTED share (a hint the next start
+/// prefers as its primary), merging over whatever else is on disk. Best-effort:
+/// the supervisor calls this off its stats hot-path and ignores any error. Returns
+/// the path written.
+pub fn save_last_good_region(tag: &str) -> Result<PathBuf, String> {
+    let mut settings = load();
+    settings.last_good_region = Some(tag.to_string());
     save(&settings)
 }
 
@@ -184,6 +228,53 @@ mod tests {
             let s = load();
             assert_eq!(s.lang.as_deref(), Some("martian"));
             assert_eq!(s.parsed_lang(), None, "unknown lang → no preference");
+        });
+    }
+
+    #[test]
+    fn save_and_clear_region_lock_round_trip() {
+        with_temp_id_dir(|| {
+            // Absent by default.
+            assert_eq!(load().region_lock, None);
+            // Set → persisted.
+            save_region_lock("asia").expect("save lock");
+            assert_eq!(load().region_lock.as_deref(), Some("asia"));
+            // Cleared → back to None (the field is omitted from the file, not `null`).
+            let path = clear_region_lock().expect("clear lock");
+            assert_eq!(load().region_lock, None);
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(!raw.contains("region_lock"), "cleared lock is omitted: {raw}");
+        });
+    }
+
+    #[test]
+    fn save_last_good_region_round_trips() {
+        with_temp_id_dir(|| {
+            assert_eq!(load().last_good_region, None);
+            save_last_good_region("us").expect("save good region");
+            assert_eq!(load().last_good_region.as_deref(), Some("us"));
+        });
+    }
+
+    /// Region settings and the language setting are independent: writing one never
+    /// clobbers the other (the merge-over-load contract), and unknown future fields
+    /// still survive.
+    #[test]
+    fn region_and_lang_settings_are_independent() {
+        with_temp_id_dir(|| {
+            std::fs::write(
+                settings_path(),
+                br#"{"schema":1,"lang":"zh","future_setting":7}"#,
+            )
+            .unwrap();
+            save_region_lock("fi").expect("save lock");
+            save_last_good_region("asia").expect("save good");
+            let s = load();
+            assert_eq!(s.parsed_lang(), Some(Lang::Zh), "lang preserved");
+            assert_eq!(s.region_lock.as_deref(), Some("fi"));
+            assert_eq!(s.last_good_region.as_deref(), Some("asia"));
+            let raw = std::fs::read_to_string(settings_path()).unwrap();
+            assert!(raw.contains("future_setting"), "unknown field preserved: {raw}");
         });
     }
 }

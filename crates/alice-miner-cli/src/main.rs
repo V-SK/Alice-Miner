@@ -444,6 +444,15 @@ struct StartArgs {
     /// `alice-miner detect` (the per-GPU list). Ignored for the CPU-XMR lane.
     #[arg(long, value_name = "IDS")]
     gpus: Option<String>,
+    /// PIN the GPU-PRL region: `us`, `asia`, or `fi`. LOCKS the lane to that region —
+    /// it never auto-fails-over to another region; if the region is unreachable it
+    /// retries that one and reports a clear error. The choice is REMEMBERED (persisted
+    /// to `~/.alice/settings.json`), so later runs stay on it. Pass `--region auto` to
+    /// CLEAR the lock and return to automatic (nearest region, with auto-failover). OMIT
+    /// the flag to keep whatever was remembered. With no lock and no history the lane
+    /// picks the nearest region (unchanged default). Only affects the GPU-PRL lane.
+    #[arg(long, value_name = "REGION")]
+    region: Option<String>,
     /// Internal marker set on the invocation the BACKGROUND SERVICE runs, so the
     /// single-owner check below doesn't make the agent refuse to start itself.
     /// Not for manual use. Hidden.
@@ -995,6 +1004,7 @@ fn start_args_auto() -> StartArgs {
         password: None,
         password_stdin: false,
         gpus: None,
+        region: None,
         from_service: false,
     }
 }
@@ -1762,6 +1772,25 @@ fn cmd_start_with_unlock(
         },
     };
 
+    // D-line region pin: `--region <us|asia|fi>` LOCKS the GPU-PRL lane to a region
+    // (persisted, no auto-failover); `--region auto` CLEARS the lock. Persist BEFORE
+    // the engine starts (it reads the setting when it builds the region plan). A
+    // usage error on an unknown value (never a silent no-op). Omitting the flag keeps
+    // whatever was remembered.
+    if let Some(raw) = args.region.as_deref() {
+        if let Err(code) = apply_region_flag(raw, args.json) {
+            return code;
+        }
+    }
+    // Human path only: label the effective region MODE (locked vs auto + last-good)
+    // so the user always knows whether the lane will auto-failover — for the GPU-PRL
+    // lane, where region applies.
+    if !args.json && !args.from_service && lane == Lane::GpuPrl {
+        if let Some(banner) = region_mode_banner() {
+            println!("{banner}");
+        }
+    }
+
     // Single-owner lock: a MANUAL `start` refuses while the background service is
     // installed/running — two miners to the same address only waste the machine.
     // The service's own invocation passes `--from-service` to bypass this (it IS
@@ -2257,6 +2286,108 @@ fn resolve_lane(s: &str, cap: &alice_miner_core::CapabilityProfile) -> Result<La
     }
 }
 
+/// Apply `--region <value>` (D-line): validate + PERSIST the GPU-PRL region pin
+/// BEFORE the engine builds its plan. `us`/`asia`/`fi` LOCK the lane to that region
+/// (no auto-failover); `auto`/`off`/`clear`/`none` CLEAR the lock. Returns `Err(exit)`
+/// only on an unknown value (a usage error — never a silent no-op). A persistence
+/// failure (e.g. a read-only home) is a non-fatal warning: the run continues on
+/// whatever is on disk. Confirmation is printed on the human path (suppressed under
+/// `--json`).
+fn apply_region_flag(raw: &str, json: bool) -> Result<(), i32> {
+    let v = raw.trim().to_ascii_lowercase();
+    // Clear the lock → back to automatic (nearest region + auto-failover).
+    if matches!(v.as_str(), "auto" | "off" | "clear" | "none" | "") {
+        match alice_miner_core::settings::clear_region_lock() {
+            Ok(_) if !json => println!(
+                "{}",
+                tr!(
+                    "Region lock cleared — the GPU-PRL lane will pick the nearest region and auto-failover.",
+                    "已清除区域锁定 — GPU-PRL 通道将选择最近区域并自动切换。"
+                )
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: could not persist region setting: {e}"),
+        }
+        return Ok(());
+    }
+    // Lock to a known region tag.
+    match alice_miner_core::lane::gpu_prl::normalize_region_tag(&v) {
+        Some(tag) => {
+            match alice_miner_core::settings::save_region_lock(tag) {
+                Ok(_) if !json => println!(
+                    "{}",
+                    tr!(
+                        "Region locked to {tag} — the GPU-PRL lane will only use this region (no auto-failover). Use `--region auto` to unlock.",
+                        "区域已锁定为 {tag} — GPU-PRL 通道将只使用该区域(不自动切换)。用 `--region auto` 解除。"
+                    )
+                    .replace("{tag}", tag)
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!("warning: could not persist region setting: {e}"),
+            }
+            Ok(())
+        }
+        None => {
+            let tags = alice_miner_core::lane::gpu_prl::region_tags().join(" | ");
+            eprintln!(
+                "error: {}",
+                tr!(
+                    "unknown region `{r}` (use: {tags} | auto)",
+                    "未知区域 `{r}`(可用: {tags} | auto)"
+                )
+                .replace("{r}", raw)
+                .replace("{tags}", &tags)
+            );
+            Err(EXIT_USAGE)
+        }
+    }
+}
+
+/// A one-line banner labeling the effective GPU-PRL region MODE (so the user always
+/// knows whether the lane will auto-failover): LOCKED to a region, an operator env
+/// override, resuming a remembered last-good region, or plain automatic. Reads the
+/// same inputs the engine's plan does ([`alice_miner_core::settings`] +
+/// `ALICE_GPU_RELAY_REGION`). `None` should not occur (the match is total); kept as
+/// `Option` so a future "nothing to say" case can suppress it.
+fn region_mode_banner() -> Option<String> {
+    use alice_miner_core::lane::gpu_prl;
+    let s = alice_miner_core::settings::load();
+    let env = std::env::var(gpu_prl::ENV_REGION).ok();
+    let banner = match gpu_prl::decide_region(
+        s.region_lock.as_deref(),
+        env.as_deref(),
+        s.last_good_region.as_deref(),
+    ) {
+        gpu_prl::RegionDecision::Locked(tag) => tr!(
+            "Region: locked to {tag} — no auto-failover (use `--region auto` to unlock).",
+            "区域: 已锁定 {tag} — 不自动切换(用 `--region auto` 解除)。"
+        )
+        .replace("{tag}", tag),
+        gpu_prl::RegionDecision::PreferHead(tag) => {
+            // Distinguish an operator env override from a remembered last-good region.
+            if gpu_prl::normalize_region_tag(env.as_deref().unwrap_or("")) == Some(tag) {
+                tr!(
+                    "Region: {tag} (operator override) — auto-failover on.",
+                    "区域: {tag}(操作员指定)— 自动切换开启。"
+                )
+                .replace("{tag}", tag)
+            } else {
+                tr!(
+                    "Region: auto — resuming last-good {tag}; auto-failover on.",
+                    "区域: 自动 — 沿用上次可用的 {tag};自动切换开启。"
+                )
+                .replace("{tag}", tag)
+            }
+        }
+        gpu_prl::RegionDecision::Probe => tr!(
+            "Region: auto (nearest region) — auto-failover on.",
+            "区域: 自动(最近区域)— 自动切换开启。"
+        )
+        .to_string(),
+    };
+    Some(banner)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // stop
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2618,6 +2749,56 @@ mod tests {
             Command::Start(a) => assert!(GpuSelection::parse_ids(a.gpus.as_deref().unwrap()).is_err()),
             _ => panic!("expected start"),
         }
+    }
+
+    #[test]
+    fn start_region_flag_parses_else_none() {
+        // Present → the raw value is carried (validation happens in apply_region_flag).
+        let cli = Cli::try_parse_from(["alice-miner", "start", "--region", "asia"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Start(a) => assert_eq!(a.region.as_deref(), Some("asia")),
+            _ => panic!("expected start"),
+        }
+        // Absent → None (keep whatever region was remembered — the conservative default).
+        let cli = Cli::try_parse_from(["alice-miner", "start"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Start(a) => assert!(a.region.is_none()),
+            _ => panic!("expected start"),
+        }
+    }
+
+    /// `apply_region_flag` LOCKS a known region, CLEARS on `auto`, and rejects an
+    /// unknown value with a usage error — all persisted under an ISOLATED identity
+    /// dir (never the real `~/.alice`).
+    #[test]
+    fn apply_region_flag_locks_clears_and_rejects() {
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "alice-region-flag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
+
+        // Lock (case-insensitive) → persisted.
+        assert!(apply_region_flag("ASIA", /*json=*/ true).is_ok());
+        assert_eq!(
+            alice_miner_core::settings::load().region_lock.as_deref(),
+            Some("asia")
+        );
+        // Clear via `auto` → lock removed.
+        assert!(apply_region_flag("auto", true).is_ok());
+        assert_eq!(alice_miner_core::settings::load().region_lock, None);
+        // Unknown region → usage error (never a silent no-op), and NOTHING persisted.
+        assert_eq!(apply_region_flag("atlantis", true), Err(EXIT_USAGE));
+        assert_eq!(alice_miner_core::settings::load().region_lock, None);
+
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

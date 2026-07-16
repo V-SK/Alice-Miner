@@ -858,10 +858,13 @@ fn start_one_lane(
             });
         }
     }
-    // GPU-PRL targets the region relays ordered by lowest RTT (operator override /
-    // probe / US-first fallback); every other lane uses its compiled plan.
+    // GPU-PRL targets the region relays under the D-line region policy: a user
+    // region LOCK (`--region <tag>` → single region, no auto-failover), else the
+    // remembered last-good region / operator env as the primary (full set,
+    // auto-failover kept), else the lowest-RTT probe. Every other lane uses its
+    // compiled plan.
     let plan = if lane == Lane::GpuPrl {
-        gpu_prl::region_plan_by_rtt()
+        gpu_prl::region_plan()
     } else {
         EndpointPlan::for_lane(lane)
     };
