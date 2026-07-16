@@ -191,7 +191,7 @@ mod tests {
         assert_eq!(LANE, Lane::GpuAlpha);
         assert_eq!(Lane::GpuAlpha.id(), "alpha");
         assert!(Lane::GpuAlpha.is_prl_lane());
-        assert_eq!(region_default_endpoints().len(), 3);
+        assert_eq!(region_default_endpoints().len(), 2);
         assert!(region_default_endpoints()
             .iter()
             .all(|e| e.port == 3341 && e.host.ends_with("aliceprotocol.org")));
@@ -285,7 +285,7 @@ mod tests {
         let plan = build_alphaminer_launch_plan(
             PathBuf::from("alpha-miner"),
             addr,
-            "fi.aliceprotocol.org:3341",
+            "asia.aliceprotocol.org:3341",
             &alpha_placeholder_address(),
             Some("volta"),
             &GpuSelection::All,

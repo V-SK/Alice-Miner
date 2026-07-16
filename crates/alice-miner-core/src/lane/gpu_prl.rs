@@ -5,7 +5,7 @@
 //!
 //! This is a DIFFERENT path from [`super::gpu_rvn`] (kawpowminer/KawPoW →
 //! `hk:8888`, no PoP): different binary (SRBMiner), algorithm (`pearlhash`), port
-//! (`3340`), region host-set (us/asia/fi), and auth model (PoP). Only the
+//! (`3340`), region host-set (us/asia), and auth model (PoP). Only the
 //! *structure* (the [`GpuLaunchPlan`], `derive_worker_id` reuse, the per-lane
 //! honesty gate) is shared.
 //!
@@ -143,10 +143,14 @@ pub const GPU_RELAY_PORT: u16 = 3340;
 
 /// The region relay hosts (lowest-RTT wins at runtime; US is the default order
 /// head). These ARE public Alice relay endpoints — shown openly.
-pub const REGION_HOSTS: [(&str, &str); 3] = [
+///
+/// NOTE: the `fi` region (`fi.aliceprotocol.org`) was removed in v0.6.1 — it was
+/// never provisioned and resolves NXDOMAIN, so shipping it made clients waste a
+/// full RTT-probe timeout on a dead host on every startup. Re-add it here (and in
+/// the tests below) if/when a real Finland relay is stood up.
+pub const REGION_HOSTS: [(&str, &str); 2] = [
     ("us", "us.aliceprotocol.org"),
     ("asia", "asia.aliceprotocol.org"),
-    ("fi", "fi.aliceprotocol.org"),
 ];
 
 /// The default region order (US-first) as plaintext [`Endpoint`]s on [`GPU_RELAY_PORT`].
@@ -265,14 +269,14 @@ pub fn build_srbminer_pearl_launch_plan_for(
 // Region selection (lowest-RTT-wins, with an operator override)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Env override: force a specific region by its short tag (`us` / `asia` / `fi`).
+/// Env override: force a specific region by its short tag (`us` / `asia`).
 /// When set to a KNOWN tag it REPLACES the RTT probe; an unknown/empty value is
 /// ignored (falls back to the RTT probe).
 pub const ENV_REGION: &str = "ALICE_GPU_RELAY_REGION";
 
 /// Per-region TCP-connect timeout for the RTT probe. A region that doesn't
 /// answer within this is treated as unreachable (skipped). Kept short so the
-/// startup probe over all three regions is bounded (~3×).
+/// startup probe over both regions is bounded (~2×).
 const RTT_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Order the region relay [`Endpoint`]s by ascending TCP-connect RTT to their
@@ -281,9 +285,9 @@ const RTT_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// every region) — only the ORDER changes.
 ///
 /// Resolution:
-///   1. `$ALICE_GPU_RELAY_REGION=<tag>` (us/asia/fi) → that region is forced to
+///   1. `$ALICE_GPU_RELAY_REGION=<tag>` (us/asia) → that region is forced to
 ///      the head (no probe); unknown/empty values are ignored.
-///   2. otherwise probe all three with [`probe_rtt`] and sort by latency;
+///   2. otherwise probe both with [`probe_rtt`] and sort by latency;
 ///      unreachable regions sort last (in their default order).
 ///   3. if EVERY region is unreachable, fall back to the US-first default order
 ///      (so the lane still launches and the miner's own reconnect can take over).
@@ -403,7 +407,7 @@ mod tests {
         assert_eq!(GPU_RELAY_PORT, 3340);
         assert_eq!(LANE, Lane::GpuPrl);
         assert_eq!(Lane::GpuPrl.id(), "prl");
-        assert_eq!(region_default_endpoints().len(), 3);
+        assert_eq!(region_default_endpoints().len(), 2);
         assert!(region_default_endpoints()
             .iter()
             .all(|e| e.port == 3340 && e.host.ends_with("aliceprotocol.org")));
@@ -640,10 +644,10 @@ mod tests {
     fn region_override_forces_tag_to_head_keeping_full_set() {
         let _g = REGION_ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var(ENV_REGION).ok();
-        // Force asia → asia must be cursor-0, all three regions still present.
+        // Force asia → asia must be cursor-0, both regions still present.
         std::env::set_var(ENV_REGION, "asia");
         let eps = select_region_endpoints();
-        assert_eq!(eps.len(), 3, "the full region set is always returned");
+        assert_eq!(eps.len(), 2, "the full region set is always returned");
         assert_eq!(eps[0].host, "asia.aliceprotocol.org");
         assert!(eps.iter().all(|e| e.port == GPU_RELAY_PORT));
         // Every default host is still represented (only the ORDER changed).
@@ -651,8 +655,8 @@ mod tests {
             assert!(eps.iter().any(|e| e.host == host), "missing region {host}");
         }
         // Case-insensitive.
-        std::env::set_var(ENV_REGION, "FI");
-        assert_eq!(select_region_endpoints()[0].host, "fi.aliceprotocol.org");
+        std::env::set_var(ENV_REGION, "US");
+        assert_eq!(select_region_endpoints()[0].host, "us.aliceprotocol.org");
 
         match prev {
             Some(v) => std::env::set_var(ENV_REGION, v),
@@ -666,10 +670,10 @@ mod tests {
         let prev = std::env::var(ENV_REGION).ok();
         // An unknown tag is ignored (falls through to the RTT probe). We can't
         // assert the probe's ORDER offline, but the set must be intact + non-empty
-        // and contain exactly the three region hosts.
+        // and contain exactly the region hosts.
         std::env::set_var(ENV_REGION, "atlantis");
         let eps = select_region_endpoints();
-        assert_eq!(eps.len(), 3);
+        assert_eq!(eps.len(), 2);
         for (_, host) in REGION_HOSTS {
             assert!(eps.iter().any(|e| e.host == host));
         }
@@ -699,7 +703,7 @@ mod tests {
         std::env::set_var(ENV_REGION, "us");
         let plan = region_plan_by_rtt();
         let ordered = plan.ordered_from_cursor();
-        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered.len(), 2);
         assert!(ordered
             .iter()
             .all(|e| e.host.ends_with("aliceprotocol.org") && e.port == GPU_RELAY_PORT));

@@ -778,7 +778,7 @@ fn demo_dual_snapshot() -> Snapshot {
                 shares_accepted: demo_prl_accepted(),
                 shares_rejected: 0,
                 uptime_s: 38 * 60 + 5,
-                endpoint: Some("fi.aliceprotocol.org:3340".into()),
+                endpoint: Some("asia.aliceprotocol.org:3340".into()),
                 failovers: 0,
                 // Demo GPU telemetry so the showcase snapshot exercises the readout.
                 temp_c: Some(62.0),
