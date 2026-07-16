@@ -131,6 +131,7 @@ dependencies = [
  "tar",
  "tokio",
  "ureq",
+ "windows-sys 0.61.2",
  "zeroize",
  "zip",
 ]

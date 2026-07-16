@@ -32,6 +32,7 @@ pub use alice_supervise;
 
 pub mod ai_config;
 pub mod binaries;
+pub mod console;
 pub mod dashboard;
 pub mod detect;
 pub mod endpoint;

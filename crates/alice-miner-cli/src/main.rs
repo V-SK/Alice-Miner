@@ -686,6 +686,13 @@ struct LangArgs {
 }
 
 fn main() {
+    // FIRST, before ANY output (including clap's help/version/usage errors): on
+    // Windows, force the console code pages to UTF-8 so our UTF-8 text — notably
+    // 中文 — is not mojibake'd by a legacy OEM code page (cp950/Big5 on 繁中
+    // Windows). No-op on other platforms and when no console is attached. See
+    // `alice_miner_core::console::init_utf8_console` for the full root-cause note.
+    alice_miner_core::console::init_utf8_console();
+
     let cli = Cli::parse();
     let no_color = cli.no_color;
     // Resolve + set the process-global UI language ONCE, before any user-facing
