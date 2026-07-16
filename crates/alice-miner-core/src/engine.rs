@@ -1567,6 +1567,14 @@ mod tests {
 
     #[test]
     fn start_without_identity_errors() {
+        // Serialize on the crate-wide identity-env lock: this test mutates the
+        // process-global `$ALICE_IDENTITY_DIR`, and so do the sibling identity tests
+        // (`resolve_prl_secrets_*` here, plus the `identity` / `settings` /
+        // `ai_config` / `train_config` tests). Without holding the SAME lock, a
+        // parallel `remove_var` below could clear another test's `$ALICE_IDENTITY_DIR`
+        // mid-flight, and its `identity::create` would then fall back to the REAL
+        // `~/.alice` (lib.rs: `IDENTITY_ENV_LOCK` invariant).
+        let _g = crate::IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let engine = EngineHandle::spawn().expect("spawn");
         // No identity, no pointer (the real ~/.alice may or may not exist; point
         // the identity dir at an empty temp dir to be deterministic).

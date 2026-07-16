@@ -96,6 +96,24 @@ fn identity_dir() -> PathBuf {
             return PathBuf::from(s);
         }
     }
+    // Test-only safety net (compiled OUT of production — `cfg(test)` is active only
+    // while alice-miner-core builds its OWN test binary, never when it is a normal
+    // dependency of the CLI/GUI): inside this crate's test suite EVERY test that
+    // touches the identity/keystore tree is required to redirect it through
+    // `$ALICE_IDENTITY_DIR` (the `with_temp_env` / `IDENTITY_ENV_LOCK` discipline).
+    // Reaching the real-`~/.alice` fallback here means a test forgot that isolation,
+    // or an env race cleared the var — fail LOUD immediately rather than silently
+    // clobbering the user's real wallet keystore. Scoped to this (keystore + pointer)
+    // resolver on purpose; the settings/train/ai_config config dirs share the same
+    // pattern but are read by broadly-run paths and hold no secret, so they stay
+    // unguarded to avoid false positives.
+    #[cfg(test)]
+    panic!(
+        "identity_dir: $ALICE_IDENTITY_DIR unset/empty under cfg(test) — a test \
+         reached the real ~/.alice fallback. Wrap it in `with_temp_env` (or set \
+         $ALICE_IDENTITY_DIR) so it never touches the real home."
+    );
+    #[cfg(not(test))]
     dirs::home_dir()
         .map(|h| h.join(".alice"))
         .unwrap_or_else(|| PathBuf::from(".alice"))
@@ -673,5 +691,70 @@ mod tests {
         };
         let json = serde_json::to_string(&cur).unwrap();
         assert!(json.contains("\"schema\":1"), "schema is written going forward: {json}");
+    }
+
+    /// Test-isolation regression: under concurrent scheduling, `create` must ALWAYS
+    /// write into the caller's `$ALICE_IDENTITY_DIR` and NEVER fall back to the real
+    /// `~/.alice`. Each worker follows the mandated discipline — take the crate-wide
+    /// `IDENTITY_ENV_LOCK`, point the identity + keystore dirs at its OWN temp base,
+    /// create, then clear — and asserts the keystore + pointer landed INSIDE that temp
+    /// base. If a future change dropped the lock from any of these env-mutating helpers,
+    /// the interleaving would clear `$ALICE_IDENTITY_DIR` mid-create and the (cfg(test))
+    /// home-fallback guard in [`identity_dir`] would panic the worker, failing this test.
+    /// We deliberately do NOT touch the process-global `HOME` (the `prl_payout` tests
+    /// mutate it under a different lock); the guard already makes any real-home fallback
+    /// a hard panic, so a worker that ever resolved the real `~/.alice` could not join.
+    #[test]
+    fn create_never_falls_back_to_home_under_parallel_pressure() {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let _g = crate::IDENTITY_ENV_LOCK
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let base = std::env::temp_dir().join(format!(
+                        "alice-id-parallel-{}-{}-{}",
+                        std::process::id(),
+                        i,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos()
+                    ));
+                    let wallet_root = base.join("wallet");
+                    let id_dir = base.join("dot-alice");
+                    std::fs::create_dir_all(&wallet_root).unwrap();
+                    std::fs::create_dir_all(&id_dir).unwrap();
+                    std::env::set_var("ALICE_WALLET_DATA_ROOT", &wallet_root);
+                    std::env::set_var("ALICE_IDENTITY_DIR", &id_dir);
+
+                    let (id, _m) = create(Some(format!("w{i}")), "correct horse battery staple")
+                        .expect("create under the lock");
+                    // The keystore + pointer landed in THIS worker's temp id dir — never
+                    // the real ~/.alice (which the cfg(test) guard would have panicked on).
+                    let ptr = identity_path();
+                    let ks = miner_keystore_path();
+                    assert!(ptr.starts_with(&id_dir), "pointer under temp id dir: {}", ptr.display());
+                    assert!(ks.starts_with(&id_dir), "keystore under temp id dir: {}", ks.display());
+                    assert!(ptr.is_file(), "pointer written: {}", ptr.display());
+                    assert!(ks.is_file(), "keystore written: {}", ks.display());
+                    assert_eq!(load_pointer().unwrap().address, id.address);
+
+                    std::env::remove_var("ALICE_WALLET_DATA_ROOT");
+                    std::env::remove_var("ALICE_IDENTITY_DIR");
+                    let _ = std::fs::remove_dir_all(&base);
+                    id.address
+                })
+            })
+            .collect();
+
+        let mut addrs = Vec::new();
+        for h in handles {
+            addrs.push(h.join().expect("worker never hit the real-home fallback"));
+        }
+        // Sanity: every worker actually ran a real create (distinct fresh identities).
+        addrs.sort();
+        addrs.dedup();
+        assert_eq!(addrs.len(), 8, "each worker created its own distinct identity");
     }
 }

@@ -17,9 +17,43 @@ use std::process::Command;
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 
-/// Path to the built binary under test.
+/// The env var that disables the CLI's startup version-check (a background GitHub
+/// call and a `~/.alice/update-check.json` write). Mirrors `update::ENV_NO_UPDATE_CHECK`;
+/// this integration test drives the BUILT binary (not the lib), so it can't reach that
+/// `pub const` and the name is duplicated here with this note.
+const ENV_NO_UPDATE_CHECK: &str = "ALICE_MINER_NO_UPDATE_CHECK";
+
+/// A single process-wide throwaway `~/.alice` substitute for the `bin()` commands that
+/// don't establish their own identity (`--help`, `detect`, the `start` gating tests,
+/// `doctor`, …). Without it those spawn the real binary against the real `~/.alice`.
+/// Created once; the isolated-identity tests layer their own per-test `TempEnv` over
+/// this (via `env.apply`), which overrides the two dir vars.
+fn shared_isolation_base() -> &'static std::path::Path {
+    static BASE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        let base = std::env::temp_dir().join(format!("alice-miner-cli-it-shared-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("wallet")).ok();
+        std::fs::create_dir_all(base.join("dot-alice")).ok();
+        base
+    })
+}
+
+/// Path to the built binary under test, with test-isolation env ALWAYS applied so a
+/// spawned binary can NEVER touch the real `~/.alice` or hit the network:
+///   * `ALICE_IDENTITY_DIR` / `ALICE_WALLET_DATA_ROOT` → a throwaway dir (so any state
+///     write lands there, not the user's real keystore).
+///   * `ALICE_MINER_NO_UPDATE_CHECK=1` → the startup version-check is a no-op (no GitHub
+///     call, no `update-check.json` write).
+///
+/// Tests that need their own identity state layer a per-test `TempEnv` over this via
+/// `env.apply(&mut cmd)`, which overrides the two dir vars (the flag stays set).
 fn bin() -> Command {
-    Command::cargo_bin("alice-miner-cli").expect("built alice-miner-cli binary")
+    let mut cmd = Command::cargo_bin("alice-miner-cli").expect("built alice-miner-cli binary");
+    let base = shared_isolation_base();
+    cmd.env("ALICE_WALLET_DATA_ROOT", base.join("wallet"));
+    cmd.env("ALICE_IDENTITY_DIR", base.join("dot-alice"));
+    cmd.env(ENV_NO_UPDATE_CHECK, "1");
+    cmd
 }
 
 /// A fresh, isolated `~/.alice` + keystore dir for an identity test, via the env
@@ -163,6 +197,7 @@ fn identity_create_reads_password_from_stdin() {
         assert_cmd::Command::cargo_bin("alice-miner-cli").expect("built alice-miner-cli binary");
     cmd.env("ALICE_WALLET_DATA_ROOT", env.wallet_root());
     cmd.env("ALICE_IDENTITY_DIR", env.id_dir());
+    cmd.env(ENV_NO_UPDATE_CHECK, "1");
     let out = cmd
         .args(["identity", "--create", "--password-stdin", "--label", "it"])
         .write_stdin("a stdin passphrase with spaces\n")
@@ -460,6 +495,7 @@ fn ai_without_shard_psk_fails_closed() {
     let mut cmd = assert_cmd::Command::cargo_bin("alice-miner-cli").unwrap();
     cmd.env("ALICE_WALLET_DATA_ROOT", env.wallet_root());
     cmd.env("ALICE_IDENTITY_DIR", env.id_dir());
+    cmd.env(ENV_NO_UPDATE_CHECK, "1");
     cmd.env_remove("SHARD_PSK");
     cmd.args([
         "ai",
