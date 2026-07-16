@@ -256,6 +256,9 @@ Your reward tracks your share of hashpower (a rolling ~24h average), not how man
                 password: None,
                 password_stdin: false,
                 gpus: None,
+                // The wizard inherits whatever region was remembered (no pin here);
+                // a user sets/clears the lock later with `start --region <tag|auto>`.
+                region: None,
                 from_service: false,
             };
             // NIT B: if we just generated the keystore, hand its passphrase straight to

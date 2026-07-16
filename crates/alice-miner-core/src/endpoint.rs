@@ -265,6 +265,37 @@ impl EndpointPlan {
         self.current()
     }
 
+    /// The endpoints Layer B could rotate TO next, in failover order (the rotation
+    /// starting just AFTER the current cursor, wrapping, excluding the current
+    /// endpoint). Empty for a single-endpoint plan — there is nowhere to fail over,
+    /// so the watchdog retries the SAME endpoint in place (the locked-region case).
+    /// The watchdog probes these off-lock to pick the first REACHABLE one before it
+    /// commits a failover (so it never switches into a dead region).
+    pub fn failover_candidates(&self) -> Vec<Endpoint> {
+        let n = self.endpoints.len();
+        (1..n)
+            .map(|i| self.endpoints[(self.cursor + i) % n].clone())
+            .collect()
+    }
+
+    /// Move the failover cursor to the endpoint matching `target` (by host + port),
+    /// returning `true` if it was found and the cursor moved there. `false` (cursor
+    /// unchanged) when no endpoint matches — the caller then falls back to a plain
+    /// [`Self::advance`]. Used by the watchdog after it has picked a reachable
+    /// failover target off-lock.
+    pub fn advance_to(&mut self, target: &Endpoint) -> bool {
+        if let Some(idx) = self
+            .endpoints
+            .iter()
+            .position(|e| e.host == target.host && e.port == target.port)
+        {
+            self.cursor = idx;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Reset the cursor to the primary endpoint (e.g. on a fresh user-initiated
     /// Start).
     pub fn reset(&mut self) {
@@ -378,6 +409,50 @@ mod tests {
         assert_eq!(plan.cursor(), 0);
         plan.reset();
         assert_eq!(plan.cursor(), 0);
+    }
+
+    #[test]
+    fn failover_candidates_exclude_current_in_rotation_order() {
+        let mut plan = EndpointPlan::new(vec![
+            Endpoint::plaintext("a.example", 1),
+            Endpoint::plaintext("b.example", 2),
+            Endpoint::plaintext("c.example", 3),
+        ])
+        .unwrap();
+        // At cursor 0 (a): candidates are b, c.
+        let c: Vec<String> = plan.failover_candidates().iter().map(|e| e.host.clone()).collect();
+        assert_eq!(c, ["b.example", "c.example"]);
+        // After advancing to b: candidates are c, a (wraps, excludes current b).
+        plan.advance();
+        let c: Vec<String> = plan.failover_candidates().iter().map(|e| e.host.clone()).collect();
+        assert_eq!(c, ["c.example", "a.example"]);
+    }
+
+    #[test]
+    fn single_endpoint_plan_has_no_failover_candidates() {
+        // A locked/single-region plan can't fail over — the watchdog retries in place.
+        let plan = EndpointPlan::single(Endpoint::plaintext("asia.aliceprotocol.org", 3340));
+        assert!(plan.failover_candidates().is_empty());
+    }
+
+    #[test]
+    fn advance_to_moves_cursor_to_matching_endpoint_else_false() {
+        let mut plan = EndpointPlan::new(vec![
+            Endpoint::plaintext("a.example", 1),
+            Endpoint::plaintext("b.example", 2),
+            Endpoint::plaintext("c.example", 3),
+        ])
+        .unwrap();
+        // Jump straight to c (matched by host+port).
+        assert!(plan.advance_to(&Endpoint::plaintext("c.example", 3)));
+        assert_eq!(plan.cursor(), 2);
+        assert_eq!(plan.current().host, "c.example");
+        // A non-member leaves the cursor untouched and returns false.
+        assert!(!plan.advance_to(&Endpoint::plaintext("z.example", 9)));
+        assert_eq!(plan.cursor(), 2, "cursor unchanged on a miss");
+        // Port is part of the match (same host, different port ⇒ miss).
+        assert!(!plan.advance_to(&Endpoint::plaintext("a.example", 999)));
+        assert_eq!(plan.cursor(), 2);
     }
 
     #[test]
