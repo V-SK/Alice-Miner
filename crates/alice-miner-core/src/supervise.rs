@@ -2326,10 +2326,21 @@ mod tests {
             )
             .expect("start");
 
+            // Poll for BOTH landing conditions inside one bounded loop: the cursor +
+            // failover counter advance BEFORE the relaunch path restores the labeled
+            // status (`spawn_run` clears `message`; the watchdog re-sets it right
+            // after — see the failover relaunch arm above). On a slow / contended
+            // runner the gap between those two lock acquisitions is observable, so a
+            // single read of `stats().message` right after `landed` can race a benign
+            // transient `None`. Only a label that NEVER shows up within the budget is
+            // a real failure.
             let mut landed = false;
+            let mut labeled = false;
             for _ in 0..200 {
-                if s.failovers() >= 1 && s.current_endpoint() == live {
-                    landed = true;
+                landed = s.failovers() >= 1 && s.current_endpoint() == live;
+                let msg = s.stats().message.unwrap_or_default();
+                labeled = msg.contains("auto-failover") || msg.contains("自动切换");
+                if landed && labeled {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2341,10 +2352,10 @@ mod tests {
                 s.current_endpoint(),
                 s.failovers()
             );
-            let msg = s.stats().message.unwrap_or_default();
             assert!(
-                msg.contains("auto-failover") || msg.contains("自动切换"),
-                "status should label the auto-failover: {msg:?}"
+                labeled,
+                "status should label the auto-failover: {:?}",
+                s.stats().message
             );
 
             s.request_stop();
