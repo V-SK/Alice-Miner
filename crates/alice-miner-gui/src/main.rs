@@ -13,6 +13,7 @@
 //! `alice-wallet/gui/src/main.rs` (~L52).
 
 mod app;
+mod platform;
 mod shot;
 mod ui;
 mod update;
@@ -74,12 +75,28 @@ fn main() -> eframe::Result<()> {
         viewport = viewport.with_icon(icon);
     }
 
+    // Pick the rendering backend BEFORE building the window. `glow` (OpenGL) stays
+    // the default for local sessions, but on a Windows remote-desktop session it
+    // paints a solid-white window (broken/software GL context), so we fall back to
+    // `wgpu` (DX12/DX11 + WARP) there. `ALICE_GUI_RENDERER=glow|wgpu` overrides.
+    // See `platform.rs`.
+    let decision = platform::choose_renderer();
+    platform::log_line(&format!(
+        "launch os={} remote_session={} renderer={} :: {}",
+        std::env::consts::OS,
+        decision.remote,
+        decision.name,
+        decision.reason,
+    ));
+
+    let renderer_name = decision.name;
     let options = eframe::NativeOptions {
         viewport,
+        renderer: decision.renderer,
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Alice Miner",
         options,
         Box::new(|cc| {
@@ -94,7 +111,24 @@ fn main() -> eframe::Result<()> {
                 }
             }
         }),
-    )
+    );
+
+    // A hard renderer/window init failure returns `Err` here (rather than a white
+    // screen, which is a *successful* run that simply never paints — that case is
+    // pre-empted by the remote-session → wgpu default above). Surface it as a
+    // native dialog with an actionable next step instead of exiting silently.
+    match &result {
+        Ok(()) => platform::log_line("exited cleanly"),
+        Err(e) => {
+            platform::log_line(&format!("run_native failed (renderer={renderer_name}): {e}"));
+            platform::show_error_dialog(
+                "Alice Miner \u{2014} display error",
+                &platform::init_failure_message(renderer_name),
+            );
+        }
+    }
+
+    result
 }
 
 /// A tiny fallback shown only if the engine fails to spawn at launch.
