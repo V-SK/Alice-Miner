@@ -21,10 +21,13 @@ alice-miner-core = { path = "../alice-miner-core" }
 # frameless-window chrome behave identically — PLUS the `wgpu` backend compiled
 # in alongside `glow`. Both backends are linked so the renderer can be chosen at
 # runtime (see `src/platform.rs`): `glow` (OpenGL) stays the default for local
-# sessions, but Windows remote-desktop sessions (RDP / DeskIn / AnyDesk) get a
-# solid-white window under OpenGL, so we fall back to `wgpu` (DX12/DX11, with a
-# WARP software adapter) there. Adds ~20 transitive crates (wgpu/naga/egui-wgpu),
-# measured 2026-07-16 — an acceptable cost for the primary remote-desktop fix.
+# sessions; a genuine Windows RDP / Terminal Services session auto-switches to
+# `wgpu` (DX12/DX11 + WARP), which survives remote desktops where OpenGL
+# white-screens. Mirror tools (DeskIn / AnyDesk / TeamViewer) aren't flagged by
+# SM_REMOTESESSION, so those users set ALICE_GUI_RENDERER=wgpu manually (a runtime
+# software-GL probe is the backstop). Adds ~20 transitive crates (wgpu/naga/
+# egui-wgpu), measured 2026-07-16 — an acceptable cost for the primary
+# remote-desktop fix.
 eframe = { version = "0.34.1", default-features = false, features = ["default_fonts", "glow", "wgpu", "wayland", "x11"] }
 egui_extras = { version = "0.34.1", features = ["svg", "image"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }

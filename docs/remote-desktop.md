@@ -11,14 +11,36 @@ software-only OpenGL context, so the window comes up but never paints — a whit
 void, with no crash and no error. This is a known egui/OpenGL limitation over
 remote sessions, not an Alice bug.
 
-## The fix (automatic)
+## The fix — what's automatic, and what isn't
 
-As of **v0.6.1**, AliceMiner detects a Windows remote-desktop session at startup
-(`GetSystemMetrics(SM_REMOTESESSION)`) and automatically switches to the
-**`wgpu`** backend (Direct3D 12/11, with a software WARP adapter as a last
+As of **v0.6.1**, AliceMiner detects a Windows **RDP / Terminal Services** session
+at startup (`GetSystemMetrics(SM_REMOTESESSION)`) and automatically switches to
+the **`wgpu`** backend (Direct3D 12/11, with a software WARP adapter as a last
 resort). Direct3D survives remote desktops where OpenGL does not, so the window
 paints normally. Local (non-remote) launches are unchanged — they keep using
 OpenGL/`glow`.
+
+### Mirror-based remote-control tools need the manual switch
+
+`SM_REMOTESESSION` only reports the **built-in Windows Remote Desktop** (`mstsc` /
+RDP). Screen-mirroring / console-sharing tools —
+
+> **DeskIn, AnyDesk, TeamViewer, Parsec, Sunflower (向日葵), Chrome Remote
+> Desktop, Splashtop**
+
+— attach to the machine's *physical console* session, so Windows reports them as
+**not** remote. AliceMiner therefore **does not auto-switch** to `wgpu` for these,
+and if OpenGL still gives you a white window you must set the backend yourself:
+
+```powershell
+$env:ALICE_GUI_RENDERER = "wgpu"
+```
+
+(There's no reliable way to tell "someone is mirroring my console" apart from a
+genuine local user, so AliceMiner won't guess — guessing would wrongly demote
+real local users. As a backstop, if the OpenGL window comes up on a *software*
+renderer, AliceMiner logs it and shows a notice pointing you here; but the manual
+switch above is the sure fix for this class of tool.)
 
 ## Forcing a backend manually
 
@@ -60,8 +82,10 @@ but the GUI.
 ## Startup log
 
 Every launch appends a line to a diagnostic log recording the OS, whether a
-remote session was detected, which backend was chosen, and any window-init
-failure:
+remote session was detected, which backend was chosen, the live OpenGL renderer
+string (e.g. `gl_renderer="GDI Generic"` vs `"NVIDIA GeForce RTX 3080/PCIe/SSE2"`
+— the former means OpenGL fell back to software and `wgpu` is needed), and any
+window-init failure:
 
 - **Windows:** `%LOCALAPPDATA%\AliceMiner\logs\gui-startup.log`
 - **macOS:** `~/Library/Application Support/AliceMiner/logs/gui-startup.log`

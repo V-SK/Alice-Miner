@@ -12,11 +12,33 @@
 //! but never paints anything (no crash, no error — just white).
 //!
 //! The robust fix is to run the **`wgpu`** backend (DX12/DX11, and — crucially —
-//! with a WARP software adapter available) whenever we detect a remote session,
-//! since Direct3D survives remote desktops where OpenGL does not. This module
-//! centralises that decision, an `ALICE_GUI_RENDERER` override, a startup log,
-//! and a native error dialog so a hard init failure surfaces as a message the
-//! user can act on instead of a white void.
+//! with a WARP software adapter available), since Direct3D survives remote
+//! desktops where OpenGL does not.
+//!
+//! ## What is (and is NOT) auto-detected
+//!
+//! `GetSystemMetrics(SM_REMOTESESSION)` only reports `true` for a genuine Windows
+//! **Terminal Services / RDP** *client* session (the built-in `mstsc` remote
+//! desktop). Mirror / console-sharing tools — **DeskIn** (what the tester used),
+//! AnyDesk, TeamViewer, Parsec, Sunflower, Chrome Remote Desktop, Splashtop —
+//! attach to the **physical console** session, so Windows reports them as *not*
+//! remote and the auto-switch to wgpu does **not** fire for them. There is no
+//! reliable API to tell "someone is mirroring my console" apart from a genuine
+//! local user, so we deliberately do **not** guess (guessing would white-screen-
+//! proof RDP at the cost of wrongly flagging local users, which the soak
+//! discipline forbids). Instead:
+//!   * `docs/remote-desktop.md` tells mirror-tool users to set
+//!     `ALICE_GUI_RENDERER=wgpu` manually (the reliable path for that class), and
+//!   * once the glow window is up we read the live OpenGL renderer string and, if
+//!     it is a **software** rasterizer (`GDI Generic`, `llvmpipe`, …) — the actual
+//!     white-screen signature, and a factual signal with no local false positive —
+//!     we log it and surface wgpu guidance (see `is_software_gl_renderer` +
+//!     `main.rs`).
+//!
+//! This module centralises the renderer decision, the `ALICE_GUI_RENDERER`
+//! override, a startup log, and a native error dialog so a hard init failure — or
+//! a running-but-software-GL window — surfaces as a message the user can act on
+//! instead of a white void.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -36,11 +58,21 @@ pub struct RendererDecision {
     pub reason: String,
 }
 
-/// `true` when the process is running inside a Windows Terminal Services / remote
-/// desktop session, via `GetSystemMetrics(SM_REMOTESESSION)` — the signal
+/// `true` when the process is running inside a Windows Terminal Services / RDP
+/// **client** session, via `GetSystemMetrics(SM_REMOTESESSION)` — the signal
 /// Microsoft documents for "am I on a remote desktop". Always `false` off
-/// Windows. The call is a side-effect-free integer query, so the `unsafe` FFI is
-/// trivially sound (no pointers, no allocation, no state).
+/// Windows.
+///
+/// NOTE (detection scope): this is `true` only for a genuine RDP / Terminal
+/// Services session (`mstsc`). Mirror / console-sharing tools — DeskIn, AnyDesk,
+/// TeamViewer, Parsec, Sunflower, Chrome Remote Desktop — run in the physical
+/// console session and return `false` here, so they are NOT auto-switched to
+/// wgpu; those users set `ALICE_GUI_RENDERER=wgpu` manually (see the module docs
+/// and `docs/remote-desktop.md`). The live-GL-renderer probe in `main.rs` is the
+/// runtime backstop that still catches the software-context case for them.
+///
+/// The call is a side-effect-free integer query, so the `unsafe` FFI is trivially
+/// sound (no pointers, no allocation, no state).
 pub fn is_remote_session() -> bool {
     #[cfg(windows)]
     {
@@ -60,14 +92,44 @@ pub fn is_remote_session() -> bool {
     }
 }
 
+/// `true` when an OpenGL `GL_RENDERER` string names a known **software**
+/// rasterizer rather than a real GPU. This is the runtime backstop for the
+/// mirror-tool case (DeskIn/AnyDesk/…), which `is_remote_session` cannot see:
+/// when a remote/console-sharing driver hands glow a software GL context, egui
+/// paints a solid-white window, and that context reports one of these names.
+///
+/// Crucially this is a **factual** test, not a heuristic — a local user with a
+/// working GPU reports a hardware string (`NVIDIA GeForce …`, `Apple M2 …`,
+/// `AMD Radeon …`), never one of these markers — so it carries **no local false
+/// positive** and only ever fires when OpenGL genuinely fell back to software.
+pub fn is_software_gl_renderer(renderer: &str) -> bool {
+    let r = renderer.to_ascii_lowercase();
+    // Case-insensitive substrings that only appear in software GL backends.
+    const SOFTWARE_MARKERS: [&str; 6] = [
+        // Windows built-in OpenGL 1.1 (no GPU) — the classic remote-desktop white screen.
+        "gdi generic",
+        // Mesa software rasterizers.
+        "llvmpipe",
+        "softpipe",
+        // Google software GL.
+        "swiftshader",
+        // Generic self-descriptions / WARP-style software device names.
+        "software rasterizer",
+        "microsoft basic render",
+    ];
+    SOFTWARE_MARKERS.iter().any(|m| r.contains(m))
+}
+
 /// Decide which renderer to run, in priority order:
 ///
 /// 1. `ALICE_GUI_RENDERER=glow|wgpu` forces the backend (aliases: `gl`/`opengl`
 ///    → glow; `wgpu`/`dx12`/`directx`/`vulkan`/`metal` → wgpu). An unrecognised
 ///    value is ignored (and noted in the reason) so a typo can never wedge the
 ///    launcher.
-/// 2. Otherwise, in a Windows remote-desktop session, default to **wgpu**
-///    (OpenGL/glow white-screens over RDP).
+/// 2. Otherwise, in a genuine Windows RDP / Terminal Services session
+///    (`SM_REMOTESESSION`; NOT mirror tools like DeskIn/AnyDesk — see
+///    `is_remote_session`), default to **wgpu** (OpenGL/glow white-screens over
+///    RDP).
 /// 3. Otherwise the shipping default, **glow** (unchanged for every local user).
 pub fn choose_renderer() -> RendererDecision {
     let remote = is_remote_session();
@@ -219,6 +281,25 @@ pub fn init_failure_message(tried: &str) -> String {
     )
 }
 
+/// Guidance shown when the window *did* open but on a software OpenGL renderer
+/// (see `is_software_gl_renderer`) — the running-but-white-screen case that a
+/// mirror tool (DeskIn/AnyDesk) produces and that `is_remote_session` can't
+/// pre-empt. Points at the wgpu override and the headless CLI, and cites the log.
+pub fn software_gl_message(renderer: &str) -> String {
+    format!(
+        "Alice Miner is running, but Windows gave it a software OpenGL renderer \
+         ({renderer}).\n\n\
+         Over remote-control tools (DeskIn / AnyDesk / TeamViewer / RDP) this often \
+         shows as a blank or white window — the app works, it just can't paint.\n\n\
+         For reliable graphics:\n\
+         \u{2022} Set the environment variable  ALICE_GUI_RENDERER=wgpu  and relaunch.\n\
+         \u{2022} Or use the command-line miner, which needs no graphics window:\n\
+         \u{20}\u{20}\u{20}\u{20}alice-miner-cli\n\n\
+         A startup log was written to:\n{log}",
+        log = gui_log_path().display(),
+    )
+}
+
 /// Show a blocking native error dialog. On Windows this is a real `MessageBoxW`,
 /// so it appears even when the egui window itself never painted; elsewhere it
 /// falls back to stderr. `title` / `body` are plain UTF-8 text.
@@ -296,6 +377,40 @@ mod tests {
         assert!(d.reason.contains("not recognised"), "reason: {}", d.reason);
 
         std::env::remove_var("ALICE_GUI_RENDERER");
+    }
+
+    #[test]
+    fn software_gl_renderer_flags_only_software_backends() {
+        // Known software backends → flagged (case-insensitive, substring).
+        for s in [
+            "GDI Generic",
+            "llvmpipe (LLVM 15.0.7, 256 bits)",
+            "SwiftShader Device (Subzero)",
+            "Software Rasterizer",
+            "softpipe",
+            "Microsoft Basic Render Driver",
+        ] {
+            assert!(is_software_gl_renderer(s), "{s:?} should read as software");
+        }
+        // Real GPUs (incl. the tester's RTX 3080) → never flagged: no local false
+        // positive, so the wgpu guidance only fires when GL truly fell to software.
+        for s in [
+            "NVIDIA GeForce RTX 3080/PCIe/SSE2",
+            "Apple M2 Max",
+            "AMD Radeon RX 6800 XT",
+            "Intel(R) UHD Graphics 630",
+            "",
+        ] {
+            assert!(!is_software_gl_renderer(s), "{s:?} should read as hardware");
+        }
+    }
+
+    #[test]
+    fn software_gl_message_points_at_wgpu_and_the_cli() {
+        let m = software_gl_message("GDI Generic");
+        assert!(m.contains("ALICE_GUI_RENDERER=wgpu"));
+        assert!(m.contains("alice-miner-cli"));
+        assert!(m.contains("GDI Generic"));
     }
 
     #[test]
