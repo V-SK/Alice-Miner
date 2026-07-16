@@ -218,6 +218,31 @@ pub fn spawn_supervised(
                 if set_pgid(0, 0) != 0 {
                     return Err(io::Error::last_os_error());
                 }
+                // macOS: take the child OUT of any inherited "background" CPU band
+                // before exec, so the miner runs on the PERFORMANCE cores.
+                //
+                // On Apple Silicon the scheduler parks a background-QoS thread on the
+                // EFFICIENCY cores, which runs RandomX/xmrig ~10x slower. A child
+                // INHERITS the parent's Darwin background clamp — so when the miner UI
+                // is App-Napped / occluded / launched at a reduced QoS, the spawned
+                // engine lands on the E-cores and hashrate collapses even though it is
+                // still in fast (dataset) mode. Measured on an M2 Max via a mock pool:
+                // xmrig 318 H/s under a `taskpolicy -b` clamp vs 3818 H/s once this
+                // clear is applied — a full 12x restoration (cf. the ~10x
+                // Background-LaunchAgent note in alice-miner-core::service, which is why
+                // the launch agent already uses ProcessType=Standard; this covers the
+                // INTERACTIVE path, which sets no explicit QoS).
+                //
+                // `setpriority(PRIO_DARWIN_PROCESS, 0, 0)` clears the background band on
+                // THIS process (`who = 0` = current; `prio = 0` = not throttled — the
+                // inverse of `PRIO_DARWIN_BG`). Best-effort: a failure must never block
+                // mining, so the result is ignored (the engine still runs, just possibly
+                // throttled). `setpriority` is a single syscall → async-signal-safe, so
+                // it is safe to call here in the post-fork / pre-exec context.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = set_darwin_priority(PRIO_DARWIN_PROCESS, 0, 0);
+                }
                 Ok(())
             });
         }
@@ -255,6 +280,21 @@ pub fn spawn_supervised(
 extern "C" {
     #[link_name = "setpgid"]
     fn set_pgid(pid: i32, pgid: i32) -> i32;
+}
+
+/// macOS `setpriority(2)` "which" selector for the Darwin per-PROCESS CPU band
+/// (`<sys/resource.h>`: `PRIO_DARWIN_PROCESS = 4`). Paired with a `prio` of `0`
+/// it CLEARS the background clamp (the inverse of `PRIO_DARWIN_BG = 0x1000`),
+/// pulling a spawned miner back onto the performance cores.
+#[cfg(target_os = "macos")]
+const PRIO_DARWIN_PROCESS: i32 = 4;
+
+// Raw `setpriority(2)`. `who` is a `u32` (`id_t`); `who = 0` targets the calling
+// process. Declared locally (no `libc` dep) to mirror the `setpgid` binding above.
+#[cfg(target_os = "macos")]
+extern "C" {
+    #[link_name = "setpriority"]
+    fn set_darwin_priority(which: i32, who: u32, prio: i32) -> i32;
 }
 
 async fn pump_lines<R>(reader: R, stream: LogStream, tx: UnboundedSender<LogLine>)

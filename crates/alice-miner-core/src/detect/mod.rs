@@ -283,19 +283,39 @@ fn probe_cpu_model(os: OsFamily, warnings: &mut Vec<String>) -> String {
 }
 
 /// Run `sysctl -n <key>` and return its trimmed stdout, or empty on ANY error.
-/// Verbatim shape of the Python `_sysctl` helper (which `check=False` and
-/// swallows every exception into `""`).
+/// Shape of the Python `_sysctl` helper (which `check=False` and swallows every
+/// exception into `""`).
+///
+/// **PATH-independent (field-bug fix).** macOS ships `sysctl` at the fixed path
+/// `/usr/sbin/sysctl`, so we invoke it by ABSOLUTE path first and only fall back
+/// to a bare `sysctl` (PATH lookup) if that somehow isn't there. A bare
+/// `Command::new("sysctl")` relies on the process PATH containing `/usr/sbin` —
+/// which is NOT guaranteed for a GUI `.app` launched via LaunchServices/launchd
+/// or any parent with a minimal env. When it wasn't, BOTH the `hw.memsize` and
+/// `machdep.cpu.brand_string` probes failed together, so `memory_gb` cratered to
+/// the conservative [`FALLBACK_MEMORY_GB`] (8 GB) and the CPU model went blank —
+/// even on a 96/128 GB Apple Silicon Mac (tester report: M4 Max reading 8 GB with
+/// `cpu_model_probe_failed` + `memory_probe_fell_back`). `logical_cores` stayed
+/// correct because it uses a direct syscall (`available_parallelism`), not PATH.
 fn sysctl(key: &str) -> String {
     use std::process::Command;
-    Command::new("sysctl")
-        .arg("-n")
-        .arg(key)
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+    // `/usr/sbin/sysctl` is the canonical macOS location; the bare `sysctl` is a
+    // defensive fallback should the absolute path ever be unavailable.
+    for prog in ["/usr/sbin/sysctl", "sysctl"] {
+        let value = Command::new(prog)
+            .arg("-n")
+            .arg(key)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    String::new()
 }
 
 /// First `model name` line of `/proc/cpuinfo`, or empty. Mirrors the Python
