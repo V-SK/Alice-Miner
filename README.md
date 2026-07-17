@@ -114,7 +114,10 @@ alice-miner setup --lane auto --address <your-alice-address> --yes
 ## Mining lanes
 
 Pick a lane with `--lane`, or use `--lane auto` to let the miner choose the best one for your
-device. Run `alice-miner detect` to see which lanes are viable on your hardware.
+device. Run `alice-miner detect` to see which lanes are viable on your hardware. Not sure which
+fits? **`alice-miner guide`** detects your hardware, recommends a lane (with one line of *why*),
+and shows how to connect — either the bundled client or **your own third-party miner**. See the
+full [**mining guide**](docs/mining-guide.md) for the details.
 
 | Lane           | `--lane`        | Hardware                                  | Notes |
 | -------------- | --------------- | ----------------------------------------- | ----- |
@@ -158,6 +161,17 @@ Backgrounding a **GPU** lane needs an OS keyring (macOS Keychain / Windows Crede
 alice-miner start --lane prl --json > rig-a.jsonl    # on box A
 alice-miner start --lane xmr --json > rig-b.jsonl    # on box B (shared/NFS path)
 alice-miner fleet rig-a.jsonl rig-b.jsonl            # one roster, refreshes live
+```
+
+**Bring your own miner.** Already run your own (closed-source / optimized) pearlhash rig? Point
+it at Alice and keep the credit routed to your address — **without your private key ever touching
+the rig**. `alice-miner companion` holds the proof-of-possession (PoP) for a third-party miner on
+a refresh loop; it **never spawns a miner**. Your rig connects with the login `<your-address>.<device>`
+and any password. Full walkthrough in the [mining guide → bring your own miner](docs/mining-guide.md#3-bring-your-own-third-party-prl-miner).
+
+```sh
+alice-miner companion --lane prl --device rig1     # hold PoP for a bring-your-own PRL rig (Ctrl-C to stop)
+alice-miner companion --lane alpha --device volta1 # ...for a Volta / V100 rig
 ```
 
 ---
@@ -295,7 +309,9 @@ alice-miner identity --set-prl-payout <prl1p…>   # your 15% PRL return address
 
 - Code & releases: **https://github.com/V-SK/Alice-Miner**
 - Website: **https://aliceprotocol.org** <!-- TODO(V): confirm the canonical marketing URL -->
-- Docs / miner guide: TODO(V): add the published docs URL (the download page's mining guide)
+- Mining guide (lanes, choosing, bring-your-own miners): [`docs/mining-guide.md`](docs/mining-guide.md)
+- Remote desktop / "white window" fix: [`docs/remote-desktop.md`](docs/remote-desktop.md)
+- Published docs URL: TODO(V): add the download page's mining-guide URL
 
 ---
 
@@ -325,6 +341,12 @@ alice-miner service --logs        # 5. 查看后台日志
 
 **挖矿 lane:** `--lane xmr`(CPU)、`--lane gpu`(GPU pearlhash)、`--lane auto`(推荐)、
 `--dual`(同时双挖,需 ≥2 个可用 lane)。用 `alice-miner detect` 查看本机可用的 lane。
+拿不准选哪个?运行 **`alice-miner guide`**(检测硬件 → 推荐 lane + 为什么 → 如何连接)。
+
+**自带第三方矿机:** 已有自己的(闭源 / 优化)pearlhash 矿机?可把它指向 Alice 并把积分
+路由到你的地址,**私钥绝不接触矿机**。`alice-miner companion --lane prl --device rig1` 会替
+第三方矿机持有所有权证明(PoP),它**绝不启动矿机**;你的矿机用登录名 `<你的地址>.<设备名>`
++ 任意密码连接。完整步骤见[挖矿指南](docs/mining-guide.md#三自带第三方-prl-矿机重点)。
 
 **加入 AI 网络:** 先运行 `alice-miner ai --menu`(检测硬件 → 网络菜单 → 选择)。三种角色:
 `serve`(单卡消费推理,已在 Linux+NVIDIA 验证;需 Python 3.11+)、`ai`(大模型分片,需公网端口)、
