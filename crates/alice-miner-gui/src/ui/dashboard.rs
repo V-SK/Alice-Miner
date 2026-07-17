@@ -1096,6 +1096,18 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                         ui.label(RichText::new("read-only").size(10.0).extra_letter_spacing(0.8).color(THEME.text4));
                     });
                 });
+                // Region status (GPU-PRL only) — the effective region MODE: LOCKED to one
+                // region (no auto-failover) vs preferred/nearest primary with failover on.
+                // Read-only; the lock is set from the CLI (`start --region <tag>`).
+                if app.active_lane() == Lane::GpuPrl {
+                    let region = app.region_status_label();
+                    srow(ui, "Region", "Auto picks the nearest region and fails over. Lock one with `start --region us|asia`.", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(widgets::mono(region, 12.5, THEME.text2));
+                            ui.label(RichText::new("read-only").size(10.0).extra_letter_spacing(0.8).color(THEME.text4));
+                        });
+                    });
+                }
             });
 
             // Background-mining panel — keep mining after the window closes / at

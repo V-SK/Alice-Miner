@@ -526,6 +526,65 @@ pub fn is_region_locked(lock: Option<&str>, env: Option<&str>, last_good: Option
     matches!(decide_region(lock, env, last_good), RegionDecision::Locked(_))
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Region TRANSPARENCY (B-line): show the effective endpoint order WITHOUT probing,
+// and flag a REMOVED region host that leaked in from a stale binary / env override.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Region relay hosts that were REMOVED from the v0.6.1 compiled defaults and must
+/// NEVER appear in a clean v0.6.1 client's effective PRL endpoints. `fi.aliceprotocol.org`
+/// was the Finland relay dropped in v0.6.1 (never provisioned → NXDOMAIN, and it made
+/// every startup waste a full RTT-probe timeout on a dead host). If it turns up in the
+/// effective set the only sources are a STALE binary/package or an operator
+/// `ALICE_MINER_ENDPOINTS_JSON` override — `doctor` names both so a tester can locate it.
+pub const REMOVED_REGION_HOSTS: [&str; 1] = ["fi.aliceprotocol.org"];
+
+/// True when any endpoint authority (`host:port`, or a bare host) names a region host
+/// that was REMOVED from the compiled defaults (currently only `fi`). Case-insensitive
+/// on the host; the port is ignored. Pure — the CLI banner / `doctor` scan the
+/// effective endpoints with it to flag a stale binary or an endpoints-JSON override.
+pub fn contains_removed_region(authorities: &[String]) -> bool {
+    authorities.iter().any(|a| {
+        let host = a.split(':').next().unwrap_or(a).trim().to_ascii_lowercase();
+        REMOVED_REGION_HOSTS.iter().any(|removed| host == *removed)
+    })
+}
+
+/// True when arbitrary `text` mentions a removed region relay host (currently `fi`).
+/// Used to scan a raw `ALICE_MINER_ENDPOINTS_JSON` override string for a decommissioned
+/// host WITHOUT parsing it (the override never steers the PRL region plan, but a `fi`
+/// inside it is exactly the "where did Finland come from" signal `doctor` reports).
+/// Case-insensitive. Pure.
+pub fn text_names_removed_region(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    REMOVED_REGION_HOSTS.iter().any(|removed| lower.contains(removed))
+}
+
+/// The effective GPU-PRL endpoint authorities (`host:port`), in the order the D-line
+/// policy presents them, computed WITHOUT the RTT probe. This lets the CLI banner and
+/// `doctor` SHOW the plan with no network cost and no double-probe (the engine runs the
+/// real probe once, at start). Mapping (mirrors [`region_plan_from`]):
+///   * LOCK        → the single locked region (no failover).
+///   * prefer-head → that region first, then the rest in default order (env / last-good).
+///   * PROBE       → the compiled candidate set in default (`us`, `asia`) order — the
+///     REAL head is chosen by a live RTT probe at engine start, so a caller SHOWING this
+///     order should label it "nearest-first, chosen at start". Pure over its args.
+pub fn planned_endpoint_authorities(
+    lock: Option<&str>,
+    env: Option<&str>,
+    last_good: Option<&str>,
+) -> Vec<String> {
+    let eps = match decide_region(lock, env, last_good) {
+        RegionDecision::Locked(tag) => {
+            let host = host_for_tag(tag).unwrap_or(REGION_HOSTS[0].1);
+            vec![Endpoint::plaintext(host, GPU_RELAY_PORT)]
+        }
+        RegionDecision::PreferHead(tag) => head_first_endpoints(tag),
+        RegionDecision::Probe => region_default_endpoints(),
+    };
+    eps.iter().map(|e| e.host_port()).collect()
+}
+
 /// The US-first default region endpoint (the ultimate fallback head).
 pub fn default_region_endpoint() -> Endpoint {
     Endpoint::plaintext(REGION_HOSTS[0].1, GPU_RELAY_PORT)
@@ -974,6 +1033,68 @@ mod tests {
         // (Asserted at the pure-decision layer so no live network probe runs here.)
         assert_eq!(decide_region(None, None, None), RegionDecision::Probe);
         assert!(!is_region_locked(None, None, None));
+    }
+
+    // ── B-line region TRANSPARENCY helpers ──────────────────────────────────────
+
+    /// The probe-free endpoint order the banner/doctor SHOW matches the real plan for
+    /// the two deterministic cases, and lists the compiled candidates for probe.
+    #[test]
+    fn planned_endpoint_authorities_matches_each_decision() {
+        // LOCK → the single locked region only (no failover partner shown).
+        let locked = planned_endpoint_authorities(Some("asia"), None, None);
+        assert_eq!(locked, vec!["asia.aliceprotocol.org:3340".to_string()]);
+
+        // prefer-head (env) → that region first, then the rest in default order.
+        let env = planned_endpoint_authorities(None, Some("asia"), None);
+        assert_eq!(
+            env,
+            vec![
+                "asia.aliceprotocol.org:3340".to_string(),
+                "us.aliceprotocol.org:3340".to_string(),
+            ]
+        );
+
+        // prefer-head (last-good) → same shape, sourced from history.
+        assert_eq!(planned_endpoint_authorities(None, None, Some("asia")), env);
+
+        // PROBE default (no lock / env / history) → compiled candidates, US-first.
+        let probe = planned_endpoint_authorities(None, None, None);
+        assert_eq!(
+            probe,
+            vec![
+                "us.aliceprotocol.org:3340".to_string(),
+                "asia.aliceprotocol.org:3340".to_string(),
+            ]
+        );
+
+        // Every authority is a public region relay on :3340 — never a removed host.
+        for set in [&locked, &env, &probe] {
+            assert!(!contains_removed_region(set), "clean v0.6.1 set has no removed host");
+            assert!(set.iter().all(|a| a.ends_with(":3340")));
+        }
+    }
+
+    /// A clean v0.6.1 client NEVER emits `fi`, and the removed-host detectors fire on a
+    /// synthetic authority list / raw endpoints-JSON that DOES name it (the FI signal).
+    #[test]
+    fn removed_region_detectors_flag_fi_only() {
+        // Compiled defaults are fi-free (us/asia only).
+        assert!(!contains_removed_region(&planned_endpoint_authorities(None, None, None)));
+        for (_, host) in REGION_HOSTS {
+            assert!(!REMOVED_REGION_HOSTS.contains(&host), "a live region can't be 'removed'");
+        }
+        // A leaked fi host (stale binary / override) is caught, port- and case-insensitively.
+        assert!(contains_removed_region(&["fi.aliceprotocol.org:3340".to_string()]));
+        assert!(contains_removed_region(&["FI.AliceProtocol.org".to_string()]));
+        assert!(!contains_removed_region(&["us.aliceprotocol.org:3340".to_string()]));
+        // Raw endpoints-JSON scan (never parsed — a plain substring signal).
+        assert!(text_names_removed_region(
+            "{\"gpu-prl\":[\"fi.aliceprotocol.org:3340\"]}"
+        ));
+        assert!(!text_names_removed_region(
+            "{\"gpu-prl\":[\"asia.aliceprotocol.org:3340\"]}"
+        ));
     }
 
     #[test]

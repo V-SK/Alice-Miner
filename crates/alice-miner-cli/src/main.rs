@@ -54,6 +54,7 @@ mod fleet;
 mod logo;
 mod menu;
 mod pidfile;
+mod region;
 mod setup;
 mod train;
 mod tui;
@@ -1789,12 +1790,24 @@ fn cmd_start_with_unlock(
             return code;
         }
     }
-    // Human path only: label the effective region MODE (locked vs auto + last-good)
-    // so the user always knows whether the lane will auto-failover — for the GPU-PRL
-    // lane, where region applies.
+    // Human path only: label the effective region MODE (locked vs auto + last-good) AND
+    // the effective endpoint order, so the user always knows whether the lane will
+    // auto-failover and exactly which relays it will use — for the GPU-PRL lane, where
+    // region applies. Computed probe-free (the engine runs the one real probe at start).
     if !args.json && !args.from_service && lane == Lane::GpuPrl {
-        if let Some(banner) = region_mode_banner() {
-            println!("{banner}");
+        let view = region::view();
+        println!("{}", view.mode);
+        println!("{}", region::endpoints_line(&view));
+        // A stale binary / `ALICE_MINER_ENDPOINTS_JSON` override that reintroduced the
+        // removed `fi` relay — surface it here too (doctor gives the full diagnosis).
+        if view.has_removed_region {
+            eprintln!(
+                "{}",
+                tr!(
+                    "warning: a removed region host (fi) is in the effective endpoints — run `alice-miner doctor` (likely an old binary or ALICE_MINER_ENDPOINTS_JSON override).",
+                    "警告: 效端点中含已移除的区域主机(fi)— 请运行 `alice-miner doctor`(很可能是旧版 binary 或 ALICE_MINER_ENDPOINTS_JSON 覆盖)。"
+                )
+            );
         }
     }
 
@@ -2348,51 +2361,6 @@ fn apply_region_flag(raw: &str, json: bool) -> Result<(), i32> {
             Err(EXIT_USAGE)
         }
     }
-}
-
-/// A one-line banner labeling the effective GPU-PRL region MODE (so the user always
-/// knows whether the lane will auto-failover): LOCKED to a region, an operator env
-/// override, resuming a remembered last-good region, or plain automatic. Reads the
-/// same inputs the engine's plan does ([`alice_miner_core::settings`] +
-/// `ALICE_GPU_RELAY_REGION`). `None` should not occur (the match is total); kept as
-/// `Option` so a future "nothing to say" case can suppress it.
-fn region_mode_banner() -> Option<String> {
-    use alice_miner_core::lane::gpu_prl;
-    let s = alice_miner_core::settings::load();
-    let env = std::env::var(gpu_prl::ENV_REGION).ok();
-    let banner = match gpu_prl::decide_region(
-        s.region_lock.as_deref(),
-        env.as_deref(),
-        s.last_good_region.as_deref(),
-    ) {
-        gpu_prl::RegionDecision::Locked(tag) => tr!(
-            "Region: locked to {tag} — no auto-failover (use `--region auto` to unlock).",
-            "区域: 已锁定 {tag} — 不自动切换(用 `--region auto` 解除)。"
-        )
-        .replace("{tag}", tag),
-        gpu_prl::RegionDecision::PreferHead(tag) => {
-            // Distinguish an operator env override from a remembered last-good region.
-            if gpu_prl::normalize_region_tag(env.as_deref().unwrap_or("")) == Some(tag) {
-                tr!(
-                    "Region: {tag} (operator override) — auto-failover on.",
-                    "区域: {tag}(操作员指定)— 自动切换开启。"
-                )
-                .replace("{tag}", tag)
-            } else {
-                tr!(
-                    "Region: auto — resuming last-good {tag}; auto-failover on.",
-                    "区域: 自动 — 沿用上次可用的 {tag};自动切换开启。"
-                )
-                .replace("{tag}", tag)
-            }
-        }
-        gpu_prl::RegionDecision::Probe => tr!(
-            "Region: auto (nearest region) — auto-failover on.",
-            "区域: 自动(最近区域)— 自动切换开启。"
-        )
-        .to_string(),
-    };
-    Some(banner)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
