@@ -164,6 +164,7 @@ pub fn run_checks(lane: Lane, cap: &CapabilityProfile) -> Vec<Check> {
         check_gpu_compute_capability(lane, cap),
         check_engine(lane),
         check_keyring(lane),
+        check_companion(lane),
         check_relay(lane),
         check_tls_trust(),
     ];
@@ -253,6 +254,58 @@ fn check_identity() -> Check {
             tr!(
                 "create one: `alice-miner identity --create` (or `--paste <address>` for watch-only)",
                 "请创建一个: `alice-miner identity --create` (或 `--paste <地址>` 用于仅观察)"
+            ),
+        ),
+    }
+}
+
+/// Companion (possession-proof) readiness — only meaningful for the PoP-gated
+/// pearlhash lanes (PRL / Alpha). Reports whether `alice-miner companion` can hold
+/// the M4 proof for a BRING-YOUR-OWN third-party miner: it needs a keystore-backed
+/// identity (a watch-only address has no signing key, so it can never prove
+/// possession). Skip for XMR/RVN (open enrollment — no companion needed).
+fn check_companion(lane: Lane) -> Check {
+    const NAME: &str = "companion (PoP)";
+    if !lane.is_prl_lane() {
+        return Check::skip(
+            NAME,
+            tr!(
+                "only the PRL/Alpha pearlhash lanes need a possession proof (XMR/RVN are open enrollment)",
+                "只有 PRL/Alpha pearlhash 通道需要所有权证明(XMR/RVN 为开放注册)"
+            ),
+        );
+    }
+    match alice_miner_core::identity::load_pointer() {
+        // A keystore-backed identity can sign the proof → the companion is usable.
+        Some(p) if p.keystore_path.is_some() => Check::pass(
+            NAME,
+            format!(
+                "{} `alice-miner companion --lane {}`",
+                tr!(
+                    "ready — a bring-your-own miner can pass PoP via",
+                    "就绪 —— 自带矿机可通过以下命令通过 PoP:"
+                ),
+                lane.cli_lane_arg()
+            ),
+        ),
+        // Watch-only: has an address but no signing key → cannot prove possession.
+        Some(_) => Check::warn(
+            NAME,
+            tr!(
+                "this identity is watch-only (no signing key) — the companion can't prove possession",
+                "此身份为仅观察(无签名密钥)—— 伴侣模式无法证明所有权"
+            ),
+            tr!(
+                "import the mnemonic/seed for this address: `alice-miner identity --import \"<24 words>\"`",
+                "导入此地址的助记词/种子: `alice-miner identity --import \"<24 个词>\"`"
+            ),
+        ),
+        // No identity at all — the identity check already FAILs; skip to avoid noise.
+        None => Check::skip(
+            NAME,
+            tr!(
+                "no identity yet (see the identity check above)",
+                "尚无身份(见上方的身份检查)"
             ),
         ),
     }
@@ -1518,6 +1571,27 @@ mod tests {
         // PRL lane: Pass or Warn depending on the box, but NEVER Fail (foreground ok).
         let k = check_keyring(Lane::GpuPrl);
         assert!(matches!(k.status, Status::Pass | Status::Warn), "got {:?}", k.status);
+    }
+
+    /// The companion (PoP) check is only meaningful for the pearlhash lanes: XMR/RVN
+    /// SKIP (open enrollment). For a PRL lane it reports readiness (Pass / Warn /
+    /// Skip depending on whether a keystore-backed identity exists) but NEVER Fail —
+    /// the identity check owns the hard failure. It names the companion command on a
+    /// Pass so the user knows the exact next step.
+    #[test]
+    fn companion_check_scopes_to_pearlhash_lanes() {
+        assert_eq!(check_companion(Lane::Xmr).status, Status::Skip);
+        assert_eq!(check_companion(Lane::GpuRvn).status, Status::Skip);
+        let c = check_companion(Lane::GpuPrl);
+        assert_eq!(c.name, "companion (PoP)");
+        assert!(
+            matches!(c.status, Status::Pass | Status::Warn | Status::Skip),
+            "PoP readiness is informational, never a hard Fail: got {:?}",
+            c.status
+        );
+        if c.status == Status::Pass {
+            assert!(c.detail.contains("companion"), "a ready check names the command: {}", c.detail);
+        }
     }
 
     /// The TLS-trust preflight always yields a well-formed check: it names the
