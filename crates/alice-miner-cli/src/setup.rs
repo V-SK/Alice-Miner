@@ -260,6 +260,7 @@ Your reward tracks your share of hashpower (a rolling ~24h average), not how man
                 // a user sets/clears the lock later with `start --region <tag|auto>`.
                 region: None,
                 from_service: false,
+                telemetry_file: None,
             };
             // NIT B: if we just generated the keystore, hand its passphrase straight to
             // start so a pearlhash lane unlocks without a SECOND prompt for the same
