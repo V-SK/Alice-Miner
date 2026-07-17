@@ -530,3 +530,164 @@ fn doctor_ai_json_shape() {
     assert!(names.contains(&"shard engine"));
     assert!(names.contains(&"endpoint port"));
 }
+
+// ── guide (help-me-choose advisor) + companion (bring-your-own PoP) ─────────────
+
+/// The two onboarding subcommands are listed at the top level and each has help.
+#[test]
+fn guide_and_companion_are_listed_and_documented() {
+    bin().arg("--help").assert().success().stdout(
+        predicate::str::contains("guide").and(predicate::str::contains("companion")),
+    );
+    bin().args(["guide", "--help"]).assert().success();
+    bin()
+        .args(["companion", "--help"])
+        .assert()
+        .success()
+        // The help must make the "no mining" contract explicit.
+        .stdout(predicate::str::contains("NEVER spawns a miner").or(predicate::str::contains("never spawns a miner")));
+}
+
+/// `guide` (human) detects the device, recommends a lane, and shows BOTH next-step
+/// paths (official client + bring-your-own connection surface) — credit-only.
+#[test]
+fn guide_human_advises_and_is_credit_only() {
+    let out = bin().args(["guide", "--lang", "en"]).assert().success().get_output().clone();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("Device"), "shows the device: {stdout}");
+    assert!(stdout.contains("Recommended lane"), "recommends a lane: {stdout}");
+    // Both next steps are present: the official client + the bring-your-own pool.
+    assert!(stdout.contains("alice-miner setup"), "official-client path: {stdout}");
+    assert!(stdout.to_lowercase().contains("pool"), "bring-your-own pool line: {stdout}");
+    // Credit-only honesty: no fiat / earnings token, no leaked collection/pool/IP.
+    let low = stdout.to_lowercase();
+    for forbidden in ["$", "usd", "fiat", "paid", "earned", "prl1p", "herominers", "supportxmr"] {
+        assert!(!low.contains(forbidden), "guide leaked `{forbidden}`: {stdout}");
+    }
+}
+
+/// `guide --json` is a valid object with the recommendation + bring-your-own surface.
+#[test]
+fn guide_json_shape() {
+    let out = bin().args(["guide", "--json"]).assert().success().get_output().clone();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(v.get("device").is_some(), "json has device: {stdout}");
+    assert!(v.get("recommended_lane").is_some(), "json has recommended_lane: {stdout}");
+    let byo = &v["bring_your_own"];
+    assert!(byo.get("algorithm").is_some(), "byo has algorithm: {stdout}");
+    assert!(byo.get("port").is_some(), "byo has port: {stdout}");
+    assert!(byo.get("needs_companion").is_some(), "byo has needs_companion: {stdout}");
+}
+
+/// `companion --lane xmr` is refused: the companion is only for the PoP-gated
+/// pearlhash lanes (XMR/RVN are open enrollment). Fails fast — no identity needed.
+#[test]
+fn companion_rejects_non_pearlhash_lane() {
+    bin()
+        .args(["companion", "--lane", "xmr", "--lang", "en", "--once"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("pearlhash"));
+}
+
+/// `companion` with an invalid `--device` is a usage error naming the allowed
+/// charset — and, crucially, it never reaches the network / spawns anything.
+#[test]
+fn companion_rejects_bad_device_label() {
+    // A valid address override so we get past address resolution to the device check.
+    let addr = alice_miner_core::alice_crypto::create_wallet_payload(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "x",
+    )
+    .unwrap()
+    .address;
+    bin()
+        .args([
+            "companion",
+            "--lane",
+            "prl",
+            "--address",
+            &addr,
+            "--device",
+            "bad name",
+            "--region",
+            "asia",
+            "--lang",
+            "en",
+            "--once",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("letters, digits"));
+}
+
+/// `companion` with NO identity fails closed with a clear message (it never creates
+/// one implicitly). `--region asia` keeps it fully offline (no RTT probe). It also
+/// writes NOTHING — proving it never touches the identity store.
+#[test]
+fn companion_without_identity_fails_closed() {
+    let env = TempEnv::new("companion-noid");
+    let mut cmd = bin();
+    env.apply(&mut cmd);
+    cmd.args(["companion", "--lane", "prl", "--region", "asia", "--once"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no reward identity"));
+    // Zero-write proof: no identity file was created in the (isolated) store.
+    assert!(
+        !env.id_dir().join("identity.json").exists(),
+        "companion must not create an identity"
+    );
+}
+
+/// `guide` is a PURE advisor: it writes nothing to the identity store (it needs no
+/// identity at all). Proven against a fresh, isolated `~/.alice` that stays empty.
+#[test]
+fn guide_writes_nothing() {
+    let env = TempEnv::new("guide-nowrite");
+    let mut cmd = bin();
+    env.apply(&mut cmd);
+    cmd.args(["guide", "--json"]).assert().success();
+    let entries: Vec<_> = std::fs::read_dir(env.id_dir()).unwrap().flatten().collect();
+    assert!(entries.is_empty(), "guide wrote {} file(s) to ~/.alice", entries.len());
+}
+
+/// `companion` refuses a WATCH-ONLY (pasted-address) identity: it has no signing
+/// key, so it can never prove possession — and it must NOT create an identity or
+/// spawn a miner. Offline (`--region asia`, fails at the key-unlock step).
+#[test]
+fn companion_watch_only_identity_cannot_prove_possession() {
+    let env = TempEnv::new("companion-watch");
+    let addr = alice_miner_core::alice_crypto::create_wallet_payload(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "x",
+    )
+    .unwrap()
+    .address;
+    let mut cmd = bin();
+    env.apply(&mut cmd);
+    cmd.args(["identity", "--paste", &addr]).assert().success();
+
+    let mut cmd = bin();
+    env.apply(&mut cmd);
+    cmd.args(["companion", "--lane", "prl", "--region", "asia", "--once"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("watch-only"));
+}
+
+/// `doctor --lane prl --json` includes the companion (PoP) readiness check.
+#[test]
+fn doctor_prl_json_includes_companion_check() {
+    let out = bin()
+        .args(["doctor", "--lane", "prl", "--json"])
+        .assert()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let checks = v["checks"].as_array().expect("checks array");
+    let names: Vec<&str> = checks.iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"companion (PoP)"), "doctor lists the companion check: {names:?}");
+}

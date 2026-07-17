@@ -47,10 +47,12 @@ use alice_miner_core::{EngineHandle, EngineState, GpuSelection, Lane, Snapshot};
 mod ai;
 mod balance;
 mod color;
+mod companion;
 mod dashboard;
 mod doctor;
 mod errmsg;
 mod fleet;
+mod guide;
 mod logo;
 mod menu;
 mod pidfile;
@@ -242,6 +244,45 @@ enum Command {
         otherwise it does nothing. Re-runnable. Credit-only — never a secret in argv, and\n\
         the generate path warns + never silently overwrites an existing identity.")]
     Setup(SetupArgs),
+
+    /// Help me choose: detect hardware → recommend a lane → how to connect.
+    #[command(long_about = "A read-only ADVISOR for the question \"what should I mine, and how do I\n\
+        connect?\". It detects your hardware (CPU / GPU), recommends a lane (GPU → PRL or\n\
+        Alpha; CPU → XMR) with one sentence of why, and gives the next step TWO ways:\n\
+        \n\
+          * mine with the OFFICIAL bundled client (`alice-miner setup` / `start`), or\n\
+          * bring your OWN third-party miner — the exact stratum connection parameters\n\
+            (pool host:port, algorithm, login), and — for the possession-proof-gated\n\
+            pearlhash lanes — a pointer at `alice-miner companion` (which holds the proof\n\
+            so your key never leaves this box).\n\
+        \n\
+        Unlike `setup`, `guide` only EXPLAINS — it needs no identity and writes nothing.\n\
+        --json emits the advice as one object (for the website). Credit-only.")]
+    Guide(GuideArgs),
+
+    /// Companion: hold the possession proof for your OWN pearlhash miner (no mining).
+    #[command(long_about = "Hold the M4 possession proof for a BRING-YOUR-OWN (third-party, closed-\n\
+        source) pearlhash miner — WITHOUT running any miner. The PRL/Alpha relays require a\n\
+        proof-of-possession; the official client proves it internally, but a third-party rig\n\
+        can't. This companion does it for it: it unlocks your Alice key LOCALLY and runs the\n\
+        same /m4/challenge → sign → /m4/verify handshake on a refresh loop (inside the relay's\n\
+        ~1800s allowlist TTL), keeping `(your address, device)` authorized.\n\
+        \n\
+        You then point your own rig at the SAME region relay with the login\n\
+        `<your-address>.<device>` and any password; the relay credits the shares to your\n\
+        address. Your private key NEVER leaves this machine.\n\
+        \n\
+        --lane prl|alpha    which pearlhash relay to enroll against (default: prl)\n\
+        --device <NAME>     the worker label your rig logs in with (default: a hostname)\n\
+        --region us|asia    pin the region relay (default: remembered / nearest)\n\
+        --address <ADDR>    the address to enroll — MUST be this box's signing identity\n\
+                            (not a way to enroll a different address; switch identity for that)\n\
+        --refresh-secs <N>  re-enroll cadence (default ~9 min; clamped inside the TTL)\n\
+        --once              enroll once and exit (prime the allowlist / scripting)\n\
+        --duration-s <N>    stop after N seconds (0 = until Ctrl-C)\n\
+        \n\
+        It NEVER spawns a miner. Credit-only — it prints no secret and no earnings figure.")]
+    Companion(CompanionArgs),
 
     /// Run as an AI inference STAGE: join the Alice pipeline-parallel swarm.
     #[command(long_about = "Run this GPU as a pipeline-parallel INFERENCE STAGE coordinated by the\n\
@@ -610,6 +651,60 @@ struct SetupArgs {
 }
 
 #[derive(clap::Args)]
+struct GuideArgs {
+    /// Emit the advice as a single JSON object (for the website / a script).
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct CompanionArgs {
+    /// Which pearlhash relay to enroll against: `prl` (SRBMiner mainline) or `alpha`
+    /// (Volta/V100). XMR/RVN are open-enrollment (no companion needed).
+    #[arg(long, default_value = "prl", value_name = "LANE")]
+    lane: String,
+    /// The device label your rig logs in with (the stratum worker suffix; the login
+    /// is `<your-address>.<device>`). Must be `[A-Za-z0-9_-]`, ≤32 chars. Omit for a
+    /// sanitized hostname default.
+    #[arg(long, value_name = "NAME")]
+    device: Option<String>,
+    /// Pin the region relay the companion enrolls against (and your rig must then
+    /// connect to — the allowlist is per-relay): `us` or `asia`. Omit / `auto` uses
+    /// the remembered (or nearest) region.
+    #[arg(long, value_name = "REGION")]
+    region: Option<String>,
+    /// The address to enroll (a validated Alice SS58-300 address). It MUST be the
+    /// address of this box's active signing identity: the companion signs the
+    /// possession proof with the local key and the relay verifies it against the
+    /// enrolled address, so any OTHER address is silently never allow-listed. Omit to
+    /// use the active `~/.alice` identity. To mine to a different address, switch
+    /// identity — this is NOT that. (A PRL cashback address is separate:
+    /// `identity --set-prl-payout`.)
+    #[arg(long, value_name = "ADDRESS")]
+    address: Option<String>,
+    /// Re-enroll cadence in seconds (default ~9 min). Clamped strictly inside the
+    /// relay's ~1800s allowlist TTL, so the pair never lapses between refreshes.
+    #[arg(long, value_name = "SECONDS")]
+    refresh_secs: Option<u64>,
+    /// Enroll ONCE and exit (prime the allowlist for a scripted run / a test) instead
+    /// of looping.
+    #[arg(long)]
+    once: bool,
+    /// Stop automatically after this many seconds (0 = run until Ctrl-C). For the
+    /// live-connect verification.
+    #[arg(long, default_value_t = 0, value_name = "SECONDS")]
+    duration_s: u64,
+    /// Wallet keystore password — the companion must unlock the signing key to prove
+    /// possession (a watch-only identity can't). INSECURE on the command line (visible
+    /// in `ps`); prefer `--password-stdin` or the interactive prompt.
+    #[arg(long, value_name = "PASS")]
+    password: Option<String>,
+    /// Read the unlock password from the first line of STDIN (secure for scripts).
+    #[arg(long, conflicts_with = "password")]
+    password_stdin: bool,
+}
+
+#[derive(clap::Args)]
 struct AiArgs {
     /// The acp gateway base URL the stage registers/heartbeats/pulls against
     /// (https:// only). Defaults to the production gateway; saved for re-runs.
@@ -729,6 +824,8 @@ fn main() {
         ),
         Some(Command::Doctor(args)) => cmd_doctor(args),
         Some(Command::Setup(args)) => setup::run(args.into(), no_color),
+        Some(Command::Guide(args)) => guide::run(args.json),
+        Some(Command::Companion(args)) => cmd_companion(args),
         Some(Command::Ai(args)) => cmd_ai(args),
         Some(Command::Train(args)) => cmd_train(args),
         Some(Command::Lang(args)) => cmd_lang(args),
@@ -818,6 +915,10 @@ fn command_allows_prompt(command: Option<&Command>) -> bool {
         Some(Command::Start(a)) => !a.json && !a.from_service,
         Some(Command::Doctor(a)) => !a.json,
         Some(Command::Balance(a)) => !a.json,
+        // `guide` is interactive-friendly, but its `--json` form is a machine consumer.
+        Some(Command::Guide(a)) => !a.json,
+        // `companion` prompts for the keystore unlock; allow the pre-prompt.
+        Some(Command::Companion(_)) => true,
         // `lang` itself sets the language; don't first-run-prompt on the way in.
         Some(Command::Lang(_)) => false,
         // `update`: the interactive apply already confirms; the terminal-line prompt
@@ -1249,6 +1350,52 @@ fn cmd_ai(args: AiArgs) -> i32 {
         allow_cpu: args.allow_cpu,
     };
     ai::run(flags, unlock)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// companion (hold the M4 PoP for a bring-your-own pearlhash miner)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `companion`: resolve the keystore unlock (the possession proof needs the signing
+/// key), then hand off to [`companion::run`] — which runs the /m4 handshake on a
+/// refresh loop WITHOUT ever spawning a miner. A watch-only identity has no keystore
+/// and fails closed inside `run`, so we only prompt for a password when one exists.
+fn cmd_companion(args: CompanionArgs) -> i32 {
+    // Non-blocking startup version check (no `--json` here). Opt out with
+    // ALICE_MINER_NO_UPDATE_CHECK=1.
+    update::startup_banner(false);
+
+    // The companion's PoP signature needs the sr25519 signing key. Resolve the
+    // unlock up front (stdin / flag / prompt) ONLY for a keystore-backed identity; a
+    // watch-only one has no keystore and `companion::run` fails closed with a clear
+    // message, so we skip the prompt there. An explicit `--address` must EQUAL this
+    // box's signing identity (the key we unlock here is the one that signs the PoP);
+    // `companion::run` rejects a mismatch up front rather than silently failing PoP.
+    let has_keystore = alice_miner_core::identity::load_pointer()
+        .map(|p| p.keystore_path.is_some())
+        .unwrap_or(false);
+    let unlock = if has_keystore {
+        match resolve_password(args.password.clone(), args.password_stdin) {
+            Ok(p) => Some(Zeroizing::new(p)),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return EXIT_USAGE;
+            }
+        }
+    } else {
+        None
+    };
+
+    let flags = companion::CompanionFlags {
+        lane: args.lane,
+        device: args.device,
+        region: args.region,
+        address: args.address,
+        refresh_secs: args.refresh_secs,
+        once: args.once,
+        duration_s: args.duration_s,
+    };
+    companion::run(flags, unlock)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
