@@ -7,6 +7,7 @@
 //! gauge + readout animate. Start sends `Start{Xmr}`; Stop sends `Stop`.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -377,6 +378,50 @@ pub struct MinerApp {
     /// Guards the one-shot lazy load of the stored PRL return address (so we read
     /// the small public pointer file once, not every frame).
     pub prl_payout_loaded: bool,
+
+    // ── CLI-in-terminal mining (the GPU-persistence path) ─────────────────────
+    /// `Some(lane)` while a headless CLI miner is running in an EXTERNAL terminal we
+    /// launched (Start → visible terminal running `alice-miner-cli start`). The
+    /// in-window engine is NOT used on this path; the Dashboard is driven by polling
+    /// the CLI's telemetry file instead. `None` when not on the terminal path.
+    pub terminal_lane: Option<Lane>,
+    /// The telemetry JSON file the launched CLI writes its latest `Snapshot` to (via
+    /// its hidden `--telemetry-file`), polled here ~every 900 ms to mirror the live
+    /// hashrate/shares into the Dashboard.
+    pub terminal_telemetry_path: Option<PathBuf>,
+    /// The instant the terminal miner last showed activity — the LATER of its launch
+    /// and the last successful telemetry read. Drives the staleness check (a terminal
+    /// the user closed / a dead CLI stops updating → we show idle, not forever-running).
+    pub last_terminal_activity: Option<Instant>,
+    /// The instant we last polled the telemetry file (throttles the ~900 ms poll).
+    pub last_terminal_poll: Option<Instant>,
+    /// Set the moment Stop is pressed on the terminal path: the CLI `stop` runs
+    /// asynchronously, so we show `Stopping…` until the telemetry goes stale (the CLI
+    /// exited) rather than snapping straight back to Idle.
+    pub terminal_stopping: bool,
+}
+
+/// The terminal miner is considered STALE (its terminal closed / the CLI died) once
+/// its telemetry file hasn't updated for this long. The CLI writes a snapshot every
+/// ~500 ms while alive, so this only trips on a genuine stop/death — never during a
+/// healthy run — while being short enough that a closed terminal returns the UI to
+/// Idle promptly (and comfortably ≥ the CLI `stop --timeout-s 8` graceful window).
+const TERMINAL_TELEMETRY_STALE: Duration = Duration::from_secs(10);
+
+/// Build the **secret-free** CLI argv the terminal launcher runs, INCLUDING the hidden
+/// `--telemetry-file <path>` so the GUI can poll the CLI's live snapshot. Pure +
+/// testable (no process spawn / no file I/O). Never carries a password / address — the
+/// CLI prompts for any wallet-unlock password interactively in its own terminal.
+fn terminal_launch_args(
+    lane: Lane,
+    gpus: &GpuSelection,
+    telemetry: &std::path::Path,
+) -> Vec<String> {
+    let mut args =
+        alice_miner_core::terminal::terminal_start_args(lane.cli_lane_arg(), gpus.csv().as_deref());
+    args.push("--telemetry-file".to_string());
+    args.push(telemetry.to_string_lossy().to_string());
+    args
 }
 
 impl MinerApp {
@@ -457,6 +502,11 @@ impl MinerApp {
             prl_payout_masked: None,
             prl_payout_error: None,
             prl_payout_loaded: false,
+            terminal_lane: None,
+            terminal_telemetry_path: None,
+            last_terminal_activity: None,
+            last_terminal_poll: None,
+            terminal_stopping: false,
         })
     }
 
@@ -1124,7 +1174,22 @@ impl MinerApp {
     }
 
     /// The engine lifecycle state (Idle until the first snapshot).
+    ///
+    /// On the CLI-in-terminal path the in-window engine is dormant, so the state comes
+    /// from the external miner: `Stopping` once Stop was pressed; `Idle` once its
+    /// telemetry goes stale (terminal closed / CLI exited); otherwise the polled
+    /// snapshot's state, or `Running` before the first snapshot lands (so pressing
+    /// Start reads active immediately, never a misleading Idle).
     pub fn state(&self) -> EngineState {
+        if self.terminal_lane.is_some() {
+            if self.terminal_telemetry_stale() {
+                return EngineState::Idle;
+            }
+            if self.terminal_stopping {
+                return EngineState::Stopping;
+            }
+            return self.snapshot.as_ref().map(|s| s.state).unwrap_or(EngineState::Running);
+        }
         self.snapshot.as_ref().map(|s| s.state).unwrap_or(EngineState::Idle)
     }
 
@@ -1393,11 +1458,103 @@ impl MinerApp {
             // No adjacent CLI (dev build) → signal the caller to use the engine.
             Err(_) => return false,
         };
-        let args = terminal::terminal_start_args(lane.cli_lane_arg(), gpus.csv().as_deref());
+        // Ask the CLI to mirror its live snapshot to a telemetry file we poll, so the
+        // Dashboard reflects the terminal miner's hashrate/shares. Remove any stale file
+        // FIRST so we never read a leftover Running/idle snapshot from a previous run.
+        let telemetry = terminal::telemetry_path();
+        let _ = std::fs::remove_file(&telemetry);
+        let args = terminal_launch_args(lane, gpus, &telemetry);
         if let Err(e) = terminal::spawn_in_terminal(&cli_path, &args) {
             self.error = Some(e);
+            // Spawn failed → don't leave the UI thinking a terminal miner is live.
+            self.clear_terminal_state();
+            return true;
         }
+        // Track the external miner so `state()` reads Running immediately (before the
+        // first telemetry lands) and Stop targets the terminal CLI. Reset the snapshot
+        // so the Dashboard doesn't show a stale in-window figure.
+        self.terminal_lane = Some(lane);
+        self.terminal_telemetry_path = Some(telemetry);
+        self.last_terminal_activity = Some(Instant::now());
+        self.last_terminal_poll = None;
+        self.terminal_stopping = false;
+        self.snapshot = None;
         true
+    }
+
+    /// Clear all CLI-in-terminal tracking (Stop confirmed, telemetry went stale, or a
+    /// launch failed) so the UI returns cleanly to Idle.
+    fn clear_terminal_state(&mut self) {
+        self.terminal_lane = None;
+        self.terminal_telemetry_path = None;
+        self.last_terminal_activity = None;
+        self.last_terminal_poll = None;
+        self.terminal_stopping = false;
+        self.snapshot = None;
+    }
+
+    /// Whether the external terminal miner's telemetry has gone stale (its terminal was
+    /// closed / the CLI died) — measured from the LATER of launch and the last read.
+    fn terminal_telemetry_stale(&self) -> bool {
+        match self.last_terminal_activity {
+            Some(t) => Instant::now().saturating_duration_since(t) > TERMINAL_TELEMETRY_STALE,
+            None => false,
+        }
+    }
+
+    /// Poll the CLI-in-terminal telemetry file (~every 900 ms) and fold the latest
+    /// `Snapshot` into the Dashboard via the SAME `on_snapshot` path the in-window
+    /// engine uses. Also runs the staleness sweep: once the file stops updating (the
+    /// terminal was closed, or a Stop's CLI exited), return the UI to Idle rather than
+    /// showing "Running" forever. No-op when not on the terminal path.
+    pub fn poll_terminal_telemetry(&mut self) {
+        if self.terminal_lane.is_none() {
+            return;
+        }
+        // Staleness sweep first: a closed terminal / a completed Stop → back to Idle.
+        if self.terminal_telemetry_stale() {
+            self.clear_terminal_state();
+            return;
+        }
+        let now = Instant::now();
+        let due = self
+            .last_terminal_poll
+            .map(|t| now.saturating_duration_since(t) >= Duration::from_millis(900))
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_terminal_poll = Some(now);
+        let Some(path) = self.terminal_telemetry_path.clone() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return; // not written yet (CLI still starting) — keep the launch-grace Running
+        };
+        if let Ok(snap) = serde_json::from_slice::<Snapshot>(&bytes) {
+            // A real snapshot arrived → the terminal miner is alive; re-arm staleness.
+            self.last_terminal_activity = Some(now);
+            self.on_snapshot(snap);
+        }
+    }
+
+    /// Stop the external terminal miner: run the bundled CLI `stop --timeout-s 8` in the
+    /// background (it signals the terminal CLI via its pid file → graceful teardown, with
+    /// the new child-pid + orphan backstops). We DON'T block the UI on it — instead we
+    /// show `Stopping…` until the telemetry goes stale (the CLI exited). Best-effort.
+    fn stop_terminal_miner(&mut self) {
+        use alice_miner_core::terminal;
+        if let Ok(cli_path) = terminal::resolve_cli_path() {
+            let _ = terminal::spawn_cli_stop(&cli_path, 8);
+        }
+        // Remove the telemetry file so a stale Running snapshot isn't re-read while the
+        // CLI winds down; keep `terminal_lane` set so `state()` reads Stopping until the
+        // staleness sweep (≥ the CLI's 8s graceful window) clears it.
+        if let Some(path) = &self.terminal_telemetry_path {
+            let _ = std::fs::remove_file(path);
+        }
+        self.terminal_stopping = true;
+        self.last_terminal_activity = Some(Instant::now());
     }
 
     /// Cancel the GPU-PRL unlock prompt without starting: zeroize+drop the captured
@@ -1433,6 +1590,14 @@ impl MinerApp {
     }
 
     pub fn stop_mining(&mut self) {
+        // On the CLI-in-terminal path, Stop must target the EXTERNAL miner (the
+        // in-window engine isn't running it), via the bundled CLI `stop`. We do NOT
+        // also send the in-window Stop — that path never started, and there must be no
+        // double-mine. `state()` shows `Stopping…` until the telemetry goes stale.
+        if self.terminal_lane.is_some() {
+            self.stop_terminal_miner();
+            return;
+        }
         if let Err(e) = self.engine.send(Command::Stop) {
             self.error = Some(e);
         }
@@ -1695,6 +1860,14 @@ impl Drop for MinerApp {
 impl eframe::App for MinerApp {
     fn ui(&mut self, ui_root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui_root.ctx().clone();
+        // Mirror the GUI's language toggle into the shared core i18n so every
+        // `tr!`-localized string (the titlebar pill, Settings labels, and any engine
+        // status text) follows the user's EN/中 choice. One cheap atomic store/frame.
+        alice_miner_core::i18n::set_lang(if self.lang_zh {
+            alice_miner_core::i18n::Lang::Zh
+        } else {
+            alice_miner_core::i18n::Lang::En
+        });
         // Scale the whole UI proportionally to the window FIRST (drives egui's
         // zoom factor), so every screen fills a consistent fraction at any size.
         self.apply_window_scaling(&ctx);
@@ -1711,6 +1884,10 @@ impl eframe::App for MinerApp {
             return;
         }
         self.drain_events();
+        // Poll the CLI-in-terminal telemetry file (the GPU-persistence path): fold the
+        // external miner's latest snapshot into the Dashboard, and sweep it back to Idle
+        // if its terminal was closed / the CLI exited. No-op off the terminal path.
+        self.poll_terminal_telemetry();
         // One-shot launch-time update check (notify-only): kick a background
         // `check_for_update` on the first real frame so a new build is surfaced
         // without the user having to open Settings (the v0.3.1 "didn't auto-
@@ -1739,6 +1916,14 @@ impl eframe::App for MinerApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Best-effort: stop any running lane so the child never outlives the app.
+        // On the CLI-in-terminal path the miner runs in an EXTERNAL process, so also
+        // fire the bundled CLI `stop` so closing the GUI doesn't leave it (and its
+        // xmrig) mining unattended.
+        if self.terminal_lane.is_some() {
+            if let Ok(cli_path) = alice_miner_core::terminal::resolve_cli_path() {
+                let _ = alice_miner_core::terminal::spawn_cli_stop(&cli_path, 8);
+            }
+        }
         let _ = self.engine.send(Command::Stop);
         std::thread::sleep(std::time::Duration::from_millis(400));
     }
@@ -2496,6 +2681,88 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         // RVN must spell `rvn` for the CLI (its id() "gpu" would launch PRL).
         let rvn = terminal::terminal_start_args(Lane::GpuRvn.cli_lane_arg(), None);
         assert_eq!(rvn, vec!["start", "--lane", "rvn"]);
+    }
+
+    /// The GUI terminal-launch argv now carries the hidden `--telemetry-file <path>`
+    /// (so the Dashboard can poll the CLI's live snapshot) — and STAYS secret-free
+    /// (no password / address / seed ever on the command line).
+    #[test]
+    fn terminal_launch_args_include_telemetry_file_and_no_secret() {
+        let telemetry = std::path::Path::new("/home/u/.alice/miner-cli.snapshot.json");
+        let args = terminal_launch_args(Lane::GpuPrl, &GpuSelection::All, telemetry);
+        // Base secret-free start argv, then the telemetry flag + its path (in order).
+        assert_eq!(
+            args,
+            vec![
+                "start".to_string(),
+                "--lane".to_string(),
+                "prl".to_string(),
+                "--telemetry-file".to_string(),
+                telemetry.to_string_lossy().to_string(),
+            ]
+        );
+        // A subset selection is preserved AND the telemetry flag still trails it.
+        let sub = terminal_launch_args(
+            Lane::GpuPrl,
+            &GpuSelection::Ids(vec![0, 2]),
+            telemetry,
+        );
+        assert_eq!(&sub[..5], &["start", "--lane", "prl", "--gpus", "0,2"]);
+        assert_eq!(sub[5], "--telemetry-file");
+        // SECRET-FREE: no password / address / seed token in ANY argv element.
+        for tok in args.iter().chain(sub.iter()) {
+            let l = tok.to_lowercase();
+            assert!(
+                !l.contains("password") && !l.contains("prl1p") && !l.contains("seed"),
+                "terminal argv leaked a secret: {tok}"
+            );
+        }
+    }
+
+    /// On the CLI-in-terminal path, `state()` reads Running the moment the terminal is
+    /// launched — BEFORE the first telemetry snapshot lands — so pressing Start never
+    /// shows a misleading Idle; and `clear_terminal_state` returns it cleanly to Idle.
+    #[test]
+    fn terminal_lane_without_snapshot_reads_running_then_idle_on_clear() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        // Simulate a just-launched terminal miner (no snapshot yet).
+        app.terminal_lane = Some(Lane::GpuPrl);
+        app.terminal_telemetry_path = Some(std::path::PathBuf::from("/tmp/x.json"));
+        app.last_terminal_activity = Some(Instant::now());
+        app.snapshot = None;
+        assert_eq!(app.state(), EngineState::Running, "launched but pre-snapshot → Running");
+        assert!(app.is_mining());
+
+        // Stop pressed → Stopping until the telemetry goes stale.
+        app.terminal_stopping = true;
+        assert_eq!(app.state(), EngineState::Stopping);
+
+        // Cleared (Stop confirmed / stale sweep) → back to Idle.
+        app.clear_terminal_state();
+        assert_eq!(app.state(), EngineState::Idle);
+        assert!(!app.is_mining());
+    }
+
+    /// Stale telemetry (the terminal was closed / the CLI died — no update for >10s)
+    /// reads Idle, NOT a stuck Running. `poll_terminal_telemetry` then fully clears
+    /// the terminal state.
+    #[test]
+    fn terminal_stale_telemetry_reads_idle_and_poll_clears() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.terminal_lane = Some(Lane::Xmr);
+        app.terminal_telemetry_path = Some(std::path::PathBuf::from("/tmp/none.json"));
+        // Last activity is comfortably past the staleness window.
+        app.last_terminal_activity =
+            Instant::now().checked_sub(TERMINAL_TELEMETRY_STALE + Duration::from_secs(5));
+        // (If the platform can't represent that instant, the test is a no-op rather
+        // than a false failure.)
+        if app.last_terminal_activity.is_some() {
+            assert!(app.terminal_telemetry_stale());
+            assert_eq!(app.state(), EngineState::Idle, "stale terminal telemetry → Idle");
+            // The poll sweep clears the terminal tracking entirely.
+            app.poll_terminal_telemetry();
+            assert!(app.terminal_lane.is_none(), "stale sweep clears terminal state");
+        }
     }
 
     /// Cancelling the unlock prompt zeroizes+drops the captured password and closes

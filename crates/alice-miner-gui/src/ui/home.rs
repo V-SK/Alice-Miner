@@ -14,6 +14,7 @@ use super::theme::THEME;
 use super::widgets::{self, Tone};
 use super::{lane_accent, lane_chip_label};
 use crate::app::MinerApp;
+use alice_miner_core::tr;
 use alice_miner_core::{EngineState, Lane, LaneSupport};
 
 /// The Home hero card's fixed inner width (mockup `.card-hero` max-width 392px).
@@ -183,7 +184,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
             if super::icons::show(ui, Icon::Copy, 13.0, THEME.text4)
                 .interact(egui::Sense::click())
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Copy address")
+                .on_hover_text(tr!("Copy address", "复制地址"))
                 .clicked()
             {
                 do_copy.set(true);
@@ -196,7 +197,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
                 .interact(egui::Sense::click());
             let edit = if can_change {
                 edit.on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text("Change reward address")
+                    .on_hover_text(tr!("Change reward address", "更换奖励地址"))
             } else {
                 edit.on_hover_text(strings::CHANGE_ADDR_MINING_BLOCK)
             };
@@ -237,7 +238,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
         let stopping = matches!(state, EngineState::Stopping);
         let do_stop = std::cell::Cell::new(false);
         centered(ui, |ui| {
-            let label = if stopping { "Stopping…" } else { "Stop mining" };
+            let label = if stopping { tr!("Stopping…", "停止中…") } else { tr!("Stop mining", "停止挖矿") };
             let stop = egui::Button::new(RichText::new(label).size(12.5).color(THEME.text2))
                 .fill(THEME.surface2)
                 .stroke(egui::Stroke::new(1.0_f32, THEME.line))
@@ -258,7 +259,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
                 if ui
                     .add(
                         egui::Label::new(
-                            RichText::new("Open dashboard →").size(12.0).strong().color(THEME.text_brand),
+                            RichText::new(tr!("Open dashboard →", "打开仪表盘 →")).size(12.0).strong().color(THEME.text_brand),
                         )
                         .sense(egui::Sense::click()),
                     )

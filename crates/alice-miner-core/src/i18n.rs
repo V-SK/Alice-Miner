@@ -10,8 +10,11 @@
 //!     local + merge-conflict-free. `tr!` expands to the `&'static str` for the
 //!     current global language, so it drops straight into `println!`/`format!`.
 //!
-//! The GUI crate has its OWN independent EN/中文 toggle (`alice-miner-gui`'s
-//! `app.lang_zh` / `ui/strings.rs`); this module is CLI-only and does not touch it.
+//! The GUI crate ALSO drives this global: `alice-miner-gui`'s `MinerApp::ui` mirrors
+//! its `app.lang_zh` toggle into [`set_lang`] each frame, so the desktop titlebar
+//! pill + Settings labels localize through the SAME `tr!` mechanism (no second i18n
+//! system). The GUI's bilingual-inline `ui/strings.rs` constants (which embed both
+//! languages in one string) are unaffected.
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU8, Ordering};

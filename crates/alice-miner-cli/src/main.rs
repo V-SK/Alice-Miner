@@ -458,6 +458,12 @@ struct StartArgs {
     /// Not for manual use. Hidden.
     #[arg(long, hide = true)]
     from_service: bool,
+    /// Internal: mirror each live `Snapshot` to this file (atomic overwrite) so the
+    /// desktop GUI — which launches this CLI in a visible terminal — can poll it and
+    /// show the live hashrate/shares. The file carries ONLY the credit-only `Snapshot`
+    /// (no secret; a core test asserts its wire form). Not for manual use. Hidden.
+    #[arg(long, value_name = "PATH", hide = true)]
+    telemetry_file: Option<std::path::PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -1013,6 +1019,7 @@ fn start_args_auto() -> StartArgs {
         gpus: None,
         region: None,
         from_service: false,
+        telemetry_file: None,
     }
 }
 
@@ -2123,6 +2130,12 @@ fn cmd_start_with_unlock(
                     }
                     saw_running = true;
                 }
+                // Mirror the latest snapshot to the telemetry file (when the GUI
+                // launched us with `--telemetry-file`) so the desktop Dashboard shows
+                // this terminal's live hashrate/shares. Atomic overwrite; credit-only.
+                if let Some(tf) = args.telemetry_file.as_deref() {
+                    write_telemetry_file(tf, &snap);
+                }
                 last_snapshot = Some(snap.clone());
                 if requested_stop
                     && matches!(snap.state, EngineState::Idle | EngineState::Error)
@@ -2254,6 +2267,35 @@ fn emit_snapshot(
         if let Some(note) = dashboard::render_credited_vs_raw_note(snap, credit) {
             print!("{note}");
         }
+    }
+}
+
+/// Mirror the latest [`Snapshot`] to `path` for the desktop GUI to poll (the GUI
+/// launches this CLI in a visible terminal, then reads this file to drive its live
+/// Dashboard). **Atomic overwrite**: serialize → write a sibling tmp in the SAME dir
+/// → rename over `path`, so the GUI never reads a half-written file AND the file only
+/// ever holds the LATEST snapshot (never appended → it can't grow without bound).
+/// Best-effort + **credit-only**: the `Snapshot` wire form carries no secret (no
+/// address-adjacent secret, no `paid_acu`/payout, and `prl_payout` is `#[serde(skip)]`
+/// — a core test asserts the shape), so this is safe to write to a plain file. Any I/O
+/// error is silently ignored — telemetry is a convenience, never worth interrupting a
+/// mining run.
+fn write_telemetry_file(path: &std::path::Path, snap: &Snapshot) {
+    let Ok(json) = serde_json::to_string(snap) else {
+        return;
+    };
+    // A sibling tmp keyed to our pid (same dir → the rename is same-filesystem +
+    // atomic; the pid suffix keeps two miners from clobbering each other's tmp).
+    let Some(name) = path.file_name() else {
+        return;
+    };
+    let tmp = path.with_file_name(format!(".{}.tmp.{}", name.to_string_lossy(), std::process::id()));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(&tmp, json.as_bytes()).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        // Don't leak the tmp file if the rename failed (e.g. a racing reader on Windows).
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -2399,43 +2441,41 @@ fn region_mode_banner() -> Option<String> {
 // stop
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Stop a running miner — with a robust ORPHAN backstop so `stop` never leaves the
+/// engine child (xmrig / SRBMiner) eating CPU when the CLI parent pid file is stale
+/// (the M4-Max "stopped, but xmrig still at 1200% CPU" report). Three layers, most
+/// specific first:
+///   1. **CLI parent** (`miner-cli.pid`) — the clean path: stopping it drops its
+///      engine + child (process group / `kill_on_drop`).
+///   2. **engine child** (`miner-child.pid`, written by `core::supervise` with the
+///      exact engine path) — reached when the parent pid is stale / missing, OR as a
+///      belt-and-suspenders after a parent SIGKILL that skipped the supervisor's own
+///      cleanup. Signalled ONLY after we RE-VERIFY the live pid's command line still
+///      contains OUR recorded engine path — so a stale pid the OS REUSED for an
+///      unrelated process (e.g. after a reboot) is never mis-killed.
+///   3. **last resort (unix)** — a still-running orphan of OUR EXACT bundled xmrig
+///      (the sibling binary next to this exe) that neither pid file caught. Each
+///      candidate's command line is re-verified against the exact bundled path AND
+///      its liveness re-checked before we ever signal it — we NEVER kill by the bare
+///      name `xmrig`, and NEVER a non-bundled process.
 fn cmd_stop(args: StopArgs) -> i32 {
+    let timeout = Duration::from_secs(args.timeout_s);
+    let mut acted = false; // stopped at least one LIVE process
+    let mut had_error = false;
+
+    // ── 1) The CLI parent process (`miner-cli.pid`). ─────────────────────────────
     match pidfile::read_pid() {
-        None => {
-            eprintln!(
-                "{}",
-                tr!(
-                    "No running miner found (no pid file at {p}).",
-                    "未找到运行中的矿工(无 pid 文件于 {p})。"
-                )
-                .replace("{p}", &pidfile::pid_path().display().to_string())
-            );
-            // Not an error per se, but non-zero so scripts can branch.
-            EXIT_RUNTIME
-        }
-        Some(pid) if !pidfile::is_alive(pid) => {
-            eprintln!(
-                "{}",
-                tr!(
-                    "No running miner (stale pid {pid}); cleaning up.",
-                    "没有运行中的矿工(过期 pid {pid});正在清理。"
-                )
-                .replace("{pid}", &pid.to_string())
-            );
-            pidfile::remove();
-            EXIT_RUNTIME
-        }
-        Some(pid) => {
+        Some(pid) if pidfile::is_alive(pid) => {
             println!(
                 "{}",
                 tr!("Stopping miner (pid {pid})…", "正在停止矿工(pid {pid})…")
                     .replace("{pid}", &pid.to_string())
             );
-            match pidfile::stop_pid(pid, Duration::from_secs(args.timeout_s)) {
+            match pidfile::stop_pid(pid, timeout) {
                 pidfile::StopOutcome::Graceful => {
                     println!("{}", tr!("Miner stopped cleanly.", "矿工已干净停止。"));
                     pidfile::remove();
-                    EXIT_OK
+                    acted = true;
                 }
                 pidfile::StopOutcome::Killed => {
                     println!(
@@ -2446,14 +2486,200 @@ fn cmd_stop(args: StopArgs) -> i32 {
                         )
                     );
                     pidfile::remove();
-                    EXIT_OK
+                    acted = true;
                 }
                 pidfile::StopOutcome::Error(e) => {
                     eprintln!("error: {e}");
-                    EXIT_RUNTIME
+                    had_error = true;
                 }
             }
         }
+        Some(stale) => {
+            // A stale parent pid — clean it, then fall through to the child backstop
+            // (this is EXACTLY the "stopped but xmrig still alive" case).
+            eprintln!(
+                "{}",
+                tr!(
+                    "No running miner at the CLI pid (stale pid {pid}); checking for a leftover engine child.",
+                    "CLI 进程已不在(过期 pid {pid});正在检查是否有遗留的引擎子进程。"
+                )
+                .replace("{pid}", &stale.to_string())
+            );
+            pidfile::remove();
+        }
+        None => { /* no parent pid file — still check the child + orphan backstops */ }
+    }
+
+    // ── 2) The engine child backstop (`miner-child.pid`). ────────────────────────
+    // Signal it ONLY after re-verifying the live pid's command line still contains OUR
+    // recorded engine path — never a stale pid the OS reused for an unrelated process.
+    if let Some(cpid) = alice_miner_core::terminal::read_child_pid() {
+        if !pidfile::is_alive(cpid) {
+            // The recorded child is gone — tidy its stale pid file.
+            alice_miner_core::terminal::remove_child_pid(cpid);
+        } else if child_pid_is_our_engine(cpid) {
+            // Alive AND its command line is OUR recorded engine → safe to stop.
+            println!(
+                "{}",
+                tr!(
+                    "Stopping a leftover bundled miner process (pid {pid})…",
+                    "正在停止遗留的内置矿工进程(pid {pid})…"
+                )
+                .replace("{pid}", &cpid.to_string())
+            );
+            match pidfile::stop_pid(cpid, timeout) {
+                pidfile::StopOutcome::Error(e) => {
+                    eprintln!("error: {e}");
+                    had_error = true;
+                }
+                _ => acted = true,
+            }
+            alice_miner_core::terminal::remove_child_pid(cpid);
+        } else {
+            // Alive, but its command line is NOT our recorded engine: the OS has REUSED
+            // this stale pid for an unrelated process. NEVER signal it. Leave the file
+            // untouched — a genuine orphan would still verify + be caught on a later
+            // stop, and a fresh `start` overwrites the record anyway.
+            eprintln!(
+                "{}",
+                tr!(
+                    "Recorded engine-child pid {pid} is now an unrelated process (reused pid); left it untouched.",
+                    "记录的引擎子进程 pid {pid} 现在是无关进程(pid 已被系统复用);已跳过,不做处理。"
+                )
+                .replace("{pid}", &cpid.to_string())
+            );
+        }
+    }
+
+    // ── 3) Last resort (unix): an orphan of OUR EXACT bundled xmrig. ─────────────
+    #[cfg(unix)]
+    for pid in orphaned_bundled_xmrig_pids() {
+        println!(
+            "{}",
+            tr!(
+                "Stopping an orphaned bundled xmrig (pid {pid})…",
+                "正在停止遗留的内置 xmrig 进程(pid {pid})…"
+            )
+            .replace("{pid}", &pid.to_string())
+        );
+        match pidfile::stop_pid(pid, timeout) {
+            pidfile::StopOutcome::Error(e) => {
+                eprintln!("error: {e}");
+                had_error = true;
+            }
+            _ => acted = true,
+        }
+    }
+
+    // ── Outcome. ─────────────────────────────────────────────────────────────────
+    if acted {
+        println!(
+            "{}",
+            tr!("Miner stopped. No orphan left.", "矿工已停止。没有遗留孤儿进程。")
+        );
+        EXIT_OK
+    } else if had_error {
+        EXIT_RUNTIME
+    } else {
+        eprintln!(
+            "{}",
+            tr!("No running miner found.", "未找到运行中的矿工。")
+        );
+        // Not an error per se, but non-zero so scripts can branch.
+        EXIT_RUNTIME
+    }
+}
+
+/// Parse a newline-separated pid list (e.g. `pgrep` stdout) into unique pids, dropping
+/// blanks / junk, pid 0, and our OWN pid (we must never signal ourselves). Pure +
+/// testable; the caller re-verifies each pid's liveness AND command line before ever
+/// signalling it (see [`orphaned_bundled_xmrig_pids`]).
+fn parse_pid_list(stdout: &str, self_pid: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        if let Ok(pid) = line.trim().parse::<u32>() {
+            if pid != 0 && pid != self_pid && !out.contains(&pid) {
+                out.push(pid);
+            }
+        }
+    }
+    out
+}
+
+/// Find live orphans running OUR EXACT bundled xmrig (the sibling binary next to this
+/// executable). The **safety red line**: we `pgrep -f` the exact bundled path, then
+/// for EACH candidate re-verify (a) it is still alive AND (b) its actual command line
+/// contains that exact path — so a process that merely shares the name `xmrig` (or any
+/// non-bundled xmrig the user runs) can NEVER be matched or killed. Returns the
+/// verified pids (empty when there is no bundled xmrig, no `pgrep`, or nothing matches).
+#[cfg(unix)]
+fn orphaned_bundled_xmrig_pids() -> Vec<u32> {
+    use std::process::Command;
+    let Some(bundled) = alice_miner_core::terminal::bundled_xmrig_path() else {
+        return Vec::new(); // no bundled xmrig beside us → nothing we're allowed to touch
+    };
+    let needle = bundled.to_string_lossy().to_string();
+    // `-f` matches the FULL command line; the exact absolute bundled path means only
+    // processes actually running OUR xmrig can appear — and we STILL re-verify below.
+    let Ok(out) = Command::new("pgrep").arg("-f").arg(&needle).output() else {
+        return Vec::new(); // no pgrep available → skip the last resort (layers 1–2 stand)
+    };
+    parse_pid_list(&String::from_utf8_lossy(&out.stdout), std::process::id())
+        .into_iter()
+        .filter(|&pid| pidfile::is_alive(pid))
+        .filter(|&pid| process_cmdline_contains(pid, &needle))
+        .collect()
+}
+
+/// True iff live process `cpid`'s command line contains OUR recorded engine binary
+/// path — the path `core::supervise` wrote next to the child pid (engine-agnostic:
+/// xmrig / SRBMiner / kawpowminer / AlphaMiner / an env-override engine). Falls back to
+/// the bundled xmrig path for a legacy pid-only child file. The hard guard that the
+/// layer-2 child-pid backstop can NEVER signal an unrelated process that merely
+/// inherited a reused pid; returns `false` when we cannot positively identify the
+/// process, so we decline to kill what we cannot verify.
+fn child_pid_is_our_engine(cpid: u32) -> bool {
+    let needle = alice_miner_core::terminal::read_child_engine_path()
+        .or_else(alice_miner_core::terminal::bundled_xmrig_path);
+    match needle {
+        Some(path) => process_cmdline_contains(cpid, &path.to_string_lossy()),
+        None => false,
+    }
+}
+
+/// Re-verify (defense in depth) that live process `pid`'s command line actually
+/// contains `needle` (an exact engine path) before we ever signal it — the hard guard
+/// that BOTH the layer-2 child-pid backstop AND the layer-3 last-resort orphan sweep
+/// can only ever hit OUR engine. Returns `false` on any failure to read the command
+/// line, so a process we cannot positively identify is never killed.
+fn process_cmdline_contains(pid: u32, needle: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::process::Command;
+        Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(needle))
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        // WMIC exposes the FULL command line for a pid. A missing / failed WMIC (e.g.
+        // removed on very recent Windows) yields `false`, so we conservatively DECLINE
+        // to signal a pid we cannot positively identify.
+        Command::new("wmic")
+            .args(["process", "where", &format!("ProcessId={pid}"), "get", "CommandLine", "/value"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(needle))
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (pid, needle);
+        false
     }
 }
 
@@ -2772,6 +2998,181 @@ mod tests {
             Command::Start(a) => assert!(a.region.is_none()),
             _ => panic!("expected start"),
         }
+    }
+
+    /// The hidden `--telemetry-file <PATH>` parses onto `StartArgs.telemetry_file`
+    /// (the GUI passes it so the desktop Dashboard can poll this terminal's live
+    /// snapshot); absent leaves it `None` (a normal `start` writes no telemetry).
+    #[test]
+    fn start_telemetry_file_flag_parses_else_none() {
+        let cli = Cli::try_parse_from([
+            "alice-miner", "start", "--telemetry-file", "/tmp/snap.json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Start(a) => {
+                assert_eq!(a.telemetry_file.as_deref(), Some(std::path::Path::new("/tmp/snap.json")))
+            }
+            _ => panic!("expected start"),
+        }
+        let cli = Cli::try_parse_from(["alice-miner", "start"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Start(a) => assert!(a.telemetry_file.is_none()),
+            _ => panic!("expected start"),
+        }
+    }
+
+    /// The telemetry file is an ATOMIC OVERWRITE, never an append: a second write
+    /// REPLACES the file (its byte length tracks only the latest snapshot, and it
+    /// deserializes back to exactly that snapshot). Also proves the on-disk JSON is
+    /// secret-free (no password / seed / paid_acu — the credit-only wire form).
+    #[test]
+    fn telemetry_file_overwrites_not_appends_and_is_secret_free() {
+        use alice_miner_core::Snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "alice-telemetry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snap.json");
+
+        // A first, LONG snapshot (running, big share count + a live hashrate). Built via
+        // serde (the `Snapshot` constructors are crate-private) — EngineState is
+        // `snake_case`. Only the required fields are present; Option/default fields fill in.
+        let running: Snapshot = serde_json::from_str(
+            r#"{"state":"running","shares_accepted":123456789,"shares_rejected":0,
+                "hashrate_hs":6520.0,"uptime_s":42,"failovers":0,"dual":false,
+                "endpoint":"asia.aliceprotocol.org:3340"}"#,
+        )
+        .unwrap();
+        write_telemetry_file(&path, &running);
+        let first = std::fs::read(&path).unwrap();
+
+        // A second, SHORTER snapshot (idle, zero shares) must REPLACE the file — if we
+        // appended, the file would only ever grow; here the byte length shrinks and the
+        // parsed content is exactly the second snapshot.
+        let idle: Snapshot = serde_json::from_str(
+            r#"{"state":"idle","shares_accepted":0,"shares_rejected":0,"uptime_s":0,
+                "failovers":0,"dual":false}"#,
+        )
+        .unwrap();
+        write_telemetry_file(&path, &idle);
+        let second = std::fs::read(&path).unwrap();
+        assert!(second.len() < first.len(), "overwrite must not append (file grew)");
+        let parsed: Snapshot = serde_json::from_slice(&second).unwrap();
+        assert_eq!(parsed, idle);
+
+        // Secret-free wire form: no reward/secret tokens ever reach the file.
+        let text = String::from_utf8_lossy(&first).to_lowercase();
+        for forbidden in ["password", "paid_acu", "seed", "mnemonic", "prl1p"] {
+            assert!(!text.contains(forbidden), "telemetry JSON leaked `{forbidden}`");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stop last-resort pid-list parser drops blanks / junk / pid 0 and our OWN
+    /// pid, and de-dups — so the orphan backstop never signals a bogus or self pid.
+    #[test]
+    fn parse_pid_list_filters_junk_self_and_dedups() {
+        let self_pid = std::process::id();
+        let stdout = format!("1234\n  5678 \n\nnot-a-pid\n0\n{self_pid}\n1234\n");
+        assert_eq!(parse_pid_list(&stdout, self_pid), vec![1234, 5678]);
+        // Empty / all-junk input → no pids.
+        assert!(parse_pid_list("\n\n  \nxyz\n", self_pid).is_empty());
+    }
+
+    /// `process_cmdline_contains` matches a LIVE process ONLY when its command line
+    /// actually carries the exact engine path — the defense-in-depth guard both stop
+    /// backstops re-check. We spawn a real child via an ABSOLUTE program path (exactly
+    /// how the engine is launched: `Command::new(<abs engine path>)`), so its command
+    /// line contains that path, and confirm a DIFFERENT path never matches it.
+    #[cfg(unix)]
+    #[test]
+    fn process_cmdline_contains_matches_only_the_exact_path() {
+        use std::process::{Command, Stdio};
+        let sleep = if std::path::Path::new("/bin/sleep").exists() {
+            "/bin/sleep"
+        } else {
+            "/usr/bin/sleep"
+        };
+        let mut child = Command::new(sleep)
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        // Positive: the child's command line DOES contain its exact program path.
+        assert!(process_cmdline_contains(pid, sleep));
+        // Negative (the pid-reuse guard): a DIFFERENT engine path is NOT in its command
+        // line, so a reused pid can never be mistaken for our engine.
+        assert!(!process_cmdline_contains(pid, "/opt/AliceMiner/Contents/MacOS/xmrig"));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The layer-2 backstop's identity gate: `child_pid_is_our_engine` returns TRUE only
+    /// when the LIVE recorded pid actually runs the engine path we recorded, and FALSE
+    /// when the pid is alive but running SOMETHING ELSE (the OS reused a stale pid) — the
+    /// exact reboot/SIGKILL mis-kill this fix closes. Isolated under `$ALICE_IDENTITY_DIR`.
+    #[cfg(unix)]
+    #[test]
+    fn child_pid_is_our_engine_rejects_a_reused_pid() {
+        use std::process::{Command, Stdio};
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "alice-childguard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
+
+        let sleep = if std::path::Path::new("/bin/sleep").exists() {
+            "/bin/sleep"
+        } else {
+            "/usr/bin/sleep"
+        };
+        let mut child = Command::new(sleep)
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        // Record the SAME live pid but a MISMATCHED engine path (models a reused pid:
+        // the process is alive, but it is NOT our engine) → the guard must REFUSE it.
+        alice_miner_core::terminal::write_child_pid(
+            pid,
+            std::path::Path::new("/opt/AliceMiner/Contents/MacOS/xmrig"),
+        );
+        assert!(
+            !child_pid_is_our_engine(pid),
+            "a live pid running something OTHER than the recorded engine must never verify"
+        );
+
+        // Record the pid with the CORRECT engine path it is actually running → verifies.
+        alice_miner_core::terminal::write_child_pid(pid, std::path::Path::new(sleep));
+        assert!(
+            child_pid_is_our_engine(pid),
+            "a live pid running the recorded engine path must verify"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// `apply_region_flag` LOCKS a known region, CLEARS on `auto`, and rejects an

@@ -14,6 +14,7 @@ use super::widgets::{self, Tone};
 use super::{lane_accent, lane_chip_label};
 use crate::app::MinerApp;
 use crate::update::UpdateUi;
+use alice_miner_core::tr;
 use alice_miner_core::{
     CreditState, CreditTotals, Lane, LaneSupport, Reconciliation, LANE_KEY_GPU_ALPHA,
     LANE_KEY_GPU_PRL,
@@ -1069,31 +1070,31 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
         .show(ui, |ui| {
             ui.add_space(22.0);
             ui.set_max_width(1000.0);
-            ui.label(RichText::new("Settings").size(21.0).strong().color(THEME.text));
-            ui.label(RichText::new("The product resists knobs — only what matters.").size(12.0).color(THEME.text3));
+            ui.label(RichText::new(tr!("Settings", "设置")).size(21.0).strong().color(THEME.text));
+            ui.label(RichText::new(tr!("The product resists knobs — only what matters.", "产品拒绝繁琐旋钮 —— 只保留真正重要的。")).size(12.0).color(THEME.text3));
             ui.add_space(16.0);
 
             // Mining panel.
-            panel(ui, "Mining", Icon::Activity, |ui| {
-                srow(ui, "Worker threads", "Mining runs at full power (拉满) only while you've pressed Start.", |ui| {
+            panel(ui, tr!("Mining", "挖矿"), Icon::Activity, |ui| {
+                srow(ui, tr!("Worker threads", "工作线程"), tr!("Mining runs at full power (拉满) only while you've pressed Start.", "只有在你点击 Start 后,挖矿才会全力(拉满)运行。"), |ui| {
                     let n = app.device.as_ref().map(|d| d.logical_cores).unwrap_or(0);
-                    ui.label(widgets::mono(format!("{n} threads"), 13.0, THEME.text));
+                    ui.label(widgets::mono(format!("{n} {}", tr!("threads", "线程")), 13.0, THEME.text));
                 });
-                srow(ui, "Lane", "Auto picks the best lane for your device. XMR uses the CPU (RandomX); PRL uses an NVIDIA/AMD GPU (pearlhash).", |ui| {
+                srow(ui, tr!("Lane", "通道"), tr!("Auto picks the best lane for your device. XMR uses the CPU (RandomX); PRL uses an NVIDIA/AMD GPU (pearlhash).", "Auto 会为你的设备自动选择最佳通道。XMR 使用 CPU(RandomX);PRL 使用 NVIDIA/AMD GPU(pearlhash)。"), |ui| {
                     let lane = app.active_lane();
                     widgets::chip(ui, Some(lane_accent(lane)), lane_chip_label(lane));
                 });
             });
 
             // Network panel.
-            panel(ui, "Network", Icon::Globe, |ui| {
-                srow(ui, "Endpoint", "Primary relay. The client handles failover automatically.", |ui| {
+            panel(ui, tr!("Network", "网络"), Icon::Globe, |ui| {
+                srow(ui, tr!("Endpoint", "节点"), tr!("Primary relay. The client handles failover automatically.", "主中继节点。客户端会自动处理故障切换。"), |ui| {
                     // Lane-aware while idle (:3333 XMR / :8888 RVN) — see
                     // `display_endpoint()` (the M3 follow-up fix).
                     let ep = app.display_endpoint();
                     ui.horizontal(|ui| {
                         ui.label(widgets::mono(ep, 12.5, THEME.text2));
-                        ui.label(RichText::new("read-only").size(10.0).extra_letter_spacing(0.8).color(THEME.text4));
+                        ui.label(RichText::new(tr!("read-only", "只读")).size(10.0).extra_letter_spacing(0.8).color(THEME.text4));
                     });
                 });
             });
@@ -1110,12 +1111,12 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
             render_update_panel(ui, app);
 
             // Appearance panel (reduced motion, language).
-            panel(ui, "Appearance", Icon::Activity, |ui| {
+            panel(ui, tr!("Appearance", "外观"), Icon::Activity, |ui| {
                 let mut rm = app.reduce_motion;
                 srow(
                     ui,
-                    "Reduce motion",
-                    "Turns off the breathing glow, gauge sweep and number tween. Colours and states stay.",
+                    tr!("Reduce motion", "减少动效"),
+                    tr!("Turns off the breathing glow, gauge sweep and number tween. Colours and states stay.", "关闭呼吸光晕、仪表扫描和数字渐变。颜色与状态保持不变。"),
                     |ui| {
                         if widgets::toggle(ui, rm).clicked() {
                             rm = !rm;
@@ -1144,8 +1145,8 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
             // disabled while mining (the reward target can't be re-keyed under a
             // running lane); the hint says why.
             let mining = app.is_mining();
-            panel(ui, "Identity", Icon::Eye, |ui| {
-                srow(ui, "Reward address", "Your own Alice address. Rewards accrue to it as pending.", |ui| {
+            panel(ui, tr!("Identity", "身份"), Icon::Eye, |ui| {
+                srow(ui, tr!("Reward address", "奖励地址"), tr!("Your own Alice address. Rewards accrue to it as pending.", "你自己的 Alice 地址。奖励以待发放形式累积到此地址。"), |ui| {
                     if let Some(addr) = app.reward_address() {
                         let watch_only = app.reward_is_watch_only();
                         ui.horizontal(|ui| {
@@ -1155,23 +1156,23 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                                 .fill(THEME.well)
                                 .stroke(egui::Stroke::new(1.0_f32, THEME.line_strong))
                                 .corner_radius(9);
-                            if ui.add(copy).on_hover_text("Click to copy").clicked() {
+                            if ui.add(copy).on_hover_text(tr!("Click to copy", "点击复制")).clicked() {
                                 ui.ctx().copy_text(addr.clone());
                                 app.copied_at = Some(std::time::Instant::now());
                             }
                         });
                     } else {
-                        ui.label(RichText::new("none").size(12.5).color(THEME.text4));
+                        ui.label(RichText::new(tr!("none", "无")).size(12.5).color(THEME.text4));
                     }
                 });
                 let hint = if mining {
                     strings::CHANGE_ADDR_MINING_BLOCK
                 } else {
-                    "Create new, import a phrase/seed, or paste a different address. Your old keystore is backed up first."
+                    tr!("Create new, import a phrase/seed, or paste a different address. Your old keystore is backed up first.", "新建、导入助记词/种子,或粘贴另一个地址。你的旧密钥库会先被备份。")
                 };
-                srow(ui, "Change reward address", hint, |ui| {
+                srow(ui, tr!("Change reward address", "更换奖励地址"), hint, |ui| {
                     let btn = egui::Button::new(
-                        RichText::new(strings::CHANGE_ADDR_ACTION)
+                        RichText::new(tr!("Change reward address", "更换奖励地址"))
                             .size(12.5)
                             .strong()
                             .color(if mining { THEME.text4 } else { THEME.ink_on_brand }),
@@ -1226,20 +1227,24 @@ fn render_background_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
     let state = app.bg_service.unwrap_or(ServiceState::NotInstalled);
     let on = !matches!(state, ServiceState::NotInstalled);
 
-    panel(ui, "Background mining", Icon::Activity, |ui| {
+    panel(ui, tr!("Background mining", "后台挖矿"), Icon::Activity, |ui| {
         let mut do_enable = false;
         let mut do_disable = false;
         srow(
             ui,
-            "Keep mining when closed",
-            "Runs your selected lane in the background so mining continues after you close the \
-             window, and restarts at login. Your reward address stays in the keystore — it is \
-             never written into the background service.",
+            tr!("Keep mining when closed", "关闭窗口后继续挖矿"),
+            tr!(
+                "Runs your selected lane in the background so mining continues after you close the \
+                 window, and restarts at login. Your reward address stays in the keystore — it is \
+                 never written into the background service.",
+                "在后台运行你所选的通道,关闭窗口后仍继续挖矿,并在登录时重启。你的奖励地址\
+                 保留在密钥库中 —— 绝不会写入后台服务。"
+            ),
             |ui| {
                 let (label, fill, ink, stroke) = if on {
-                    ("Turn off", THEME.well, THEME.text2, THEME.line_strong)
+                    (tr!("Turn off", "关闭"), THEME.well, THEME.text2, THEME.line_strong)
                 } else {
-                    ("Turn on", THEME.brand, THEME.ink_on_brand, THEME.brand)
+                    (tr!("Turn on", "开启"), THEME.brand, THEME.ink_on_brand, THEME.brand)
                 };
                 let btn = egui::Button::new(RichText::new(label).size(12.5).strong().color(ink))
                     .fill(fill)
@@ -1261,31 +1266,31 @@ fn render_background_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
         // The lane the background service will run, so the user knows what backgrounds.
         srow(
             ui,
-            "Lane",
-            "The lane the background service will mine (mirrors your selection).",
+            tr!("Lane", "通道"),
+            tr!("The lane the background service will mine (mirrors your selection).", "后台服务将挖矿的通道(与你的选择一致)。"),
             |ui| {
                 ui.label(RichText::new(bg_lane.label()).size(12.5).color(THEME.text2));
             },
         );
         let (word, tone) = match state {
-            ServiceState::Running => ("On — mining in the background", THEME.live),
-            ServiceState::Loaded => ("On — installed (the miner will keep retrying)", THEME.warn),
-            ServiceState::NotInstalled => ("Off", THEME.text3),
+            ServiceState::Running => (tr!("On — mining in the background", "已开启 —— 正在后台挖矿"), THEME.live),
+            ServiceState::Loaded => (tr!("On — installed (the miner will keep retrying)", "已开启 —— 已安装(矿工将持续重试)"), THEME.warn),
+            ServiceState::NotInstalled => (tr!("Off", "已关闭"), THEME.text3),
         };
-        srow(ui, "Status", "Background agent state.", |ui| {
+        srow(ui, tr!("Status", "状态"), tr!("Background agent state.", "后台代理状态。"), |ui| {
             ui.label(RichText::new(word).size(12.5).color(tone));
         });
         // Honest explainer when a GPU lane is selected but no keyring is available —
         // we refuse rather than silently background XMR. Only shown while OFF.
         if !on {
             if let Some(reason) = &disabled_reason {
-                srow(ui, "Why disabled", "This GPU lane needs an OS keyring.", |ui| {
+                srow(ui, tr!("Why disabled", "为何禁用"), tr!("This GPU lane needs an OS keyring.", "此 GPU 通道需要操作系统密钥环。"), |ui| {
                     ui.label(RichText::new(reason).size(11.5).color(THEME.text3));
                 });
             }
         }
         if let Some(err) = app.bg_service_error.clone() {
-            srow(ui, "Last error", "The toggle action reported this.", |ui| {
+            srow(ui, tr!("Last error", "最近错误"), tr!("The toggle action reported this.", "开关操作报告了此错误。"), |ui| {
                 ui.label(RichText::new(err).size(11.5).color(THEME.err));
             });
         }
@@ -1307,16 +1312,16 @@ fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
     // as the fallback for platforms without an in-app artifact.
     const RELEASES_PAGE: &str = "https://github.com/V-SK/alice-miner/releases/latest";
 
-    panel(ui, "Software update", Icon::Globe, |ui| {
+    panel(ui, tr!("Software update", "软件更新"), Icon::Globe, |ui| {
         // A one-time "updated to vX" confirmation, if the health gate committed a
         // freshly-applied build at startup. Cleared after it's shown once.
         if let Some(v) = app.update_committed_note.clone() {
             srow(
                 ui,
-                "Updated",
-                "This build was just installed and verified.",
+                tr!("Updated", "已更新"),
+                tr!("This build was just installed and verified.", "此版本刚刚安装并通过校验。"),
                 |ui| {
-                    ui.label(widgets::mono(format!("now on v{v}"), 12.5, THEME.live));
+                    ui.label(widgets::mono(format!("{} v{v}", tr!("now on", "当前")), 12.5, THEME.live));
                 },
             );
             app.update_committed_note = None;
@@ -1330,10 +1335,10 @@ fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
         let mut do_check = false;
         srow(
             ui,
-            "Check for updates",
-            "Updates are signed (ed25519) and integrity-checked (SHA-256). Your keystore is never touched.",
+            tr!("Check for updates", "检查更新"),
+            tr!("Updates are signed (ed25519) and integrity-checked (SHA-256). Your keystore is never touched.", "更新经过签名(ed25519)与完整性校验(SHA-256)。绝不会触碰你的密钥库。"),
             |ui| {
-                let label = if busy { "Checking…" } else { "Check for updates" };
+                let label = if busy { tr!("Checking…", "检查中…") } else { tr!("Check for updates", "检查更新") };
                 let btn = egui::Button::new(
                     RichText::new(label)
                         .size(12.5)
