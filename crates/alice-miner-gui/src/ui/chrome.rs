@@ -152,20 +152,23 @@ fn titlebar(ui_root: &mut egui::Ui, app: &mut MinerApp) {
         });
 }
 
-/// Map the engine state to the titlebar pill (tone, label, blink).
+/// Map the engine state to the titlebar pill (tone, label, blink). The label follows
+/// the user's EN/中 toggle via the shared `tr!` i18n (synced from `app.lang_zh` each
+/// frame in `MinerApp::ui`).
 fn status_for(app: &MinerApp) -> (Tone, String, bool) {
+    use alice_miner_core::tr;
     match app.state() {
         EngineState::Running => {
             // Reflect the ACTUAL active lane (was hardcoded "XMR" — wrong for the
             // GPU-PRL mainline and for dual-mine).
             let dual = app.snapshot.as_ref().map(|s| s.dual).unwrap_or(false);
             let lane = pill_lane_label(app.active_lane(), dual);
-            (Tone::Live, format!("Mining · {lane}"), true)
+            (Tone::Live, format!("{} · {lane}", tr!("Mining", "挖矿")), true)
         }
-        EngineState::Starting => (Tone::Warn, "Connecting".into(), true),
-        EngineState::Stopping => (Tone::Warn, "Stopping".into(), true),
-        EngineState::Error => (Tone::Danger, "Error".into(), false),
-        EngineState::Idle => (Tone::Off, "Idle".into(), false),
+        EngineState::Starting => (Tone::Warn, tr!("Connecting", "连接中").into(), true),
+        EngineState::Stopping => (Tone::Warn, tr!("Stopping", "停止中").into(), true),
+        EngineState::Error => (Tone::Danger, tr!("Error", "错误").into(), false),
+        EngineState::Idle => (Tone::Off, tr!("Idle", "空闲").into(), false),
     }
 }
 
@@ -307,5 +310,21 @@ mod tests {
         // Dual-mine reads "Dual" regardless of the primary lane.
         assert_eq!(pill_lane_label(Lane::Xmr, true), "Dual");
         assert_eq!(pill_lane_label(Lane::GpuPrl, true), "Dual");
+    }
+
+    /// The titlebar status pill LOCALIZES with the shared i18n language: English under
+    /// EN, 中文 under 中 — the concrete "中文模式下 pill 仍是英文" fix. (No other GUI test
+    /// mutates the process-global language, so setting + restoring it here is safe.)
+    #[test]
+    fn status_pill_label_localizes_with_language() {
+        use alice_miner_core::i18n::{set_lang, Lang};
+        let app = MinerApp::new().expect("engine spawns"); // Idle (no snapshot)
+        set_lang(Lang::En);
+        let (_t, en, _b) = status_for(&app);
+        assert_eq!(en, "Idle");
+        set_lang(Lang::Zh);
+        let (_t, zh, _b) = status_for(&app);
+        assert_eq!(zh, "空闲");
+        set_lang(Lang::En); // restore the default for any later test in this binary
     }
 }
