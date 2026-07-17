@@ -167,8 +167,77 @@ pub fn run_checks(lane: Lane, cap: &CapabilityProfile) -> Vec<Check> {
         check_relay(lane),
         check_tls_trust(),
     ];
+    // GPU-PRL region transparency: the effective region MODE + endpoint order + the
+    // per-source breakdown, so a tester can see whether the lane will auto-failover and
+    // where a rogue `fi` relay came from. Only the PRL lane uses region policy.
+    if lane == Lane::GpuPrl {
+        checks.extend(prl_region_checks(&crate::region::view()));
+    }
     checks.extend(platform_guardrails());
     checks
+}
+
+/// GPU-PRL region diagnostics (read-only, credit-only). Surfaces, from a probe-free
+/// [`crate::region::RegionView`]:
+///   * the effective region MODE (locked / operator-override / last-good / auto) + whether
+///     auto-failover is on;
+///   * the per-source inputs — `region_lock`, `last_good_region`, `ALICE_GPU_RELAY_REGION`,
+///     and whether `ALICE_MINER_ENDPOINTS_JSON` is set (presence only, never its content);
+///   * the effective endpoint order — a WARN with the exact hint when a REMOVED region host
+///     (`fi`) leaked in from a stale binary / endpoints-JSON override, else a PASS.
+///
+/// Pure over the view (the impure settings/env read is [`crate::region::view`]), so the
+/// FI-warning path is unit-testable with a synthetic view.
+fn prl_region_checks(view: &crate::region::RegionView) -> Vec<Check> {
+    let not_set = tr!("(not set)", "(未设置)");
+    let mut out = Vec::new();
+
+    // (1) Effective MODE (+ failover, embedded in the localized label).
+    out.push(Check::pass("PRL region mode", view.mode.clone()));
+
+    // (2) Per-source breakdown — exactly where the effective region comes from.
+    let sources = format!(
+        "region_lock={}, last_good_region={}, {}={}, {}={}",
+        view.region_lock.as_deref().unwrap_or(not_set),
+        view.last_good.as_deref().unwrap_or(not_set),
+        alice_miner_core::lane::gpu_prl::ENV_REGION,
+        view.env_region.as_deref().unwrap_or(not_set),
+        alice_miner_core::endpoint::ENDPOINTS_ENV,
+        if view.endpoints_json_set { tr!("set", "已设置") } else { not_set },
+    );
+    out.push(Check::pass("PRL region sources", sources));
+
+    // (3) Effective endpoint order + auto-failover state; WARN on a removed `fi` host.
+    let failover = if view.failover_on {
+        tr!("auto-failover on", "自动切换开启")
+    } else {
+        tr!("auto-failover off (region locked)", "自动切换关闭(区域已锁定)")
+    };
+    let order = if view.authorities.is_empty() {
+        tr!("(none)", "(无)").to_string()
+    } else {
+        view.authorities.join(" -> ")
+    };
+    let mut detail = format!("{order} — {failover}");
+    if view.probed {
+        detail.push_str(tr!(
+            " (nearest-first, chosen at start)",
+            "(启动时按最近优先选择)"
+        ));
+    }
+    if view.has_removed_region {
+        out.push(Check::warn(
+            "PRL effective endpoints",
+            detail,
+            tr!(
+                "FI is not in v0.6.1 compiled defaults; check old binary or ALICE_MINER_ENDPOINTS_JSON override.",
+                "FI 不在 v0.6.1 编译默认值中;请检查旧版 binary 或 ALICE_MINER_ENDPOINTS_JSON 覆盖。"
+            ),
+        ));
+    } else {
+        out.push(Check::pass("PRL effective endpoints", detail));
+    }
+    out
 }
 
 /// Config file integrity: the non-secret `settings.json` (language / lane prefs) must
@@ -1480,6 +1549,72 @@ mod tests {
                 assert!(!c.fix.is_empty(), "{} ({:?}) must carry a fix", c.name, c.status);
             }
         }
+    }
+
+    /// GPU-PRL region diagnostics: the three lines appear ONLY for the PRL lane, name
+    /// every source, and show the effective endpoint order + failover state.
+    #[test]
+    fn prl_region_checks_present_only_for_prl() {
+        // The PRL battery carries the region diagnostics.
+        let prl: Vec<&str> = run_checks(Lane::GpuPrl, &cap()).iter().map(|c| c.name).collect();
+        assert!(prl.contains(&"PRL region mode"));
+        assert!(prl.contains(&"PRL region sources"));
+        assert!(prl.contains(&"PRL effective endpoints"));
+        // A CPU-XMR battery does NOT (region policy is PRL-only).
+        let xmr: Vec<&str> = run_checks(Lane::Xmr, &cap()).iter().map(|c| c.name).collect();
+        assert!(!xmr.contains(&"PRL region mode"));
+    }
+
+    /// The per-source breakdown reflects each input, and the effective-endpoints line
+    /// carries the order + failover state. Uses a synthetic view (no settings/env).
+    /// Assertions are LANGUAGE-INDEPENDENT (region hosts + literal `key=` prefixes +
+    /// status), so a concurrent lang-mutating test in this crate can't flake them.
+    #[test]
+    fn prl_region_sources_and_order_reflect_inputs() {
+        // A LOCK on asia: single endpoint (failover implied off), source names the lock.
+        let locked = crate::region::from_inputs(Some("asia".into()), None, None, None);
+        let checks = prl_region_checks(&locked);
+        let sources = checks.iter().find(|c| c.name == "PRL region sources").unwrap();
+        assert!(sources.detail.contains("region_lock=asia"));
+        assert!(sources.detail.contains(alice_miner_core::endpoint::ENDPOINTS_ENV));
+        let eff = checks.iter().find(|c| c.name == "PRL effective endpoints").unwrap();
+        assert_eq!(eff.status, Status::Pass);
+        assert!(eff.detail.contains("asia.aliceprotocol.org:3340"));
+        assert!(!eff.detail.contains("us.aliceprotocol.org"), "a lock shows only its region");
+
+        // A clean auto default: both regions in order, all sources unset (no host value
+        // after `region_lock=`), the effective-endpoints line PASSes.
+        let auto = crate::region::from_inputs(None, None, None, None);
+        let checks = prl_region_checks(&auto);
+        let sources = checks.iter().find(|c| c.name == "PRL region sources").unwrap();
+        assert!(sources.detail.contains("region_lock="));
+        assert!(!sources.detail.contains("region_lock=us") && !sources.detail.contains("region_lock=asia"));
+        let eff = checks.iter().find(|c| c.name == "PRL effective endpoints").unwrap();
+        assert_eq!(eff.status, Status::Pass);
+        assert!(eff.detail.contains("us.aliceprotocol.org:3340 -> asia.aliceprotocol.org:3340"));
+    }
+
+    /// A removed `fi` relay (here via an endpoints-JSON override) turns the effective
+    /// endpoints line into a WARN with the stale-binary / override hint — the tester
+    /// signal for "where did Finland come from?". Structural (status) + a non-empty fix.
+    #[test]
+    fn prl_region_warns_on_removed_fi_host() {
+        let leaked = crate::region::from_inputs(
+            None,
+            None,
+            None,
+            Some("{\"gpu-prl\":[\"fi.aliceprotocol.org:3340\"]}".into()),
+        );
+        let checks = prl_region_checks(&leaked);
+        let eff = checks.iter().find(|c| c.name == "PRL effective endpoints").unwrap();
+        assert_eq!(eff.status, Status::Warn, "a removed fi host is a WARN");
+        // The hint mentions FI in either language, and is never empty.
+        assert!(!eff.fix.is_empty());
+        assert!(eff.fix.contains("FI"), "the fix names FI in both languages: {}", eff.fix);
+        // The endpoints-JSON presence is surfaced in the sources line (the env NAME is a
+        // language-independent literal; presence value is language-dependent so unchecked).
+        let sources = checks.iter().find(|c| c.name == "PRL region sources").unwrap();
+        assert!(sources.detail.contains(&format!("{}=", alice_miner_core::endpoint::ENDPOINTS_ENV)));
     }
 
     /// The CC check is honest about a Volta/V100 card: it FAILS for the PRL lane

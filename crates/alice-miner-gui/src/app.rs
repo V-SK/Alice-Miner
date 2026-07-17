@@ -1221,6 +1221,43 @@ impl MinerApp {
             .host_port()
     }
 
+    /// A compact, read-only label of the effective GPU-PRL region MODE for the Settings
+    /// "Region" row (B-line transparency): whether the lane is LOCKED to one region (no
+    /// auto-failover) or will auto-failover from a preferred / nearest primary. Reads the
+    /// same persisted settings + `ALICE_GPU_RELAY_REGION` the CLI/engine use, so the GUI
+    /// tells the identical story. The GUI has no region PICKER (region is set via
+    /// `alice-miner start --region <tag>`), so this is a status annotation only. Region
+    /// applies to the PRL lane only — callers show it only for that lane. Bilingual.
+    pub fn region_status_label(&self) -> String {
+        use alice_miner_core::lane::gpu_prl::{self, RegionDecision};
+        let s = alice_miner_core::settings::load();
+        let env = std::env::var(gpu_prl::ENV_REGION).ok();
+        let zh = self.lang_zh;
+        match gpu_prl::decide_region(s.region_lock.as_deref(), env.as_deref(), s.last_good_region.as_deref()) {
+            RegionDecision::Locked(tag) => {
+                if zh {
+                    format!("已锁定 {tag} · 不自动切换")
+                } else {
+                    format!("locked to {tag} · no failover")
+                }
+            }
+            RegionDecision::PreferHead(tag) => {
+                if zh {
+                    format!("{tag} 优先 · 自动切换开启")
+                } else {
+                    format!("{tag} first · failover on")
+                }
+            }
+            RegionDecision::Probe => {
+                if zh {
+                    "自动(最近) · 自动切换开启".to_string()
+                } else {
+                    "auto (nearest) · failover on".to_string()
+                }
+            }
+        }
+    }
+
     /// Current raw hashrate in kH/s from the snapshot (0 if none).
     pub fn hashrate_khs(&self) -> f32 {
         self.snapshot
