@@ -2447,10 +2447,12 @@ fn region_mode_banner() -> Option<String> {
 /// specific first:
 ///   1. **CLI parent** (`miner-cli.pid`) — the clean path: stopping it drops its
 ///      engine + child (process group / `kill_on_drop`).
-///   2. **engine child** (`miner-child.pid`, written by `core::supervise`) — reached
-///      when the parent pid is stale / missing, OR as a belt-and-suspenders after a
-///      parent SIGKILL that skipped the supervisor's own cleanup. Only ever our OWN
-///      recorded child pid.
+///   2. **engine child** (`miner-child.pid`, written by `core::supervise` with the
+///      exact engine path) — reached when the parent pid is stale / missing, OR as a
+///      belt-and-suspenders after a parent SIGKILL that skipped the supervisor's own
+///      cleanup. Signalled ONLY after we RE-VERIFY the live pid's command line still
+///      contains OUR recorded engine path — so a stale pid the OS REUSED for an
+///      unrelated process (e.g. after a reboot) is never mis-killed.
 ///   3. **last resort (unix)** — a still-running orphan of OUR EXACT bundled xmrig
 ///      (the sibling binary next to this exe) that neither pid file caught. Each
 ///      candidate's command line is re-verified against the exact bundled path AND
@@ -2509,8 +2511,14 @@ fn cmd_stop(args: StopArgs) -> i32 {
     }
 
     // ── 2) The engine child backstop (`miner-child.pid`). ────────────────────────
+    // Signal it ONLY after re-verifying the live pid's command line still contains OUR
+    // recorded engine path — never a stale pid the OS reused for an unrelated process.
     if let Some(cpid) = alice_miner_core::terminal::read_child_pid() {
-        if pidfile::is_alive(cpid) {
+        if !pidfile::is_alive(cpid) {
+            // The recorded child is gone — tidy its stale pid file.
+            alice_miner_core::terminal::remove_child_pid(cpid);
+        } else if child_pid_is_our_engine(cpid) {
+            // Alive AND its command line is OUR recorded engine → safe to stop.
             println!(
                 "{}",
                 tr!(
@@ -2526,9 +2534,21 @@ fn cmd_stop(args: StopArgs) -> i32 {
                 }
                 _ => acted = true,
             }
+            alice_miner_core::terminal::remove_child_pid(cpid);
+        } else {
+            // Alive, but its command line is NOT our recorded engine: the OS has REUSED
+            // this stale pid for an unrelated process. NEVER signal it. Leave the file
+            // untouched — a genuine orphan would still verify + be caught on a later
+            // stop, and a fresh `start` overwrites the record anyway.
+            eprintln!(
+                "{}",
+                tr!(
+                    "Recorded engine-child pid {pid} is now an unrelated process (reused pid); left it untouched.",
+                    "记录的引擎子进程 pid {pid} 现在是无关进程(pid 已被系统复用);已跳过,不做处理。"
+                )
+                .replace("{pid}", &cpid.to_string())
+            );
         }
-        // Clean the child pid file whether it was live (now stopped) or already dead.
-        alice_miner_core::terminal::remove_child_pid(cpid);
     }
 
     // ── 3) Last resort (unix): an orphan of OUR EXACT bundled xmrig. ─────────────
@@ -2611,18 +2631,56 @@ fn orphaned_bundled_xmrig_pids() -> Vec<u32> {
         .collect()
 }
 
+/// True iff live process `cpid`'s command line contains OUR recorded engine binary
+/// path — the path `core::supervise` wrote next to the child pid (engine-agnostic:
+/// xmrig / SRBMiner / kawpowminer / AlphaMiner / an env-override engine). Falls back to
+/// the bundled xmrig path for a legacy pid-only child file. The hard guard that the
+/// layer-2 child-pid backstop can NEVER signal an unrelated process that merely
+/// inherited a reused pid; returns `false` when we cannot positively identify the
+/// process, so we decline to kill what we cannot verify.
+fn child_pid_is_our_engine(cpid: u32) -> bool {
+    let needle = alice_miner_core::terminal::read_child_engine_path()
+        .or_else(alice_miner_core::terminal::bundled_xmrig_path);
+    match needle {
+        Some(path) => process_cmdline_contains(cpid, &path.to_string_lossy()),
+        None => false,
+    }
+}
+
 /// Re-verify (defense in depth) that live process `pid`'s command line actually
-/// contains `needle` (our exact bundled xmrig path) before we ever signal it — the
-/// hard guard that the last-resort stop can only ever hit OUR bundled binary.
-#[cfg(unix)]
+/// contains `needle` (an exact engine path) before we ever signal it — the hard guard
+/// that BOTH the layer-2 child-pid backstop AND the layer-3 last-resort orphan sweep
+/// can only ever hit OUR engine. Returns `false` on any failure to read the command
+/// line, so a process we cannot positively identify is never killed.
 fn process_cmdline_contains(pid: u32, needle: &str) -> bool {
-    use std::process::Command;
-    Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(needle))
-        .unwrap_or(false)
+    #[cfg(unix)]
+    {
+        use std::process::Command;
+        Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(needle))
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        // WMIC exposes the FULL command line for a pid. A missing / failed WMIC (e.g.
+        // removed on very recent Windows) yields `false`, so we conservatively DECLINE
+        // to signal a pid we cannot positively identify.
+        Command::new("wmic")
+            .args(["process", "where", &format!("ProcessId={pid}"), "get", "CommandLine", "/value"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(needle))
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (pid, needle);
+        false
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3026,6 +3084,95 @@ mod tests {
         assert_eq!(parse_pid_list(&stdout, self_pid), vec![1234, 5678]);
         // Empty / all-junk input → no pids.
         assert!(parse_pid_list("\n\n  \nxyz\n", self_pid).is_empty());
+    }
+
+    /// `process_cmdline_contains` matches a LIVE process ONLY when its command line
+    /// actually carries the exact engine path — the defense-in-depth guard both stop
+    /// backstops re-check. We spawn a real child via an ABSOLUTE program path (exactly
+    /// how the engine is launched: `Command::new(<abs engine path>)`), so its command
+    /// line contains that path, and confirm a DIFFERENT path never matches it.
+    #[cfg(unix)]
+    #[test]
+    fn process_cmdline_contains_matches_only_the_exact_path() {
+        use std::process::{Command, Stdio};
+        let sleep = if std::path::Path::new("/bin/sleep").exists() {
+            "/bin/sleep"
+        } else {
+            "/usr/bin/sleep"
+        };
+        let mut child = Command::new(sleep)
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        // Positive: the child's command line DOES contain its exact program path.
+        assert!(process_cmdline_contains(pid, sleep));
+        // Negative (the pid-reuse guard): a DIFFERENT engine path is NOT in its command
+        // line, so a reused pid can never be mistaken for our engine.
+        assert!(!process_cmdline_contains(pid, "/opt/AliceMiner/Contents/MacOS/xmrig"));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The layer-2 backstop's identity gate: `child_pid_is_our_engine` returns TRUE only
+    /// when the LIVE recorded pid actually runs the engine path we recorded, and FALSE
+    /// when the pid is alive but running SOMETHING ELSE (the OS reused a stale pid) — the
+    /// exact reboot/SIGKILL mis-kill this fix closes. Isolated under `$ALICE_IDENTITY_DIR`.
+    #[cfg(unix)]
+    #[test]
+    fn child_pid_is_our_engine_rejects_a_reused_pid() {
+        use std::process::{Command, Stdio};
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "alice-childguard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
+
+        let sleep = if std::path::Path::new("/bin/sleep").exists() {
+            "/bin/sleep"
+        } else {
+            "/usr/bin/sleep"
+        };
+        let mut child = Command::new(sleep)
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        // Record the SAME live pid but a MISMATCHED engine path (models a reused pid:
+        // the process is alive, but it is NOT our engine) → the guard must REFUSE it.
+        alice_miner_core::terminal::write_child_pid(
+            pid,
+            std::path::Path::new("/opt/AliceMiner/Contents/MacOS/xmrig"),
+        );
+        assert!(
+            !child_pid_is_our_engine(pid),
+            "a live pid running something OTHER than the recorded engine must never verify"
+        );
+
+        // Record the pid with the CORRECT engine path it is actually running → verifies.
+        alice_miner_core::terminal::write_child_pid(pid, std::path::Path::new(sleep));
+        assert!(
+            child_pid_is_our_engine(pid),
+            "a live pid running the recorded engine path must verify"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// `apply_region_flag` LOCKS a known region, CLEARS on `auto`, and rejects an

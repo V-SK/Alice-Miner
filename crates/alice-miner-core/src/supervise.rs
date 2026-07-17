@@ -503,12 +503,14 @@ impl LaneSupervisor {
             g.pid = Some(pid);
             g.state = ProcState::Running;
         }
-        // Record the ENGINE CHILD's pid (the real xmrig/SRBMiner — the process that
-        // eats CPU) so `alice-miner stop` can reach it even when the CLI PARENT pid
-        // file (`miner-cli.pid`) is stale/missing (the "stopped but xmrig still at
-        // 1200% CPU" orphan). Best-effort + public (a bare pid integer). Cleared on
-        // exit/stop in `supervise_until_exit`.
-        crate::terminal::write_child_pid(pid);
+        // Record the ENGINE CHILD's pid AND its exact engine path (the real
+        // xmrig/SRBMiner/kawpowminer/AlphaMiner — the process that eats CPU) so
+        // `alice-miner stop` can reach it even when the CLI PARENT pid file
+        // (`miner-cli.pid`) is stale/missing (the "stopped but xmrig still at 1200%
+        // CPU" orphan) — AND re-verify the pid still runs OUR engine before signalling
+        // it, so a reused pid is never mis-killed. Best-effort + public (pid + on-disk
+        // path). Cleared on exit/stop in `supervise_until_exit`.
+        crate::terminal::write_child_pid(pid, &program);
 
         // GPU-PRL log-file tail (blocker fix): SRBMiner emits shares/hashrate ONLY
         // to its `--log-file`, so without tailing it the stdout-only log pump sees

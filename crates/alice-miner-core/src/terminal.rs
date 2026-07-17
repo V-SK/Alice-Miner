@@ -59,11 +59,12 @@ pub fn resolve_cli_path() -> Result<std::path::PathBuf, String> {
 // When the GUI launches the headless CLI in a visible terminal, the CLI writes its
 // latest `Snapshot` to a small JSON file the GUI polls, so the GUI Dashboard mirrors
 // the CLI's live hashrate/shares. Separately, the engine child (xmrig / SRBMiner —
-// the process that actually eats CPU) records its pid to a second file so `stop` can
-// find and kill it even when the CLI PARENT pid file is stale (the "stopped but xmrig
-// still at 1200% CPU" report). Both files hold PUBLIC data only (the credit-only
-// `Snapshot`, whose wire form carries no secret — a core test asserts it; and a bare
-// pid integer). Co-located with the identity pointer under the same per-user dir.
+// the process that actually eats CPU) records its pid AND the exact engine binary path
+// to a second file so `stop` can find, IDENTITY-VERIFY, and kill it even when the CLI
+// PARENT pid file is stale (the "stopped but xmrig still at 1200% CPU" report). Both
+// files hold PUBLIC data only (the credit-only `Snapshot`, whose wire form carries no
+// secret — a core test asserts it; and the child's pid + on-disk engine path). Co-located
+// with the identity pointer under the same per-user dir.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The CLI→GUI telemetry file basename (latest `Snapshot`, atomically overwritten).
@@ -115,23 +116,38 @@ pub fn child_pid_path() -> PathBuf {
     alice_dir().join(CHILD_PID_FILE_NAME)
 }
 
-/// Record the engine child's pid (the real xmrig/SRBMiner, so `stop` can reach it if
-/// the CLI parent's pid file is stale). Best-effort: creates the dir if needed; a
-/// write failure is non-fatal (mining proceeds — only the child-pid backstop is lost).
-/// The file holds ONLY the public pid integer — never an address / password / endpoint.
-pub fn write_child_pid(pid: u32) {
+/// Record the engine child's pid (line 1) AND the exact engine binary path it was
+/// spawned from (line 2) — the real xmrig / SRBMiner / kawpowminer / AlphaMiner (the
+/// process that eats CPU) — so `stop` can (a) reach it when the CLI parent's pid file
+/// is stale AND (b) RE-VERIFY the pid still runs OUR engine before signalling it (never
+/// an unrelated process the OS reused that pid for after a parent SIGKILL / reboot).
+/// Best-effort: creates the dir if needed; a write failure is non-fatal (mining proceeds
+/// — only the child-pid backstop is lost). The file holds ONLY public data: the pid
+/// integer + the on-disk engine path — never an address / password / endpoint.
+pub fn write_child_pid(pid: u32, engine_path: &Path) {
     let path = child_pid_path();
     if let Some(parent) = path.parent() {
         if fs::create_dir_all(parent).is_err() {
             return;
         }
     }
-    let _ = fs::write(&path, pid.to_string());
+    let _ = fs::write(&path, format!("{pid}\n{}\n", engine_path.display()));
 }
 
-/// Read the recorded engine-child pid, if the file exists + parses.
+/// Read the recorded engine-child pid (line 1), if the file exists + parses. Tolerates
+/// both the current two-line record and a legacy single-line (pid-only) file.
 pub fn read_child_pid() -> Option<u32> {
-    fs::read_to_string(child_pid_path()).ok()?.trim().parse::<u32>().ok()
+    let body = fs::read_to_string(child_pid_path()).ok()?;
+    body.lines().next()?.trim().parse::<u32>().ok()
+}
+
+/// Read the engine binary path (line 2) the child was spawned from, if the file carries
+/// it (a legacy pid-only file returns `None`). Used by `stop` to verify a live child pid
+/// actually runs OUR engine — engine-agnostic — before it is ever signalled.
+pub fn read_child_engine_path() -> Option<PathBuf> {
+    let body = fs::read_to_string(child_pid_path()).ok()?;
+    let line = body.lines().nth(1)?.trim();
+    (!line.is_empty()).then(|| PathBuf::from(line))
 }
 
 /// Remove the child-pid file, but ONLY if it still names `pid` — so a stale removal
@@ -566,7 +582,8 @@ mod tests {
         std::env::remove_var("ALICE_IDENTITY_DIR");
     }
 
-    /// write_child_pid → read_child_pid round-trips the bare pid integer, and
+    /// write_child_pid → read_child_pid/read_child_engine_path round-trips the pid AND
+    /// the exact engine path (engine-agnostic), tolerates a legacy pid-only file, and
     /// remove_child_pid clears it — but ONLY when the file still names that pid.
     #[test]
     fn child_pid_write_read_remove_round_trip() {
@@ -575,12 +592,29 @@ mod tests {
         std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
 
         assert_eq!(read_child_pid(), None); // nothing yet
-        write_child_pid(4242);
-        assert_eq!(read_child_pid(), Some(4242));
-        // The file holds ONLY the pid integer — never a secret.
-        let body = std::fs::read_to_string(child_pid_path()).unwrap();
-        assert_eq!(body.trim(), "4242");
+        assert_eq!(read_child_engine_path(), None);
 
+        // Records BOTH the pid (line 1) and the exact engine path (line 2) — here
+        // SRBMiner, to prove the backstop is engine-agnostic (not xmrig-only).
+        let engine = std::path::Path::new("/opt/AliceMiner/Contents/MacOS/SRBMiner-MULTI");
+        write_child_pid(4242, engine);
+        assert_eq!(read_child_pid(), Some(4242));
+        assert_eq!(read_child_engine_path().as_deref(), Some(engine));
+
+        // The file carries ONLY public data: the pid integer + on-disk engine path.
+        let body = std::fs::read_to_string(child_pid_path()).unwrap();
+        assert_eq!(body.lines().next(), Some("4242"));
+        assert!(body.contains("SRBMiner-MULTI"));
+        assert!(!body.to_lowercase().contains("password"));
+
+        // A LEGACY single-line (pid-only) file written by a pre-fix binary still reads
+        // back its pid (upgrade tolerance); it simply carries no engine path.
+        std::fs::write(child_pid_path(), "777").unwrap();
+        assert_eq!(read_child_pid(), Some(777));
+        assert_eq!(read_child_engine_path(), None);
+
+        // Re-establish the two-line record for the remove-race assertions.
+        write_child_pid(4242, engine);
         // remove_child_pid(other) is a no-op — it must not delete a DIFFERENT child's
         // rendezvous (the race guard).
         remove_child_pid(9999);
