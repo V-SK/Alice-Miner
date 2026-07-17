@@ -503,6 +503,12 @@ impl LaneSupervisor {
             g.pid = Some(pid);
             g.state = ProcState::Running;
         }
+        // Record the ENGINE CHILD's pid (the real xmrig/SRBMiner — the process that
+        // eats CPU) so `alice-miner stop` can reach it even when the CLI PARENT pid
+        // file (`miner-cli.pid`) is stale/missing (the "stopped but xmrig still at
+        // 1200% CPU" orphan). Best-effort + public (a bare pid integer). Cleared on
+        // exit/stop in `supervise_until_exit`.
+        crate::terminal::write_child_pid(pid);
 
         // GPU-PRL log-file tail (blocker fix): SRBMiner emits shares/hashrate ONLY
         // to its `--log-file`, so without tailing it the stdout-only log pump sees
@@ -570,8 +576,13 @@ impl LaneSupervisor {
     }
 
     async fn supervise_until_exit(&self, mut owned: OwnedChild, gen: u64) {
+        // The child pid we recorded in `spawn_run`; cleared on either teardown path
+        // below (guarded so it never deletes a NEWER child's rendezvous).
+        let child_pid = owned.pid();
         loop {
             if let Some(code) = owned.try_exit_code() {
+                // The engine child exited on its own — clear its pid backstop file.
+                crate::terminal::remove_child_pid(child_pid);
                 let mut g = self.inner.lock().expect("mutex");
                 if g.generation == gen {
                     g.last_exit_code = Some(code);
@@ -602,6 +613,8 @@ impl LaneSupervisor {
             if should_stop {
                 // SIGTERM → bounded wait → SIGKILL, on the OWNED child only.
                 let code = owned.stop(STOP_GRACE).await.ok().flatten();
+                // The child is torn down — clear its pid backstop file.
+                crate::terminal::remove_child_pid(child_pid);
                 let mut g = self.inner.lock().expect("mutex");
                 if g.generation == gen {
                     g.pid = None;
