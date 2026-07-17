@@ -1102,7 +1102,7 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                 // Read-only; the lock is set from the CLI (`start --region <tag>`).
                 if app.active_lane() == Lane::GpuPrl {
                     let region = app.region_status_label();
-                    srow(ui, "Region", "Auto picks the nearest region and fails over. Lock one with `start --region us|asia`.", |ui| {
+                    srow(ui, "Region", "Auto picks the nearest region and fails over. Lock one with `start --region us|asia|eu`.", |ui| {
                         ui.horizontal(|ui| {
                             ui.label(widgets::mono(region, 12.5, THEME.text2));
                             ui.label(RichText::new("read-only").size(10.0).extra_letter_spacing(0.8).color(THEME.text4));

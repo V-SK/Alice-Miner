@@ -146,11 +146,15 @@ pub const GPU_RELAY_PORT: u16 = 3340;
 ///
 /// NOTE: the `fi` region (`fi.aliceprotocol.org`) was removed in v0.6.1 — it was
 /// never provisioned and resolves NXDOMAIN, so shipping it made clients waste a
-/// full RTT-probe timeout on a dead host on every startup. Re-add it here (and in
-/// the tests below) if/when a real Finland relay is stood up.
-pub const REGION_HOSTS: [(&str, &str); 2] = [
+/// full RTT-probe timeout on a dead host on every startup. A stood-up relay is
+/// added here (and it flows to every derived call site — `region_tags`,
+/// `normalize_region_tag`, the default endpoint order, the CLI/GUI banners, and
+/// `doctor`). `eu` (`eu.aliceprotocol.org`) went fully live in v0.6.2 (cert
+/// signed, behaviour identical to us/asia), so it joins the compiled set here.
+pub const REGION_HOSTS: [(&str, &str); 3] = [
     ("us", "us.aliceprotocol.org"),
     ("asia", "asia.aliceprotocol.org"),
+    ("eu", "eu.aliceprotocol.org"),
 ];
 
 /// The default region order (US-first) as plaintext [`Endpoint`]s on [`GPU_RELAY_PORT`].
@@ -198,10 +202,11 @@ pub fn normalize_region_tag(tag: &str) -> Option<&'static str> {
         .map(|(t, _)| *t)
 }
 
-/// The default region order (`us`, `asia`) as short tags — the canonical
-/// list a UI/CLI shows for `--region <tag>`. (`fi` was removed in v0.6.1.)
-pub fn region_tags() -> [&'static str; 2] {
-    [REGION_HOSTS[0].0, REGION_HOSTS[1].0]
+/// The default region order (`us`, `asia`, `eu`) as short tags — the canonical
+/// list a UI/CLI shows for `--region <tag>`. (`fi` was removed in v0.6.1; `eu`
+/// was added in v0.6.2.) Sourced from [`REGION_HOSTS`] so it stays in lockstep.
+pub fn region_tags() -> [&'static str; REGION_HOSTS.len()] {
+    [REGION_HOSTS[0].0, REGION_HOSTS[1].0, REGION_HOSTS[2].0]
 }
 
 /// Build the validated **SRBMiner pearlhash** launch plan against ONE region
@@ -328,7 +333,7 @@ const RTT_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Resolution:
 ///   1. `$ALICE_GPU_RELAY_REGION=<tag>` (us/asia) → that region is forced to
 ///      the head (no probe); unknown/empty values are ignored.
-///   2. otherwise probe both with [`probe_rtt`] and sort by latency;
+///   2. otherwise probe them all with [`probe_rtt`] and sort by latency;
 ///      unreachable regions sort last (in their default order).
 ///   3. if EVERY region is unreachable, fall back to the US-first default order
 ///      (so the lane still launches and the miner's own reconnect can take over).
@@ -456,7 +461,7 @@ pub fn decide_region(
 }
 
 /// The full region set (all region relays) reordered so `tag` is the primary
-/// (cursor-0), the rest following in the default `us, asia` order. Deterministic
+/// (cursor-0), the rest following in the default `us, asia, eu` order. Deterministic
 /// (no probe) — used for the prefer-head decision so a restart resumes on the
 /// remembered/forced region immediately, while auto-failover to the others stays
 /// available.
@@ -627,7 +632,7 @@ mod tests {
         assert_eq!(GPU_RELAY_PORT, 3340);
         assert_eq!(LANE, Lane::GpuPrl);
         assert_eq!(Lane::GpuPrl.id(), "prl");
-        assert_eq!(region_default_endpoints().len(), 2);
+        assert_eq!(region_default_endpoints().len(), 3);
         assert!(region_default_endpoints()
             .iter()
             .all(|e| e.port == 3340 && e.host.ends_with("aliceprotocol.org")));
@@ -867,7 +872,7 @@ mod tests {
         // Force asia → asia must be cursor-0, both regions still present.
         std::env::set_var(ENV_REGION, "asia");
         let eps = select_region_endpoints();
-        assert_eq!(eps.len(), 2, "the full region set is always returned");
+        assert_eq!(eps.len(), 3, "the full region set is always returned");
         assert_eq!(eps[0].host, "asia.aliceprotocol.org");
         assert!(eps.iter().all(|e| e.port == GPU_RELAY_PORT));
         // Every default host is still represented (only the ORDER changed).
@@ -893,7 +898,7 @@ mod tests {
         // and contain exactly the region hosts.
         std::env::set_var(ENV_REGION, "atlantis");
         let eps = select_region_endpoints();
-        assert_eq!(eps.len(), 2);
+        assert_eq!(eps.len(), 3);
         for (_, host) in REGION_HOSTS {
             assert!(eps.iter().any(|e| e.host == host));
         }
@@ -923,7 +928,7 @@ mod tests {
         std::env::set_var(ENV_REGION, "us");
         let plan = region_plan_by_rtt();
         let ordered = plan.ordered_from_cursor();
-        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered.len(), 3);
         assert!(ordered
             .iter()
             .all(|e| e.host.ends_with("aliceprotocol.org") && e.port == GPU_RELAY_PORT));
@@ -947,8 +952,11 @@ mod tests {
         assert_eq!(host_for_tag("  fi "), None);
         assert_eq!(host_for_tag("atlantis"), None);
         assert_eq!(normalize_region_tag(" US "), Some("us"));
+        assert_eq!(normalize_region_tag(" EU "), Some("eu"));
         assert_eq!(normalize_region_tag("mars"), None);
-        assert_eq!(region_tags(), ["us", "asia"]);
+        assert_eq!(region_tag_for_host("eu.aliceprotocol.org"), Some("eu"));
+        assert_eq!(host_for_tag("EU"), Some("eu.aliceprotocol.org"));
+        assert_eq!(region_tags(), ["us", "asia", "eu"]);
     }
 
     #[test]
@@ -983,7 +991,7 @@ mod tests {
     #[test]
     fn head_first_endpoints_puts_tag_first_keeps_full_set() {
         let eps = head_first_endpoints("asia");
-        assert_eq!(eps.len(), 2, "full set retained (failover still possible)");
+        assert_eq!(eps.len(), 3, "full set retained (failover still possible)");
         assert_eq!(eps[0].host, "asia.aliceprotocol.org");
         assert!(eps.iter().all(|e| e.port == GPU_RELAY_PORT));
         for (_, host) in REGION_HOSTS {
@@ -991,7 +999,7 @@ mod tests {
         }
         // An unknown tag degrades to the plain default order (no panic, non-empty).
         let d = head_first_endpoints("atlantis");
-        assert_eq!(d.len(), 2);
+        assert_eq!(d.len(), 3);
         assert_eq!(d[0].host, "us.aliceprotocol.org");
     }
 
@@ -1009,7 +1017,7 @@ mod tests {
     fn region_plan_from_last_good_prefers_head_keeps_failover() {
         // Remembered last-good = asia, no lock, no env → asia primary, full set.
         let plan = region_plan_from(None, None, Some("asia"));
-        assert_eq!(plan.len(), 2);
+        assert_eq!(plan.len(), 3);
         assert!(plan.can_failover(), "prefer-head keeps auto-failover available");
         assert_eq!(plan.current().host, "asia.aliceprotocol.org");
         assert!(!is_region_locked(None, None, Some("asia")));
@@ -1019,7 +1027,7 @@ mod tests {
     fn region_plan_from_env_override_prefers_head() {
         // The operator env keeps its legacy meaning: reorder head, keep full set.
         let plan = region_plan_from(None, Some("us"), Some("asia"));
-        assert_eq!(plan.len(), 2);
+        assert_eq!(plan.len(), 3);
         assert!(plan.can_failover());
         assert_eq!(plan.current().host, "us.aliceprotocol.org", "env beats last-good");
     }
@@ -1052,6 +1060,7 @@ mod tests {
             vec![
                 "asia.aliceprotocol.org:3340".to_string(),
                 "us.aliceprotocol.org:3340".to_string(),
+                "eu.aliceprotocol.org:3340".to_string(),
             ]
         );
 
@@ -1065,6 +1074,7 @@ mod tests {
             vec![
                 "us.aliceprotocol.org:3340".to_string(),
                 "asia.aliceprotocol.org:3340".to_string(),
+                "eu.aliceprotocol.org:3340".to_string(),
             ]
         );
 
@@ -1079,7 +1089,7 @@ mod tests {
     /// synthetic authority list / raw endpoints-JSON that DOES name it (the FI signal).
     #[test]
     fn removed_region_detectors_flag_fi_only() {
-        // Compiled defaults are fi-free (us/asia only).
+        // Compiled defaults are fi-free (us/asia/eu only).
         assert!(!contains_removed_region(&planned_endpoint_authorities(None, None, None)));
         for (_, host) in REGION_HOSTS {
             assert!(!REMOVED_REGION_HOSTS.contains(&host), "a live region can't be 'removed'");

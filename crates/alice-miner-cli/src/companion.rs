@@ -50,7 +50,7 @@ pub struct CompanionFlags {
     /// The device label (the stratum worker suffix your rig logs in with). Absent →
     /// a sanitized hostname default.
     pub device: Option<String>,
-    /// Pin a region (`us`/`asia`), else the remembered/nearest region is used.
+    /// Pin a region (`us`/`asia`/`eu`), else the remembered/nearest region is used.
     pub region: Option<String>,
     /// Reward address override (else the active `~/.alice` identity).
     pub address: Option<String>,
@@ -184,7 +184,7 @@ pub fn stratum_port(lane: Lane) -> u16 {
 }
 
 /// Resolve the region relay HOST the companion enrolls against (and the rig must
-/// then connect to — the allowlist is per-relay). An explicit `--region us|asia`
+/// then connect to — the allowlist is per-relay). An explicit `--region us|asia|eu`
 /// pins it; `auto`/empty or omitted uses the remembered/nearest region
 /// ([`gpu_prl::region_plan`]). Rejects an unknown tag.
 fn resolve_region_host(region: Option<&str>) -> Result<String, String> {

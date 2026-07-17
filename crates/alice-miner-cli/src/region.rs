@@ -11,7 +11,7 @@
 //! It ALSO surfaces the tester-facing "where did Finland come from?" signal: if the
 //! effective endpoints (or a raw `ALICE_MINER_ENDPOINTS_JSON` override) name the removed
 //! `fi` relay, [`RegionView::has_removed_region`] is set so `doctor` can point at a stale
-//! binary / env override (v0.6.1 compiled defaults are `us`/`asia` only).
+//! binary / env override (the compiled defaults are `us`/`asia`/`eu` — `fi` is never one).
 
 use alice_miner_core::lane::gpu_prl::{self, RegionDecision};
 use alice_miner_core::tr;
@@ -166,6 +166,7 @@ mod tests {
             vec![
                 "asia.aliceprotocol.org:3340".to_string(),
                 "us.aliceprotocol.org:3340".to_string(),
+                "eu.aliceprotocol.org:3340".to_string(),
             ]
         );
 
@@ -182,6 +183,7 @@ mod tests {
             vec![
                 "us.aliceprotocol.org:3340".to_string(),
                 "asia.aliceprotocol.org:3340".to_string(),
+                "eu.aliceprotocol.org:3340".to_string(),
             ]
         );
 
@@ -204,7 +206,7 @@ mod tests {
         assert!(v.mode.contains("asia (operator override)"));
         assert_eq!(
             endpoints_line(&v),
-            "endpoints: asia.aliceprotocol.org:3340 -> us.aliceprotocol.org:3340"
+            "endpoints: asia.aliceprotocol.org:3340 -> us.aliceprotocol.org:3340 -> eu.aliceprotocol.org:3340"
         );
         let v = from_inputs(None, None, Some("asia".into()), None);
         assert!(v.mode.contains("resuming last-good asia"));

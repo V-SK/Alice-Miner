@@ -191,7 +191,7 @@ mod tests {
         assert_eq!(LANE, Lane::GpuAlpha);
         assert_eq!(Lane::GpuAlpha.id(), "alpha");
         assert!(Lane::GpuAlpha.is_prl_lane());
-        assert_eq!(region_default_endpoints().len(), 2);
+        assert_eq!(region_default_endpoints().len(), 3);
         assert!(region_default_endpoints()
             .iter()
             .all(|e| e.port == 3341 && e.host.ends_with("aliceprotocol.org")));

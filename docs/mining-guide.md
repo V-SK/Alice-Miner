@@ -94,8 +94,8 @@ your own miner). It needs no identity and writes nothing.
 
 | Lane | `--lane` | Hardware | Algorithm | Relay endpoint | Notes |
 | ---- | -------- | -------- | --------- | -------------- | ----- |
-| **GPU · PRL** | `gpu` / `prl` | NVIDIA (CUDA, cc ≥ 7.5) / AMD (OpenCL) | `pearlhash` | `us` / `asia.aliceprotocol.org : 3340` | **The GPU mainline.** PoP-gated (needs a possession proof). |
-| **GPU · Alpha** | `alpha` | Volta / V100-class NVIDIA | `pearlhash` | `us` / `asia.aliceprotocol.org : 3341` | The pearlhash path for cards SRBMiner can't run. PoP-gated. |
+| **GPU · PRL** | `gpu` / `prl` | NVIDIA (CUDA, cc ≥ 7.5) / AMD (OpenCL) | `pearlhash` | `us` / `asia` / `eu.aliceprotocol.org : 3340` | **The GPU mainline.** PoP-gated (needs a possession proof). |
+| **GPU · Alpha** | `alpha` | Volta / V100-class NVIDIA | `pearlhash` | `us` / `asia` / `eu.aliceprotocol.org : 3341` | The pearlhash path for cards SRBMiner can't run. PoP-gated. |
 | **CPU · XMR** | `xmr` | Any CPU (RandomX) | `rx/0` | `hk.aliceprotocol.org : 3333` | Open enrollment — no proof, no GPU needed. |
 | **GPU · RVN** | `rvn` | NVIDIA (KawPoW) | `kawpow` | `hk.aliceprotocol.org : 8888` | Legacy path; the pearlhash lanes are the mainline today. |
 | **ASIC · scrypt** | — | scrypt ASIC (LTC-family) | `scrypt` | *see note* | The 15% ASIC pool. Not yet a self-serve client lane — see below. |
@@ -109,8 +109,8 @@ quote an expected reward — credit depends on the whole network's contribution 
 round, and nothing is settled to a currency yet.
 
 - **Never use the FI region.** The `fi.aliceprotocol.org` host is a dead zone
-  (NXDOMAIN) and was removed in v0.6.1 — only `us` and `asia` are live for the
-  pearlhash lanes.
+  (NXDOMAIN) and was removed in v0.6.1 — the live pearlhash regions are `us`,
+  `asia`, and `eu` (EU went live in v0.6.2).
 - **AMD is the OpenCL exception.** The `compute capability ≥ 7.5` bar is an NVIDIA
   (CUDA) figure; AMD cards have no CUDA compute-capability number and instead run
   pearlhash through the miner's **OpenCL** backend — so the cc threshold simply does
@@ -236,7 +236,7 @@ Keep this running while you mine; stop with Ctrl-C. (prl)
 Options you'll want:
 
 ```sh
-alice-miner companion --lane prl --device rig1 --region asia   # pin us | asia (default: nearest/remembered)
+alice-miner companion --lane prl --device rig1 --region asia   # pin us | asia | eu (default: nearest/remembered)
 alice-miner companion --lane alpha --device volta1             # for a Volta / V100 rig (port 3341)
 alice-miner companion --lane prl --address <alice-addr>        # pin the address explicitly — it MUST be your own identity's (see below)
 alice-miner companion --lane prl --once                        # enroll once and exit (prime a scripted run / a test)
@@ -305,7 +305,7 @@ companion) and credits the shares to your Alice address.
   (`identity --import`). A PRL cashback address is a separate setting
   (`identity --set-prl-payout`) and does not change who mines.
 - **Do not use the FI region.** `fi.aliceprotocol.org` is a dead zone (NXDOMAIN).
-  Only `us` and `asia` are live.
+  The live regions are `us`, `asia`, and `eu`.
 - **A wrong address is rejected.** The login address is validated (SS58 format-300);
   a typo won't silently credit someone else — it just won't be authorized. Copy it
   from `alice-miner identity --show`.
@@ -433,8 +433,8 @@ alice-miner guide --json   # 同上,机器可读(供脚本 / 官网使用)
 
 | 通道 | `--lane` | 硬件 | 算法 | 中继端点 | 说明 |
 | ---- | -------- | ---- | ---- | -------- | ---- |
-| **GPU · PRL** | `gpu` / `prl` | NVIDIA(CUDA 算力 ≥ 7.5)/ AMD(OpenCL) | `pearlhash` | `us` / `asia.aliceprotocol.org : 3340` | **GPU 主线**,需 PoP(所有权证明)。 |
-| **GPU · Alpha** | `alpha` | Volta / V100 架构 NVIDIA | `pearlhash` | `us` / `asia.aliceprotocol.org : 3341` | SRBMiner 跑不了的卡的 pearlhash 路径,需 PoP。 |
+| **GPU · PRL** | `gpu` / `prl` | NVIDIA(CUDA 算力 ≥ 7.5)/ AMD(OpenCL) | `pearlhash` | `us` / `asia` / `eu.aliceprotocol.org : 3340` | **GPU 主线**,需 PoP(所有权证明)。 |
+| **GPU · Alpha** | `alpha` | Volta / V100 架构 NVIDIA | `pearlhash` | `us` / `asia` / `eu.aliceprotocol.org : 3341` | SRBMiner 跑不了的卡的 pearlhash 路径,需 PoP。 |
 | **CPU · XMR** | `xmr` | 任意 CPU(RandomX) | `rx/0` | `hk.aliceprotocol.org : 3333` | 开放注册,无需证明、无需 GPU。 |
 | **GPU · RVN** | `rvn` | NVIDIA(KawPoW) | `kawpow` | `hk.aliceprotocol.org : 8888` | 旧路径;如今 pearlhash 才是主线。 |
 | **ASIC · scrypt** | — | scrypt ASIC(LTC 系) | `scrypt` | *见下* | 15% 的 ASIC 池,尚未成为自助客户端通道。 |
@@ -444,7 +444,7 @@ alice-miner guide --json   # 同上,机器可读(供脚本 / 官网使用)
   **GH/s–TH/s**。用 `alice-miner detect` 查看本机可用通道。我们**刻意不**给出任何
   预期数字 —— 积分取决于每一轮全网的贡献,且尚未结算为任何货币。
 - **绝不使用 FI 区域:** `fi.aliceprotocol.org` 是死区(NXDOMAIN),v0.6.1 起已移除
-  —— pearlhash 通道只有 `us` 和 `asia` 可用。
+  —— pearlhash 通道现有 `us`、`asia`、`eu` 可用(EU 于 v0.6.2 上线)。
 - **AMD 是 OpenCL 例外:** 「算力 ≥ 7.5」是 NVIDIA(CUDA)的指标;AMD 卡没有 CUDA
   算力(compute capability)这个数字,而是通过矿机的 **OpenCL** 后端跑 pearlhash ——
   所以该算力门槛对 AMD 不适用。
@@ -502,7 +502,7 @@ alice-miner companion --lane prl --device rig1
 **连接横幅**,给出你的矿机要用的中继主机、端口和登录名。常用选项:
 
 ```sh
-alice-miner companion --lane prl --device rig1 --region asia   # 固定 us | asia(默认最近/记忆)
+alice-miner companion --lane prl --device rig1 --region asia   # 固定 us | asia | eu(默认最近/记忆)
 alice-miner companion --lane alpha --device volta1             # Volta / V100 矿机(端口 3341)
 alice-miner companion --lane prl --address <alice-地址>        # 显式指定地址 —— 必须是你本机身份的地址(见下方说明)
 alice-miner doctor --lane prl                                  # 含 "companion (PoP)" 就绪检查
@@ -545,7 +545,7 @@ alice-miner doctor --lane prl                                  # 含 "companion 
   所以它只能注册这把密钥所派生的地址 —— `--address` 只是让你显式写出自己的地址(若不是你的
   签名身份,伴侣会当场拒绝)。要挖到另一个地址,请切换身份(`identity --import`)。PRL 返现
   地址是另一项独立设置(`identity --set-prl-payout`),不改变由谁来挖。
-- **绝不使用 FI 区域:** `fi.aliceprotocol.org` 是死区(NXDOMAIN),只用 `us` / `asia`。
+- **绝不使用 FI 区域:** `fi.aliceprotocol.org` 是死区(NXDOMAIN),只用 `us` / `asia` / `eu`。
 - **地址写错会被拒:** 登录地址会做 SS58 format-300 校验,写错不会悄悄记给别人,只是
   不被授权。请从 `alice-miner identity --show` 复制。
 - **CPU-XMR 不需要这些:** XMR 是开放注册 —— 直接指向 `hk.aliceprotocol.org:3333`、

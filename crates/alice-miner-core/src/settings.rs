@@ -33,7 +33,7 @@ pub struct Settings {
     /// again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
-    /// A user-PINNED GPU region tag (`"us"` / `"asia"`), set by
+    /// A user-PINNED GPU region tag (`"us"` / `"asia"` / `"eu"`), set by
     /// `start --region <tag>`. When present the GPU-PRL lane LOCKS to this region:
     /// it never auto-fails-over to another region — it only retries this one and
     /// reports a clear error if it stays unreachable. `None` (the default) leaves
