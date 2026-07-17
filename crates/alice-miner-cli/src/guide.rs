@@ -26,7 +26,7 @@
 //! foundation collection address, an upstream pool, or the core IP) and describes
 //! rewards only as credit (积分, credit-only), matching the rest of the CLI.
 
-use alice_miner_core::lane::{gpu_alpha, gpu_prl, xmr};
+use alice_miner_core::lane::{gpu_alpha, gpu_prl, gpu_rvn, xmr};
 use alice_miner_core::tr;
 use alice_miner_core::{CapabilityProfile, Lane};
 
@@ -79,8 +79,10 @@ fn byo_connection(lane: Lane) -> ByoConnection {
         },
         Lane::GpuRvn => ByoConnection {
             algorithm: "kawpow",
-            hosts: vec![xmr::ALICE_POOL_HOST],
-            port: 8888,
+            // The RVN relay constants (host/port live in the lane module — don't
+            // hardcode 8888 here or the two can drift).
+            hosts: vec![gpu_rvn::ALICE_POOL_HOST],
+            port: gpu_rvn::ALICE_POOL_PORT,
             needs_companion: false,
             companion_lane: "",
         },

@@ -262,6 +262,19 @@ pub fn run(flags: CompanionFlags, unlock: Option<Zeroizing<String>>) -> i32 {
         }
     };
 
+    // (5a) The address we ENROLL must be the one this signing key derives. The relay
+    // verifies the possession proof against the ENROLLED address's pubkey, so a
+    // `--address` that isn't this box's signing identity yields a signature the relay
+    // can't verify: the (address, device) pair is silently never allow-listed and the
+    // rig loops forever on `code:24`. Turn that fail-safe dead-end into a loud error
+    // BEFORE printing the banner / starting the loop.
+    if let Err(e) =
+        check_address_matches_signer(&address, &secrets.address, flags.address.is_some())
+    {
+        eprintln!("error: {e}");
+        return EXIT_USAGE;
+    }
+
     let port = stratum_port(lane);
     print_connection_banner(lane, &address, &device, &region_host, port);
 
@@ -318,6 +331,70 @@ fn resolve_address(override_addr: Option<&str>) -> Result<String, i32> {
             Err(EXIT_USAGE)
         }
     }
+}
+
+/// GUARD — the address the companion enrolls MUST be the one THIS box's signing key
+/// derives (SS58 format-300). The companion signs the `/m4` possession proof with the
+/// local key, and the relay verifies that signature against the ENROLLED address's
+/// pubkey. So enrolling any OTHER address (a `--address` pointing at someone else's
+/// address, or a stale pointer) produces a signature the relay can't verify: the
+/// `(address, device)` pair is **never** allow-listed and the rig loops forever on
+/// `code:24` — a silent, fail-safe dead-end. This makes that dead-end LOUD.
+///
+/// `enroll_addr` = the address the companion would enroll (a `--address` override,
+/// else the active identity). `signer_addr` = the address the unlocked keystore key
+/// derives (guaranteed by `unlock_wallet`'s `verify_identity`). `explicit_override`
+/// = whether the user passed `--address` (it only shapes the fix hint). Pure +
+/// testable (no keystore / network): `Ok(())` = proceed, `Err(msg)` = a usage error.
+///
+/// NOTE — two DIFFERENT addresses that users conflate: (1) the MINING IDENTITY address
+/// (this SS58 — companion signs the PoP with it, credit accrues to it; it MUST equal
+/// the local signing key's address); (2) the PRL cashback address (a `prl1p…` set via
+/// `identity --set-prl-payout`, where a future 15% PRL return goes) — unrelated, and
+/// NOT what `--address` controls.
+pub fn check_address_matches_signer(
+    enroll_addr: &str,
+    signer_addr: &str,
+    explicit_override: bool,
+) -> Result<(), String> {
+    if enroll_addr == signer_addr {
+        return Ok(());
+    }
+    let fix = if explicit_override {
+        tr!(
+            "You passed --address, but the companion can ONLY enroll the address of THIS box's \
+             signing identity. To mine to a DIFFERENT Alice address, switch identity first \
+             (`alice-miner identity --import \"<24 words>\"`) and drop --address.",
+            "你传入了 --address,但伴侣只能为本机签名身份的地址注册。要挖到另一个 Alice 地址,\
+             请先切换身份(`alice-miner identity --import \"<24 个词>\"`)并去掉 --address。"
+        )
+    } else {
+        tr!(
+            "This identity's stored address does not match the key in its keystore — re-import \
+             it (`alice-miner identity --import \"<24 words>\"`) so the address matches the \
+             signing key.",
+            "该身份记录的地址与其 keystore 中的密钥不一致 —— 请重新导入\
+             (`alice-miner identity --import \"<24 个词>\"`),使地址与签名密钥相符。"
+        )
+    };
+    Err(format!(
+        "{head}\n  {l_signer}: {signer_addr}\n  {l_asked}: {enroll_addr}\n  {fix}\n  {note}",
+        head = tr!(
+            "the companion can only enroll the address that THIS box's signing key derives. The \
+             relay verifies the possession proof against the enrolled address, so a mismatched \
+             address is never allow-listed (your rig would loop on code:24).",
+            "伴侣只能注册本机签名密钥所派生的地址。中继会用被注册的地址来验证所有权证明,因此\
+             不匹配的地址永远进不了允许名单(你的矿机会一直卡在 code:24)。"
+        ),
+        l_signer = tr!("signing identity (this box)", "签名身份(本机)"),
+        l_asked = tr!("you asked to enroll", "你请求注册的地址"),
+        note = tr!(
+            "(A PRL cashback address is a SEPARATE setting — it does not change who mines. Set it \
+             with `alice-miner identity --set-prl-payout <prl1p…>`.)",
+            "(PRL 返现地址是另一项独立设置 —— 它不改变由谁来挖。用 \
+             `alice-miner identity --set-prl-payout <prl1p…>` 设置。)"
+        ),
+    ))
 }
 
 /// Print the copy-paste connection instructions for the user's own rig.
@@ -542,6 +619,53 @@ mod tests {
     fn stratum_port_is_lane_specific() {
         assert_eq!(stratum_port(Lane::GpuPrl), 3340);
         assert_eq!(stratum_port(Lane::GpuAlpha), 3341);
+    }
+
+    /// The address the companion enrolls must be the one the LOCAL signing key derives.
+    /// When they match (the normal path — `--address` omitted, or `--address` set to
+    /// your own identity) the guard proceeds with ZERO behavior change.
+    #[test]
+    fn address_matching_signer_is_allowed() {
+        let a = "a2uJXaVk7Zx4fgk9aRLnhiD2RdpAP4usJxKXpN4vh4hDNoP1C";
+        // No override + equal → proceed (the default, unchanged path).
+        assert!(check_address_matches_signer(a, a, false).is_ok());
+        // Explicit --address equal to the signer → also fine.
+        assert!(check_address_matches_signer(a, a, true).is_ok());
+    }
+
+    /// The BUG this fixes: a `--address` that isn't the local signing identity used to
+    /// enroll silently, PoP-fail, and loop on `code:24` forever. Now it's a LOUD,
+    /// actionable usage error (names BOTH addresses, points at the real fix, and
+    /// disambiguates the separate PRL cashback address). Asserts only on lang-invariant
+    /// substrings, so it needs no lang lock and is robust under parallel test threads.
+    #[test]
+    fn address_not_matching_signer_is_a_loud_error_not_silent() {
+        let asked = "a2uJXaVk7Zx4fgk9aRLnhiD2RdpAP4usJxKXpN4vh4hDNoP1C";
+        let signer = "a2vDifferentSignerAddressForThisUnitTestOnlyXXXXXXX";
+        let err = check_address_matches_signer(asked, signer, true).unwrap_err();
+        // Loud (non-empty) + names both addresses so the user sees the mix-up.
+        assert!(!err.is_empty());
+        assert!(err.contains(asked), "must name the requested address: {err}");
+        assert!(err.contains(signer), "must name the signing address: {err}");
+        // Explains the failure mode (not a silent dead-end) and the real fix.
+        assert!(err.contains("code:24"), "must name the symptom: {err}");
+        assert!(err.contains("--address"), "must reference the offending flag: {err}");
+        assert!(err.contains("identity --import"), "must point at switching identity: {err}");
+        // Disambiguates the SEPARATE PRL cashback address.
+        assert!(err.contains("--set-prl-payout"), "must disambiguate the PRL payout address: {err}");
+    }
+
+    /// The "should never happen" pointer-vs-keystore drift (no `--address`): still a
+    /// LOUD error, never a silent PoP failure. The hint is about re-importing, not
+    /// about dropping --address (there is none).
+    #[test]
+    fn address_mismatch_without_override_still_errors_clearly() {
+        let asked = "a2uJXaVk7Zx4fgk9aRLnhiD2RdpAP4usJxKXpN4vh4hDNoP1C";
+        let signer = "a2vSomeOtherSignerAddressForPointerDriftCaseXXXXXXX";
+        let err = check_address_matches_signer(asked, signer, false).unwrap_err();
+        assert!(err.contains(asked) && err.contains(signer));
+        assert!(err.contains("code:24"), "must name the symptom: {err}");
+        assert!(err.contains("identity --import"), "must point at re-importing: {err}");
     }
 
     #[test]

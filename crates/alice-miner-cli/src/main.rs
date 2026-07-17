@@ -274,7 +274,8 @@ enum Command {
         --lane prl|alpha    which pearlhash relay to enroll against (default: prl)\n\
         --device <NAME>     the worker label your rig logs in with (default: a hostname)\n\
         --region us|asia    pin the region relay (default: remembered / nearest)\n\
-        --address <ADDR>    reward address override (default: your ~/.alice identity)\n\
+        --address <ADDR>    the address to enroll — MUST be this box's signing identity\n\
+                            (not a way to enroll a different address; switch identity for that)\n\
         --refresh-secs <N>  re-enroll cadence (default ~9 min; clamped inside the TTL)\n\
         --once              enroll once and exit (prime the allowlist / scripting)\n\
         --duration-s <N>    stop after N seconds (0 = until Ctrl-C)\n\
@@ -665,8 +666,13 @@ struct CompanionArgs {
     /// the remembered (or nearest) region.
     #[arg(long, value_name = "REGION")]
     region: Option<String>,
-    /// Reward address override (a validated Alice SS58-300 address). Omit to use the
-    /// active `~/.alice` identity.
+    /// The address to enroll (a validated Alice SS58-300 address). It MUST be the
+    /// address of this box's active signing identity: the companion signs the
+    /// possession proof with the local key and the relay verifies it against the
+    /// enrolled address, so any OTHER address is silently never allow-listed. Omit to
+    /// use the active `~/.alice` identity. To mine to a different address, switch
+    /// identity — this is NOT that. (A PRL cashback address is separate:
+    /// `identity --set-prl-payout`.)
     #[arg(long, value_name = "ADDRESS")]
     address: Option<String>,
     /// Re-enroll cadence in seconds (default ~9 min). Clamped strictly inside the
@@ -1354,9 +1360,9 @@ fn cmd_companion(args: CompanionArgs) -> i32 {
     // The companion's PoP signature needs the sr25519 signing key. Resolve the
     // unlock up front (stdin / flag / prompt) ONLY for a keystore-backed identity; a
     // watch-only one has no keystore and `companion::run` fails closed with a clear
-    // message, so we skip the prompt there. When an explicit `--address` overrides
-    // the active identity we still resolve the ACTIVE identity's keystore (that is
-    // the key we sign with — the override only changes the credited address string).
+    // message, so we skip the prompt there. An explicit `--address` must EQUAL this
+    // box's signing identity (the key we unlock here is the one that signs the PoP);
+    // `companion::run` rejects a mismatch up front rather than silently failing PoP.
     let has_keystore = alice_miner_core::identity::load_pointer()
         .map(|p| p.keystore_path.is_some())
         .unwrap_or(false);

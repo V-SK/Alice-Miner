@@ -94,7 +94,7 @@ your own miner). It needs no identity and writes nothing.
 
 | Lane | `--lane` | Hardware | Algorithm | Relay endpoint | Notes |
 | ---- | -------- | -------- | --------- | -------------- | ----- |
-| **GPU · PRL** | `gpu` / `prl` | NVIDIA / AMD, compute capability ≥ 7.5 | `pearlhash` | `us` / `asia.aliceprotocol.org : 3340` | **The GPU mainline.** PoP-gated (needs a possession proof). |
+| **GPU · PRL** | `gpu` / `prl` | NVIDIA (CUDA, cc ≥ 7.5) / AMD (OpenCL) | `pearlhash` | `us` / `asia.aliceprotocol.org : 3340` | **The GPU mainline.** PoP-gated (needs a possession proof). |
 | **GPU · Alpha** | `alpha` | Volta / V100-class NVIDIA | `pearlhash` | `us` / `asia.aliceprotocol.org : 3341` | The pearlhash path for cards SRBMiner can't run. PoP-gated. |
 | **CPU · XMR** | `xmr` | Any CPU (RandomX) | `rx/0` | `hk.aliceprotocol.org : 3333` | Open enrollment — no proof, no GPU needed. |
 | **GPU · RVN** | `rvn` | NVIDIA (KawPoW) | `kawpow` | `hk.aliceprotocol.org : 8888` | Legacy path; the pearlhash lanes are the mainline today. |
@@ -111,6 +111,10 @@ round, and nothing is settled to a currency yet.
 - **Never use the FI region.** The `fi.aliceprotocol.org` host is a dead zone
   (NXDOMAIN) and was removed in v0.6.1 — only `us` and `asia` are live for the
   pearlhash lanes.
+- **AMD is the OpenCL exception.** The `compute capability ≥ 7.5` bar is an NVIDIA
+  (CUDA) figure; AMD cards have no CUDA compute-capability number and instead run
+  pearlhash through the miner's **OpenCL** backend — so the cc threshold simply does
+  not apply to them.
 
 ### About the ASIC / scrypt pool
 
@@ -234,9 +238,23 @@ Options you'll want:
 ```sh
 alice-miner companion --lane prl --device rig1 --region asia   # pin us | asia (default: nearest/remembered)
 alice-miner companion --lane alpha --device volta1             # for a Volta / V100 rig (port 3341)
-alice-miner companion --lane prl --address <alice-addr>        # enroll a DIFFERENT reward address than the local identity
+alice-miner companion --lane prl --address <alice-addr>        # pin the address explicitly — it MUST be your own identity's (see below)
 alice-miner companion --lane prl --once                        # enroll once and exit (prime a scripted run / a test)
 ```
+
+> **Two different addresses — don't conflate them.**
+> - **Your mining identity address** is the Alice address the companion enrolls. The
+>   companion signs the possession proof with **your local signing key**, and the relay
+>   verifies that signature against the enrolled address — so the enrolled address
+>   **must** be the one your key derives. You **cannot** use `--address` to enroll some
+>   *other* address (there's no key to sign for it, so the relay would never allow-list
+>   it — the rig would just loop on `code:24`). `--address` only lets you state your own
+>   address explicitly; the companion refuses up front if it isn't your signing
+>   identity. **To mine to a different address, switch identity** (`identity --import`),
+>   not `--address`.
+> - **Your PRL cashback address** is a *separate* `prl1p…` address (`identity
+>   --set-prl-payout`) where a future 15% PRL return would go. It has nothing to do with
+>   who mines or with the companion — setting it does not change your mining identity.
 
 Check the companion is ready before you rely on it:
 
@@ -280,6 +298,12 @@ companion) and credits the shares to your Alice address.
   only needs your Alice keystore and outbound HTTPS to the relay. Point every rig's
   login at `<your-address>.<device>` for the same address, and pin them all to the
   region the companion enrolled against.
+- **Can `--address` enroll a *different* reward address?** **No.** The companion signs
+  the proof with your local key, so it can only enroll the address that key derives —
+  `--address` just states your own address explicitly (it refuses up front if it isn't
+  your signing identity). To mine to a different address, switch identity
+  (`identity --import`). A PRL cashback address is a separate setting
+  (`identity --set-prl-payout`) and does not change who mines.
 - **Do not use the FI region.** `fi.aliceprotocol.org` is a dead zone (NXDOMAIN).
   Only `us` and `asia` are live.
 - **A wrong address is rejected.** The login address is validated (SS58 format-300);
@@ -409,7 +433,7 @@ alice-miner guide --json   # 同上,机器可读(供脚本 / 官网使用)
 
 | 通道 | `--lane` | 硬件 | 算法 | 中继端点 | 说明 |
 | ---- | -------- | ---- | ---- | -------- | ---- |
-| **GPU · PRL** | `gpu` / `prl` | NVIDIA / AMD,算力 ≥ 7.5 | `pearlhash` | `us` / `asia.aliceprotocol.org : 3340` | **GPU 主线**,需 PoP(所有权证明)。 |
+| **GPU · PRL** | `gpu` / `prl` | NVIDIA(CUDA 算力 ≥ 7.5)/ AMD(OpenCL) | `pearlhash` | `us` / `asia.aliceprotocol.org : 3340` | **GPU 主线**,需 PoP(所有权证明)。 |
 | **GPU · Alpha** | `alpha` | Volta / V100 架构 NVIDIA | `pearlhash` | `us` / `asia.aliceprotocol.org : 3341` | SRBMiner 跑不了的卡的 pearlhash 路径,需 PoP。 |
 | **CPU · XMR** | `xmr` | 任意 CPU(RandomX) | `rx/0` | `hk.aliceprotocol.org : 3333` | 开放注册,无需证明、无需 GPU。 |
 | **GPU · RVN** | `rvn` | NVIDIA(KawPoW) | `kawpow` | `hk.aliceprotocol.org : 8888` | 旧路径;如今 pearlhash 才是主线。 |
@@ -421,6 +445,9 @@ alice-miner guide --json   # 同上,机器可读(供脚本 / 官网使用)
   预期数字 —— 积分取决于每一轮全网的贡献,且尚未结算为任何货币。
 - **绝不使用 FI 区域:** `fi.aliceprotocol.org` 是死区(NXDOMAIN),v0.6.1 起已移除
   —— pearlhash 通道只有 `us` 和 `asia` 可用。
+- **AMD 是 OpenCL 例外:** 「算力 ≥ 7.5」是 NVIDIA(CUDA)的指标;AMD 卡没有 CUDA
+  算力(compute capability)这个数字,而是通过矿机的 **OpenCL** 后端跑 pearlhash ——
+  所以该算力门槛对 AMD 不适用。
 - **关于 ASIC / scrypt 池:** 15% 的 ASIC 池是排放的真实组成部分,Alice 中继在上游也
   说 scrypt(LTC 系)stratum 协议。但 scrypt **尚未成为自助客户端通道**:官方客户端
   不打包 scrypt 矿机(ASIC 本就跑自己的固件),本版本也没有公开的自助 scrypt 端点。
@@ -477,9 +504,19 @@ alice-miner companion --lane prl --device rig1
 ```sh
 alice-miner companion --lane prl --device rig1 --region asia   # 固定 us | asia(默认最近/记忆)
 alice-miner companion --lane alpha --device volta1             # Volta / V100 矿机(端口 3341)
-alice-miner companion --lane prl --address <alice-地址>        # 为不同于本机身份的地址注册
+alice-miner companion --lane prl --address <alice-地址>        # 显式指定地址 —— 必须是你本机身份的地址(见下方说明)
 alice-miner doctor --lane prl                                  # 含 "companion (PoP)" 就绪检查
 ```
+
+> **两个不同的地址 —— 别混淆。**
+> - **挖矿身份地址**是伴侣注册的 Alice 地址。伴侣用**你本机的签名密钥**签署所有权证明,
+>   中继会用被注册的地址来验签 —— 所以被注册的地址**必须**是你这把密钥所派生的地址。
+>   你**无法**用 `--address` 去注册**别的**地址(你没有那把私钥签不了名,中继永远不会把它
+>   加入允许名单 —— 矿机只会一直卡在 `code:24`)。`--address` 只是让你显式写出自己的地址;
+>   若它不是你的签名身份,伴侣会当场拒绝。**要挖到另一个地址,请切换身份**
+>   (`identity --import`),而不是用 `--address`。
+> - **PRL 返现地址**是一个**独立**的 `prl1p…` 地址(`identity --set-prl-payout`),用于将来
+>   15% 的 PRL 返还去处。它与由谁来挖、与伴侣都无关 —— 设置它不会改变你的挖矿身份。
 
 **c) 把你自己的 pearlhash 矿机指向该中继**,使用横幅打印的值:
 
@@ -504,6 +541,10 @@ alice-miner doctor --lane prl                                  # 含 "companion 
 - **能把伴侣跑在与矿机不同的机器上吗?** 可以。伴侣只需你的 keystore 和到中继的出站
   HTTPS。把每台矿机的登录名都指向同一地址的 `<地址>.<设备名>`,并固定到伴侣注册的
   区域。
+- **`--address` 能注册一个*不同*的奖励地址吗?** **不能。** 伴侣用你本机的密钥签署证明,
+  所以它只能注册这把密钥所派生的地址 —— `--address` 只是让你显式写出自己的地址(若不是你的
+  签名身份,伴侣会当场拒绝)。要挖到另一个地址,请切换身份(`identity --import`)。PRL 返现
+  地址是另一项独立设置(`identity --set-prl-payout`),不改变由谁来挖。
 - **绝不使用 FI 区域:** `fi.aliceprotocol.org` 是死区(NXDOMAIN),只用 `us` / `asia`。
 - **地址写错会被拒:** 登录地址会做 SS58 format-300 校验,写错不会悄悄记给别人,只是
   不被授权。请从 `alice-miner identity --show` 复制。
