@@ -669,7 +669,7 @@ struct CompanionArgs {
     #[arg(long, value_name = "NAME")]
     device: Option<String>,
     /// Pin the region relay the companion enrolls against (and your rig must then
-    /// connect to — the allowlist is per-relay): `us` or `asia`. Omit / `auto` uses
+    /// connect to — the allowlist is per-relay): `us`, `asia`, or `eu`. Omit / `auto` uses
     /// the remembered (or nearest) region.
     #[arg(long, value_name = "REGION")]
     region: Option<String>,
