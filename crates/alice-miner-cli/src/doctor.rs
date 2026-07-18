@@ -231,8 +231,8 @@ fn prl_region_checks(view: &crate::region::RegionView) -> Vec<Check> {
             "PRL effective endpoints",
             detail,
             tr!(
-                "FI is not in v0.6.1 compiled defaults; check old binary or ALICE_MINER_ENDPOINTS_JSON override.",
-                "FI 不在 v0.6.1 编译默认值中;请检查旧版 binary 或 ALICE_MINER_ENDPOINTS_JSON 覆盖。"
+                "FI is not in this build's compiled defaults; check for an old binary or an ALICE_MINER_ENDPOINTS_JSON override.",
+                "FI 不在本版本的编译默认值中;请检查是否为旧版 binary 或存在 ALICE_MINER_ENDPOINTS_JSON 覆盖。"
             ),
         ));
     } else {
