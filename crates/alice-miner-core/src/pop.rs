@@ -206,6 +206,11 @@ struct VerifyResponse {
 
 #[derive(Deserialize)]
 struct EnrollNonceResponse {
+    // The server (shadow_server/http_app.py) emits the single-use nonce under the key
+    // `enroll_nonce`; accept it AND the plain `nonce` alias. Without this alias the
+    // 0.6.0–0.6.3 body (`enroll_nonce` only) failed to deserialize ("missing field
+    // `nonce`") → EnrollOutcome::Failed → the enroll completion POST was never sent.
+    #[serde(alias = "enroll_nonce")]
     nonce: String,
 }
 
@@ -828,7 +833,18 @@ mod tests {
     }
 
     #[test]
-    fn enroll_nonce_response_parses() {
+    fn enroll_nonce_response_parses_canonical_server_field() {
+        // The REAL server body carries the nonce under `enroll_nonce` (plus other
+        // informational fields it ignores). This is the shape that previously failed
+        // to deserialize; it MUST parse via the serde alias.
+        let raw = r#"{"ok":true,"alice_address":"a","device_id":"d","enroll_nonce":"enroll-nonce-xyz","scheme":"sr25519","single_use":true,"nonce_contract":"alice_prl_m4_enroll_nonce_v1"}"#;
+        let resp: EnrollNonceResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.nonce, "enroll-nonce-xyz");
+    }
+
+    #[test]
+    fn enroll_nonce_response_accepts_plain_nonce_alias() {
+        // The forward-compat `nonce` key (post-hotfix the server emits BOTH) also parses.
         let resp: EnrollNonceResponse =
             serde_json::from_str(r#"{"nonce":"enroll-nonce-xyz"}"#).unwrap();
         assert_eq!(resp.nonce, "enroll-nonce-xyz");
