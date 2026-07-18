@@ -1530,6 +1530,19 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap()
     }
 
+    /// Serialize any test that SPAWNS a child against the `terminal::tests` child-pid
+    /// tests. `spawn_run` records the engine child via `terminal::write_child_pid`, whose
+    /// path resolves under the process-global `$ALICE_IDENTITY_DIR`. A concurrent
+    /// `terminal::tests` child-pid test sets that var (under this SAME lock) and asserts on
+    /// the file, so an unguarded spawn here would write its own pid into that test's dir and
+    /// flake its assertion. Holding `IDENTITY_ENV_LOCK` for the spawn test's duration keeps
+    /// the two from ever overlapping. Gated `#[cfg(unix)]` — the only callers are the unix
+    /// spawn tests, so an unconditional definition would be dead code on Windows (`-D warnings`).
+    #[cfg(unix)]
+    fn spawn_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A no-op rebuild closure for tests that don't exercise failover (keeps the
     /// single-endpoint relay plan). The args are fixed.
     fn fixed_rebuild(program: std::path::PathBuf, args: Vec<String>) -> RebuildFn {
@@ -1879,6 +1892,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn start_then_stop_transitions_and_captures_shares() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             // Stand-in "miner": emit an accepted-share line + a speed line then
@@ -1924,6 +1938,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gpu_lane_start_parses_kawpow_then_stops() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             // Stand-in kawpowminer: emit a Speed line with a share block, then idle.
@@ -1966,6 +1981,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unexpected_exit_lands_in_error_not_restart_loop() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             let program = std::path::PathBuf::from("/bin/sh");
@@ -1994,6 +2010,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn two_supervisors_are_crash_isolated() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             let prog = std::path::PathBuf::from("/bin/sh");
@@ -2052,6 +2069,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn layer_b_failover_advances_cursor_and_relaunches() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             // A 2-endpoint plan: bogus primary, then the "good" endpoint.
@@ -2133,6 +2151,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failover_budget_exhaustion_lands_in_error_no_storm() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             let plan = EndpointPlan::new(vec![
@@ -2220,6 +2239,7 @@ mod tests {
             eprintln!("skipping live failover test (set ALICE_MINER_LIVE_FAILOVER=1 to run)");
             return;
         }
+        let _env = spawn_env_guard();
         use crate::endpoint::Endpoint;
         let rt = rt();
         rt.block_on(async {
@@ -2412,6 +2432,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failover_preflight_skips_dead_candidate_for_live_one() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind live");
@@ -2499,6 +2520,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn locked_region_retries_in_place_then_clear_error() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             // A single-region plan is exactly what `region_plan_from(lock,…)` builds.
