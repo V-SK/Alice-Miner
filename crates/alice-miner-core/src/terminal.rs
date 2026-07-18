@@ -186,13 +186,16 @@ pub fn terminal_pids_alive() -> bool {
 /// module uses, bound directly to avoid a `libc` dependency on this crate. On non-unix we
 /// can't cheaply probe, so we fail-SAFE to ALIVE (never falsely declare a miner dead).
 pub fn pid_is_alive(pid: u32) -> bool {
+    // A pid of 0 is never a single miner process: on unix `kill(0, 0)` addresses the
+    // caller's whole process group (a false-positive "alive"), and on Windows it is not a
+    // valid target either. Guard before the platform probe so both branches agree that
+    // pid 0 is NOT a live miner. This is the one contractual sentinel — real pids still
+    // flow to the platform probe, where an indeterminate result fail-SAFEs to ALIVE.
+    if pid == 0 {
+        return false;
+    }
     #[cfg(unix)]
     {
-        // A pid of 0 addresses the whole process group on unix — never a single miner
-        // process — so treat it as "not a live miner" rather than probing it.
-        if pid == 0 {
-            return false;
-        }
         unsafe { libc_kill(pid as i32, 0) == 0 }
     }
     #[cfg(not(unix))]
