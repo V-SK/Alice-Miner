@@ -401,12 +401,17 @@ pub struct MinerApp {
     pub terminal_stopping: bool,
 }
 
-/// The terminal miner is considered STALE (its terminal closed / the CLI died) once
-/// its telemetry file hasn't updated for this long. The CLI writes a snapshot every
-/// ~500 ms while alive, so this only trips on a genuine stop/death — never during a
-/// healthy run — while being short enough that a closed terminal returns the UI to
-/// Idle promptly (and comfortably ≥ the CLI `stop --timeout-s 8` graceful window).
-const TERMINAL_TELEMETRY_STALE: Duration = Duration::from_secs(10);
+/// The external terminal miner is considered STALE only once its telemetry SNAPSHOT FILE
+/// has gone this long without an update AND no CLI/engine pid is alive (see
+/// [`MinerApp::terminal_telemetry_stale`]). Freshness is judged by the file's own mtime —
+/// the CLI's write clock — NOT the GUI's poll cadence, so a GUI-side stall (macOS App Nap,
+/// an occluded/backgrounded window, repaint starvation, a stretch of failed reads) can
+/// never falsely strand a still-updating miner at Idle (the M4-Max "Idle while the CLI is
+/// still mining" report). Generous on purpose (the CLI's telemetry cadence can be seconds
+/// between speed lines, so a 10 s window risked a false trip): ≥45 s absorbs any single
+/// delayed write while still returning a genuinely closed terminal to Idle promptly, and
+/// stays comfortably ≥ the CLI `stop --timeout-s 8` graceful window.
+const TERMINAL_TELEMETRY_STALE: Duration = Duration::from_secs(45);
 
 /// Build the **secret-free** CLI argv the terminal launcher runs, INCLUDING the hidden
 /// `--telemetry-file <path>` so the GUI can poll the CLI's live snapshot. Pure +
@@ -1565,9 +1570,44 @@ impl MinerApp {
         self.snapshot = None;
     }
 
-    /// Whether the external terminal miner's telemetry has gone stale (its terminal was
-    /// closed / the CLI died) — measured from the LATER of launch and the last read.
+    /// Whether the external terminal miner has gone stale (its terminal was closed / the
+    /// CLI died) — the ONLY condition (besides an explicit stop/idle snapshot) that lets
+    /// the UI drop back to Idle.
+    ///
+    /// Judged from the SNAPSHOT FILE's own mtime (the CLI's write clock) plus pid LIVENESS
+    /// — never the GUI's poll clock. This is the fix for the M4-Max "Idle while the CLI is
+    /// still mining" report: the old check timed from the GUI's last successful read, so any
+    /// GUI-side gap (macOS App Nap once the window was backgrounded, an occluded window,
+    /// repaint starvation, a run of failed reads) tripped a false stale even though the file
+    /// on disk was fresh and both pids were alive — and the resulting `clear_terminal_state`
+    /// then nuked tracking so the UI never recovered.
+    ///
+    /// NOT stale when either a CLI-parent OR engine-child pid is a LIVE process (the miner
+    /// is provably up — path-independent, so an AppTranslocation-mounted engine counts), or
+    /// the snapshot file's mtime is within the fresh window.
+    ///
+    /// Stale only when the file's mtime is older than the window AND no pid is alive — or,
+    /// during the launch grace before the file first appears, when the GUI-side activity
+    /// clock (launch / last read) itself exceeds the window (so a CLI that never came up is
+    /// still swept, without depending on that clock while the file exists).
     fn terminal_telemetry_stale(&self) -> bool {
+        use alice_miner_core::terminal;
+        // A live cli/engine process = the miner is up; never stale regardless of mtime
+        // jitter or a GUI-side poll gap.
+        if terminal::terminal_pids_alive() {
+            return false;
+        }
+        // No live pid → judge by the file's OWN mtime (the CLI's write clock).
+        let path = self
+            .terminal_telemetry_path
+            .clone()
+            .unwrap_or_else(terminal::telemetry_path);
+        if let Some(age) = terminal::snapshot_age_at(&path) {
+            return age > TERMINAL_TELEMETRY_STALE;
+        }
+        // No readable file mtime AND no live pid: fall back to the GUI-side activity clock
+        // (launch / last successful read) so a just-launched miner whose telemetry file
+        // hasn't appeared yet isn't declared stale during its start-up grace window.
         match self.last_terminal_activity {
             Some(t) => Instant::now().saturating_duration_since(t) > TERMINAL_TELEMETRY_STALE,
             None => false,
@@ -1581,6 +1621,19 @@ impl MinerApp {
     /// showing "Running" forever. No-op when not on the terminal path.
     pub fn poll_terminal_telemetry(&mut self) {
         use alice_miner_core::terminal;
+        // RE-ATTACH FIRST: even when we hold NO in-memory terminal tracking — the GUI just
+        // launched while a CLI it (or a prior session) started is still mining, or a prior
+        // transient cleared tracking — a fresh + Running snapshot backed by a LIVE pid means
+        // an external terminal miner is up. Adopt it so the UI shows Mining, not a false
+        // Idle. Gated on `state() == Idle` so it never clobbers an in-window engine run
+        // (whose snapshot already reads Running) and only probes on the calm Idle repaint
+        // cadence; skipped mid-stop so a pressed Stop still converges to Idle.
+        if self.terminal_lane.is_none()
+            && !self.terminal_stopping
+            && self.state() == EngineState::Idle
+        {
+            self.try_reattach_terminal();
+        }
         if self.terminal_lane.is_none() {
             return;
         }
@@ -1637,6 +1690,53 @@ impl MinerApp {
             self.last_terminal_activity = Some(now);
             self.on_snapshot(snap);
         }
+    }
+
+    /// RE-ATTACH the UI to an external terminal miner that is STILL RUNNING even though we
+    /// hold no in-memory tracking — the GUI was just launched while the CLI keeps mining, or
+    /// a prior transient cleared tracking. This is what lets a fresh + `Running`
+    /// `miner-cli.snapshot.json` win over a lost launcher handle, a GUI restart, or an
+    /// AppTranslocation bundle-path mismatch (the Idle-while-running fix).
+    ///
+    /// Adopts ONLY a miner that is PROVABLY up, so it never resurrects a stopped one:
+    ///   * a LIVE cli/engine pid (a fresh-looking file a just-SIGKILL'd miner left behind is
+    ///     rejected — the pid it names is dead), AND
+    ///   * a snapshot fresh by the FILE's own mtime, AND
+    ///   * `snapshot.state == Running` (never a final idle/stopped/error snapshot).
+    ///
+    /// Derives the lane from the snapshot so Stop + the labels target the right lane.
+    fn try_reattach_terminal(&mut self) {
+        use alice_miner_core::terminal;
+        // A live process is REQUIRED — never adopt a miner whose pid is dead (a crash / Ctrl-C
+        // that left a <window-old Running file behind must NOT read as Mining).
+        if !terminal::terminal_pids_alive() {
+            return;
+        }
+        // Fresh by the file's OWN mtime (the CLI's write clock), not our poll clock.
+        match terminal::snapshot_age() {
+            Some(age) if age <= TERMINAL_TELEMETRY_STALE => {}
+            _ => return,
+        }
+        let Ok(bytes) = std::fs::read(terminal::telemetry_path()) else {
+            return;
+        };
+        let Ok(snap) = serde_json::from_slice::<Snapshot>(&bytes) else {
+            return;
+        };
+        // Only a RUNNING miner is adopted.
+        if snap.state != EngineState::Running {
+            return;
+        }
+        let lane = snap
+            .lane
+            .or_else(|| snap.lanes.first().map(|l| l.lane))
+            .unwrap_or(Lane::Xmr);
+        self.terminal_lane = Some(lane);
+        self.terminal_telemetry_path = Some(terminal::telemetry_path());
+        self.last_terminal_activity = Some(Instant::now());
+        self.last_terminal_poll = None;
+        self.terminal_stopping = false;
+        self.on_snapshot(snap);
     }
 
     /// Stop the external terminal miner: run the bundled CLI `stop --timeout-s 8` in the
@@ -2870,26 +2970,184 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Stale telemetry (the terminal was closed / the CLI died — no update for >10s)
-    /// reads Idle, NOT a stuck Running. `poll_terminal_telemetry` then fully clears
-    /// the terminal state.
+    /// T4 (may Idle): a genuinely gone terminal — NO telemetry file, NO live pid, and the
+    /// launch-grace activity clock elapsed — reads Idle, and `poll_terminal_telemetry` then
+    /// fully clears the terminal state. Env-locked: `terminal_pids_alive` resolves the pid
+    /// files through `$ALICE_IDENTITY_DIR`, so isolation keeps it off the real `~/.alice`
+    /// (and deterministic even if the developer's own miner is running).
     #[test]
     fn terminal_stale_telemetry_reads_idle_and_poll_clears() {
+        let _g = PRL_PAYOUT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_dir = std::env::var("ALICE_IDENTITY_DIR").ok();
+        let dir = std::env::temp_dir().join(format!(
+            "alice-gui-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+
         let mut app = MinerApp::new().expect("engine spawns");
         app.terminal_lane = Some(Lane::Xmr);
-        app.terminal_telemetry_path = Some(std::path::PathBuf::from("/tmp/none.json"));
-        // Last activity is comfortably past the staleness window.
+        // No telemetry file exists at this path (the terminal never wrote / was closed).
+        app.terminal_telemetry_path = Some(dir.join("miner-cli.snapshot.json"));
+        // The launch-grace activity clock is comfortably past the staleness window.
         app.last_terminal_activity =
             Instant::now().checked_sub(TERMINAL_TELEMETRY_STALE + Duration::from_secs(5));
-        // (If the platform can't represent that instant, the test is a no-op rather
-        // than a false failure.)
+        // (If the platform can't represent that instant, the test is a no-op rather than a
+        // false failure.)
         if app.last_terminal_activity.is_some() {
+            // No file mtime + no live pid + an elapsed grace clock → stale.
             assert!(app.terminal_telemetry_stale());
-            assert_eq!(app.state(), EngineState::Idle, "stale terminal telemetry → Idle");
+            assert_eq!(app.state(), EngineState::Idle, "genuinely gone terminal → Idle");
             // The poll sweep clears the terminal tracking entirely.
             app.poll_terminal_telemetry();
             assert!(app.terminal_lane.is_none(), "stale sweep clears terminal state");
         }
+
+        match prev_dir {
+            Some(v) => std::env::set_var("ALICE_IDENTITY_DIR", v),
+            None => std::env::remove_var("ALICE_IDENTITY_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T1/T2/T3 (the M4-Max fix — must NOT false-Idle): with the GUI's OWN activity clock
+    /// long elapsed (simulating App Nap / an occluded window / repaint starvation), a
+    /// FRESH + `Running` snapshot file whose CLI/engine pid is a LIVE process keeps the UI
+    /// at Mining — never Idle. Covers all three report scenarios at once: the internal clock
+    /// says "idle" (T1), no launcher handle is consulted (T2), and the engine pid is recorded
+    /// at an AppTranslocation path that is never inspected (T3). Env-locked.
+    #[test]
+    fn terminal_fresh_running_snapshot_with_live_pid_stays_mining_despite_gui_clock() {
+        use alice_miner_core::terminal;
+        let _g = PRL_PAYOUT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_dir = std::env::var("ALICE_IDENTITY_DIR").ok();
+        let dir = std::env::temp_dir().join(format!(
+            "alice-gui-freshlive-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+
+        let mut app = MinerApp::new().expect("engine spawns");
+        let tf = terminal::telemetry_path();
+        // A LIVE cli parent + a LIVE engine child recorded at an AppTranslocation path (our
+        // own pid, so `pid_is_alive` is true; the path is NEVER inspected for liveness).
+        std::fs::write(terminal::cli_pid_path(), format!("{}\n", std::process::id())).unwrap();
+        terminal::write_child_pid(
+            std::process::id(),
+            std::path::Path::new(
+                "/private/var/folders/zz/T/AppTranslocation/ABC/d/AliceMiner.app/Contents/MacOS/xmrig",
+            ),
+        );
+        // A FRESH, Running snapshot on disk (the CLI keeps writing it).
+        std::fs::write(&tf, serde_json::to_vec(&terminal_snapshot(EngineState::Running)).unwrap())
+            .unwrap();
+
+        app.terminal_lane = Some(Lane::Xmr);
+        app.terminal_telemetry_path = Some(tf.clone());
+        // The GUI's own clock is LONG elapsed — the old code's false-stale trigger.
+        app.last_terminal_activity =
+            Instant::now().checked_sub(TERMINAL_TELEMETRY_STALE + Duration::from_secs(300));
+
+        // The fix: a live pid + fresh file wins over the elapsed GUI clock.
+        assert!(!app.terminal_telemetry_stale(), "live pid + fresh file → NOT stale");
+        assert_eq!(app.state(), EngineState::Running, "stays Mining, not a false Idle");
+        // A poll folds the fresh snapshot in and keeps tracking (never clears).
+        app.poll_terminal_telemetry();
+        assert!(app.terminal_lane.is_some(), "a fresh+running miner is never swept");
+        assert!(app.is_mining());
+
+        match prev_dir {
+            Some(v) => std::env::set_var("ALICE_IDENTITY_DIR", v),
+            None => std::env::remove_var("ALICE_IDENTITY_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T6 (re-attach): with NO in-memory terminal tracking (a freshly launched GUI, or a
+    /// prior clear) but a LIVE pid + a FRESH `Running` snapshot on disk, a poll RE-ATTACHES —
+    /// the UI adopts the external miner and shows Mining rather than Idle. A subsequent poll
+    /// keeps it (never a flap). Env-locked.
+    #[test]
+    fn terminal_reattach_from_snapshot_when_untracked() {
+        use alice_miner_core::terminal;
+        let _g = PRL_PAYOUT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_dir = std::env::var("ALICE_IDENTITY_DIR").ok();
+        let dir = std::env::temp_dir().join(format!(
+            "alice-gui-reattach-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+
+        let mut app = MinerApp::new().expect("engine spawns");
+        let tf = terminal::telemetry_path();
+        // Untracked to start with (the GUI just opened): no terminal_lane, no snapshot.
+        assert!(app.terminal_lane.is_none());
+        assert_eq!(app.state(), EngineState::Idle, "untracked + no external miner → Idle");
+
+        // An external CLI is already mining: live pid files + a fresh Running snapshot.
+        std::fs::write(terminal::cli_pid_path(), format!("{}\n", std::process::id())).unwrap();
+        terminal::write_child_pid(std::process::id(), std::path::Path::new("/x/xmrig"));
+        std::fs::write(&tf, serde_json::to_vec(&terminal_snapshot(EngineState::Running)).unwrap())
+            .unwrap();
+
+        // A poll re-attaches: the UI adopts the running miner (lane from the snapshot).
+        app.poll_terminal_telemetry();
+        assert!(app.terminal_lane.is_some(), "re-attached to the running external miner");
+        assert_eq!(app.state(), EngineState::Running, "re-attach shows Mining, not Idle");
+        assert!(app.is_mining());
+
+        // A follow-up poll keeps it (no flap back to Idle).
+        app.last_terminal_poll = None;
+        app.poll_terminal_telemetry();
+        assert_eq!(app.state(), EngineState::Running, "stays attached across polls");
+
+        match prev_dir {
+            Some(v) => std::env::set_var("ALICE_IDENTITY_DIR", v),
+            None => std::env::remove_var("ALICE_IDENTITY_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-attach must NOT resurrect a STOPPED miner: with NO tracking, a stale pid FILE whose
+    /// process is DEAD (a crash / SIGKILL leftover) — even alongside a lingering `Running`
+    /// snapshot file — is never adopted. The UI stays Idle. Env-locked. Unix-only: the
+    /// dead-pid rejection relies on `kill(pid, 0)` liveness (non-unix fail-safes to alive).
+    #[cfg(unix)]
+    #[test]
+    fn terminal_reattach_rejects_dead_pid_leftovers() {
+        use alice_miner_core::terminal;
+        let _g = PRL_PAYOUT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_dir = std::env::var("ALICE_IDENTITY_DIR").ok();
+        let dir = std::env::temp_dir().join(format!(
+            "alice-gui-reattach-dead-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+
+        let mut app = MinerApp::new().expect("engine spawns");
+        let tf = terminal::telemetry_path();
+        // A DEAD pid (2147483646 is unused) in the pid file + a lingering Running snapshot.
+        std::fs::write(terminal::cli_pid_path(), "2147483646\n").unwrap();
+        std::fs::write(&tf, serde_json::to_vec(&terminal_snapshot(EngineState::Running)).unwrap())
+            .unwrap();
+
+        app.poll_terminal_telemetry();
+        assert!(app.terminal_lane.is_none(), "a dead-pid leftover is never re-attached");
+        assert_eq!(app.state(), EngineState::Idle, "stays Idle (no live miner)");
+
+        match prev_dir {
+            Some(v) => std::env::set_var("ALICE_IDENTITY_DIR", v),
+            None => std::env::remove_var("ALICE_IDENTITY_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A minimal terminal `Snapshot` in a given state, for the stop-convergence tests.
