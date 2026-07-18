@@ -74,6 +74,18 @@ pub const TELEMETRY_FILE_NAME: &str = "miner-cli.snapshot.json";
 /// parent's `miner-cli.pid`).
 pub const CHILD_PID_FILE_NAME: &str = "miner-child.pid";
 
+/// The CLI **parent** pid file basename — the `alice-miner-cli start` process itself
+/// (written by the CLI's `pidfile` module, removed on its graceful exit). Kept HERE as
+/// a shared constant so the GUI can probe its presence for stop-convergence WITHOUT
+/// depending on the CLI crate. MUST stay in lock-step with `alice-miner-cli`'s
+/// `pidfile::pid_path` basename.
+pub const CLI_PID_FILE_NAME: &str = "miner-cli.pid";
+
+/// A LEGACY pid file basename from pre-terminal builds (`miner.pid`). Newer builds
+/// never write it, but a residual one from an old install can linger; we sweep it on
+/// stop-convergence so it can't confuse a future `stop` / a stale-pid probe.
+pub const LEGACY_PID_FILE_NAME: &str = "miner.pid";
+
 /// Resolve the per-user Alice dir (`$ALICE_IDENTITY_DIR`, else `~/.alice`, else the
 /// relative `.alice`) — the SAME location [`crate::identity::identity_path`] and the
 /// CLI `miner-cli.pid` resolve to, so all four files share one dir + override knob.
@@ -114,6 +126,36 @@ pub fn telemetry_path() -> PathBuf {
 /// The engine-child pid file path (`<alice-dir>/miner-child.pid`).
 pub fn child_pid_path() -> PathBuf {
     alice_dir().join(CHILD_PID_FILE_NAME)
+}
+
+/// The CLI-parent pid file path (`<alice-dir>/miner-cli.pid`) — the SAME path the
+/// `alice-miner-cli` `pidfile` module resolves to (both honor `$ALICE_IDENTITY_DIR`,
+/// else `~/.alice`). Used by the GUI's stop-convergence to tell that the external CLI
+/// has fully exited (it drops this file on graceful shutdown).
+pub fn cli_pid_path() -> PathBuf {
+    alice_dir().join(CLI_PID_FILE_NAME)
+}
+
+/// The legacy pid file path (`<alice-dir>/miner.pid`) — see [`LEGACY_PID_FILE_NAME`].
+pub fn legacy_pid_path() -> PathBuf {
+    alice_dir().join(LEGACY_PID_FILE_NAME)
+}
+
+/// Whether BOTH the CLI-parent pid file (`miner-cli.pid`) and the engine-child pid file
+/// (`miner-child.pid`) are ABSENT — the DEFINITIVE "the external terminal miner is fully
+/// down" signal used by the GUI's stop-convergence. Independent of telemetry, so a final
+/// idle `Snapshot` the CLI writes on its way out (which would otherwise keep telemetry
+/// "fresh") can never strand the UI at `Stopping…`. Best-effort + fail-safe: a path that
+/// can't be probed is treated as absent (the staleness sweep remains the backstop).
+pub fn terminal_pids_absent() -> bool {
+    !cli_pid_path().exists() && !child_pid_path().exists()
+}
+
+/// Best-effort remove of a residual legacy `miner.pid` (see [`LEGACY_PID_FILE_NAME`]).
+/// Called on stop-convergence so an old-build leftover can't linger. A missing file is
+/// fine; any error is ignored (this is pure hygiene, never load-bearing).
+pub fn remove_legacy_pid() {
+    let _ = fs::remove_file(legacy_pid_path());
 }
 
 /// Record the engine child's pid (line 1) AND the exact engine binary path it was
@@ -622,6 +664,62 @@ mod tests {
         // remove_child_pid(matching) clears it.
         remove_child_pid(4242);
         assert_eq!(read_child_pid(), None);
+
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The CLI-parent + legacy pid paths sit under `$ALICE_IDENTITY_DIR`, co-located
+    /// with the identity pointer + the other rendezvous files, with stable basenames
+    /// matching the CLI's own `pidfile` module.
+    #[test]
+    fn cli_and_legacy_pid_paths_honor_override() {
+        let _g = crate::IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = temp_dir("cli-legacy");
+        std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
+        assert_eq!(cli_pid_path(), tmp.join(CLI_PID_FILE_NAME));
+        assert_eq!(legacy_pid_path(), tmp.join(LEGACY_PID_FILE_NAME));
+        assert_eq!(CLI_PID_FILE_NAME, "miner-cli.pid");
+        assert_eq!(LEGACY_PID_FILE_NAME, "miner.pid");
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+    }
+
+    /// `terminal_pids_absent` is the stop-convergence signal: TRUE only when NEITHER the
+    /// CLI-parent nor the engine-child pid file exists. A lingering final telemetry file
+    /// is irrelevant to it (it probes pid files only). `remove_legacy_pid` sweeps the old
+    /// `miner.pid` and is a no-op when none exists.
+    #[test]
+    fn terminal_pids_absent_tracks_both_pid_files_and_legacy_sweep() {
+        let _g = crate::IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = temp_dir("pids-absent");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
+
+        // Nothing written yet → absent.
+        assert!(terminal_pids_absent(), "no pid files → absent");
+
+        // The CLI-parent pid alone → NOT absent (the CLI is still winding down).
+        std::fs::write(cli_pid_path(), "12345").unwrap();
+        assert!(!terminal_pids_absent(), "cli-pid present → not converged");
+
+        // Add the engine-child pid → still not absent.
+        write_child_pid(12346, std::path::Path::new("/x/xmrig"));
+        assert!(!terminal_pids_absent());
+
+        // Remove the CLI-parent pid but keep the child → still not absent (the belt).
+        std::fs::remove_file(cli_pid_path()).unwrap();
+        assert!(!terminal_pids_absent(), "child-pid alone → not converged");
+
+        // Remove the child too → BOTH gone → converged.
+        std::fs::remove_file(child_pid_path()).unwrap();
+        assert!(terminal_pids_absent(), "both pid files gone → converged");
+
+        // remove_legacy_pid: a no-op when absent, and clears a residual one.
+        remove_legacy_pid(); // no legacy file — must not panic
+        std::fs::write(legacy_pid_path(), "999").unwrap();
+        assert!(legacy_pid_path().exists());
+        remove_legacy_pid();
+        assert!(!legacy_pid_path().exists(), "legacy miner.pid swept");
 
         std::env::remove_var("ALICE_IDENTITY_DIR");
         let _ = std::fs::remove_dir_all(&tmp);

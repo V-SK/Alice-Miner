@@ -68,7 +68,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     // Header.
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.label(RichText::new("Dashboard").size(21.0).strong().color(THEME.text));
+            ui.label(RichText::new(tr!("Dashboard", "仪表盘")).size(21.0).strong().color(THEME.text));
             let lane_label = lane_chip_label(app.active_lane());
             let sub = app
                 .device
@@ -89,7 +89,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
                     ui.horizontal(|ui| {
                         widgets::status_dot(ui, tone.fg(), 8.0, blink);
                         ui.add_space(8.0);
-                        let label = if mining { "uptime" } else { "idle" };
+                        let label = if mining { tr!("uptime", "运行时长") } else { tr!("idle", "空闲") };
                         ui.label(RichText::new(label).size(12.0).color(THEME.text2));
                         ui.add_space(4.0);
                         ui.label(widgets::mono(up, 12.0, THEME.text2));
@@ -113,7 +113,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     // ── SOURCE A — local activity (what the miner is doing locally, NOT earnings).
     // Label it explicitly so the user (and the honesty audit) can never mistake
     // these live figures for confirmed earnings.
-    source_label(ui, strings::ACTIVITY_SECTION, strings::ACTIVITY_CAPTION, Tone::Live);
+    source_label(ui, strings::activity_section(), strings::activity_caption(), Tone::Live);
     ui.add_space(12.0);
 
     // ── Stat grid (4 cards) ───────────────────────────────────────────────────
@@ -191,7 +191,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
                     ui,
                     card_w,
                     CARD_MIN_CONTENT_H,
-                    "Hashrate",
+                    tr!("Hashrate", "算力"),
                     hr_val.clone(),
                     None,
                     Some(THEME.lane_xmr),
@@ -211,9 +211,9 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
                 ui,
                 card_w,
                 CARD_MIN_CONTENT_H,
-                "Shares A / R",
+                tr!("Shares A / R", "份额 接受/拒绝"),
                 widgets::mono(format!("{a}"), 25.0, THEME.text).strong(),
-                Some(widgets::mono(format!("/ {r} rejected"), 11.5, THEME.text3)),
+                Some(widgets::mono(format!("/ {r} {}", tr!("rejected", "拒绝")), 11.5, THEME.text3)),
                 None,
                 None,
             );
@@ -243,8 +243,8 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
                 ui,
                 card_w,
                 CARD_MIN_CONTENT_H,
-                "Est. rewards",
-                RichText::new(strings::REWARD_PENDING_SHORT).size(20.0).strong().color(THEME.brand300),
+                tr!("Est. rewards", "预计奖励"),
+                RichText::new(strings::reward_pending_short()).size(20.0).strong().color(THEME.brand300),
                 Some(RichText::new(strings::REWARD_RATE_PENDING).size(11.0).color(THEME.text3)),
                 None,
                 None,
@@ -283,7 +283,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
 
     // ── Lanes ─────────────────────────────────────────────────────────────────
     ui.add_space(22.0);
-    widgets::section_label(ui, "Lanes");
+    widgets::section_label(ui, tr!("Lanes", "通道"));
     ui.add_space(10.0);
     // M4: in dual-mine BOTH lanes run, so read each lane's row from the snapshot's
     // per-lane breakdown (`snap.lanes`) when present. In single-lane mode only the
@@ -305,7 +305,7 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
         ui,
         THEME.lane_xmr,
         "XMR · RandomX",
-        &format!("· CPU · {} threads", app.device.as_ref().map(|d| d.logical_cores).unwrap_or(0)),
+        &format!("· CPU · {} {}", app.device.as_ref().map(|d| d.logical_cores).unwrap_or(0), tr!("threads", "线程")),
         xmr_hr,
         xmr_sh,
         xmr_active,
@@ -319,9 +319,9 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
         mining && app.active_lane() == Lane::GpuPrl
     };
     let prl_role = match app.lane_support(Lane::GpuPrl) {
-        LaneSupport::Viable => "· GPU · NVIDIA/AMD · ready",
-        LaneSupport::ComingSoon => "· GPU · coming soon",
-        LaneSupport::Unavailable => "· GPU · needs NVIDIA/AMD GPU",
+        LaneSupport::Viable => tr!("· GPU · NVIDIA/AMD · ready", "· GPU · NVIDIA/AMD · 就绪"),
+        LaneSupport::ComingSoon => tr!("· GPU · coming soon", "· GPU · 即将推出"),
+        LaneSupport::Unavailable => tr!("· GPU · needs NVIDIA/AMD GPU", "· GPU · 需要 NVIDIA/AMD GPU"),
     };
     let (prl_hr, prl_sh) = lane_live_figures(app, dual, prl_ls, prl_active, (a, r));
     lane_row(
@@ -348,19 +348,19 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     // ── SOURCE B — server-confirmed credit (read-only). Clearly separated from
     // the live activity above; honest by construction (no fabricated number).
     ui.add_space(24.0);
-    source_label(ui, strings::CREDIT_SECTION, strings::CREDIT_CAPTION, Tone::Off);
+    source_label(ui, strings::credit_section(), strings::credit_caption(), Tone::Off);
     ui.add_space(10.0);
     credit_panel(ui, app);
 
     // ── Connection ─────────────────────────────────────────────────────────────
     ui.add_space(22.0);
-    widgets::section_label(ui, "Connection");
+    widgets::section_label(ui, tr!("Connection", "连接"));
     ui.add_space(10.0);
     connection_panel(ui, app);
 
     // ── Log ─────────────────────────────────────────────────────────────────────
     ui.add_space(22.0);
-    widgets::section_label(ui, "Log");
+    widgets::section_label(ui, tr!("Log", "日志"));
     ui.add_space(10.0);
     log_panel(ui, app);
 }
@@ -453,9 +453,9 @@ fn reject_health_sub(
 /// "Accepted" + the `pct%` headline.
 fn accepted_card(mining: bool, active_lane: Lane, accepted: u64, pct: &str) -> (&'static str, String) {
     if mining && active_lane == Lane::GpuAlpha {
-        ("Submitted", format!("{accepted}"))
+        (tr!("Submitted", "已提交"), format!("{accepted}"))
     } else {
-        ("Accepted", format!("{pct}%"))
+        (tr!("Accepted", "已接受"), format!("{pct}%"))
     }
 }
 
@@ -523,9 +523,9 @@ fn lane_row(
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if live {
-                        ui.label(RichText::new("live").size(11.0).color(THEME.text2));
+                        ui.label(RichText::new(tr!("live", "实时")).size(11.0).color(THEME.text2));
                     } else {
-                        ui.label(RichText::new("off").size(11.0).color(THEME.text4));
+                        ui.label(RichText::new(tr!("off", "关闭")).size(11.0).color(THEME.text4));
                     }
                     ui.add_space(12.0);
                     let sh = if live || shares.0 + shares.1 > 0 {
@@ -576,7 +576,7 @@ fn connection_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                 .num_columns(2)
                 .spacing(egui::vec2(20.0, 12.0))
                 .show(ui, |ui| {
-                    kv_key(ui, "Endpoint");
+                    kv_key(ui, tr!("Endpoint", "节点"));
                     ui.horizontal(|ui| {
                         ui.label(widgets::mono(endpoint, 13.0, THEME.text));
                         // M4: a "failed over" note when Layer B has rotated the
@@ -591,18 +591,18 @@ fn connection_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                                 .inner_margin(egui::Margin::symmetric(7, 2))
                                 .show(ui, |ui| {
                                     let label = if failovers == 1 {
-                                        "failed over".to_string()
+                                        tr!("failed over", "已故障切换").to_string()
                                     } else {
-                                        format!("failed over ×{failovers}")
+                                        format!("{} ×{failovers}", tr!("failed over", "已故障切换"))
                                     };
                                     ui.label(RichText::new(label).size(10.5).color(THEME.warn));
                                 });
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let (tone, label) = if connected {
-                                (Tone::Live, "connected")
+                                (Tone::Live, tr!("connected", "已连接"))
                             } else {
-                                (Tone::Off, "not connected")
+                                (Tone::Off, tr!("not connected", "未连接"))
                             };
                             widgets::status_dot(ui, tone.fg(), 8.0, connected && motion);
                             ui.add_space(8.0);
@@ -611,14 +611,14 @@ fn connection_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                     });
                     ui.end_row();
 
-                    kv_key(ui, "Worker");
+                    kv_key(ui, tr!("Worker", "矿工"));
                     ui.horizontal(|ui| {
                         let w = worker.clone().map(|w| widgets::shorten(&w)).unwrap_or_else(|| "—".into());
                         ui.label(widgets::mono(format!("rig-{w}"), 13.0, THEME.text));
-                        ui.label(RichText::new("· rig-id derived").size(12.0).color(THEME.text4));
+                        ui.label(RichText::new(tr!("· rig-id derived", "· 由地址派生")).size(12.0).color(THEME.text4));
                         if let Some(addr) = app.reward_address() {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let copy = egui::Button::new(RichText::new("copy address").size(11.0).color(THEME.text3))
+                                let copy = egui::Button::new(RichText::new(tr!("copy address", "复制地址")).size(11.0).color(THEME.text3))
                                     .fill(egui::Color32::TRANSPARENT)
                                     .stroke(egui::Stroke::new(1.0_f32, THEME.line))
                                     .corner_radius(8);
@@ -683,7 +683,7 @@ fn reconciliation_badge(ui: &mut egui::Ui, recon: Reconciliation) {
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 7.0;
-                ui.label(RichText::new(strings::RECONCILE_PREFIX).size(10.0).color(THEME.text3));
+                ui.label(RichText::new(strings::reconcile_prefix()).size(10.0).color(THEME.text3));
                 ui.label(RichText::new(recon.label()).size(11.0).strong().color(fg));
             });
         });
@@ -711,7 +711,7 @@ fn credit_panel(ui: &mut egui::Ui, app: &MinerApp) {
                         super::icons::show(ui, Icon::Globe, 14.0, THEME.brand300);
                         ui.add_space(9.0);
                         ui.label(
-                            RichText::new(strings::CREDIT_NOTEXPOSED_TITLE)
+                            RichText::new(strings::credit_notexposed_title())
                                 .size(13.5)
                                 .strong()
                                 .color(THEME.text),
@@ -722,9 +722,9 @@ fn credit_panel(ui: &mut egui::Ui, app: &MinerApp) {
                         });
                     });
                     ui.add_space(8.0);
-                    ui.label(RichText::new(strings::CREDIT_NOTEXPOSED_BODY_1).size(12.0).color(THEME.text2));
+                    ui.label(RichText::new(strings::credit_notexposed_body_1()).size(12.0).color(THEME.text2));
                     ui.add_space(3.0);
-                    ui.label(RichText::new(strings::CREDIT_NOTEXPOSED_BODY_2).size(12.0).color(THEME.text3));
+                    ui.label(RichText::new(strings::credit_notexposed_body_2()).size(12.0).color(THEME.text3));
                     ui.add_space(12.0);
                     explorer_link(ui);
                 }
@@ -732,7 +732,7 @@ fn credit_panel(ui: &mut egui::Ui, app: &MinerApp) {
                     credit_status_row(
                         ui,
                         Tone::Off,
-                        strings::CREDIT_SECTION,
+                        strings::credit_section(),
                         strings::CREDIT_CONFIRMING,
                         app.motion_enabled(),
                     );
@@ -766,7 +766,7 @@ fn credit_panel(ui: &mut egui::Ui, app: &MinerApp) {
                     credit_status_row(
                         ui,
                         Tone::Warn,
-                        strings::CREDIT_SECTION,
+                        strings::credit_section(),
                         strings::CREDIT_UNCONFIRMED,
                         false,
                     );
@@ -829,7 +829,7 @@ fn prl_return_panel(ui: &mut egui::Ui, disp: &alice_miner_core::PrlPayoutDisplay
             // The honest pending body — bound / unbound / no-address. No numbers.
             ui.add_space(8.0);
             let body = if disp.enrolled {
-                strings::PRL_RETURN_BODY_BOUND
+                strings::prl_return_body_bound()
             } else if disp.payout_masked.is_some() {
                 strings::PRL_RETURN_BODY_UNBOUND
             } else {
@@ -890,7 +890,7 @@ fn credit_cumulative_panel(ui: &mut egui::Ui, totals: &CreditTotals, motion: boo
         widgets::status_dot(ui, Tone::Live.fg(), 8.0, motion);
         ui.add_space(9.0);
         ui.label(
-            RichText::new(strings::CREDIT_CUMULATIVE_TITLE)
+            RichText::new(strings::credit_cumulative_title())
                 .size(13.0)
                 .strong()
                 .color(THEME.text),
@@ -1030,7 +1030,7 @@ fn log_panel(ui: &mut egui::Ui, app: &MinerApp) {
             ui.set_width(ui.available_width());
             ui.set_min_height(60.0);
             if app.log.is_empty() {
-                ui.label(widgets::mono("waiting for engine output…", 11.5, THEME.text4));
+                ui.label(widgets::mono(tr!("waiting for engine output…", "正在等待引擎输出…"), 11.5, THEME.text4));
             } else {
                 egui::ScrollArea::vertical()
                     .max_height(166.0)
@@ -1102,12 +1102,20 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                 // Read-only; the lock is set from the CLI (`start --region <tag>`).
                 if app.active_lane() == Lane::GpuPrl {
                     let region = app.region_status_label();
-                    srow(ui, "Region", "Auto picks the nearest region and fails over. Lock one with `start --region us|asia|eu`.", |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(widgets::mono(region, 12.5, THEME.text2));
-                            ui.label(RichText::new("read-only").size(10.0).extra_letter_spacing(0.8).color(THEME.text4));
-                        });
-                    });
+                    srow(
+                        ui,
+                        tr!("Region", "区域"),
+                        tr!(
+                            "Auto picks the nearest region and fails over. Lock one with `start --region us|asia|eu`.",
+                            "Auto 会选择最近的区域并自动故障切换。用 `start --region us|asia|eu` 锁定某个区域。"
+                        ),
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(widgets::mono(region, 12.5, THEME.text2));
+                                ui.label(RichText::new(tr!("read-only", "只读")).size(10.0).extra_letter_spacing(0.8).color(THEME.text4));
+                            });
+                        },
+                    );
                 }
             });
 
@@ -1137,7 +1145,7 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                 );
                 app.reduce_motion = rm;
                 let mut zh = app.lang_zh;
-                srow(ui, "Language · 语言", "Interface language. Numbers stay mono in both.", |ui| {
+                srow(ui, "Language · 语言", tr!("Interface language. Numbers stay mono in both.", "界面语言。两种语言下数字都保持等宽显示。"), |ui| {
                     ui.horizontal(|ui| {
                         if lang_seg(ui, "EN", !zh).clicked() {
                             zh = false;
@@ -1205,7 +1213,7 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
 
             ui.add_space(18.0);
             ui.label(
-                RichText::new(format!("{} {}", strings::FOOTER_LINE_1, strings::FOOTER_LINE_2))
+                RichText::new(format!("{} {}", strings::footer_line_1(), strings::footer_line_2()))
                     .size(11.0)
                     .color(THEME.text3),
             );
@@ -1373,39 +1381,41 @@ fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
         // The result/status row depends on the current updater state.
         match app.updater.ui.clone() {
             UpdateUi::Idle => {
-                srow(ui, "Status", "No check run yet this session.", |ui| {
+                srow(ui, tr!("Status", "状态"), tr!("No check run yet this session.", "本次会话尚未检查。"), |ui| {
                     ui.label(widgets::mono(format!("v{current}"), 12.5, THEME.text3));
                 });
             }
             UpdateUi::Checking | UpdateUi::Applying => {
                 let what = if matches!(app.updater.ui, UpdateUi::Applying) {
-                    "Downloading and verifying the update…"
+                    tr!("Downloading and verifying the update…", "正在下载并校验更新…")
                 } else {
-                    "Contacting the release channel…"
+                    tr!("Contacting the release channel…", "正在连接发布通道…")
                 };
-                srow(ui, "Status", what, |ui| {
-                    ui.label(RichText::new("working…").size(12.0).color(THEME.text3));
+                srow(ui, tr!("Status", "状态"), what, |ui| {
+                    ui.label(RichText::new(tr!("working…", "处理中…")).size(12.0).color(THEME.text3));
                 });
             }
             UpdateUi::UpToDate { current } => {
-                srow(ui, "Status", "You're on the latest build.", |ui| {
+                srow(ui, tr!("Status", "状态"), tr!("You're on the latest build.", "你已是最新版本。"), |ui| {
                     ui.horizontal(|ui| {
                         widgets::status_dot(ui, THEME.live, 8.0, false);
                         ui.add_space(6.0);
-                        ui.label(widgets::mono(format!("v{current} · up to date"), 12.5, THEME.text2));
+                        ui.label(widgets::mono(format!("v{current} · {}", tr!("up to date", "已是最新")), 12.5, THEME.text2));
                     });
                 });
             }
             UpdateUi::Available { version, notes, .. } => {
                 let hint = if notes.trim().is_empty() {
-                    format!("Version {version} is available.")
+                    tr!("Version {v} is available.", "有可用版本 {v}。").replace("{v}", &version)
                 } else {
-                    format!("Version {version} is available — {notes}")
+                    tr!("Version {v} is available — {notes}", "有可用版本 {v} —— {notes}")
+                        .replace("{v}", &version)
+                        .replace("{notes}", &notes)
                 };
                 let mut do_apply = false;
-                srow(ui, "Update available", &hint, |ui| {
+                srow(ui, tr!("Update available", "有可用更新"), &hint, |ui| {
                     let btn = egui::Button::new(
-                        RichText::new("Update now")
+                        RichText::new(tr!("Update now", "立即更新"))
                             .size(12.5)
                             .strong()
                             .color(THEME.ink_on_brand),
@@ -1425,11 +1435,14 @@ fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
             UpdateUi::AvailableNoArtifact { version, .. } => {
                 srow(
                     ui,
-                    "Update available",
-                    &format!("Version {version} is available, but there's no in-app build for this platform — download it from the releases page."),
+                    tr!("Update available", "有可用更新"),
+                    &tr!(
+                        "Version {v} is available, but there's no in-app build for this platform — download it from the releases page.",
+                        "有可用版本 {v},但本平台没有应用内构建 —— 请从发布页面下载。"
+                    ).replace("{v}", &version),
                     |ui| {
                         let btn = egui::Button::new(
-                            RichText::new("Open releases").size(12.5).strong().color(THEME.text),
+                            RichText::new(tr!("Open releases", "打开发布页")).size(12.5).strong().color(THEME.text),
                         )
                         .fill(THEME.well)
                         .stroke(egui::Stroke::new(1.0_f32, THEME.line_strong))
@@ -1444,11 +1457,14 @@ fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
             UpdateUi::Unsupported { min_supported, .. } => {
                 srow(
                     ui,
-                    "Update required",
-                    &format!("This build is older than the minimum supported (v{min_supported}). Please update to keep mining."),
+                    tr!("Update required", "需要更新"),
+                    &tr!(
+                        "This build is older than the minimum supported (v{v}). Please update to keep mining.",
+                        "此版本低于最低支持版本(v{v})。请更新以继续挖矿。"
+                    ).replace("{v}", &min_supported),
                     |ui| {
                         let btn = egui::Button::new(
-                            RichText::new("Open releases").size(12.5).strong().color(THEME.ink_on_brand),
+                            RichText::new(tr!("Open releases", "打开发布页")).size(12.5).strong().color(THEME.ink_on_brand),
                         )
                         .fill(THEME.warn)
                         .stroke(egui::Stroke::new(1.0_f32, THEME.warn))
@@ -1463,16 +1479,19 @@ fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
             UpdateUi::Applied { version } => {
                 srow(
                     ui,
-                    "Update installed",
-                    &format!("Version {version} is installed and verified. Restart Alice Miner to run it."),
+                    tr!("Update installed", "更新已安装"),
+                    &tr!(
+                        "Version {v} is installed and verified. Restart Alice Miner to run it.",
+                        "版本 {v} 已安装并通过校验。重启 Alice Miner 以运行它。"
+                    ).replace("{v}", &version),
                     |ui| {
-                        ui.label(widgets::mono("restart to apply", 12.5, THEME.live));
+                        ui.label(widgets::mono(tr!("restart to apply", "重启以生效"), 12.5, THEME.live));
                     },
                 );
             }
             UpdateUi::Failed { message } => {
-                srow(ui, "Update check failed", &message, |ui| {
-                    ui.label(RichText::new("could not update").size(12.0).color(THEME.err));
+                srow(ui, tr!("Update check failed", "检查更新失败"), &message, |ui| {
+                    ui.label(RichText::new(tr!("could not update", "无法更新")).size(12.0).color(THEME.err));
                 });
             }
         }
@@ -1547,7 +1566,7 @@ fn prl_payout_row(ui: &mut egui::Ui, app: &mut MinerApp) {
                 // Title + the masked current value (or "not set") on the right.
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(strings::PRL_PAYOUT_FIELD_LABEL)
+                        RichText::new(strings::prl_payout_field_label())
                             .size(13.5)
                             .strong()
                             .color(THEME.text),
@@ -1566,7 +1585,7 @@ fn prl_payout_row(ui: &mut egui::Ui, app: &mut MinerApp) {
                     });
                 });
                 ui.add_space(3.0);
-                ui.label(RichText::new(strings::PRL_PAYOUT_ROW_HINT).size(11.5).color(THEME.text3));
+                ui.label(RichText::new(strings::prl_payout_row_hint()).size(11.5).color(THEME.text3));
                 ui.add_space(9.0);
 
                 if watch_only {
@@ -1574,7 +1593,7 @@ fn prl_payout_row(ui: &mut egui::Ui, app: &mut MinerApp) {
                     ui.horizontal_top(|ui| {
                         super::icons::show(ui, Icon::Eye, 13.0, THEME.text4);
                         ui.add_space(8.0);
-                        ui.label(RichText::new(strings::PRL_PAYOUT_WATCH_ONLY).size(11.0).color(THEME.text4));
+                        ui.label(RichText::new(strings::prl_payout_watch_only()).size(11.0).color(THEME.text4));
                     });
                     return;
                 }
@@ -1585,7 +1604,7 @@ fn prl_payout_row(ui: &mut egui::Ui, app: &mut MinerApp) {
                     let resp = widgets::text_input(
                         ui,
                         &mut app.form_prl_payout,
-                        strings::PRL_PAYOUT_FIELD_HINT,
+                        strings::prl_payout_field_hint(),
                         true,
                     );
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
