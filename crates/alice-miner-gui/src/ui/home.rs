@@ -244,8 +244,17 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
                 .stroke(egui::Stroke::new(1.0_f32, THEME.line))
                 .corner_radius(255)
                 .min_size(egui::vec2(130.0, 34.0));
-            // The button is inert during the stopping grace (non-interactive).
-            if ui.add_enabled(!stopping, stop).clicked() {
+            // The button is inert during the stopping grace (non-interactive). When
+            // clickable it shows the pointing-hand cursor so it reads as a button; while
+            // Stopping… (disabled) the cursor stays the default arrow (it can't be
+            // clicked), which is the correct affordance for a non-interactive control.
+            let resp = ui.add_enabled(!stopping, stop);
+            let resp = if stopping {
+                resp
+            } else {
+                resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+            };
+            if resp.clicked() {
                 do_stop.set(true);
             }
         });
