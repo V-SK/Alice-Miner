@@ -15,22 +15,48 @@
 // every one today. Keeping them here is the point (single auditable surface).
 #![allow(dead_code)]
 
+// Some entries are LANGUAGE-AWARE: a bilingual pair `NAME_EN` / `NAME_ZH` (both
+// scanned by the honesty gate below) plus a tiny `pub fn name()` accessor that
+// returns the variant for the current global language via `tr!`. This keeps the
+// user string a SINGLE clean language in the UI (no "English 残留" in 中文 mode)
+// while every reward-adjacent literal stays on this one auditable surface.
+use alice_miner_core::tr;
+
 /// The ONLY way "rewards" are ever rendered: pending, bilingual.
 pub const REWARD_PENDING: &str = "pending · 待发放";
 
-/// The short pending tag used inline (e.g. on a stat card value).
-pub const REWARD_PENDING_SHORT: &str = "— pending";
+/// The short pending tag used inline (e.g. on a stat card value). Bilingual-aware.
+pub const REWARD_PENDING_SHORT_EN: &str = "— pending";
+pub const REWARD_PENDING_SHORT_ZH: &str = "— 待发放";
+pub fn reward_pending_short() -> &'static str {
+    tr!(REWARD_PENDING_SHORT_EN, REWARD_PENDING_SHORT_ZH)
+}
 
 /// The honest sub-line for the est-rewards card (no rate, no number).
 pub const REWARD_RATE_PENDING: &str = "待发放 · rate pending";
 
 /// The Home footer — rewards accrue as pending; payout/settlement/transfer stay
-/// gated. Bilingual, verbatim intent from the mockup `.foot`.
-pub const FOOTER_LINE_1: &str = "Rewards accrue as pending · 待发放.";
-pub const FOOTER_LINE_2: &str = "Payout, settlement & on-chain transfer stay gated.";
+/// gated. Bilingual-aware (LINE_1 already carried both; LINE_2 gains a 中文 variant).
+/// The `payout … gated` wording is an honest NEGATIVE disclosure (the honesty gate
+/// permits `payout`/`settlement` only alongside gated/off/disabled).
+pub const FOOTER_LINE_1_EN: &str = "Rewards accrue as pending.";
+pub const FOOTER_LINE_1_ZH: &str = "奖励以待发放形式累积。";
+pub fn footer_line_1() -> &'static str {
+    tr!(FOOTER_LINE_1_EN, FOOTER_LINE_1_ZH)
+}
+pub const FOOTER_LINE_2_EN: &str = "Payout, settlement & on-chain transfer stay gated.";
+pub const FOOTER_LINE_2_ZH: &str = "发放、结算与链上转账均处于关闭(gated)状态。";
+pub fn footer_line_2() -> &'static str {
+    tr!(FOOTER_LINE_2_EN, FOOTER_LINE_2_ZH)
+}
 
 /// The "hashing" sub-label shown under the live hashrate number while mining.
-pub const HASHING_SUB: &str = "hashing · 待发放";
+/// Bilingual-aware; reward-adjacent (carries the "pending · 待发放" framing).
+pub const HASHING_SUB_EN: &str = "hashing · pending";
+pub const HASHING_SUB_ZH: &str = "哈希中 · 待发放";
+pub fn hashing_sub() -> &'static str {
+    tr!(HASHING_SUB_EN, HASHING_SUB_ZH)
+}
 
 /// The difficulty explainer — one honest line that removes "difficulty" from the
 /// miner's mental model. There is nothing to configure: the server matches the
@@ -44,38 +70,24 @@ pub const DIFFICULTY_EXPLAINER: &str =
      · 无需设置难度 —— Alice 会自动把工作量匹配到你的设备;你的份额取决于你的算力,\
      而非你提交了多少 share。";
 
-/// Idle hero CTA + its sub-line.
-pub const CTA_START: &str = "START";
-pub const CTA_START_SUB: &str = "press to begin · 点击开始";
-
-/// Connecting hero readout (the indeterminate sweep state).
-pub const CTA_CONNECTING: &str = "CONNECTING";
-pub const CTA_CONNECTING_SUB: &str = "reaching the relay · 连接中";
-
-/// Stopping hero readout (the brief tear-down transient).
-pub const CTA_STOPPING: &str = "STOPPING";
-pub const CTA_STOPPING_SUB: &str = "winding down · 停止中";
-
-/// Error hero readout — a calm "start again" affordance (no scary dump).
-pub const CTA_RETRY: &str = "START AGAIN";
-pub const CTA_RETRY_SUB: &str = "the lane stopped · 已停止";
+// The idle/connecting/stopping/error hero CTA labels + sub-lines are NEUTRAL chrome
+// (no reward claim), so they live inline as `tr!(en, zh)` at their single call site in
+// `ui/home.rs::readout` rather than here — this module stays the reward/honesty surface.
 
 /// "Rewards to <addr>" prefix (the address itself is the user's OWN public one,
-/// supplied at call sites — never a collection address).
-pub const REWARDS_TO: &str = "Rewards to";
+/// supplied at call sites — never a collection address). Bilingual-aware.
+pub const REWARDS_TO_EN: &str = "Rewards to";
+pub const REWARDS_TO_ZH: &str = "奖励到";
+pub fn rewards_to() -> &'static str {
+    tr!(REWARDS_TO_EN, REWARDS_TO_ZH)
+}
 
 /// Experimental badge ("测试中") — the mining feature is opt-in + experimental.
 pub const EXPERIMENTAL: &str = "experimental · 测试中";
 
 // ── Home status lines (one per engine state) ─────────────────────────────────
-/// Idle status line.
-pub const STATUS_IDLE: &str = "Idle — press Start to begin";
-/// Connecting status line (the PUBLIC relay only — never the upstream pool).
-pub const STATUS_CONNECTING: &str = "Connecting to the relay…";
-/// Stopping status line.
-pub const STATUS_STOPPING: &str = "Stopping the miner…";
-/// A calm, generic error status when the engine gave no specific reason.
-pub const STATUS_ERROR_GENERIC: &str = "The mining lane stopped. You can start again.";
+// These are NEUTRAL status chrome (no reward claim), so they live inline as
+// `tr!(en, zh)` at their single call site in `ui/home.rs::status_line`.
 
 // ── Onboarding (create / back-up / confirm / import / watch-only) ────────────
 pub const OB_WELCOME_EYEBROW: &str = "Welcome · 欢迎";
@@ -185,22 +197,53 @@ pub const BG_UNLOCK_NOTE: &str =
 
 // ── M5 dashboard depth: Source A (activity) / Source B (server-confirmed) ─────
 /// Source-A section eyebrow + caption — this is LOCAL ACTIVITY, explicitly NOT
-/// earnings (the brief's hard separation).
-pub const ACTIVITY_SECTION: &str = "Local activity";
-pub const ACTIVITY_CAPTION: &str = "What this miner is doing right now · 本机活动";
+/// earnings (the brief's hard separation). Bilingual-aware.
+pub const ACTIVITY_SECTION_EN: &str = "Local activity";
+pub const ACTIVITY_SECTION_ZH: &str = "本机活动";
+pub fn activity_section() -> &'static str {
+    tr!(ACTIVITY_SECTION_EN, ACTIVITY_SECTION_ZH)
+}
+pub const ACTIVITY_CAPTION_EN: &str = "What this miner is doing right now";
+pub const ACTIVITY_CAPTION_ZH: &str = "本机此刻的活动";
+pub fn activity_caption() -> &'static str {
+    tr!(ACTIVITY_CAPTION_EN, ACTIVITY_CAPTION_ZH)
+}
 
 /// Source-B section eyebrow + caption — server-confirmed credit (read-only).
-pub const CREDIT_SECTION: &str = "Server-confirmed credit";
-pub const CREDIT_CAPTION: &str = "Read-only · confirmed by the network · 服务端确认";
+/// Bilingual-aware.
+pub const CREDIT_SECTION_EN: &str = "Server-confirmed credit";
+pub const CREDIT_SECTION_ZH: &str = "服务端确认的积分";
+pub fn credit_section() -> &'static str {
+    tr!(CREDIT_SECTION_EN, CREDIT_SECTION_ZH)
+}
+pub const CREDIT_CAPTION_EN: &str = "Read-only · confirmed by the network";
+pub const CREDIT_CAPTION_ZH: &str = "只读 · 由网络确认";
+pub fn credit_caption() -> &'static str {
+    tr!(CREDIT_CAPTION_EN, CREDIT_CAPTION_ZH)
+}
 
 /// The honest `NotExposed` panel (Option 3, the v1 path). Credit accounting is
 /// live; payout is OFF (phase-J); the per-address total is not exposed to the
 /// client yet. No fabricated number — point the user at the explorer.
-pub const CREDIT_NOTEXPOSED_TITLE: &str = "Credit accounting is live";
-pub const CREDIT_NOTEXPOSED_BODY_1: &str =
+pub const CREDIT_NOTEXPOSED_TITLE_EN: &str = "Credit accounting is live";
+pub const CREDIT_NOTEXPOSED_TITLE_ZH: &str = "积分记账已上线";
+pub fn credit_notexposed_title() -> &'static str {
+    tr!(CREDIT_NOTEXPOSED_TITLE_EN, CREDIT_NOTEXPOSED_TITLE_ZH)
+}
+pub const CREDIT_NOTEXPOSED_BODY_1_EN: &str =
     "Your accepted work is being counted by the network. Payout is off (phase-J).";
-pub const CREDIT_NOTEXPOSED_BODY_2: &str =
+pub const CREDIT_NOTEXPOSED_BODY_1_ZH: &str =
+    "你被接受的工作正在由网络计数。发放功能未开启(phase-J)。";
+pub fn credit_notexposed_body_1() -> &'static str {
+    tr!(CREDIT_NOTEXPOSED_BODY_1_EN, CREDIT_NOTEXPOSED_BODY_1_ZH)
+}
+pub const CREDIT_NOTEXPOSED_BODY_2_EN: &str =
     "A per-address total isn't exposed in the app yet — look it up in the explorer.";
+pub const CREDIT_NOTEXPOSED_BODY_2_ZH: &str =
+    "应用暂不显示单地址累计 —— 请在区块浏览器中查询。";
+pub fn credit_notexposed_body_2() -> &'static str {
+    tr!(CREDIT_NOTEXPOSED_BODY_2_EN, CREDIT_NOTEXPOSED_BODY_2_ZH)
+}
 /// The explorer deep-link label + URL (PUBLIC apex; never an internal/core host).
 pub const CREDIT_EXPLORER_LABEL: &str = "Open explorer · 浏览器";
 pub const CREDIT_EXPLORER_URL: &str = "https://aliceprotocol.org/explorer.html";
@@ -213,7 +256,11 @@ pub const CREDIT_PENDING_VALUE: &str = "pending · 待发放";
 /// accepted-share COUNTS (cumulative + 24h + the GPU·Alpha / GPU·PRL split) — which
 /// are SHARE COUNTS, not money, so they are credit-only. The number is rendered by
 /// the panel from the count fields; these are the static labels around it.
-pub const CREDIT_CUMULATIVE_TITLE: &str = "Confirmed by the network";
+pub const CREDIT_CUMULATIVE_TITLE_EN: &str = "Confirmed by the network";
+pub const CREDIT_CUMULATIVE_TITLE_ZH: &str = "已由网络确认";
+pub fn credit_cumulative_title() -> &'static str {
+    tr!(CREDIT_CUMULATIVE_TITLE_EN, CREDIT_CUMULATIVE_TITLE_ZH)
+}
 /// Row label for the cumulative accepted-share count (the headline number).
 pub const CREDIT_CUMULATIVE_TOTAL_LABEL: &str = "Accepted shares · 累计接受";
 /// Row label for the 24h accepted-share count.
@@ -250,7 +297,12 @@ pub const CREDIT_UPGRADE_BODY: &str =
 pub const CREDIT_UPGRADE_CTA: &str = "Get the update · 获取更新";
 
 /// The reconciliation badge prefix (the qualitative local-vs-server status).
-pub const RECONCILE_PREFIX: &str = "local vs network";
+/// Bilingual-aware.
+pub const RECONCILE_PREFIX_EN: &str = "local vs network";
+pub const RECONCILE_PREFIX_ZH: &str = "本地 vs 网络";
+pub fn reconcile_prefix() -> &'static str {
+    tr!(RECONCILE_PREFIX_EN, RECONCILE_PREFIX_ZH)
+}
 
 // ── GPU-PRL "15% PRL 返还" display block (A2c) ────────────────────────────────
 /// The GPU-PRL lane's 15% PRL-return block. Credit-only: this surfaces the
@@ -267,9 +319,14 @@ pub const PRL_RETURN_ADDR_LABEL: &str = "返还地址 · return wallet";
 pub const PRL_RETURN_ENROLLED: &str = "bound · 已绑定";
 pub const PRL_RETURN_PENDING: &str = "pending · 待绑定";
 /// The honest "pending" body when bound — the 15% return accrues as pending and is
-/// routed on-chain; nothing is claimable in the app.
-pub const PRL_RETURN_BODY_BOUND: &str =
-    "Your return wallet is bound. The 15% accrues as pending · 待发放 and is routed on-chain.";
+/// routed on-chain; nothing is claimable in the app. Bilingual-aware.
+pub const PRL_RETURN_BODY_BOUND_EN: &str =
+    "Your return wallet is bound. The 15% accrues as pending and is routed on-chain.";
+pub const PRL_RETURN_BODY_BOUND_ZH: &str =
+    "返还钱包已绑定。15% 以待发放形式累积,并在链上路由。";
+pub fn prl_return_body_bound() -> &'static str {
+    tr!(PRL_RETURN_BODY_BOUND_EN, PRL_RETURN_BODY_BOUND_ZH)
+}
 /// The body when NOT yet bound but a return address is configured (the bind runs
 /// automatically once GPU-PRL mining proves possession).
 pub const PRL_RETURN_BODY_UNBOUND: &str =
@@ -283,23 +340,44 @@ pub const PRL_RETURN_BODY_NOADDR: &str =
 // ── Settings · 15%-PRL return-address INPUT (A2c GUI parity) ──────────────────
 /// The labeled return-address field in Settings → Identity. PUBLIC address (not a
 /// secret); shown masked once saved. No reward vocabulary — just an address input.
-pub const PRL_PAYOUT_FIELD_LABEL: &str = "PRL 返还地址 (可选 · 15% 返还)";
-/// The input placeholder (a prl1p… address).
-pub const PRL_PAYOUT_FIELD_HINT: &str = "prl1p… (your own return wallet)";
+/// Bilingual-aware.
+pub const PRL_PAYOUT_FIELD_LABEL_EN: &str = "PRL return address (optional · 15% return)";
+pub const PRL_PAYOUT_FIELD_LABEL_ZH: &str = "PRL 返还地址(可选 · 15% 返还)";
+pub fn prl_payout_field_label() -> &'static str {
+    tr!(PRL_PAYOUT_FIELD_LABEL_EN, PRL_PAYOUT_FIELD_LABEL_ZH)
+}
+/// The input placeholder (a prl1p… address). Bilingual-aware.
+pub const PRL_PAYOUT_FIELD_HINT_EN: &str = "prl1p… (your own return wallet)";
+pub const PRL_PAYOUT_FIELD_HINT_ZH: &str = "prl1p…(你自己的返还钱包)";
+pub fn prl_payout_field_hint() -> &'static str {
+    tr!(PRL_PAYOUT_FIELD_HINT_EN, PRL_PAYOUT_FIELD_HINT_ZH)
+}
 /// The Save button.
 pub const PRL_PAYOUT_SAVE: &str = "Save · 保存";
-/// The row hint under the field.
-pub const PRL_PAYOUT_ROW_HINT: &str =
-    "Where the network sends your 15% PRL 返还. A public prl1p… address — bound to your Alice \
+/// The row hint under the field. Bilingual-aware.
+pub const PRL_PAYOUT_ROW_HINT_EN: &str =
+    "Where the network sends your 15% PRL return. A public prl1p… address — bound to your Alice \
      address on the next GPU mining start.";
+pub const PRL_PAYOUT_ROW_HINT_ZH: &str =
+    "网络把你的 15% PRL 返还发送到的地址。一个公开的 prl1p… 地址 —— 在下次 GPU 挖矿启动时\
+     绑定到你的 Alice 地址。";
+pub fn prl_payout_row_hint() -> &'static str {
+    tr!(PRL_PAYOUT_ROW_HINT_EN, PRL_PAYOUT_ROW_HINT_ZH)
+}
 /// The masked-current-value prefix (the stored address follows, mono + masked).
 pub const PRL_PAYOUT_CURRENT: &str = "Saved · 已保存";
 /// Shown when nothing is stored yet.
 pub const PRL_PAYOUT_UNSET: &str = "未设置 · not set";
 /// Watch-only gating copy: a pasted address can't sign the PoP that binds the 15%
 /// return, so it must import the signing key first (mirrors the start-PRL gating).
-pub const PRL_PAYOUT_WATCH_ONLY: &str =
-    "GPU-PRL/Alpha 需要可签名钱包才能绑定 15% 返还 — import this address's key first.";
+/// Bilingual-aware.
+pub const PRL_PAYOUT_WATCH_ONLY_EN: &str =
+    "GPU-PRL/Alpha needs a signable wallet to bind the 15% return — import this address's key first.";
+pub const PRL_PAYOUT_WATCH_ONLY_ZH: &str =
+    "GPU-PRL/Alpha 需要可签名钱包才能绑定 15% 返还 —— 请先导入该地址的私钥。";
+pub fn prl_payout_watch_only() -> &'static str {
+    tr!(PRL_PAYOUT_WATCH_ONLY_EN, PRL_PAYOUT_WATCH_ONLY_ZH)
+}
 
 #[cfg(test)]
 mod tests {

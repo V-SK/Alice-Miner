@@ -72,12 +72,12 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     // miner), show "Connecting" instead of a confident "live" so a 0 H/s screen
     // never reads as healthy mining (the macOS "0 under LIVE" symptom).
     let eyebrow = match state {
-        EngineState::Running if app.is_warming_up() => "Connecting · 连接中",
-        EngineState::Running => "Mining · live",
-        EngineState::Starting => "Connecting · 连接中",
-        EngineState::Stopping => "Stopping · 停止中",
-        EngineState::Error => "Lane stopped · 已停止",
-        EngineState::Idle => "Device auto-detected",
+        EngineState::Running if app.is_warming_up() => tr!("Connecting", "连接中"),
+        EngineState::Running => tr!("Mining · live", "挖矿中 · 实时"),
+        EngineState::Starting => tr!("Connecting", "连接中"),
+        EngineState::Stopping => tr!("Stopping", "停止中"),
+        EngineState::Error => tr!("Lane stopped", "通道已停止"),
+        EngineState::Idle => tr!("Device auto-detected", "已自动检测设备"),
     };
     centered(ui, |ui| widgets::eyebrow(ui, eyebrow));
     ui.add_space(11.0);
@@ -87,7 +87,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
         .device
         .as_ref()
         .map(|d| d.display.clone())
-        .unwrap_or_else(|| "Detecting device…".to_string());
+        .unwrap_or_else(|| tr!("Detecting device…", "正在检测设备…").to_string());
     centered(ui, |ui| {
         // Chip-ic with a CPU glyph.
         egui::Frame::NONE
@@ -177,7 +177,7 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
         let do_change = std::cell::Cell::new(false);
         let can_change = !app.is_mining();
         centered(ui, |ui| {
-            ui.label(RichText::new(strings::REWARDS_TO).size(12.5).color(THEME.text2));
+            ui.label(RichText::new(strings::rewards_to()).size(12.5).color(THEME.text2));
             ui.add_space(6.0);
             ui.label(widgets::mono(widgets::shorten(&addr), 12.5, THEME.text));
             ui.add_space(4.0);
@@ -309,7 +309,7 @@ fn readout(ui: &mut egui::Ui, app: &MinerApp, mode: HeroMode) {
             ui.add_space(4.0);
             centered(ui, |ui| {
                 ui.label(
-                    RichText::new(strings::HASHING_SUB)
+                    RichText::new(strings::hashing_sub())
                         .size(10.5)
                         .extra_letter_spacing(1.0)
                         .color(THEME.text4),
@@ -317,17 +317,17 @@ fn readout(ui: &mut egui::Ui, app: &MinerApp, mode: HeroMode) {
             });
         }
         HeroMode::Connecting => {
-            cta_readout(ui, strings::CTA_CONNECTING, strings::CTA_CONNECTING_SUB, THEME.warn, None);
+            cta_readout(ui, tr!("CONNECTING", "连接中"), tr!("reaching the relay", "正在连接中继"), THEME.warn, None);
         }
         HeroMode::Stopping => {
-            cta_readout(ui, strings::CTA_STOPPING, strings::CTA_STOPPING_SUB, THEME.text2, None);
+            cta_readout(ui, tr!("STOPPING", "停止中"), tr!("winding down", "正在收尾"), THEME.text2, None);
         }
         HeroMode::Error => {
             // Calm "start again" affordance — brand (inviting), never red.
-            cta_readout(ui, strings::CTA_RETRY, strings::CTA_RETRY_SUB, THEME.text_brand, Some(Icon::Play));
+            cta_readout(ui, tr!("START AGAIN", "重新开始"), tr!("the lane stopped", "通道已停止"), THEME.text_brand, Some(Icon::Play));
         }
         HeroMode::Idle => {
-            cta_readout(ui, strings::CTA_START, strings::CTA_START_SUB, THEME.text_brand, Some(Icon::Play));
+            cta_readout(ui, tr!("START", "开始"), tr!("press to begin", "点击开始"), THEME.text_brand, Some(Icon::Play));
         }
     }
 }
@@ -371,7 +371,7 @@ fn status_line(ui: &mut egui::Ui, app: &MinerApp) {
         // Running but no hashrate yet → connecting/warming up (not a confident
         // green "live" next to 0.00 kH/s).
         EngineState::Running if app.is_warming_up() => {
-            (Tone::Warn, strings::STATUS_CONNECTING.to_string())
+            (Tone::Warn, tr!("Connecting to the relay…", "正在连接中继…").to_string())
         }
         EngineState::Running => {
             // A transient warning pushed while STILL mining (e.g. the PoP-refresh
@@ -384,25 +384,29 @@ fn status_line(ui: &mut egui::Ui, app: &MinerApp) {
             } else if let Some(secs) = app.share_stall_secs().filter(|s| *s >= STALL_WARN_SECS) {
                 (
                     Tone::Warn,
-                    format!("No new share for {}m — still hashing, checking the pool", secs / 60),
+                    tr!(
+                        "No new share for {m}m — still hashing, checking the pool",
+                        "已 {m} 分钟没有新 share —— 仍在哈希,正在检查矿池"
+                    )
+                    .replace("{m}", &(secs / 60).to_string()),
                 )
             } else {
                 let a = app.snapshot.as_ref().map(|s| s.shares_accepted).unwrap_or(0);
                 let r = app.snapshot.as_ref().map(|s| s.shares_rejected).unwrap_or(0);
-                (Tone::Live, format!("Mining · {a}/{r} shares"))
+                (Tone::Live, format!("{} · {a}/{r} shares", tr!("Mining", "挖矿中")))
             }
         }
-        EngineState::Starting => (Tone::Warn, strings::STATUS_CONNECTING.to_string()),
-        EngineState::Stopping => (Tone::Warn, strings::STATUS_STOPPING.to_string()),
+        EngineState::Starting => (Tone::Warn, tr!("Connecting to the relay…", "正在连接中继…").to_string()),
+        EngineState::Stopping => (Tone::Warn, tr!("Stopping the miner…", "正在停止矿工…").to_string()),
         EngineState::Error => (
             Tone::Danger,
             app.snapshot
                 .as_ref()
                 .and_then(|s| s.message.clone())
                 .or_else(|| app.error.clone())
-                .unwrap_or_else(|| strings::STATUS_ERROR_GENERIC.to_string()),
+                .unwrap_or_else(|| tr!("The mining lane stopped. You can start again.", "挖矿通道已停止。你可以重新开始。").to_string()),
         ),
-        EngineState::Idle => (Tone::Off, strings::STATUS_IDLE.to_string()),
+        EngineState::Idle => (Tone::Off, tr!("Idle — press Start to begin", "空闲 —— 点击 Start 开始").to_string()),
     };
     let dot_blink = matches!(tone, Tone::Live | Tone::Warn) && blink;
     centered(ui, |ui| {
@@ -513,7 +517,7 @@ fn dual_mine_row(ui: &mut egui::Ui, app: &mut MinerApp) {
             centered(ui, |ui| {
                 widgets::status_dot(ui, THEME.lane_gpu, 7.0, false);
                 ui.add_space(7.0);
-                ui.label(RichText::new("Dual-mine active · CPU + GPU").size(11.5).color(THEME.text3));
+                ui.label(RichText::new(tr!("Dual-mine active · CPU + GPU", "双挖进行中 · CPU + GPU")).size(11.5).color(THEME.text3));
             });
         }
         return;
@@ -526,9 +530,9 @@ fn dual_mine_row(ui: &mut egui::Ui, app: &mut MinerApp) {
     centered(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 9.0;
         // Label + sub.
-        ui.label(RichText::new("Dual-mine").size(12.5).strong().color(if viable { THEME.text2 } else { THEME.text4 }));
+        ui.label(RichText::new(tr!("Dual-mine", "双挖")).size(12.5).strong().color(if viable { THEME.text2 } else { THEME.text4 }));
         ui.label(
-            RichText::new(if viable { "CPU + GPU" } else { "needs a supported GPU" })
+            RichText::new(if viable { tr!("CPU + GPU", "CPU + GPU") } else { tr!("needs a supported GPU", "需要受支持的 GPU") })
                 .size(11.0)
                 .color(THEME.text4),
         );
@@ -583,20 +587,23 @@ fn dual_mine_row(ui: &mut egui::Ui, app: &mut MinerApp) {
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        RichText::new("Dual-mine runs CPU and GPU together")
+                        RichText::new(tr!("Dual-mine runs CPU and GPU together", "双挖会同时运行 CPU 与 GPU"))
                             .size(12.0)
                             .strong()
                             .color(THEME.text),
                     );
                     ui.add_space(3.0);
                     ui.label(
-                        RichText::new("More heat + fan noise; XMR drops 2 cores for the GPU. You can stop anytime.")
+                        RichText::new(tr!(
+                            "More heat + fan noise; XMR drops 2 cores for the GPU. You can stop anytime.",
+                            "更高的发热与风扇噪音;XMR 会让出 2 个核心给 GPU。你可以随时停止。"
+                        ))
                             .size(11.0)
                             .color(THEME.text3),
                     );
                     ui.add_space(9.0);
                     ui.horizontal(|ui| {
-                        let cancel_btn = egui::Button::new(RichText::new("Cancel").size(12.0).color(THEME.text2))
+                        let cancel_btn = egui::Button::new(RichText::new(tr!("Cancel", "取消")).size(12.0).color(THEME.text2))
                             .fill(THEME.surface2)
                             .stroke(egui::Stroke::new(1.0_f32, THEME.line))
                             .corner_radius(8)
@@ -605,7 +612,7 @@ fn dual_mine_row(ui: &mut egui::Ui, app: &mut MinerApp) {
                             cancel.set(true);
                         }
                         ui.add_space(8.0);
-                        let ok_btn = egui::Button::new(RichText::new("Enable dual-mine").size(12.0).strong().color(THEME.ink_on_brand))
+                        let ok_btn = egui::Button::new(RichText::new(tr!("Enable dual-mine", "启用双挖")).size(12.0).strong().color(THEME.ink_on_brand))
                             .fill(THEME.brand)
                             .corner_radius(8)
                             .min_size(egui::vec2(140.0, 30.0));
@@ -658,12 +665,16 @@ fn gpu_selector(ui: &mut egui::Ui, app: &mut MinerApp) {
             ui.set_width(HERO_CARD_W - 64.0);
             // Header: label + the "N of M cards" count.
             centered(ui, |ui| {
-                ui.label(RichText::new("GPUs to mine").size(12.0).strong().color(THEME.text2));
+                ui.label(RichText::new(tr!("GPUs to mine", "参与挖矿的 GPU")).size(12.0).strong().color(THEME.text2));
                 ui.add_space(7.0);
                 ui.label(
-                    RichText::new(format!("{} of {} selected", checked_count, rows.len()))
-                        .size(11.0)
-                        .color(THEME.text4),
+                    RichText::new(
+                        tr!("{n} of {m} selected", "已选 {n} / {m}")
+                            .replace("{n}", &checked_count.to_string())
+                            .replace("{m}", &rows.len().to_string()),
+                    )
+                    .size(11.0)
+                    .color(THEME.text4),
                 );
             });
             ui.add_space(8.0);
@@ -741,7 +752,7 @@ fn gpu_row(
     let resp = frame.response;
     if last_checked {
         resp.interact(egui::Sense::hover())
-            .on_hover_text("At least one GPU must stay selected")
+            .on_hover_text(tr!("At least one GPU must stay selected", "至少需要保留一块 GPU"))
     } else {
         resp.interact(egui::Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -784,7 +795,7 @@ fn lane_chip(
         }
         LaneSupport::ComingSoon => (
             // "RVN · coming soon" (drop the algo to make room for the state).
-            format!("{} · coming soon", lane_short(lane)),
+            format!("{} · {}", lane_short(lane), tr!("coming soon", "即将推出")),
             THEME.text4,
             None,
             egui::Stroke::new(1.0_f32, THEME.line),
@@ -841,16 +852,16 @@ fn lane_short(lane: Lane) -> &'static str {
     }
 }
 
-/// The honest tail for an Unavailable lane (why it can't run here).
+/// The honest tail for an Unavailable lane (why it can't run here). Bilingual.
 fn unavailable_tail(lane: Lane) -> &'static str {
     match lane {
         // RVN unavailable means no NVIDIA (Apple/CPU-only) → XMR is the lane.
-        Lane::GpuRvn => "needs NVIDIA",
+        Lane::GpuRvn => tr!("needs NVIDIA", "需要 NVIDIA"),
         // PRL (SRBMiner) needs an NVIDIA/AMD GPU; no macOS build.
-        Lane::GpuPrl => "needs NVIDIA/AMD GPU",
+        Lane::GpuPrl => tr!("needs NVIDIA/AMD GPU", "需要 NVIDIA/AMD GPU"),
         // Alpha (alpha-miner) is NVIDIA-CUDA only (the Volta/V100 path).
-        Lane::GpuAlpha => "needs NVIDIA GPU",
-        Lane::Xmr => "not supported",
+        Lane::GpuAlpha => tr!("needs NVIDIA GPU", "需要 NVIDIA GPU"),
+        Lane::Xmr => tr!("not supported", "不受支持"),
     }
 }
 
@@ -863,9 +874,9 @@ fn centered(ui: &mut egui::Ui, add: impl Fn(&mut egui::Ui)) {
 fn footer(ui: &mut egui::Ui) {
     // Two STACKED centered lines (not a row) — center each independently.
     centered(ui, |ui| {
-        ui.label(RichText::new(strings::FOOTER_LINE_1).size(10.5).color(THEME.text3));
+        ui.label(RichText::new(strings::footer_line_1()).size(10.5).color(THEME.text3));
     });
     centered(ui, |ui| {
-        ui.label(RichText::new(strings::FOOTER_LINE_2).size(10.5).color(THEME.text3));
+        ui.label(RichText::new(strings::footer_line_2()).size(10.5).color(THEME.text3));
     });
 }
