@@ -472,10 +472,12 @@ const UPSTREAM_POOL_MARKERS: &[&str] = &[
 ///   * seed / private-key material (`seed` / `priv` / a `0x…` hex blob);
 ///
 /// And, for a pearlhash (PoP) lane, it requires every stratum host to be
-/// `*.aliceprotocol.org`. The PoP password (a public signature we minted) is
-/// SCRUBBED out of each token before the substring scan so a legitimate base64
-/// signature that happens to contain `0x`/`prl1p` can never false-trip the gate;
-/// it is separately checked to carry no whitespace/control (an argv-injection
+/// `*.aliceprotocol.org`. A sufficiently long PoP password (a public signature we
+/// minted) is SCRUBBED out of each token before the substring scan so a legitimate
+/// base64 signature that happens to contain `0x`/`prl1p` can never false-trip the
+/// gate; a SHORT password (e.g. the XMR/RVN default `"x"`) is left in place, since
+/// scrubbing it would strip that byte everywhere and blind the forbidden-word scan.
+/// The password is separately checked to carry no whitespace/control (an argv-injection
 /// guard, mirroring [`crate::lane::gpu_prl`]).
 pub fn assert_no_forbidden(args: &[String], lane: Lane, ctx: &ArgContext) -> Result<(), String> {
     // The password rides `--password`/`-p`; it must not smuggle extra argv tokens.
@@ -489,7 +491,16 @@ pub fn assert_no_forbidden(args: &[String], lane: Lane, ctx: &ArgContext) -> Res
     for arg in args {
         // Neutralise the (public) PoP password wherever it is embedded, THEN scan —
         // so a base64 signature containing `0x`/`prl1p` never false-positives.
-        let scrubbed = if ctx.password.is_empty() {
+        //
+        // Only scrub a password long enough to plausibly BE a secret worth masking
+        // (a PoP token). A SHORT password — e.g. the XMR/RVN default `"x"` — is not a
+        // secret, and scrubbing it would strip every occurrence of that byte from the
+        // arg and BLIND the forbidden-word scan: `"x"` erases the `x` in `contains_hex_key`'s
+        // `0x` probe and in markers like `supportxmr` / `kryptex` / `flexpool`, letting a
+        // real leak slip through. So leave a short password in place; it never legitimately
+        // overlaps a forbidden substring anyway.
+        const MIN_SCRUB_LEN: usize = 6;
+        let scrubbed = if ctx.password.len() < MIN_SCRUB_LEN {
             arg.clone()
         } else {
             arg.replace(&ctx.password, "")
@@ -785,6 +796,58 @@ mod tests {
             .render_args(&ctx(Lane::GpuPrl, token, Some("/tmp/x.log")))
             .expect("a base64 password with 0x must not false-trip the seed gate");
         assert!(args.join(" ").contains(token));
+    }
+
+    #[test]
+    fn short_default_password_x_does_not_blind_honesty_gate() {
+        // The XMR/RVN default stratum password is the literal `"x"`. Scrubbing it out
+        // of every arg (as a long PoP token IS scrubbed) would strip every `x`, blinding
+        // the forbidden-word scan: `0x…` would lose its `0x`, and markers like
+        // `supportxmr` / `kryptex` / `flexpool` (all contain `x`) would no longer match.
+        // With the min-length scrub guard, `"x"` is left in place so these leaks are
+        // still caught. The password `{PASSWORD}` is also present in the argv to prove
+        // a legitimately-embedded `"x"` never causes over-scrubbing of a sibling arg.
+        for &lane in &[Lane::Xmr, Lane::GpuRvn] {
+            // 1) A `0x…` private-key blob must still be flagged (scrubbing `"x"` would
+            //    have turned `0xdead…` into `0dead…` and hidden it).
+            let tpl_hex = vec![
+                "-o".into(), "{POOL}".into(), "-u".into(), "{WALLET}".into(),
+                "-p".into(), "{PASSWORD}".into(),
+                "--misc".into(), "0xdeadbeefdeadbeef0123".into(),
+            ];
+            let cm = custom(MinerPreset::Template, lane, Some(tpl_hex), false);
+            let err = cm.render_args(&ctx(lane, "x", None)).unwrap_err();
+            assert!(
+                err.to_lowercase().contains("seed") || err.contains("key"),
+                "0x hex key must still trip the seed/key gate under password \"x\" ({lane:?}); got: {err}"
+            );
+
+            // 2) An upstream `supportxmr` host (contains `x`) must still be flagged.
+            let tpl_xmr = vec![
+                "-o".into(), "{POOL}".into(), "-u".into(), "{WALLET}".into(),
+                "-p".into(), "{PASSWORD}".into(),
+                "--backup".into(), "supportxmr.com:3333".into(),
+            ];
+            let cm = custom(MinerPreset::Template, lane, Some(tpl_xmr), false);
+            let err = cm.render_args(&ctx(lane, "x", None)).unwrap_err();
+            assert!(
+                err.to_lowercase().contains("supportxmr"),
+                "supportxmr host must still trip the upstream-marker gate under password \"x\" ({lane:?}); got: {err}"
+            );
+
+            // 3) An upstream `kryptex` host (contains `x`) must still be flagged.
+            let tpl_kx = vec![
+                "-o".into(), "{POOL}".into(), "-u".into(), "{WALLET}".into(),
+                "-p".into(), "{PASSWORD}".into(),
+                "--backup".into(), "prl.kryptex.network:7048".into(),
+            ];
+            let cm = custom(MinerPreset::Template, lane, Some(tpl_kx), false);
+            let err = cm.render_args(&ctx(lane, "x", None)).unwrap_err();
+            assert!(
+                err.to_lowercase().contains("kryptex"),
+                "kryptex host must still trip the upstream-marker gate under password \"x\" ({lane:?}); got: {err}"
+            );
+        }
     }
 
     #[test]

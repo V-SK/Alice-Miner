@@ -745,7 +745,10 @@ fn configure_custom_miner(cfg: &SetupConfig, lane: Lane) -> Result<(), i32> {
         preset: preset.id().to_string(),
         arg_template,
         log_file: None,
-        acknowledged_unverified: true,
+        // Defence-in-depth: use the value we actually computed above (the early return
+        // at the `!acknowledged` check already guarantees it is `true` here, but binding
+        // the real variable keeps the two in lockstep if that guard is ever refactored).
+        acknowledged_unverified: acknowledged,
     };
     match CustomMiner::from_config(&store) {
         Ok(cm) => {
