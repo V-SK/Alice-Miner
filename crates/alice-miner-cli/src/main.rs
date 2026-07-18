@@ -648,6 +648,33 @@ struct SetupArgs {
     /// Read the `--generate` keystore passphrase from the first line of STDIN.
     #[arg(long, conflicts_with = "password")]
     password_stdin: bool,
+    /// Which miner to run: `bundled` (the recommended SHA-pinned engine — the
+    /// default), `custom` (your OWN, possibly closed-source binary — the CLI fully
+    /// manages it), or `companion` (don't spawn a miner; run only the possession-proof
+    /// keep-alive so YOUR own rig's shares are credited to you). Omit to be asked.
+    #[arg(long, value_name = "MODE")]
+    miner: Option<String>,
+    /// (with `--miner custom`) Absolute path to your miner binary.
+    #[arg(long, value_name = "PATH")]
+    miner_bin: Option<String>,
+    /// (with `--miner custom`) The miner family / argv shape: `srbminer`, `xmrig`,
+    /// `trex`, `lolminer`, `gminer`, `nbminer`, `alpha-miner`, `generic-stratum`, or
+    /// `template` (used with `--miner-arg-template`).
+    #[arg(long, value_name = "PRESET")]
+    miner_preset: Option<String>,
+    /// (with `--miner custom --miner-preset template`) A fully custom argv with the
+    /// placeholders {POOL} {HOST} {PORT} {WALLET} {PASSWORD} {ALGO} {LOGFILE}
+    /// (space-separated; Alice substitutes the real values).
+    #[arg(long, value_name = "ARGV")]
+    miner_arg_template: Option<String>,
+    /// (with `--miner custom`) Confirm you want to run your OWN unverified binary (its
+    /// integrity is NOT SHA-checked). Required for a non-interactive custom setup.
+    #[arg(long)]
+    i_understand_unverified: bool,
+    /// Pin the GPU region: `us`, `asia`, `eu`, or `auto` (nearest — the default).
+    /// Remembered for later runs (only affects the GPU-PRL lane).
+    #[arg(long, value_name = "REGION")]
+    region: Option<String>,
 }
 
 #[derive(clap::Args)]
