@@ -1,6 +1,6 @@
 [package]
 name = "alice-miner-gui"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2021"
 
 # The Alice Miner desktop app (the product): an eframe/egui binary on the SAME
