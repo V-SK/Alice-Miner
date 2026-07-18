@@ -299,11 +299,26 @@ impl CustomMiner {
     /// lane. `None` when nothing is configured or it targets a different lane (that
     /// lane then uses the bundled engine). A malformed config is treated as "none"
     /// here (the engine surfaces the parse error via [`CustomMiner::from_config`] on
-    /// the configured lane only).
+    /// the configured lane only). The lenient variant — the CLI / tests use it.
     pub fn resolve_for_lane(lane: Lane) -> Option<CustomMiner> {
         let cfg = crate::settings::load().custom_miner?;
         let cm = CustomMiner::from_config(&cfg).ok()?;
         (cm.lane == lane).then_some(cm)
+    }
+
+    /// Like [`CustomMiner::resolve_for_lane`], but SURFACES a config error when the
+    /// persisted custom miner TARGETS `lane` (so the engine fails start with a clear
+    /// message rather than silently running the bundled engine on a broken custom
+    /// config). A config that targets a DIFFERENT lane — or has an unparseable lane
+    /// token — yields `Ok(None)` (that lane cleanly uses the bundled engine).
+    pub fn resolve_for_lane_strict(lane: Lane) -> Result<Option<CustomMiner>, String> {
+        let Some(cfg) = crate::settings::load().custom_miner else {
+            return Ok(None);
+        };
+        match parse_lane_token(&cfg.lane) {
+            Some(l) if l == lane => Ok(Some(CustomMiner::from_config(&cfg)?)),
+            _ => Ok(None),
+        }
     }
 
     /// Whether the supervisor must TAIL a log file for this miner's stats.

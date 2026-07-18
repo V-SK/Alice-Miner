@@ -876,7 +876,22 @@ fn start_one_lane(
     // a Layer-B failover. Resolves the binary each time so a freshly-installed
     // engine is picked up; the honesty invariant holds (relay-only endpoints).
     let addr_for_rebuild = address.clone();
-    let rebuild: crate::supervise::RebuildFn = match lane {
+
+    // ── Backend selection (form A) ──────────────────────────────────────────────
+    // If the user configured a CUSTOM (bring-your-own, possibly closed-source) miner
+    // for THIS lane, spawn it — fully managed, reusing the SAME supervisor / region-
+    // bound PoP / failover / telemetry shell — instead of the bundled engine. Only
+    // the binary + argv shape differ; the reward-attribution login (`<alice>.<worker>`)
+    // and every PoP/enroll/refresh path below are byte-identical. A config targeting a
+    // different lane (or none) falls through to the bundled engine.
+    let (rebuild, parser, log_tail): (
+        crate::supervise::RebuildFn,
+        crate::stats::ParserKind,
+        Option<std::path::PathBuf>,
+    ) = if let Some(custom) = crate::backend::CustomMiner::resolve_for_lane_strict(lane)? {
+        build_custom_backend(lane, addr_for_rebuild.clone(), secrets.clone(), custom)?
+    } else {
+        let rebuild: crate::supervise::RebuildFn = match lane {
         Lane::Xmr => {
             // XMR-lane PoP (mirror of GPU-Alpha's OOB pattern). xmrig speaks only
             // stock stratum and cannot fetch+sign a challenge itself, so when PoP is
@@ -1046,12 +1061,14 @@ fn start_one_lane(
                 Ok((p.program, p.args))
             })
         }
+        };
+        (rebuild, crate::stats::ParserKind::for_lane(lane), None)
     };
 
     // Build the initial launch plan (Layer A: all endpoints, primary first).
     let (program, args) = rebuild(&plan.ordered_from_cursor())?;
 
-    let sup = LaneSupervisor::with_endpoints(lane, plan);
+    let sup = LaneSupervisor::with_backend(lane, plan, parser, log_tail);
     sup.start(program, args, rebuild)?;
 
     // ── T4 item 5: OOB-allowlist refresh task (GPU-PRL only). The relay drops a
@@ -1119,6 +1136,108 @@ fn prl_log_path() -> std::path::PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!("alice-gpu-prl-{}-{}.log", std::process::id(), nanos))
+}
+
+/// A unique, supervisor-owned log path for a CUSTOM file-logging miner (the miner's
+/// argv `{LOGFILE}` / `--log-file` value; the supervisor tails it). Stable for the
+/// run + unique per process so two runs never collide.
+fn custom_log_path() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("alice-custom-{}-{}.log", std::process::id(), nanos))
+}
+
+/// The mining algorithm token a lane's argv carries (`pearlhash` / `rx/0` /
+/// `kawpow`). Argv-only; used to fill the custom miner's [`crate::backend::ArgContext`].
+fn lane_algo(lane: Lane) -> &'static str {
+    match lane {
+        Lane::GpuPrl | Lane::GpuAlpha => "pearlhash",
+        Lane::Xmr => "rx/0",
+        Lane::GpuRvn => "kawpow",
+    }
+}
+
+/// Build the [`crate::supervise::RebuildFn`] + parser + optional log-tail path for a
+/// CUSTOM (bring-your-own) miner. Structurally IDENTICAL to the bundled rebuild
+/// closures (§2.2): resolve the binary, derive the `<alice>.<worker>` login (the
+/// reward-attribution key is UNCHANGED), run the region-bound PoP for a pearlhash
+/// lane (or the OOB enroll for an XMR-PoP lane), then render the miner's argv from
+/// its preset/template — every argv passes the honesty gate ([`crate::backend::
+/// assert_no_forbidden`], run inside `render_args`). The only difference from a
+/// bundled lane is the binary + argv shape; the shared enroll/refresh block below
+/// (`is_prl_lane`) applies verbatim so a custom pearlhash miner is credited exactly
+/// like the bundled one.
+fn build_custom_backend(
+    lane: Lane,
+    address: String,
+    secrets: Option<alice_crypto::WalletSecrets>,
+    custom: crate::backend::CustomMiner,
+) -> Result<
+    (
+        crate::supervise::RebuildFn,
+        crate::stats::ParserKind,
+        Option<std::path::PathBuf>,
+    ),
+    String,
+> {
+    let parser = custom.preset.parser_kind();
+    let log_tail: Option<std::path::PathBuf> = custom.needs_log_tail().then(custom_log_path);
+    let algo = lane_algo(lane).to_string();
+    let is_prl = lane.is_prl_lane();
+    let xmr_pop = lane == Lane::Xmr && xmr_pop_required();
+    // A pearlhash lane MUST have the unlocked signing key for the region-bound PoP —
+    // the caller (worker_loop) already unlocked + rejected watch-only, so a missing
+    // secret here is a programming error; fail closed (mirrors the bundled arms).
+    if (is_prl || xmr_pop) && secrets.is_none() {
+        return Err(
+            "internal: custom PoP lane started without an unlocked signing key".into(),
+        );
+    }
+    let ret_log_tail = log_tail.clone();
+    let rebuild: crate::supervise::RebuildFn = Arc::new(move |eps: &[Endpoint]| {
+        let Some(active) = eps.first() else {
+            return Err("custom miner launch plan needs at least one endpoint".into());
+        };
+        let program = crate::backend::resolve_custom_binary(&custom)?;
+        // device_id == the stratum worker suffix the login presents (the same
+        // reward-attribution key + OOB allowlist key the bundled lanes use).
+        let device_id = xmr::derive_worker_id(&address)?;
+        let wallet = format!("{address}.{device_id}");
+        let password = if is_prl {
+            let secrets = secrets
+                .as_ref()
+                .ok_or("internal: custom pearlhash lane without an unlocked key")?;
+            // Region-bound PoP for the ACTIVE region (re-minted on every rebuild /
+            // failover, exactly like the bundled pearlhash lanes).
+            let token = crate::pop::establish_pop(&active.host, &address, &device_id, secrets, None)?;
+            token.password
+        } else if xmr_pop {
+            // XMR-PoP: OOB-enroll (address, device) so the token-less `x` login is
+            // authorized; the password stays the conventional `x`.
+            let secrets = secrets
+                .as_ref()
+                .ok_or("internal: custom xmr PoP lane without an unlocked key")?;
+            let _t = crate::pop::establish_pop(&active.host, &address, &device_id, secrets, None)?;
+            "x".to_string()
+        } else {
+            "x".to_string()
+        };
+        let ctx = crate::backend::ArgContext {
+            pool_authority: format!("{}:{}", active.host, active.port),
+            pool_url: format!("stratum+tcp://{}:{}", active.host, active.port),
+            host: active.host.clone(),
+            port: active.port,
+            wallet,
+            password,
+            algo: algo.clone(),
+            log_file: log_tail.clone(),
+        };
+        let args = custom.render_args(&ctx)?;
+        Ok((program, args))
+    });
+    Ok((rebuild, parser, ret_log_tail))
 }
 
 /// Spawn the GPU-PRL OOB-allowlist refresh task (T4 item 5). MUST be called inside
@@ -1419,6 +1538,59 @@ fn build_prl_payout_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T4: a CUSTOM (bring-your-own) miner on the XMR lane produces a launch plan that
+    /// runs the USER's binary with the reward-attribution login (`<addr>.<worker>`), the
+    /// lane's algorithm, the Alice relay, and NO leaked secret/collection/upstream —
+    /// proving `build_custom_backend` reuses the bundled shell (only the binary + argv
+    /// shape differ). XMR (PoP off by default) needs no key/network, so this is hermetic.
+    #[test]
+    fn custom_backend_xmr_builds_user_binary_launch_plan() {
+        let addr = alice_crypto::create_wallet_payload(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "miner-test-passphrase",
+        )
+        .expect("test wallet payload")
+        .address;
+
+        // A real, executable stub binary the resolver will accept (acknowledged).
+        let tmp = std::env::temp_dir().join(format!("alice-custom-engine-{}", std::process::id()));
+        std::fs::write(&tmp, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&tmp).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&tmp, perm).unwrap();
+        }
+        let custom = crate::backend::CustomMiner {
+            path: tmp.clone(),
+            lane: Lane::Xmr,
+            preset: crate::backend::MinerPreset::GenericStratum,
+            arg_template: None,
+            log_file: false,
+            acknowledged_unverified: true,
+        };
+        let (rebuild, parser, log_tail) =
+            build_custom_backend(Lane::Xmr, addr.clone(), None, custom).expect("build backend");
+        assert_eq!(parser, crate::stats::ParserKind::Generic);
+        assert!(log_tail.is_none(), "a stdout miner needs no log tail");
+
+        let eps = vec![Endpoint::plaintext("hk.aliceprotocol.org", 3333)];
+        let (program, args) = rebuild(&eps).expect("rebuild");
+        assert_eq!(program, tmp, "runs the USER's binary");
+        let worker = xmr::derive_worker_id(&addr).unwrap();
+        let j = args.join(" ");
+        assert!(j.contains(&format!("{addr}.{worker}")), "reward login is <addr>.<worker>: {j}");
+        assert!(j.contains("rx/0"), "xmr algorithm: {j}");
+        assert!(j.contains("stratum+tcp://hk.aliceprotocol.org:3333"), "alice relay: {j}");
+        // Honesty: no collection address / upstream pool / seed in the argv.
+        assert!(!j.contains("prl1p"));
+        assert!(!j.to_lowercase().contains("herominers"));
+        assert!(!args.iter().any(|a| a.contains("seed") || a.contains("priv")));
+
+        let _ = std::fs::remove_file(&tmp);
+    }
 
     /// CREDIT-ONLY: the serialized snapshot must never carry a `paid_acu` (or
     /// any payout/claim/settlement) field — by construction (PLAN §2.2).
