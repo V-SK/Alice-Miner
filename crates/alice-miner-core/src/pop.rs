@@ -206,12 +206,24 @@ struct VerifyResponse {
 
 #[derive(Deserialize)]
 struct EnrollNonceResponse {
-    // The server (shadow_server/http_app.py) emits the single-use nonce under the key
-    // `enroll_nonce`; accept it AND the plain `nonce` alias. Without this alias the
-    // 0.6.0–0.6.3 body (`enroll_nonce` only) failed to deserialize ("missing field
-    // `nonce`") → EnrollOutcome::Failed → the enroll completion POST was never sent.
-    #[serde(alias = "enroll_nonce")]
-    nonce: String,
+    // The server (shadow_server/http_app.py) emits the single-use nonce under the
+    // canonical key `enroll_nonce`; the post-hotfix server ALSO emits the byte-identical
+    // value under `nonce` so pre-hotfix clients parse. Deserialize BOTH as distinct
+    // optional fields and resolve with `.or()` in `fetch_enroll_nonce` — mirrors
+    // `ChallengeResponse` above.
+    //
+    // A single `#[serde(alias = "enroll_nonce")]` field is WRONG here: when the body
+    // carries both keys (the steady state every post-hotfix client sees) serde rejects
+    // it with "duplicate field `nonce`", so the alias client would break against the
+    // very server it is meant to pair with. Two fields accept nonce-only, enroll_nonce
+    // -only, AND both.
+    /// Canonical field.
+    #[serde(default)]
+    enroll_nonce: Option<String>,
+    /// Back-compat / forward-compat plain field (older assumed shape; also emitted by
+    /// the post-hotfix server).
+    #[serde(default)]
+    nonce: Option<String>,
 }
 
 /// Reject any non-`https://` URL — fail closed so a PoP token / payout binding can
@@ -355,10 +367,14 @@ pub fn fetch_enroll_nonce(alice_address: &str, device_id: &str) -> Result<String
         device_id,
     };
     let resp: EnrollNonceResponse = post_json(&url, &body)?;
-    if resp.nonce.is_empty() {
+    let nonce = resp
+        .enroll_nonce
+        .or(resp.nonce)
+        .ok_or_else(|| "enroll-nonce response missing enroll_nonce/nonce".to_string())?;
+    if nonce.is_empty() {
         return Err("enroll-nonce response had empty nonce".into());
     }
-    Ok(resp.nonce)
+    Ok(nonce)
 }
 
 /// Submit the M4 enroll (payout-binding) to the CENTRAL host (or [`ENV_ENROLL_URL`]).
@@ -834,19 +850,32 @@ mod tests {
 
     #[test]
     fn enroll_nonce_response_parses_canonical_server_field() {
-        // The REAL server body carries the nonce under `enroll_nonce` (plus other
-        // informational fields it ignores). This is the shape that previously failed
-        // to deserialize; it MUST parse via the serde alias.
+        // The REAL pre-hotfix server body carries the nonce ONLY under `enroll_nonce`
+        // (plus informational fields the client ignores). This is the shape that
+        // previously failed to deserialize; it MUST resolve via the `enroll_nonce` field.
         let raw = r#"{"ok":true,"alice_address":"a","device_id":"d","enroll_nonce":"enroll-nonce-xyz","scheme":"sr25519","single_use":true,"nonce_contract":"alice_prl_m4_enroll_nonce_v1"}"#;
         let resp: EnrollNonceResponse = serde_json::from_str(raw).unwrap();
-        assert_eq!(resp.nonce, "enroll-nonce-xyz");
+        assert_eq!(resp.enroll_nonce.or(resp.nonce).as_deref(), Some("enroll-nonce-xyz"));
     }
 
     #[test]
     fn enroll_nonce_response_accepts_plain_nonce_alias() {
-        // The forward-compat `nonce` key (post-hotfix the server emits BOTH) also parses.
+        // A body that carries ONLY the plain `nonce` key still resolves (forward-compat).
         let resp: EnrollNonceResponse =
             serde_json::from_str(r#"{"nonce":"enroll-nonce-xyz"}"#).unwrap();
-        assert_eq!(resp.nonce, "enroll-nonce-xyz");
+        assert_eq!(resp.enroll_nonce.or(resp.nonce).as_deref(), Some("enroll-nonce-xyz"));
+    }
+
+    #[test]
+    fn enroll_nonce_response_accepts_both_keys_steady_state() {
+        // Regression lock for the alias-collision bug: the POST-HOTFIX server emits
+        // BOTH `enroll_nonce` and `nonce` with a byte-identical value. A single
+        // `#[serde(alias = "enroll_nonce")]` field rejects this body with serde's
+        // "duplicate field `nonce`" — so the v0.6.4 alias client would break against the
+        // steady-state server. The two-field `.or()` shape MUST accept it. (The earlier
+        // single-key tests were a false green precisely because they never fed both keys.)
+        let raw = r#"{"ok":true,"alice_address":"a","device_id":"d","enroll_nonce":"enroll-nonce-xyz","nonce":"enroll-nonce-xyz","scheme":"sr25519","single_use":true}"#;
+        let resp: EnrollNonceResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.enroll_nonce.or(resp.nonce).as_deref(), Some("enroll-nonce-xyz"));
     }
 }
