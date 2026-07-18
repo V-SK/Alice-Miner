@@ -57,6 +57,33 @@ pub enum StartChoice {
     Ask,
 }
 
+/// Which miner program the wizard configures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinerChoice {
+    /// The recommended bundled (SHA-pinned) engine — the default.
+    Bundled,
+    /// A user-supplied custom (bring-your-own, possibly closed-source) miner — the
+    /// CLI fully manages it (form A).
+    Custom,
+    /// Don't spawn a miner; run only the possession-proof keep-alive for the user's
+    /// OWN rig (form B — `companion`).
+    CompanionOnly,
+    /// Decide interactively (default to Bundled when non-interactive).
+    Ask,
+}
+
+impl MinerChoice {
+    /// Parse the `--miner` token. `None` for an unknown value.
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "bundled" | "official" | "default" => Some(MinerChoice::Bundled),
+            "custom" | "byo" => Some(MinerChoice::Custom),
+            "companion" | "companion-only" | "byo-companion" => Some(MinerChoice::CompanionOnly),
+            _ => None,
+        }
+    }
+}
+
 /// The resolved wizard configuration (flags + interactivity).
 #[derive(Debug, Clone)]
 pub struct SetupConfig {
@@ -75,6 +102,20 @@ pub struct SetupConfig {
     /// shared resolver) — or read from stdin when `password_stdin`.
     pub password: Option<String>,
     pub password_stdin: bool,
+    /// Which miner program to run (`--miner`): bundled / custom / companion-only, or
+    /// [`MinerChoice::Ask`].
+    pub miner: MinerChoice,
+    /// (custom) The user's miner binary path (`--miner-bin`).
+    pub miner_bin: Option<String>,
+    /// (custom) The miner family / argv shape (`--miner-preset`).
+    pub miner_preset: Option<String>,
+    /// (custom + template preset) A custom argv with placeholders (`--miner-arg-template`).
+    pub miner_arg_template: Option<String>,
+    /// (custom) The explicit "run my own unverified binary" acknowledgement.
+    pub i_understand_unverified: bool,
+    /// The GPU region to pin (`--region`): `us`/`asia`/`eu`/`auto`, or `None` to ask
+    /// (interactive) / keep the remembered value (non-interactive).
+    pub region: Option<String>,
 }
 
 impl SetupConfig {
@@ -90,6 +131,12 @@ impl SetupConfig {
             start: StartChoice::Ask,
             password: None,
             password_stdin: false,
+            miner: MinerChoice::Ask,
+            miner_bin: None,
+            miner_preset: None,
+            miner_arg_template: None,
+            i_understand_unverified: false,
+            region: None,
         }
     }
 }
@@ -110,6 +157,13 @@ impl From<crate::SetupArgs> for SetupConfig {
         } else {
             StartChoice::Ask
         };
+        // A `--miner-bin`/`--miner-preset` without an explicit `--miner custom` still
+        // implies the custom path (the user is clearly configuring a custom miner).
+        let miner = match a.miner.as_deref().and_then(MinerChoice::parse) {
+            Some(c) => c,
+            None if a.miner_bin.is_some() || a.miner_preset.is_some() => MinerChoice::Custom,
+            None => MinerChoice::Ask,
+        };
         SetupConfig {
             lane: a.lane,
             address,
@@ -119,6 +173,12 @@ impl From<crate::SetupArgs> for SetupConfig {
             start,
             password: a.password,
             password_stdin: a.password_stdin,
+            miner,
+            miner_bin: a.miner_bin,
+            miner_preset: a.miner_preset,
+            miner_arg_template: a.miner_arg_template,
+            i_understand_unverified: a.i_understand_unverified,
+            region: a.region,
         }
     }
 }
@@ -164,8 +224,15 @@ pub fn run(cfg: SetupConfig, no_color: bool) -> i32 {
             tr!("selected", "已选")
         }
     );
-    // Honest viability gate (the same one `start` uses) — refuse early.
-    if !cap.support(lane).is_runnable() {
+
+    // (1b) Miner program: the recommended bundled engine, your OWN custom miner, or
+    // companion-only (you launch your rig; the CLI only holds the possession proof).
+    let miner_choice = resolve_miner_choice(&cfg);
+
+    // Honest viability gate (the same one `start` uses) — refuse early. Skipped for
+    // companion-only: there the miner runs on the USER's rig (possibly another box),
+    // so this machine's GPU viability is irrelevant — the CLI only holds the PoP.
+    if miner_choice != MinerChoice::CompanionOnly && !cap.support(lane).is_runnable() {
         eprintln!(
             "error: {}",
             tr!(
@@ -189,6 +256,25 @@ pub fn run(cfg: SetupConfig, no_color: bool) -> i32 {
         Err(code) => return code,
     };
     println!("{}: {address}", tr!("Address", "地址"));
+
+    // Companion-only (form B): don't spawn a miner — collect the region, then run the
+    // possession-proof keep-alive for the user's OWN rig. Routes to the existing
+    // `companion` path; never touches the mining start / prl-payout / difficulty steps.
+    if miner_choice == MinerChoice::CompanionOnly {
+        return run_companion_only(&cfg, lane, address, generated_passphrase);
+    }
+
+    // (2b) Custom miner (form A): configure + persist the backend, or clear any stale
+    // custom config for a bundled choice (so a prior custom setup doesn't linger).
+    if let Err(code) = apply_miner_choice(&cfg, miner_choice, lane) {
+        return code;
+    }
+
+    // (2c) Region: `us`/`asia`/`eu` LOCKS the GPU-PRL lane to a region (remembered);
+    // `auto` clears the lock (nearest, with auto-failover). Only affects GPU-PRL.
+    if let Err(code) = resolve_and_persist_region(&cfg, lane) {
+        return code;
+    }
 
     // (3) Optional 15% PRL return address for a GPU lane.
     if let Err(code) = maybe_set_prl_payout(&cfg, lane) {
@@ -313,21 +399,29 @@ fn resolve_reward_address(
                 );
                 return Err(EXIT_USAGE);
             }
-            // Paste or generate?
-            println!("{}", tr!("Set your reward address:", "设置你的奖励地址:"));
-            println!("  {}", tr!("1) paste an existing Alice address", "1) 粘贴已有的 Alice 地址"));
+            // No reward address yet: make generating one the frictionless DEFAULT
+            // (`[Y/n]`), and treat "no" as "paste an existing address" — so a brand-new
+            // miner just presses Enter to get an identity + backup phrase.
             println!(
-                "  {}",
+                "{}",
                 tr!(
-                    "2) generate a new identity (you'll back up a 24-word phrase)",
-                    "2) 生成新身份(你需要备份 24 个词的助记词)"
+                    "No reward address yet.",
+                    "尚无奖励地址。"
                 )
             );
-            let choice = prompt_line(tr!("Choose [1/2]: ", "选择 [1/2]: ")).unwrap_or_default();
-            if choice == "2" {
+            let ans = prompt_line(tr!(
+                "Generate a new identity now? (you'll back up a 24-word phrase) [Y/n] ",
+                "现在生成一个新身份?(你需要备份 24 个词的助记词)[Y/n] "
+            ))
+            .unwrap_or_default();
+            if ans.is_empty() || ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes") {
                 generate_identity_address(cfg).map(|(a, pw)| (a, Some(pw)))
             } else {
-                let pasted = prompt_line(tr!("Alice address: ", "Alice 地址: ")).unwrap_or_default();
+                let pasted = prompt_line(tr!(
+                    "Paste your existing Alice address: ",
+                    "粘贴你已有的 Alice 地址: "
+                ))
+                .unwrap_or_default();
                 validate_or_reject(&pasted).map(|a| (a, None))
             }
         }
@@ -522,6 +616,389 @@ fn start_choice(cfg: &SetupConfig) -> StartChoice {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// T6: miner-program selection, custom-miner configuration, region, companion.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve which miner program to configure. A flag choice wins; otherwise, on a
+/// terminal, ask (default = the recommended bundled engine); non-interactive with no
+/// flag defaults to Bundled (the copy-paste line's zero-config path).
+fn resolve_miner_choice(cfg: &SetupConfig) -> MinerChoice {
+    if cfg.miner != MinerChoice::Ask {
+        return cfg.miner;
+    }
+    if !can_prompt(cfg) {
+        return MinerChoice::Bundled;
+    }
+    println!("\n{}", tr!("Miner program:", "挖矿程序:"));
+    println!(
+        "  {}",
+        tr!(
+            "1) recommended engine, managed for you (default)",
+            "1) 推荐引擎,由我们托管(默认)"
+        )
+    );
+    println!(
+        "  {}",
+        tr!(
+            "2) my own miner program (I'll give its path)",
+            "2) 我自己的挖矿程序(我来提供路径)"
+        )
+    );
+    println!(
+        "  {}",
+        tr!(
+            "3) I run my own rig — just hold my authorization (companion)",
+            "3) 我自己启动矿机 —— 只需持有我的授权(伴侣模式)"
+        )
+    );
+    match prompt_line(tr!("Choose [1/2/3]: ", "选择 [1/2/3]: "))
+        .unwrap_or_default()
+        .trim()
+    {
+        "2" => MinerChoice::Custom,
+        "3" => MinerChoice::CompanionOnly,
+        _ => MinerChoice::Bundled,
+    }
+}
+
+/// Apply the miner choice: configure + persist a custom miner, or clear any stale
+/// custom config for a bundled run (so a prior custom setup never lingers).
+/// Companion-only is handled earlier in `run` and never reaches here.
+fn apply_miner_choice(cfg: &SetupConfig, choice: MinerChoice, lane: Lane) -> Result<(), i32> {
+    match choice {
+        MinerChoice::Custom => configure_custom_miner(cfg, lane),
+        _ => {
+            // Bundled (or a stray Ask): clear any previously-saved custom miner so the
+            // bundled engine actually runs. Best-effort (a read-only home is not fatal).
+            let _ = alice_miner_core::settings::clear_custom_miner();
+            Ok(())
+        }
+    }
+}
+
+/// Configure + persist a CUSTOM (bring-your-own) miner for `lane`: resolve the binary
+/// path (flag / detected / prompt), the preset (flag / detected family / prompt), an
+/// arg-template for the `template` preset, and the explicit unverified acknowledgement.
+fn configure_custom_miner(cfg: &SetupConfig, lane: Lane) -> Result<(), i32> {
+    use alice_miner_core::backend::{CustomMiner, MinerPreset};
+
+    // 1) Binary path: an explicit flag, else a detected miner / manual prompt.
+    let (path, detected_family): (String, Option<MinerPreset>) = match cfg.miner_bin.clone() {
+        Some(p) => (p, None),
+        None => pick_custom_binary(cfg, lane)?,
+    };
+
+    // 2) Preset: flag → detected family → prompt/default.
+    let preset = resolve_custom_preset(cfg, detected_family)?;
+
+    // 3) arg_template (only for the `template` preset).
+    let arg_template = if preset == MinerPreset::Template {
+        let raw = cfg.miner_arg_template.clone().or_else(|| {
+            can_prompt(cfg)
+                .then(|| {
+                    prompt_line(tr!(
+                        "argv template (use {POOL} {WALLET} {PASSWORD} {ALGO} [{LOGFILE}]): ",
+                        "argv 模板(使用 {POOL} {WALLET} {PASSWORD} {ALGO} [{LOGFILE}]): "
+                    ))
+                })
+                .flatten()
+        });
+        let tokens: Vec<String> = raw
+            .as_deref()
+            .unwrap_or("")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        if tokens.is_empty() {
+            eprintln!(
+                "error: {}",
+                tr!(
+                    "the `template` preset needs an argv template (--miner-arg-template).",
+                    "`template` 预设需要 argv 模板(--miner-arg-template)。"
+                )
+            );
+            return Err(EXIT_USAGE);
+        }
+        Some(tokens)
+    } else {
+        None
+    };
+
+    // 4) Explicit unverified acknowledgement (flag or one [y/N] prompt).
+    let acknowledged = cfg.i_understand_unverified || ack_unverified(cfg, &path);
+    if !acknowledged {
+        eprintln!(
+            "error: {}",
+            tr!(
+                "a custom miner is not integrity-checked; re-run with --i-understand-unverified to confirm.",
+                "自定义矿机不做完整性校验;请加 --i-understand-unverified 确认后重试。"
+            )
+        );
+        return Err(EXIT_USAGE);
+    }
+
+    // 5) Build (validates lane/preset/template) + persist.
+    let store = alice_miner_core::settings::CustomMinerConfig {
+        path,
+        lane: lane.cli_lane_arg().to_string(),
+        preset: preset.id().to_string(),
+        arg_template,
+        log_file: None,
+        // Defence-in-depth: use the value we actually computed above (the early return
+        // at the `!acknowledged` check already guarantees it is `true` here, but binding
+        // the real variable keeps the two in lockstep if that guard is ever refactored).
+        acknowledged_unverified: acknowledged,
+    };
+    match CustomMiner::from_config(&store) {
+        Ok(cm) => {
+            if !cm.path.is_file() {
+                eprintln!(
+                    "warning: {}",
+                    tr!(
+                        "custom miner path does not exist yet: {p}",
+                        "自定义矿机路径尚不存在: {p}"
+                    )
+                    .replace("{p}", &cm.path.display().to_string())
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Err(EXIT_USAGE);
+        }
+    }
+    match alice_miner_core::settings::save_custom_miner(&store) {
+        Ok(_) => {
+            println!(
+                "{}: {} [{}]",
+                tr!("Custom miner set", "已设置自定义矿机"),
+                store.path,
+                store.preset
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            Err(EXIT_RUNTIME)
+        }
+    }
+}
+
+/// Pick the custom binary: scan for installed miners compatible with `lane`, list
+/// them, and let the user choose one or enter a path. Returns `(path, detected
+/// family)`. Non-interactive with no `--miner-bin` is a usage error.
+fn pick_custom_binary(cfg: &SetupConfig, lane: Lane) -> Result<(String, Option<alice_miner_core::backend::MinerPreset>), i32> {
+    let candidates: Vec<alice_miner_core::detect::DetectedMiner> =
+        alice_miner_core::detect::scan_installed_miners()
+            .into_iter()
+            .filter(|m| m.supports_lane(lane))
+            .collect();
+
+    if !can_prompt(cfg) {
+        eprintln!(
+            "error: {}",
+            tr!(
+                "no --miner-bin given and no interactive prompt available.",
+                "未提供 --miner-bin,且无法进行交互式提示。"
+            )
+        );
+        return Err(EXIT_USAGE);
+    }
+
+    if !candidates.is_empty() {
+        println!("\n{}", tr!("Detected miners:", "检测到的矿机:"));
+        for (i, m) in candidates.iter().enumerate() {
+            println!(
+                "  {}) {} [{}]{}",
+                i + 1,
+                m.path.display(),
+                m.family.id(),
+                m.version.as_deref().map(|v| format!("  {v}")).unwrap_or_default()
+            );
+        }
+        println!(
+            "  {}) {}",
+            candidates.len() + 1,
+            tr!("enter a path manually", "手动输入路径")
+        );
+        let ans = prompt_line(tr!("Choose a miner: ", "选择矿机: ")).unwrap_or_default();
+        if let Ok(n) = ans.trim().parse::<usize>() {
+            if (1..=candidates.len()).contains(&n) {
+                let m = &candidates[n - 1];
+                return Ok((m.path.display().to_string(), Some(m.family)));
+            }
+        }
+        // Any other answer → fall through to a manual path.
+    }
+
+    let p = prompt_line(tr!(
+        "Absolute path to your miner binary: ",
+        "你的矿机二进制的绝对路径: "
+    ))
+    .unwrap_or_default();
+    if p.trim().is_empty() {
+        eprintln!("error: {}", tr!("no miner path given.", "未提供矿机路径。"));
+        return Err(EXIT_USAGE);
+    }
+    Ok((p.trim().to_string(), None))
+}
+
+/// Resolve the custom miner PRESET: an explicit `--miner-preset`, else the detected
+/// family, else a prompt (default `generic-stratum`). Non-interactive with neither
+/// → `generic-stratum` (the safe standard shape).
+fn resolve_custom_preset(
+    cfg: &SetupConfig,
+    detected: Option<alice_miner_core::backend::MinerPreset>,
+) -> Result<alice_miner_core::backend::MinerPreset, i32> {
+    use alice_miner_core::backend::MinerPreset;
+    if let Some(tok) = cfg.miner_preset.as_deref() {
+        return MinerPreset::parse(tok).ok_or_else(|| {
+            eprintln!(
+                "error: {}",
+                tr!("unknown --miner-preset `{p}`.", "未知的 --miner-preset `{p}`。").replace("{p}", tok)
+            );
+            EXIT_USAGE
+        });
+    }
+    if let Some(f) = detected {
+        return Ok(f);
+    }
+    if can_prompt(cfg) {
+        let ans = prompt_line(tr!(
+            "Miner family [srbminer/xmrig/trex/lolminer/gminer/nbminer/alpha-miner/generic-stratum/template] (default generic-stratum): ",
+            "矿机族 [srbminer/xmrig/trex/lolminer/gminer/nbminer/alpha-miner/generic-stratum/template](默认 generic-stratum): "
+        ))
+        .unwrap_or_default();
+        if ans.trim().is_empty() {
+            return Ok(MinerPreset::GenericStratum);
+        }
+        return MinerPreset::parse(ans.trim()).ok_or_else(|| {
+            eprintln!("error: {}", tr!("unknown miner family.", "未知的矿机族。"));
+            EXIT_USAGE
+        });
+    }
+    Ok(MinerPreset::GenericStratum)
+}
+
+/// One `[y/N]` confirmation that the user wants to run their OWN unverified binary
+/// (its integrity is not SHA-checked). Non-interactive → `false` (the caller then
+/// requires the `--i-understand-unverified` flag).
+fn ack_unverified(cfg: &SetupConfig, path: &str) -> bool {
+    if !can_prompt(cfg) {
+        return false;
+    }
+    println!(
+        "\n{}",
+        tr!(
+            "A custom miner is YOUR binary — its integrity is NOT checked against any signed release.",
+            "自定义矿机是你自己的二进制 —— 其完整性不会与任何签名发布做校验。"
+        )
+    );
+    let ans = prompt_line(
+        &tr!("Run {p} anyway? [y/N] ", "仍然运行 {p} 吗?[y/N] ").replace("{p}", path),
+    )
+    .unwrap_or_default();
+    ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes")
+}
+
+/// Resolve + persist the GPU-PRL region pin from `--region` (or a prompt on the
+/// GPU-PRL lane): a known tag LOCKS the lane to it (remembered); `auto`/blank CLEARS
+/// the lock. Only the GPU-PRL lane is region-aware; other lanes are a no-op.
+fn resolve_and_persist_region(cfg: &SetupConfig, lane: Lane) -> Result<(), i32> {
+    let raw: String = if let Some(r) = cfg.region.as_deref() {
+        r.to_string()
+    } else if lane == Lane::GpuPrl && can_prompt(cfg) {
+        let tags = alice_miner_core::lane::gpu_prl::region_tags().join("/");
+        prompt_line(
+            &tr!(
+                "Region? [auto/{tags}] (default auto): ",
+                "区域?[auto/{tags}](默认 auto): "
+            )
+            .replace("{tags}", &tags),
+        )
+        .unwrap_or_default()
+    } else {
+        return Ok(()); // keep whatever's remembered
+    };
+    let v = raw.trim().to_ascii_lowercase();
+    if v.is_empty() || v == "auto" {
+        let _ = alice_miner_core::settings::clear_region_lock();
+        return Ok(());
+    }
+    match alice_miner_core::lane::gpu_prl::normalize_region_tag(&v) {
+        Some(tag) => {
+            match alice_miner_core::settings::save_region_lock(tag) {
+                Ok(_) => println!("{}: {tag}", tr!("Region locked", "已锁定区域")),
+                Err(e) => eprintln!("warning: {e}"), // non-fatal (read-only home)
+            }
+            Ok(())
+        }
+        None => {
+            eprintln!(
+                "error: {}",
+                tr!("unknown region `{r}` (use: us/asia/eu/auto).", "未知区域 `{r}`(可用: us/asia/eu/auto)。")
+                    .replace("{r}", raw.trim())
+            );
+            Err(EXIT_USAGE)
+        }
+    }
+}
+
+/// Companion-only (form B): don't spawn a miner — run the possession-proof keep-alive
+/// for the user's OWN rig. Reuses the existing `companion` path. The companion needs
+/// the wallet UNLOCK to sign the proof: the freshly-generated passphrase (generate
+/// path), else a resolved keystore passphrase; a watch-only identity fails closed in
+/// `companion::run` with a clear message.
+fn run_companion_only(
+    cfg: &SetupConfig,
+    lane: Lane,
+    address: String,
+    generated: Option<Zeroizing<String>>,
+) -> i32 {
+    // The companion is only for the PoP-gated pearlhash lanes; default to `prl` when
+    // the resolved lane isn't one (e.g. a laptop holding the proof for a remote rig).
+    let companion_lane = if lane.is_prl_lane() { lane.cli_lane_arg() } else { "prl" }.to_string();
+
+    let unlock = match generated {
+        Some(pw) => Some(pw),
+        None => {
+            let has_keystore = alice_miner_core::identity::load_pointer()
+                .map(|p| p.keystore_path.is_some())
+                .unwrap_or(false);
+            if has_keystore {
+                match crate::resolve_password(cfg.password.clone(), cfg.password_stdin) {
+                    Ok(p) => Some(Zeroizing::new(p)),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return EXIT_USAGE;
+                    }
+                }
+            } else {
+                None
+            }
+        }
+    };
+
+    println!(
+        "\n{}",
+        tr!(
+            "Companion mode — this holds your authorization while YOUR miner runs (Ctrl-C to stop).",
+            "伴侣模式 —— 在你自己的矿机运行期间由它持有你的授权(Ctrl-C 停止)。"
+        )
+    );
+    let flags = crate::companion::CompanionFlags {
+        lane: companion_lane,
+        device: None,
+        region: cfg.region.clone(),
+        address: Some(address),
+        refresh_secs: None,
+        once: false,
+        duration_s: 0,
+    };
+    crate::companion::run(flags, unlock)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,6 +1019,12 @@ mod tests {
             no_start: false,
             password: None,
             password_stdin: false,
+            miner: None,
+            miner_bin: None,
+            miner_preset: None,
+            miner_arg_template: None,
+            i_understand_unverified: false,
+            region: None,
         });
         assert!(matches!(cfg.address, AddressMode::Paste(ref a) if a == "a2abc"));
         assert_eq!(cfg.lane, "xmr");
@@ -560,6 +1043,12 @@ mod tests {
             no_start: true,
             password: None,
             password_stdin: false,
+            miner: None,
+            miner_bin: None,
+            miner_preset: None,
+            miner_arg_template: None,
+            i_understand_unverified: false,
+            region: None,
         });
         assert_eq!(cfg.address, AddressMode::Generate);
         assert_eq!(cfg.prl_payout.as_deref(), Some("prl1pxyz"));
@@ -578,9 +1067,90 @@ mod tests {
             no_start: false,
             password: None,
             password_stdin: false,
+            miner: None,
+            miner_bin: None,
+            miner_preset: None,
+            miner_arg_template: None,
+            i_understand_unverified: false,
+            region: None,
         });
         assert_eq!(cfg.address, AddressMode::Ask);
         assert_eq!(start_choice(&cfg), StartChoice::Yes);
+    }
+
+    /// T6: `--miner`/`--region` map onto the config; a `--miner-bin` with no explicit
+    /// `--miner` still implies the custom path; `--miner companion` maps to companion.
+    #[test]
+    fn config_maps_miner_and_region_flags() {
+        // Explicit custom + region.
+        let cfg = SetupConfig::from(crate::SetupArgs {
+            lane: "prl".into(),
+            address: None,
+            generate: false,
+            prl_payout: None,
+            yes: false,
+            no_input: true,
+            start: false,
+            no_start: true,
+            password: None,
+            password_stdin: false,
+            miner: Some("custom".into()),
+            miner_bin: Some("/opt/my-srb".into()),
+            miner_preset: Some("srbminer".into()),
+            miner_arg_template: None,
+            i_understand_unverified: true,
+            region: Some("asia".into()),
+        });
+        assert_eq!(cfg.miner, MinerChoice::Custom);
+        assert_eq!(cfg.miner_bin.as_deref(), Some("/opt/my-srb"));
+        assert_eq!(cfg.miner_preset.as_deref(), Some("srbminer"));
+        assert!(cfg.i_understand_unverified);
+        assert_eq!(cfg.region.as_deref(), Some("asia"));
+
+        // A bare --miner-bin (no --miner) implies custom.
+        let cfg2 = SetupConfig::from(crate::SetupArgs {
+            lane: "auto".into(),
+            address: None,
+            generate: false,
+            prl_payout: None,
+            yes: false,
+            no_input: true,
+            start: false,
+            no_start: true,
+            password: None,
+            password_stdin: false,
+            miner: None,
+            miner_bin: Some("/opt/m".into()),
+            miner_preset: None,
+            miner_arg_template: None,
+            i_understand_unverified: false,
+            region: None,
+        });
+        assert_eq!(cfg2.miner, MinerChoice::Custom, "--miner-bin implies custom");
+
+        // --miner companion.
+        let cfg3 = SetupConfig::from(crate::SetupArgs {
+            lane: "auto".into(),
+            address: None,
+            generate: false,
+            prl_payout: None,
+            yes: false,
+            no_input: false,
+            start: false,
+            no_start: false,
+            password: None,
+            password_stdin: false,
+            miner: Some("companion".into()),
+            miner_bin: None,
+            miner_preset: None,
+            miner_arg_template: None,
+            i_understand_unverified: false,
+            region: None,
+        });
+        assert_eq!(cfg3.miner, MinerChoice::CompanionOnly);
+
+        // No flag → Ask.
+        assert_eq!(SetupConfig::first_launch().miner, MinerChoice::Ask);
     }
 
     /// The first-launch config is fully interactive (Ask everything), no flags.

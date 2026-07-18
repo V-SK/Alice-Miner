@@ -49,10 +49,43 @@ pub struct Settings {
     /// until the first accepted share on a region relay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_good_region: Option<String>,
+    /// A user-supplied CUSTOM (bring-your-own, possibly closed-source) miner for one
+    /// lane. When present and its `lane` matches the lane being started, the engine
+    /// spawns THIS binary (fully managed — same supervisor / PoP / telemetry shell)
+    /// instead of the bundled engine. `None` (the default) uses the bundled engine.
+    /// See [`crate::backend::CustomMiner`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_miner: Option<CustomMinerConfig>,
     /// Any settings keys this build does not know about, preserved verbatim so a
     /// round-trip through an older binary never drops a newer field.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A persisted CUSTOM miner backend (form A — the CLI fully manages the user's own
+/// binary). All PUBLIC (a path + shape config; no secret). Parsed into a
+/// [`crate::backend::CustomMiner`] at start; a garbage value surfaces a clear error
+/// on the configured lane rather than silently falling back.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CustomMinerConfig {
+    /// Absolute path to the user's miner binary.
+    pub path: String,
+    /// The lane this miner runs: `"prl"` / `"alpha"` / `"xmr"` / `"rvn"`.
+    pub lane: String,
+    /// The known family or `"template"` — see [`crate::backend::MinerPreset`].
+    pub preset: String,
+    /// A fully custom argv with `{POOL}`/`{WALLET}`/… placeholders (only for the
+    /// `template` preset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_template: Option<Vec<String>>,
+    /// Whether this miner writes its stats ONLY to a log file (needs a tail). `None`
+    /// (the default) lets the preset decide (SRBMiner does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_file: Option<bool>,
+    /// The user's explicit "run my own unverified binary" acknowledgement — a custom
+    /// binary is refused until this is `true` (design §2.6).
+    #[serde(default)]
+    pub acknowledged_unverified: bool,
 }
 
 impl Settings {
@@ -146,6 +179,22 @@ pub fn clear_region_lock() -> Result<PathBuf, String> {
 pub fn save_last_good_region(tag: &str) -> Result<PathBuf, String> {
     let mut settings = load();
     settings.last_good_region = Some(tag.to_string());
+    save(&settings)
+}
+
+/// Persist the CUSTOM miner backend, merging over whatever else is on disk (never
+/// clobbers `lang`/`region_lock`/…). Returns the path written.
+pub fn save_custom_miner(cfg: &CustomMinerConfig) -> Result<PathBuf, String> {
+    let mut settings = load();
+    settings.custom_miner = Some(cfg.clone());
+    save(&settings)
+}
+
+/// Clear the custom miner backend (back to the bundled engine), merging over the
+/// rest of the settings. Returns the path written.
+pub fn clear_custom_miner() -> Result<PathBuf, String> {
+    let mut settings = load();
+    settings.custom_miner = None;
     save(&settings)
 }
 
@@ -253,6 +302,53 @@ mod tests {
             assert_eq!(load().last_good_region, None);
             save_last_good_region("us").expect("save good region");
             assert_eq!(load().last_good_region.as_deref(), Some("us"));
+        });
+    }
+
+    #[test]
+    fn save_and_clear_custom_miner_round_trip() {
+        with_temp_id_dir(|| {
+            assert_eq!(load().custom_miner, None);
+            let cfg = CustomMinerConfig {
+                path: "/opt/my-srb".into(),
+                lane: "prl".into(),
+                preset: "srbminer".into(),
+                arg_template: None,
+                log_file: None,
+                acknowledged_unverified: true,
+            };
+            save_custom_miner(&cfg).expect("save custom");
+            let loaded = load().custom_miner.expect("present");
+            assert_eq!(loaded.path, "/opt/my-srb");
+            assert_eq!(loaded.lane, "prl");
+            assert_eq!(loaded.preset, "srbminer");
+            assert!(loaded.acknowledged_unverified);
+            // Cleared → omitted from the file (not `null`).
+            let path = clear_custom_miner().expect("clear");
+            assert_eq!(load().custom_miner, None);
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(!raw.contains("custom_miner"), "cleared custom miner is omitted: {raw}");
+        });
+    }
+
+    #[test]
+    fn custom_miner_is_independent_of_region_and_lang() {
+        with_temp_id_dir(|| {
+            save_lang(Lang::Zh).expect("lang");
+            save_region_lock("asia").expect("lock");
+            let cfg = CustomMinerConfig {
+                path: "/opt/m".into(),
+                lane: "prl".into(),
+                preset: "template".into(),
+                arg_template: Some(vec!["-o".into(), "{POOL}".into(), "-u".into(), "{WALLET}".into()]),
+                log_file: Some(false),
+                acknowledged_unverified: true,
+            };
+            save_custom_miner(&cfg).expect("custom");
+            let s = load();
+            assert_eq!(s.parsed_lang(), Some(Lang::Zh));
+            assert_eq!(s.region_lock.as_deref(), Some("asia"));
+            assert_eq!(s.custom_miner.as_ref().unwrap().arg_template.as_ref().unwrap().len(), 4);
         });
     }
 

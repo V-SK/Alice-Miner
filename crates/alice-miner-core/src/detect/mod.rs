@@ -30,8 +30,10 @@
 #![allow(dead_code)]
 
 pub mod capability;
+pub mod scan;
 
 pub use capability::{CapabilityProfile, LaneSupport, LaneViability};
+pub use scan::{scan_installed_miners, DetectedMiner};
 
 use std::time::Duration;
 

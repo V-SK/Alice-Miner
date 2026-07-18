@@ -38,6 +38,7 @@ use crate::endpoint::{Endpoint, EndpointPlan};
 use crate::lane::Lane;
 use crate::stats::parse_kawpow;
 use crate::stats::parse_srbminer;
+use crate::stats::{parse_generic, ParserKind};
 
 /// Grace period for a graceful miner stop before SIGKILL (verbatim from Wallet).
 const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -172,6 +173,15 @@ impl LaneStats {
 #[derive(Clone)]
 pub struct LaneSupervisor {
     lane: Lane,
+    /// Which log parser drives this lane's stats. Derived from the lane for a
+    /// BUNDLED engine ([`ParserKind::for_lane`]); a CUSTOM (bring-your-own) miner
+    /// overrides it with its preset's parser (a lane no longer implies one format).
+    parser: ParserKind,
+    /// An explicit log-file path to TAIL for a miner that writes its share/hashrate
+    /// stats ONLY to a file (SRBMiner + custom file-logging miners). `None` for a
+    /// stdout miner. When `None` the bundled GPU-PRL lane still falls back to
+    /// extracting `--log-file` from the argv (unchanged behavior).
+    log_tail: Option<std::path::PathBuf>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -264,10 +274,29 @@ impl LaneSupervisor {
     }
 
     /// A supervisor with an explicit [`EndpointPlan`] (used by tests + the
-    /// failover verification to inject a bogus-primary→relay plan).
+    /// failover verification to inject a bogus-primary→relay plan). The parser is
+    /// derived from the lane (the BUNDLED-engine mapping) and there is no explicit
+    /// log-tail path (the GPU-PRL lane still tails its `--log-file` from argv).
     pub fn with_endpoints(lane: Lane, endpoint_plan: EndpointPlan) -> Self {
+        Self::with_backend(lane, endpoint_plan, ParserKind::for_lane(lane), None)
+    }
+
+    /// A supervisor with an explicit parser + optional log-tail path — the CUSTOM
+    /// (bring-your-own miner) constructor. `parser` decides how the child's output is
+    /// read (the miner's preset, not the lane), and `log_tail` is the file the
+    /// supervisor must tail for a file-logging miner (`None` = the miner prints stats
+    /// to stdout). Everything else — PoP, failover, refresh — is identical to a
+    /// bundled lane.
+    pub fn with_backend(
+        lane: Lane,
+        endpoint_plan: EndpointPlan,
+        parser: ParserKind,
+        log_tail: Option<std::path::PathBuf>,
+    ) -> Self {
         Self {
             lane,
+            parser,
+            log_tail,
             inner: Arc::new(Mutex::new(Inner {
                 state: ProcState::Stopped,
                 pid: None,
@@ -481,11 +510,18 @@ impl LaneSupervisor {
         };
 
         let (log_tx, mut log_rx) = unbounded_channel::<LogLine>();
-        // GPU-PRL only: SRBMiner writes shares/hashrate ONLY to its --log-file
-        // (never stdout), so clone a sender for a file-tail task that feeds those
-        // lines into the SAME channel the parser drains (the tail task is spawned
-        // after the child is up, below).
-        let log_tx_tail = (self.lane == Lane::GpuPrl).then(|| log_tx.clone());
+        // A file-logging miner (SRBMiner, or a custom file-logging miner) writes
+        // shares/hashrate ONLY to its log file (never stdout), so clone a sender for a
+        // file-tail task that feeds those lines into the SAME channel the parser drains
+        // (the tail task is spawned after the child is up, below). The path is the
+        // explicit `log_tail` (custom backend), or — for the BUNDLED GPU-PRL lane with
+        // no explicit path — the `--log-file` extracted from argv (unchanged behavior).
+        let tail_path: Option<std::path::PathBuf> = self.log_tail.clone().or_else(|| {
+            (self.lane == Lane::GpuPrl)
+                .then(|| extract_log_file_arg(&args))
+                .flatten()
+        });
+        let log_tx_tail = tail_path.as_ref().map(|_| log_tx.clone());
         // No extra env, no PID file — the miner is fully ephemeral.
         let owned = match spawn_supervised(&program, &args, &[], None, log_tx) {
             Ok(c) => c,
@@ -517,18 +553,17 @@ impl LaneSupervisor {
         // ~0 shares and the Layer-B no-progress watchdog wrongly tears down a
         // HEALTHY lane. Feed the file's new lines into the SAME LogLine channel the
         // parser drains. Generation-gated so a stale tail can't clobber a newer run.
-        if let Some(tail_tx) = log_tx_tail {
-            if let Some(log_file) = extract_log_file_arg(&args) {
-                let tail_inner = self.inner.clone();
-                tokio::spawn(async move {
-                    tail_log_file_into(log_file, tail_tx, tail_inner, gen).await;
-                });
-            }
+        if let (Some(tail_tx), Some(log_file)) = (log_tx_tail, tail_path) {
+            let tail_inner = self.inner.clone();
+            tokio::spawn(async move {
+                tail_log_file_into(log_file, tail_tx, tail_inner, gen).await;
+            });
         }
 
-        // Log pump → parse hashrate / shares into the snapshot (per-lane parser).
+        // Log pump → parse hashrate / shares into the snapshot (per-PARSER, not
+        // per-lane: a custom miner picks the parser its preset implies).
         let inner_for_logs = self.inner.clone();
-        let lane = self.lane;
+        let parser = self.parser;
         tokio::spawn(async move {
             while let Some(line) = log_rx.recv().await {
                 // Parse under the lock, then persist any new last-good region AFTER
@@ -538,7 +573,7 @@ impl LaneSupervisor {
                     if g.generation != gen {
                         break; // superseded by a newer run
                     }
-                    apply_log_line(&mut g, lane, &line.text);
+                    apply_log_line(&mut g, parser, &line.text);
                     g.pending_good_region.take()
                 };
                 if let Some(tag) = persist_region {
@@ -973,20 +1008,25 @@ fn log_verbose(context: &str, err: &str) {
 }
 
 /// Update the snapshot from one raw engine output line, dispatching to the
-/// PER-LANE parser: the XMR/RandomX line parsers ([`parse_hashrate_hs`] /
-/// [`parse_share_counts`], verbatim from the Wallet) for [`Lane::Xmr`], and the
-/// generalized KawPoW parser ([`crate::stats::parse_kawpow`], tolerating both
-/// kawpowminer and T-Rex) for [`Lane::GpuRvn`]. Both yield hashrate in H/s +
-/// cumulative accepted/rejected shares, so the [`LaneStats`] shape is identical
-/// across lanes. ALSO marks Layer-B **progress** (a new accepted share or a
-/// higher hashrate re-arms the no-progress watchdog).
-fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
+/// parser named by [`ParserKind`] (derived from the lane for a bundled engine, or
+/// from the custom miner's preset): the XMR/RandomX line parsers
+/// ([`parse_hashrate_hs`] / [`parse_share_counts`], verbatim from the Wallet) for
+/// [`ParserKind::Xmr`], the KawPoW parser for [`ParserKind::Kawpow`], the SRBMiner
+/// parser for [`ParserKind::Srbminer`], the AlphaMiner parser for
+/// [`ParserKind::Alpha`], and the honest best-effort [`parse_generic`] for
+/// [`ParserKind::Generic`] (an UNKNOWN custom miner). All yield hashrate in H/s +
+/// cumulative accepted/rejected shares, so the [`LaneStats`] shape is identical.
+/// ALSO marks Layer-B **progress** (a new accepted share or a higher hashrate
+/// re-arms the no-progress watchdog). For a `Generic` miner whose format can't be
+/// read, every field stays `None` — the lane shows "running, telemetry unavailable"
+/// (the dashboard's honest degrade), NEVER a fabricated number.
+fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
     let line = sanitize_log_line(raw);
     if line.is_empty() {
         return;
     }
-    match lane {
-        Lane::Xmr => {
+    match parser {
+        ParserKind::Xmr => {
             if let Some(hr) = parse_hashrate_hs(&line) {
                 g.hashrate_hs = Some(hr);
                 note_hashrate_progress(g, hr);
@@ -1007,7 +1047,7 @@ fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
                 note_accepted_progress(g, accepted);
             }
         }
-        Lane::GpuRvn => {
+        ParserKind::Kawpow => {
             if let Some(sample) = parse_kawpow(&line) {
                 if let Some(hr) = sample.hashrate_hs {
                     g.hashrate_hs = Some(hr);
@@ -1021,7 +1061,7 @@ fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
                 apply_telemetry(g, &sample);
             }
         }
-        Lane::GpuPrl => {
+        ParserKind::Srbminer => {
             // SRBMiner (pearlhash) writes share/hashrate lines to its --log-file
             // (the supervisor tails it). Accepted/rejected can arrive on SEPARATE
             // lines, so update each independently (unlike the kawpow both-or-none).
@@ -1049,7 +1089,7 @@ fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
                 apply_telemetry(g, &sample);
             }
         }
-        Lane::GpuAlpha => {
+        ParserKind::Alpha => {
             // alpha-miner (V100/Volta pearlhash) writes logfmt to STDOUT (the stdout
             // pump feeds this arm — no --log-file needed). `parse_alpha`, validated
             // against the real V100 capture, reads the periodic miner-status line:
@@ -1064,6 +1104,26 @@ fn apply_log_line(g: &mut Inner, lane: Lane, raw: &str) {
                 if let Some(a) = sample.accepted {
                     g.accepted = a;
                     note_accepted_progress(g, a);
+                }
+                apply_telemetry(g, &sample);
+            }
+        }
+        ParserKind::Generic => {
+            // An UNKNOWN custom miner: best-effort scan (`<num> <hash-unit>` +
+            // accepted/rejected). Assign each field only when present (cumulative,
+            // last-wins). When a line can't be read every field stays `None`, so the
+            // lane shows "running, telemetry unavailable" — NEVER a fabricated number.
+            if let Some(sample) = parse_generic(&line) {
+                if let Some(hr) = sample.hashrate_hs {
+                    g.hashrate_hs = Some(hr);
+                    note_hashrate_progress(g, hr);
+                }
+                if let Some(a) = sample.accepted {
+                    g.accepted = a;
+                    note_accepted_progress(g, a);
+                }
+                if let Some(r) = sample.rejected {
+                    g.rejected = r;
                 }
                 apply_telemetry(g, &sample);
             }
@@ -1470,6 +1530,19 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap()
     }
 
+    /// Serialize any test that SPAWNS a child against the `terminal::tests` child-pid
+    /// tests. `spawn_run` records the engine child via `terminal::write_child_pid`, whose
+    /// path resolves under the process-global `$ALICE_IDENTITY_DIR`. A concurrent
+    /// `terminal::tests` child-pid test sets that var (under this SAME lock) and asserts on
+    /// the file, so an unguarded spawn here would write its own pid into that test's dir and
+    /// flake its assertion. Holding `IDENTITY_ENV_LOCK` for the spawn test's duration keeps
+    /// the two from ever overlapping. Gated `#[cfg(unix)]` — the only callers are the unix
+    /// spawn tests, so an unconditional definition would be dead code on Windows (`-D warnings`).
+    #[cfg(unix)]
+    fn spawn_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A no-op rebuild closure for tests that don't exercise failover (keeps the
     /// single-endpoint relay plan). The args are fixed.
     fn fixed_rebuild(program: std::path::PathBuf, args: Vec<String>) -> RebuildFn {
@@ -1697,8 +1770,8 @@ mod tests {
         let s = LaneSupervisor::new(Lane::Xmr);
         {
             let mut g = s.inner.lock().unwrap();
-            apply_log_line(&mut g, Lane::Xmr, "\u{1b}[1;32maccepted\u{1b}[0m (7/1) diff 900 (40 ms)");
-            apply_log_line(&mut g, Lane::Xmr, "miner    speed 10s/60s/15m 555.5 540.0 n/a H/s");
+            apply_log_line(&mut g, ParserKind::Xmr, "\u{1b}[1;32maccepted\u{1b}[0m (7/1) diff 900 (40 ms)");
+            apply_log_line(&mut g, ParserKind::Xmr, "miner    speed 10s/60s/15m 555.5 540.0 n/a H/s");
         }
         let st = s.stats();
         assert_eq!(st.accepted, 7);
@@ -1719,7 +1792,7 @@ mod tests {
         {
             let mut g = s.inner.lock().unwrap();
             // A kawpow speed line carries ONE instantaneous rate, no window triple.
-            apply_log_line(&mut g, Lane::GpuRvn, "m kawpowminer Speed 25.00 Mh/s gpu0 [A5+0:R0+0:F0]");
+            apply_log_line(&mut g, ParserKind::Kawpow, "m kawpowminer Speed 25.00 Mh/s gpu0 [A5+0:R0+0:F0]");
         }
         let st = s.stats();
         assert!(st.hashrate_hs.is_some(), "the single rate is still parsed");
@@ -1735,7 +1808,7 @@ mod tests {
             let mut g = s.inner.lock().unwrap();
             apply_log_line(
                 &mut g,
-                Lane::GpuRvn,
+                ParserKind::Kawpow,
                 "m 12:01:42 kawpowminer Speed 25.43 Mh/s gpu0 [A4+0:R0+0:F0]",
             );
         }
@@ -1748,6 +1821,53 @@ mod tests {
         assert_eq!(st.endpoint.as_deref(), Some("hk.aliceprotocol.org:8888"));
     }
 
+    /// T5: a CUSTOM miner with an unknown format routes through the GENERIC parser
+    /// (chosen by preset, not lane). A recognisable `<num> <unit>` + accepted line is
+    /// read; an UNREADABLE line leaves the stats untouched (no fabrication) — the lane
+    /// stays "running, telemetry unavailable".
+    #[test]
+    fn apply_log_line_generic_parser_reads_known_and_degrades_on_unknown() {
+        // Build a supervisor whose PARSER is Generic (as a custom miner would set).
+        let s = LaneSupervisor::with_backend(
+            Lane::GpuPrl,
+            EndpointPlan::single(Endpoint::plaintext("us.aliceprotocol.org", 3340)),
+            ParserKind::Generic,
+            None,
+        );
+        {
+            let mut g = s.inner.lock().unwrap();
+            // A readable line: 30.5 MH/s + accepted 12.
+            apply_log_line(&mut g, ParserKind::Generic, "[worker] 30.5 MH/s  accepted 12");
+        }
+        let st = s.stats();
+        assert_eq!(st.hashrate_hs, Some(30_500_000.0));
+        assert_eq!(st.accepted, 12);
+        {
+            // An UNreadable line must not zero or invent anything.
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Generic, "some proprietary status blob 0xdeadbeef");
+        }
+        let st2 = s.stats();
+        assert_eq!(st2.hashrate_hs, Some(30_500_000.0), "unreadable line kept the last real rate");
+        assert_eq!(st2.accepted, 12, "no fabricated share count");
+    }
+
+    /// T5: a supervisor built `with_backend` and an explicit `log_tail` path exposes
+    /// that path to the tailer (rather than scanning argv), so a custom file-logging
+    /// miner with a non-`--log-file` flag is still tailed.
+    #[test]
+    fn with_backend_carries_parser_and_log_tail() {
+        let log = std::env::temp_dir().join("alice-custom-tail-test.log");
+        let s = LaneSupervisor::with_backend(
+            Lane::GpuPrl,
+            EndpointPlan::single(Endpoint::plaintext("us.aliceprotocol.org", 3340)),
+            ParserKind::Srbminer,
+            Some(log.clone()),
+        );
+        assert_eq!(s.parser, ParserKind::Srbminer);
+        assert_eq!(s.log_tail.as_deref(), Some(log.as_path()));
+    }
+
     /// Progress marking: a new accepted share OR a higher hashrate re-arms the
     /// watchdog (`last_progress_at` moves forward); a flat/repeat does not.
     #[test]
@@ -1757,21 +1877,22 @@ mod tests {
         g.last_progress_at = Some(Instant::now() - Duration::from_secs(60));
         let before = g.last_progress_at.unwrap();
         // A higher hashrate → progress.
-        apply_log_line(&mut g, Lane::Xmr, "miner    speed 10s/60s/15m 100.0 90.0 n/a H/s");
+        apply_log_line(&mut g, ParserKind::Xmr, "miner    speed 10s/60s/15m 100.0 90.0 n/a H/s");
         assert!(g.last_progress_at.unwrap() > before);
         // The SAME hashrate again → no new progress mark.
         let mark2 = g.last_progress_at.unwrap();
         std::thread::sleep(Duration::from_millis(2));
-        apply_log_line(&mut g, Lane::Xmr, "miner    speed 10s/60s/15m 100.0 90.0 n/a H/s");
+        apply_log_line(&mut g, ParserKind::Xmr, "miner    speed 10s/60s/15m 100.0 90.0 n/a H/s");
         assert_eq!(g.last_progress_at.unwrap(), mark2, "flat hashrate is not progress");
         // A new accepted share → progress.
-        apply_log_line(&mut g, Lane::Xmr, "net      accepted (1/0) diff 100 (10 ms)");
+        apply_log_line(&mut g, ParserKind::Xmr, "net      accepted (1/0) diff 100 (10 ms)");
         assert!(g.last_progress_at.unwrap() > mark2);
     }
 
     #[cfg(unix)]
     #[test]
     fn start_then_stop_transitions_and_captures_shares() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             // Stand-in "miner": emit an accepted-share line + a speed line then
@@ -1817,6 +1938,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gpu_lane_start_parses_kawpow_then_stops() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             // Stand-in kawpowminer: emit a Speed line with a share block, then idle.
@@ -1859,6 +1981,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unexpected_exit_lands_in_error_not_restart_loop() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             let program = std::path::PathBuf::from("/bin/sh");
@@ -1887,6 +2010,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn two_supervisors_are_crash_isolated() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             let prog = std::path::PathBuf::from("/bin/sh");
@@ -1945,6 +2069,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn layer_b_failover_advances_cursor_and_relaunches() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             // A 2-endpoint plan: bogus primary, then the "good" endpoint.
@@ -2026,6 +2151,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failover_budget_exhaustion_lands_in_error_no_storm() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             let plan = EndpointPlan::new(vec![
@@ -2113,6 +2239,7 @@ mod tests {
             eprintln!("skipping live failover test (set ALICE_MINER_LIVE_FAILOVER=1 to run)");
             return;
         }
+        let _env = spawn_env_guard();
         use crate::endpoint::Endpoint;
         let rt = rt();
         rt.block_on(async {
@@ -2275,13 +2402,13 @@ mod tests {
             EndpointPlan::single(Endpoint::plaintext("asia.aliceprotocol.org", 3340)),
         );
         let mut g = s.inner.lock().unwrap();
-        apply_log_line(&mut g, Lane::GpuPrl, "Shares acc.  : 5");
+        apply_log_line(&mut g, ParserKind::Srbminer, "Shares acc.  : 5");
         assert_eq!(g.accepted, 5, "the accepted count parsed");
         assert_eq!(g.pending_good_region.as_deref(), Some("asia"));
         assert_eq!(g.persisted_good_region.as_deref(), Some("asia"));
         // A further rise on the SAME region does not re-stage a write (debounced).
         g.pending_good_region = None;
-        apply_log_line(&mut g, Lane::GpuPrl, "Shares acc.  : 9");
+        apply_log_line(&mut g, ParserKind::Srbminer, "Shares acc.  : 9");
         assert_eq!(g.accepted, 9);
         assert_eq!(g.pending_good_region, None, "same region → no duplicate persist");
     }
@@ -2292,7 +2419,7 @@ mod tests {
     fn note_accepted_progress_ignores_non_region_relay() {
         let s = LaneSupervisor::new(Lane::Xmr); // default plan = hk.aliceprotocol.org:3333
         let mut g = s.inner.lock().unwrap();
-        apply_log_line(&mut g, Lane::Xmr, "net      accepted (3/0) diff 100 (10 ms)");
+        apply_log_line(&mut g, ParserKind::Xmr, "net      accepted (3/0) diff 100 (10 ms)");
         assert_eq!(g.accepted, 3);
         assert_eq!(g.pending_good_region, None);
         assert_eq!(g.persisted_good_region, None);
@@ -2305,6 +2432,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failover_preflight_skips_dead_candidate_for_live_one() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind live");
@@ -2392,6 +2520,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn locked_region_retries_in_place_then_clear_error() {
+        let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
             // A single-region plan is exactly what `region_plan_from(lock,…)` builds.
