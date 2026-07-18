@@ -755,6 +755,10 @@ impl LaneSupervisor {
                         backoff,
                         probe_timeout: g.failover_probe_timeout,
                         window,
+                        // The region that last landed an accepted share THIS run — the
+                        // recovery order prefers it (so a restart-in-place resumes where
+                        // mining was actually working, per `settings.last_good_region`).
+                        last_good: g.persisted_good_region.clone(),
                     }
                 }
             };
@@ -768,82 +772,141 @@ impl LaneSupervisor {
                     backoff,
                     probe_timeout,
                     window,
+                    last_good,
                 } => {
                     // If we have no rebuild closure (single-endpoint / start_simple),
                     // there's nothing to rotate to — leave the lane to its own
                     // reconnect and stop watching (the miner's Layer-A handles it).
                     let Some(rebuild) = rebuild else { return };
+                    // A LOCKED / single-region plan (no failover candidates) can only
+                    // retry THIS region in place; an AUTO / failover-capable plan rotates
+                    // across regions. This is the explicit-lock vs auto-selected split:
+                    // ONLY a lock (an empty candidate set = a single-endpoint plan built
+                    // from `--region`) disables cross-region rotation. An auto-selected
+                    // region NEVER becomes a lock — its plan keeps every region, so this
+                    // set is non-empty and the recovery loop below rotates freely.
+                    let locked = candidates.is_empty();
                     // Stop the current child first (graceful + reaped), then wait the
                     // backoff. `spawn_run` (below) bumps the generation so the old
                     // supervise/log tasks detach.
                     self.teardown_current_child(gen).await;
                     tokio::time::sleep(backoff).await;
 
-                    // PRE-FLIGHT the candidate region(s): pick the first that answers a
-                    // bounded TCP connect, so we never rotate into a DEAD region and
-                    // instantly error (the exact tester symptom). Empty candidates (a
-                    // locked / single-region plan) ⇒ retry THIS region in place. If NO
-                    // candidate answers, fall back to the plain next endpoint — no worse
-                    // than the pre-probe behaviour.
-                    let chosen = if candidates.is_empty() {
-                        from.clone()
+                    // The ORDERED set of regions to (try to) relaunch on this round. For a
+                    // locked plan that is just `from`; for an auto plan it is every other
+                    // region (reachable-first, `last_good` first) plus a final in-place
+                    // retry of `from` (a region that merely jittered can be resumed once it
+                    // recovers). Crucially, if a region's rebuild — its region-bound PoP
+                    // handshake — FAILS, we advance to the NEXT region instead of
+                    // dead-ending in Error (THE bug: auto-switch to US, US relay unhealthy,
+                    // then stuck on US with a "retrying other regions" status that never
+                    // actually retried).
+                    let targets: Vec<Endpoint> = if locked {
+                        vec![from.clone()]
                     } else {
-                        pick_reachable(&candidates, probe_timeout)
+                        recovery_targets(&candidates, &from, last_good.as_deref(), probe_timeout)
                             .await
-                            .unwrap_or_else(|| candidates[0].clone())
                     };
-                    let changed = chosen.host != from.host || chosen.port != from.port;
 
-                    // Commit the rotation under the lock (advance the cursor to the
-                    // chosen endpoint; count a failover only for a real region change).
-                    let order = {
-                        let mut g = self.inner.lock().expect("mutex");
-                        if g.generation != gen {
-                            return; // superseded while probing
-                        }
-                        if changed {
-                            if !g.endpoint_plan.advance_to(&chosen) {
+                    let mut launched = false;
+                    for target in &targets {
+                        // `changed` (target vs the STALLED region) drives the failover
+                        // COUNT + status label — a real region switch vs an in-place
+                        // resume. The cursor itself always follows `target`.
+                        let changed = target.host != from.host || target.port != from.port;
+                        // Commit the cursor to this target UNDER THE LOCK *before* the
+                        // rebuild, so the snapshot endpoint always shows the region
+                        // currently being attempted — it tracks the failover cursor and
+                        // never freezes on a dead region.
+                        let order = {
+                            let mut g = self.inner.lock().expect("mutex");
+                            if g.generation != gen {
+                                return; // superseded while probing / retrying
+                            }
+                            if !g.endpoint_plan.advance_to(target) {
+                                // Shouldn't happen (the target came from the plan) → a
+                                // best-effort plain advance keeps the cursor moving.
                                 g.endpoint_plan.advance();
                             }
-                            g.failovers += 1;
-                        }
-                        g.endpoint_plan.ordered_from_cursor()
-                    };
+                            g.endpoint_plan.ordered_from_cursor()
+                        };
 
-                    match rebuild(&order) {
-                        Ok((program, args)) => match self.spawn_run(program, args, true) {
-                            Ok(()) => {
-                                // `spawn_run` cleared `message`; restore the LABELED
-                                // status so the UI shows what happened — `auto-failover:
-                                // <from> → <to>` for a real change, or `region <r>
-                                // locked — retrying` for a locked/single-region plan.
-                                let mut g = self.inner.lock().expect("mutex");
-                                g.message = Some(failover_status(&from, &chosen, changed, window));
-                            }
+                        match rebuild(&order) {
+                            Ok((program, args)) => match self.spawn_run(program, args, true) {
+                                Ok(()) => {
+                                    // `spawn_run` cleared `message` + bumped the generation
+                                    // (the NEW child's watchdog now owns the lane). Restore
+                                    // the LABELED, honest status; count a failover ONLY for a
+                                    // real region change.
+                                    let mut g = self.inner.lock().expect("mutex");
+                                    if changed {
+                                        g.failovers += 1;
+                                    }
+                                    g.message = Some(if changed {
+                                        // auto-failover: <from> → <to>
+                                        failover_status(&from, target, true, window)
+                                    } else if locked {
+                                        // region <r> locked — retrying, no auto-failover
+                                        failover_status(&from, target, false, window)
+                                    } else {
+                                        // auto plan resuming the (recovered) same region
+                                        region_resumed_status(target, window)
+                                    });
+                                    launched = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    // A spawn/exec failure (the miner binary itself couldn't
+                                    // launch) is region-independent — another region won't
+                                    // help — and `spawn_run` already bumped the generation
+                                    // (this watchdog is now stale) and set Error. Surface a
+                                    // clear status and stop; raw detail stays in verbose log.
+                                    log_verbose("failover relaunch failed", &e);
+                                    let mut g = self.inner.lock().expect("mutex");
+                                    g.state = ProcState::Error;
+                                    g.message = Some(region_retry_message());
+                                    return;
+                                }
+                            },
                             Err(e) => {
-                                // The raw `e` can carry the internal relaunch detail; keep
-                                // it out of the primary status (a clear, actionable line
-                                // there) and only echo it under the verbose env for debug.
-                                log_verbose("failover relaunch failed", &e);
+                                // The region answered the TCP pre-flight but its rebuild (the
+                                // region-bound PoP challenge to `https://<host>/m4/challenge`)
+                                // FAILED — the relay's control plane is unhealthy. THE FIX:
+                                // do NOT dead-end. Record an honest "retrying other regions"
+                                // status and advance to the NEXT region. The generation is
+                                // unchanged (no child spawned), so the loop stays valid; the
+                                // restart budget was charged ONCE for this stall (in the
+                                // decision stage), so trying several regions is not a storm.
+                                log_verbose("failover plan rebuild failed", &e);
                                 let mut g = self.inner.lock().expect("mutex");
-                                g.state = ProcState::Error;
+                                if g.generation != gen {
+                                    return;
+                                }
                                 g.message = Some(region_retry_message());
+                                // fall through to the next target
                             }
-                        },
-                        Err(e) => {
-                            // The raw `e` here is the failover-plan REBUILD error — for a
-                            // pearlhash lane it can surface a bare `POST https://…/m4/challenge:
-                            // …` URL (the PoP endpoint), which is noise to the user and leaks an
-                            // internal path. Show a clear bilingual "region unreachable, retrying"
-                            // status instead; keep the raw error only under the verbose env.
-                            log_verbose("failover plan rebuild failed", &e);
-                            let mut g = self.inner.lock().expect("mutex");
-                            g.state = ProcState::Error;
-                            g.message = Some(region_retry_message());
                         }
                     }
-                    // This watchdog's generation is now stale (spawn_run bumped it);
-                    // the NEW run started its own watchdog. Exit.
+
+                    if !launched {
+                        // Every region tried this round failed to (re)build/relaunch — all
+                        // relays are currently unreachable/unhealthy. Land in a clear, honest
+                        // Error (bounded: the budget was charged once, so no restart storm).
+                        // A locked plan keeps its existing single-region give-up wording.
+                        let mut g = self.inner.lock().expect("mutex");
+                        if g.generation != gen {
+                            return;
+                        }
+                        g.state = ProcState::Error;
+                        g.message = Some(if locked {
+                            region_retry_message()
+                        } else {
+                            all_regions_unreachable_message()
+                        });
+                    }
+                    // On a successful relaunch this watchdog's generation is now stale
+                    // (spawn_run bumped it) and the NEW run owns its own watchdog; on the
+                    // all-failed path we've set a terminal Error. Either way, exit.
                     return;
                 }
             }
@@ -897,10 +960,13 @@ enum WatchAction {
     /// Budget exhausted — the lane was put into `Error`; stop watching.
     GiveUp,
     /// A stall with budget remaining. The post-lock stage pre-flights `candidates`
-    /// (after `backoff`), rotates from `from` to the first reachable one, and
-    /// relaunches. Empty `candidates` (a locked / single-region plan) ⇒ retry `from`
-    /// in place. `window` feeds the status line's reason; `probe_timeout` bounds each
-    /// reachability probe.
+    /// (after `backoff`), then tries to relaunch on them in a RECOVERY order —
+    /// reachable-first, remembered `last_good` first — advancing to the NEXT region
+    /// if a region's rebuild (its region-bound PoP handshake) fails, so an unhealthy
+    /// region never dead-ends the lane. Empty `candidates` (a locked / single-region
+    /// plan) ⇒ retry `from` in place. `window` feeds the status line's reason;
+    /// `probe_timeout` bounds each reachability probe; `last_good` is the in-run
+    /// last-good region tag (a recovery priority hint).
     Failover {
         from: Endpoint,
         candidates: Vec<Endpoint>,
@@ -908,6 +974,7 @@ enum WatchAction {
         backoff: Duration,
         probe_timeout: Duration,
         window: Duration,
+        last_good: Option<String>,
     },
 }
 
@@ -943,20 +1010,84 @@ fn region_label(ep: &Endpoint) -> String {
     }
 }
 
-/// Probe each candidate endpoint (a bounded TCP connect on a blocking thread) and
-/// return the FIRST that answers — the reachable failover target. `None` when NONE
-/// answer (the caller then falls back to the plain next endpoint). Runs off the
-/// async worker via `spawn_blocking` so a slow connect never stalls the runtime.
-async fn pick_reachable(candidates: &[Endpoint], timeout: Duration) -> Option<Endpoint> {
-    let candidates = candidates.to_vec();
+/// Push `ep` onto `list` only if no endpoint with the same host+port is already there
+/// (de-dupe by identity, preserving first-seen order).
+fn push_distinct(list: &mut Vec<Endpoint>, ep: &Endpoint) {
+    if !list.iter().any(|e| e.host == ep.host && e.port == ep.port) {
+        list.push(ep.clone());
+    }
+}
+
+/// The ORDERED list of endpoints a failover-capable (auto) lane should try to
+/// (re)launch on after a stall, most-preferred first:
+///   1. the remembered `last_good` region — but ONLY if it is one of the failover
+///      candidates AND is not the region that just stalled (resume where mining was
+///      actually landing shares, per `settings.last_good_region`);
+///   2. the remaining failover candidates, in the plan's rotation order;
+///   3. the stalled `from` region itself, as a FINAL in-place retry (a region that
+///      merely jittered can be resumed once it recovers).
+///
+/// The result is then STABLE-reordered reachable-first by a bounded TCP pre-flight
+/// probe, so a region that answers is tried before one that doesn't — but an
+/// unreachable region is still KEPT (tried last), because the rebuild's own
+/// region-bound PoP handshake is the real health gate (a region can answer TCP yet
+/// fail PoP, and vice-versa). Distinct by host+port; never empty (always `from`).
+async fn recovery_targets(
+    candidates: &[Endpoint],
+    from: &Endpoint,
+    last_good: Option<&str>,
+    probe_timeout: Duration,
+) -> Vec<Endpoint> {
+    partition_reachable(recovery_order(candidates, from, last_good), probe_timeout).await
+}
+
+/// The PURE (network-free) recovery order — the priority ordering `recovery_targets`
+/// then stable-reorders reachable-first. Testable without a probe. See
+/// [`recovery_targets`] for the priority rationale.
+fn recovery_order(candidates: &[Endpoint], from: &Endpoint, last_good: Option<&str>) -> Vec<Endpoint> {
+    let mut base: Vec<Endpoint> = Vec::new();
+    // 1. last_good first — only if it is a candidate and differs from the stalled region.
+    if let Some(tag) = last_good {
+        let from_tag = crate::lane::gpu_prl::region_tag_for_host(&from.host);
+        if from_tag != Some(tag) {
+            if let Some(ep) = candidates
+                .iter()
+                .find(|e| crate::lane::gpu_prl::region_tag_for_host(&e.host) == Some(tag))
+            {
+                push_distinct(&mut base, ep);
+            }
+        }
+    }
+    // 2. the remaining candidates, in rotation order.
+    for ep in candidates {
+        push_distinct(&mut base, ep);
+    }
+    // 3. the stalled region, as a final in-place retry.
+    push_distinct(&mut base, from);
+    base
+}
+
+/// Stable-reorder `order` so TCP-reachable endpoints come first (each group keeps its
+/// input order), using a bounded connect probe per endpoint. The (blocking) probes run
+/// on a blocking thread so a slow connect never stalls the runtime. On a join failure the
+/// input order is returned unchanged (best-effort — the rebuild still guards health).
+async fn partition_reachable(order: Vec<Endpoint>, timeout: Duration) -> Vec<Endpoint> {
+    let fallback = order.clone();
     tokio::task::spawn_blocking(move || {
-        candidates
-            .into_iter()
-            .find(|ep| endpoint_reachable(&ep.host, ep.port, timeout))
+        let mut reachable: Vec<Endpoint> = Vec::new();
+        let mut unreachable: Vec<Endpoint> = Vec::new();
+        for ep in order {
+            if endpoint_reachable(&ep.host, ep.port, timeout) {
+                reachable.push(ep);
+            } else {
+                unreachable.push(ep);
+            }
+        }
+        reachable.extend(unreachable);
+        reachable
     })
     .await
-    .ok()
-    .flatten()
+    .unwrap_or(fallback)
 }
 
 /// A bounded reachability check to `host:port`: `true` when a TCP connection is
@@ -993,6 +1124,30 @@ fn region_retry_message() -> String {
     crate::tr!(
         "Region endpoint temporarily unreachable; retrying other regions",
         "区域节点暂时不可达,正在重试其他区域"
+    )
+    .to_string()
+}
+
+/// The status shown when an AUTO (failover-capable) lane relaunches on the SAME region
+/// it was on (the stalled region recovered after other regions were unavailable). Unlike
+/// the locked-retry label this does NOT claim the region is locked — auto-failover stays
+/// available. Localized via [`crate::tr!`].
+fn region_resumed_status(to: &Endpoint, window: Duration) -> String {
+    let secs = window.as_secs();
+    let r = region_label(to);
+    crate::tr!(
+        format!("region {r} recovered — resuming (no progress for {secs}s)"),
+        format!("区域 {r} 已恢复 — 继续运行(此前 {secs}s 无进展)")
+    )
+}
+
+/// The status shown when EVERY region failed to (re)build/relaunch in one failover round
+/// — all relays are currently unreachable/unhealthy — so the lane lands in a clear Error
+/// rather than silently claiming to keep retrying. Honest + actionable + bilingual.
+fn all_regions_unreachable_message() -> String {
+    crate::tr!(
+        "All region relays are temporarily unavailable; the lane stopped — restart to retry",
+        "所有区域节点暂时不可用;通道已停止 — 请重新启动重试"
     )
     .to_string()
 }
@@ -2563,6 +2718,213 @@ mod tests {
                 calls.load(Ordering::SeqCst) >= 1,
                 "the locked region must be retried in place (rebuild called)"
             );
+        });
+    }
+
+    // ── fix/prl-failover-recover: recover past an unhealthy region, don't dead-end ──
+
+    /// The PURE recovery order: `last_good` (when it is a candidate AND is not the
+    /// stalled region) is tried FIRST; then the remaining candidates in rotation order;
+    /// then the stalled `from` region as a final in-place retry. When `last_good`
+    /// equals the stalled region it is NOT prioritised (retrying the just-failed region
+    /// first is futile) — it stays the final in-place retry.
+    #[test]
+    fn recovery_order_prefers_last_good_then_rotation_then_from() {
+        let us = Endpoint::plaintext("us.aliceprotocol.org", 3340);
+        let asia = Endpoint::plaintext("asia.aliceprotocol.org", 3340);
+        let eu = Endpoint::plaintext("eu.aliceprotocol.org", 3340);
+
+        // Stalled on `us`; candidates (rotation after us) = [asia, eu]; last_good = eu.
+        // Expected: eu (last_good) first, then asia (remaining candidate), then us (from).
+        let order = recovery_order(&[asia.clone(), eu.clone()], &us, Some("eu"));
+        let hosts: Vec<&str> = order.iter().map(|e| e.host.as_str()).collect();
+        assert_eq!(
+            hosts,
+            [
+                "eu.aliceprotocol.org",
+                "asia.aliceprotocol.org",
+                "us.aliceprotocol.org"
+            ],
+            "last_good (eu) must be tried first, then the rest, then the stalled from"
+        );
+
+        // last_good == the stalled region (us) → NOT prioritised; plain rotation + from.
+        let order2 = recovery_order(&[asia.clone(), eu.clone()], &us, Some("us"));
+        let hosts2: Vec<&str> = order2.iter().map(|e| e.host.as_str()).collect();
+        assert_eq!(
+            hosts2,
+            [
+                "asia.aliceprotocol.org",
+                "eu.aliceprotocol.org",
+                "us.aliceprotocol.org"
+            ],
+            "last_good == from must not jump ahead of other candidates"
+        );
+
+        // No last_good → rotation order, then the stalled from as the final retry.
+        let order3 = recovery_order(&[asia.clone(), eu.clone()], &us, None);
+        assert_eq!(order3.last().unwrap().host, "us.aliceprotocol.org");
+        assert_eq!(order3.len(), 3, "distinct: asia, eu, us(from)");
+    }
+
+    /// THE FIX (the tester's exact bug): an AUTO / failover-capable lane whose auto-
+    /// selected next region is UNHEALTHY (answers the TCP pre-flight but its rebuild —
+    /// the region-bound PoP handshake — FAILS) must NOT dead-end on that region. It must
+    /// advance to the NEXT region, relaunch there, update the snapshot endpoint, and land
+    /// Running — never stuck in `error` on the unhealthy region with a lying "retrying"
+    /// status. Plan: stalled primary → UNHEALTHY region (TCP-live, rebuild Err) → GOOD
+    /// region (TCP-live, rebuild Ok + progressing child).
+    #[cfg(unix)]
+    #[test]
+    fn auto_failover_recovers_past_unhealthy_region_no_dead_end() {
+        let _env = spawn_env_guard();
+        let rt = rt();
+        rt.block_on(async {
+            // Two local listeners: an "unhealthy relay" (TCP answers, PoP/rebuild fails)
+            // and a "good relay" (TCP answers, rebuild succeeds → progressing child).
+            let unhealthy = std::net::TcpListener::bind("127.0.0.1:0").expect("bind unhealthy");
+            let unhealthy_port = unhealthy.local_addr().unwrap().port();
+            let good = std::net::TcpListener::bind("127.0.0.1:0").expect("bind good");
+            let good_port = good.local_addr().unwrap().port();
+            let good_authority = format!("127.0.0.1:{good_port}");
+
+            let plan = EndpointPlan::new(vec![
+                Endpoint::plaintext("blackhole-primary.invalid", 65010), // stalled primary
+                Endpoint::plaintext("127.0.0.1", unhealthy_port),        // reachable but PoP-dead
+                Endpoint::plaintext("127.0.0.1", good_port),             // reachable + healthy
+            ])
+            .unwrap();
+            let s = LaneSupervisor::with_endpoints(Lane::Xmr, plan);
+            s.set_failover_timing(Duration::from_millis(60), Duration::from_millis(10));
+
+            // rebuild: the UNHEALTHY region's control plane is down → Err (simulating a
+            // failed region-bound PoP re-establish). The GOOD region rebuilds fine and
+            // returns a PROGRESSING child so the lane settles there. Any other endpoint
+            // (the blackhole primary) just sleeps.
+            let rebuild: RebuildFn = Arc::new(move |eps: &[Endpoint]| {
+                let primary = &eps[0];
+                if primary.host == "127.0.0.1" && primary.port == unhealthy_port {
+                    Err("region relay control plane unhealthy (simulated PoP failure)".into())
+                } else if primary.host == "127.0.0.1" && primary.port == good_port {
+                    Ok((
+                        std::path::PathBuf::from("/bin/sh"),
+                        vec![
+                            "-c".into(),
+                            "i=0; while true; do i=$((i+1)); \
+                             echo \"net      accepted ($i/0) diff 100 (10 ms)\"; sleep 0.02; done"
+                                .into(),
+                        ],
+                    ))
+                } else {
+                    Ok((
+                        std::path::PathBuf::from("/bin/sh"),
+                        vec!["-c".into(), "echo connecting; sleep 30".into()],
+                    ))
+                }
+            });
+
+            s.start(
+                std::path::PathBuf::from("/bin/sh"),
+                vec!["-c".into(), "echo init; sleep 30".into()],
+                rebuild,
+            )
+            .expect("start");
+
+            // The lane must recover onto the GOOD region — skipping the unhealthy one
+            // whose rebuild failed — and be Running with rising shares. Bounded wait.
+            let mut recovered = false;
+            for _ in 0..300 {
+                let st = s.stats();
+                if s.current_endpoint() == good_authority
+                    && st.state == ProcState::Running
+                    && st.accepted >= 1
+                {
+                    recovered = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let st = s.stats();
+            assert!(
+                recovered,
+                "auto lane must recover onto the good region, not dead-end on the \
+                 unhealthy one (endpoint={:?}, state={:?}, failovers={})",
+                st.endpoint, st.state, st.failovers
+            );
+            assert_ne!(st.state, ProcState::Error, "must NOT be stuck in error");
+            assert!(st.failovers >= 1, "a real region change must be counted");
+            // The snapshot endpoint tracked the cursor to the good region (never froze
+            // on the unhealthy one).
+            assert_eq!(st.endpoint.as_deref(), Some(good_authority.as_str()));
+
+            s.request_stop();
+            for _ in 0..50 {
+                let stt = s.stats().state;
+                if stt == ProcState::Stopped || stt == ProcState::Error {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            drop(unhealthy);
+            drop(good);
+        });
+    }
+
+    /// When EVERY region's rebuild fails in one round (all relays' control planes down),
+    /// the auto lane lands in a clear Error with the honest "all regions unavailable"
+    /// status — NOT the "retrying other regions" line (which would be a lie once there
+    /// is nothing left to try) — and it does so bounded (no restart storm).
+    #[cfg(unix)]
+    #[test]
+    fn auto_failover_all_regions_unhealthy_lands_clear_error() {
+        let _env = spawn_env_guard();
+        let rt = rt();
+        rt.block_on(async {
+            // Two TCP-live listeners whose rebuild ALWAYS fails (control plane down).
+            let a = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a");
+            let a_port = a.local_addr().unwrap().port();
+            let b = std::net::TcpListener::bind("127.0.0.1:0").expect("bind b");
+            let b_port = b.local_addr().unwrap().port();
+
+            let plan = EndpointPlan::new(vec![
+                Endpoint::plaintext("127.0.0.1", a_port),
+                Endpoint::plaintext("127.0.0.1", b_port),
+            ])
+            .unwrap();
+            let s = LaneSupervisor::with_endpoints(Lane::Xmr, plan);
+            s.set_failover_timing(Duration::from_millis(50), Duration::from_millis(10));
+
+            // Every rebuild fails (both regions' control planes are down).
+            let rebuild: RebuildFn =
+                Arc::new(move |_eps: &[Endpoint]| Err("all region control planes down".into()));
+            // Initial child stalls (sleeps) so the watchdog trips and enters recovery.
+            s.start(
+                std::path::PathBuf::from("/bin/sh"),
+                vec!["-c".into(), "sleep 30".into()],
+                rebuild,
+            )
+            .expect("start");
+
+            let mut errored = false;
+            for _ in 0..300 {
+                if s.stats().state == ProcState::Error {
+                    errored = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(errored, "all-regions-unhealthy must land in a clear Error");
+            let msg = s.stats().message.unwrap_or_default();
+            assert!(
+                msg.contains("unavailable") || msg.contains("不可用"),
+                "the terminal status must be the honest all-regions-unavailable line: {msg:?}"
+            );
+            // Bounded — no restart storm (failovers never counted a phantom switch).
+            assert_eq!(s.failovers(), 0, "no region ever actually switched");
+
+            s.request_stop();
+            drop(a);
+            drop(b);
         });
     }
 }
