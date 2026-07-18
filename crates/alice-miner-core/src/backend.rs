@@ -912,9 +912,19 @@ mod tests {
     #[test]
     fn resolve_custom_binary_rejects_relative_and_missing() {
         let mut cm = custom(MinerPreset::GenericStratum, Lane::GpuPrl, None, false);
+        // A relative path is refused on EVERY platform: we require an absolute path
+        // to avoid PATH lookup / ambiguity (a security property, not cosmetic).
         cm.path = PathBuf::from("relative/miner");
         assert!(resolve_custom_binary(&cm).unwrap_err().contains("absolute"));
-        cm.path = PathBuf::from("/no/such/alice/custom/miner");
+        // An absolute path that does not exist is refused as "not found". Build it
+        // from the platform temp dir (always absolute) rather than hardcoding a Unix
+        // "/…" literal — on Windows a leading-slash path has no drive letter, so
+        // `Path::is_absolute()` is false and it would wrongly hit the "absolute"
+        // branch. temp_dir() is absolute on Unix and Windows alike.
+        let missing =
+            std::env::temp_dir().join(format!("alice-no-such-custom-miner-{}", std::process::id()));
+        assert!(!missing.exists(), "temp probe path unexpectedly exists: {}", missing.display());
+        cm.path = missing;
         assert!(resolve_custom_binary(&cm).unwrap_err().contains("not found"));
     }
 
