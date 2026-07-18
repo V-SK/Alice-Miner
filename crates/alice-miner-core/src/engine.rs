@@ -1390,11 +1390,25 @@ fn spawn_prl_enroll_task(
         // "15% PRL 返还" block shows the honest enrolled/skipped state. The enroll
         // is still fail-open w.r.t. the lane (a Failed/JoinError never stops mining).
         use crate::prl_payout::EnrollOutcome;
-        let code = match outcome {
+        // Log the failure REASON (previously discarded) so a future server/client field
+        // -contract drift surfaces in the miner log instead of a fully silent FAILED flag.
+        // Still fail-open: a Failed/JoinError never stops the lane. (A richer dashboard
+        // string channel is a follow-up — the status flag itself is only a u8.)
+        let code = match &outcome {
             Ok(EnrollOutcome::Enrolled) => enroll_status::ENROLLED,
             Ok(EnrollOutcome::NoPayoutAddress) => enroll_status::NO_ADDRESS,
             Ok(EnrollOutcome::WatchOnly) => enroll_status::WATCH_ONLY,
-            Ok(EnrollOutcome::Failed(_)) | Err(_) => enroll_status::FAILED,
+            Ok(EnrollOutcome::Failed(reason)) => {
+                eprintln!(
+                    "[prl-enroll] payout-address enroll failed (best-effort, mining \
+                     continues): {reason}"
+                );
+                enroll_status::FAILED
+            }
+            Err(join_err) => {
+                eprintln!("[prl-enroll] enroll task panicked: {join_err}");
+                enroll_status::FAILED
+            }
         };
         status.store(code, Ordering::Relaxed);
     });
