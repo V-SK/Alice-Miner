@@ -1193,13 +1193,21 @@ impl MinerApp {
             if self.terminal_stop_has_converged() {
                 return EngineState::Idle;
             }
-            // The CLI's FINAL snapshot reports a terminal state (Idle/Error) once it has
-            // stopped — reflect it immediately instead of holding Stopping. On the
-            // terminal path the engine only ever emits Idle AFTER a stop (a healthy start
-            // emits Starting/Running, never Idle), so this can't mis-fire during warm-up.
-            if let Some(s) = self.snapshot.as_ref() {
-                if matches!(s.state, EngineState::Idle | EngineState::Error) {
-                    return s.state;
+            // The CLI's FINAL snapshot reports a terminal state (Idle/Error) once the
+            // external miner has fully exited — reflect it immediately instead of holding
+            // Stopping. GATE it on pid-absence: the CLI mirrors EVERY snapshot each second,
+            // so a TRANSIENT Idle a Layer-B failover / in-place restart emits — or the Error
+            // a child crash emits — arrives while the CLI PARENT (`miner-cli.pid`) is still
+            // LIVE and the lane is about to come back Running. Reading that as "stopped"
+            // would mis-report a running miner as Idle. Only when BOTH pid files are gone
+            // (the CLI truly exited / a Ctrl-C) is a terminal-state snapshot the real end.
+            // (When the parent is still live and the child crashed, `Error` is preserved by
+            // the fall-through below so the crash stays visible — it just doesn't converge.)
+            if alice_miner_core::terminal::terminal_pids_absent() {
+                if let Some(s) = self.snapshot.as_ref() {
+                    if matches!(s.state, EngineState::Idle | EngineState::Error) {
+                        return s.state;
+                    }
                 }
             }
             if self.terminal_stopping {
@@ -1605,18 +1613,27 @@ impl MinerApp {
             return; // not written yet (CLI still starting) — keep the launch-grace Running
         };
         if let Ok(snap) = serde_json::from_slice::<Snapshot>(&bytes) {
-            // The CLI writes a FINAL snapshot in a terminal state (Idle/Error) as it stops
-            // — whether via the GUI's Stop or a manual Ctrl-C in the terminal window.
-            // Treat that as stop-complete: return to Idle rather than folding it in and
-            // re-arming staleness (which would strand the UI at Stopping…). On the
-            // terminal path the engine only ever emits Idle AFTER a stop (a healthy start
-            // emits Starting/Running), so this never mis-fires during warm-up.
-            if matches!(snap.state, EngineState::Idle | EngineState::Error) {
+            // A FINAL terminal-state snapshot (Idle/Error) means "stop complete" ONLY when
+            // the external miner is truly gone — BOTH pid files absent (the CLI dropped its
+            // own `miner-cli.pid` on graceful exit / Ctrl-C, and the child backstop cleared).
+            // Gating on pid-absence is essential: the CLI mirrors EVERY snapshot each second,
+            // including the TRANSIENT Idle a Layer-B failover / in-place restart emits and
+            // the Error a child crash emits, all WHILE its parent pid is still LIVE. Clearing
+            // on those would permanently drop tracking + STOP the poll, stranding the UI at
+            // Idle while the terminal miner restarts and keeps Running (the false "Idle while
+            // running"). (A pressed Stop converges earlier via `terminal_stop_has_converged`;
+            // this pid-absent clear is the belt for a Ctrl-C we weren't `stopping` for.)
+            if matches!(snap.state, EngineState::Idle | EngineState::Error)
+                && terminal::terminal_pids_absent()
+            {
                 terminal::remove_legacy_pid();
                 self.clear_terminal_state();
                 return;
             }
-            // A live snapshot → the terminal miner is alive; re-arm staleness + fold in.
+            // The miner is still alive — a live snapshot, OR a transient Idle/Error while its
+            // parent pid persists — so re-arm staleness and fold it in. Folding keeps the
+            // poll active (recovering to Running after a failover) and surfaces a crash's
+            // Error (and message) instead of silently swallowing it to Idle.
             self.last_terminal_activity = Some(now);
             self.on_snapshot(snap);
         }
@@ -2968,15 +2985,20 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         app.poll_terminal_telemetry();
         assert_eq!(app.state(), EngineState::Stopping, "a live snapshot mid-stop stays Stopping");
 
-        // The CLI writes its FINAL idle snapshot (pids still present) → poll returns Idle,
-        // WITHOUT deleting the file.
+        // The CLI writes an idle snapshot but its pid files are STILL present (it hasn't
+        // exited yet). This is NOT the definitive stop signal — the same transient Idle can
+        // appear mid-failover — so the poll must NOT converge on it: tracking is retained and
+        // the UI holds Stopping until the pids actually vanish. The file is preserved.
         std::fs::write(&tf, serde_json::to_vec(&terminal_snapshot(EngineState::Idle)).unwrap())
             .unwrap();
         app.last_terminal_poll = None;
         app.poll_terminal_telemetry();
-        assert!(app.terminal_lane.is_none(), "final idle snapshot clears terminal tracking");
-        assert_eq!(app.state(), EngineState::Idle);
-        assert!(tf.exists(), "the final idle snapshot file is preserved, not deleted");
+        assert!(
+            app.terminal_lane.is_some(),
+            "an idle snapshot with pids still present must NOT converge (not the definitive stop)"
+        );
+        assert_eq!(app.state(), EngineState::Stopping, "still winding down (pids present) → Stopping");
+        assert!(tf.exists(), "the idle snapshot file is preserved, not deleted");
 
         // Convergence path: re-arm a stopping terminal, then BOTH pid files vanish (a
         // graceful CLI exit) → converged → Idle, and a residual legacy miner.pid is swept.
@@ -2996,6 +3018,93 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             !terminal::legacy_pid_path().exists(),
             "a residual legacy miner.pid is swept on convergence"
         );
+
+        match prev_dir {
+            Some(v) => std::env::set_var("ALICE_IDENTITY_DIR", v),
+            None => std::env::remove_var("ALICE_IDENTITY_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REGRESSION (failover / crash must NOT false-converge to Idle): the CLI mirrors EVERY
+    /// snapshot each second, so a TRANSIENT Idle a Layer-B failover / in-place restart emits
+    /// — or the Error a child crash emits — reaches the GUI while the CLI PARENT
+    /// (`miner-cli.pid`) is still LIVE and no Stop was pressed. That must NOT clear terminal
+    /// tracking / stop the poll (which would strand the UI at Idle while the terminal miner
+    /// restarts and keeps Running). Only a genuine exit (BOTH pid files gone) converges.
+    /// Complements `terminal_stop_converges_to_idle`, which runs entirely with
+    /// `terminal_stopping = true`; this exercises the `stopping = false` + live-cli path.
+    /// Env-locked (sets `$ALICE_IDENTITY_DIR`) so the pid/telemetry paths never touch home.
+    #[test]
+    fn terminal_transient_idle_or_error_with_live_cli_does_not_converge() {
+        use alice_miner_core::terminal;
+        let _g = PRL_PAYOUT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_dir = std::env::var("ALICE_IDENTITY_DIR").ok();
+        let dir = std::env::temp_dir().join(format!(
+            "alice-gui-failover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+
+        let mut app = MinerApp::new().expect("engine spawns");
+        let tf = terminal::telemetry_path();
+        app.terminal_lane = Some(Lane::GpuPrl);
+        app.terminal_telemetry_path = Some(tf.clone());
+        app.last_terminal_activity = Some(Instant::now());
+        app.snapshot = None;
+        // NOT stopping — a live miner mid-failover, not a user Stop.
+        app.terminal_stopping = false;
+        // The CLI PARENT is still alive (its pid file present); the engine child is
+        // momentarily down while the supervisor respawns it (Layer-B backoff window).
+        std::fs::write(terminal::cli_pid_path(), "111").unwrap();
+        assert!(!terminal::terminal_pids_absent(), "cli-pid present → miner not gone");
+
+        // (1) The TRANSIENT Idle the CLI mirrors during the failover gap must NOT converge.
+        std::fs::write(&tf, serde_json::to_vec(&terminal_snapshot(EngineState::Idle)).unwrap())
+            .unwrap();
+        app.last_terminal_poll = None;
+        app.poll_terminal_telemetry();
+        assert!(
+            app.terminal_lane.is_some(),
+            "a transient Idle with the CLI parent still live must NOT clear tracking"
+        );
+
+        // (2) A child CRASH → Error, CLI parent still live: tracking retained AND the Error
+        // is surfaced (not silently swallowed to Idle) so the crash stays visible.
+        std::fs::write(&tf, serde_json::to_vec(&terminal_snapshot(EngineState::Error)).unwrap())
+            .unwrap();
+        app.last_terminal_poll = None;
+        app.poll_terminal_telemetry();
+        assert!(
+            app.terminal_lane.is_some(),
+            "an Error with a live CLI parent must NOT clear tracking"
+        );
+        assert_eq!(app.state(), EngineState::Error, "a live-cli crash Error stays visible");
+
+        // (3) The supervisor respawns the child → a Running snapshot: the poll (still active,
+        // never stopped) folds it in and the UI recovers to Running — proving it was never
+        // stranded at Idle.
+        std::fs::write(&tf, serde_json::to_vec(&terminal_snapshot(EngineState::Running)).unwrap())
+            .unwrap();
+        app.last_terminal_poll = None;
+        app.poll_terminal_telemetry();
+        assert_eq!(app.state(), EngineState::Running, "recovers to Running after failover");
+        assert!(app.is_mining());
+
+        // (4) Now a GENUINE exit: the CLI removed its pid file → the SAME Idle snapshot
+        // legitimately converges (the definitive stop signal is pids-gone, even though Stop
+        // was never pressed — e.g. a Ctrl-C in the terminal window).
+        let _ = std::fs::remove_file(terminal::cli_pid_path());
+        let _ = std::fs::remove_file(terminal::child_pid_path());
+        assert!(terminal::terminal_pids_absent());
+        std::fs::write(&tf, serde_json::to_vec(&terminal_snapshot(EngineState::Idle)).unwrap())
+            .unwrap();
+        app.last_terminal_poll = None;
+        app.poll_terminal_telemetry();
+        assert!(app.terminal_lane.is_none(), "pids gone + Idle → genuine convergence");
+        assert_eq!(app.state(), EngineState::Idle);
 
         match prev_dir {
             Some(v) => std::env::set_var("ALICE_IDENTITY_DIR", v),
