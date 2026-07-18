@@ -1185,12 +1185,39 @@ impl MinerApp {
             if self.terminal_telemetry_stale() {
                 return EngineState::Idle;
             }
+            // Definitive stop convergence: a pressed Stop whose external CLI + engine
+            // child have BOTH fully exited (their pid files are gone). This wins over a
+            // lingering final idle `Snapshot` the CLI writes on its way out — that
+            // snapshot would otherwise keep telemetry "fresh" and strand the UI at
+            // `Stopping…` forever (the M4-Max "stuck at Stopping" report).
+            if self.terminal_stop_has_converged() {
+                return EngineState::Idle;
+            }
+            // The CLI's FINAL snapshot reports a terminal state (Idle/Error) once it has
+            // stopped — reflect it immediately instead of holding Stopping. On the
+            // terminal path the engine only ever emits Idle AFTER a stop (a healthy start
+            // emits Starting/Running, never Idle), so this can't mis-fire during warm-up.
+            if let Some(s) = self.snapshot.as_ref() {
+                if matches!(s.state, EngineState::Idle | EngineState::Error) {
+                    return s.state;
+                }
+            }
             if self.terminal_stopping {
                 return EngineState::Stopping;
             }
             return self.snapshot.as_ref().map(|s| s.state).unwrap_or(EngineState::Running);
         }
         self.snapshot.as_ref().map(|s| s.state).unwrap_or(EngineState::Idle)
+    }
+
+    /// On the terminal path, whether a pressed Stop has fully CONVERGED: we are in the
+    /// stopping state AND both the CLI-parent (`miner-cli.pid`) and engine-child
+    /// (`miner-child.pid`) pid files are gone — the CLI removed its own pid on graceful
+    /// exit and the child backstop was cleared. This is the DEFINITIVE stop signal,
+    /// independent of telemetry, so a final idle snapshot re-arming the staleness clock
+    /// can never leave the UI stuck at `Stopping…`. Only meaningful on the terminal path.
+    fn terminal_stop_has_converged(&self) -> bool {
+        self.terminal_stopping && alice_miner_core::terminal::terminal_pids_absent()
     }
 
     pub fn is_mining(&self) -> bool {
@@ -1545,10 +1572,19 @@ impl MinerApp {
     /// terminal was closed, or a Stop's CLI exited), return the UI to Idle rather than
     /// showing "Running" forever. No-op when not on the terminal path.
     pub fn poll_terminal_telemetry(&mut self) {
+        use alice_miner_core::terminal;
         if self.terminal_lane.is_none() {
             return;
         }
-        // Staleness sweep first: a closed terminal / a completed Stop → back to Idle.
+        // Definitive stop convergence FIRST: a pressed Stop whose CLI + engine child
+        // both fully exited (pid files gone) → the external miner is down; return to Idle
+        // regardless of any lingering final snapshot. Sweep a legacy `miner.pid` too.
+        if self.terminal_stop_has_converged() {
+            terminal::remove_legacy_pid();
+            self.clear_terminal_state();
+            return;
+        }
+        // Staleness sweep: a closed terminal / a CLI that exited without a final snapshot.
         if self.terminal_telemetry_stale() {
             self.clear_terminal_state();
             return;
@@ -1569,7 +1605,18 @@ impl MinerApp {
             return; // not written yet (CLI still starting) — keep the launch-grace Running
         };
         if let Ok(snap) = serde_json::from_slice::<Snapshot>(&bytes) {
-            // A real snapshot arrived → the terminal miner is alive; re-arm staleness.
+            // The CLI writes a FINAL snapshot in a terminal state (Idle/Error) as it stops
+            // — whether via the GUI's Stop or a manual Ctrl-C in the terminal window.
+            // Treat that as stop-complete: return to Idle rather than folding it in and
+            // re-arming staleness (which would strand the UI at Stopping…). On the
+            // terminal path the engine only ever emits Idle AFTER a stop (a healthy start
+            // emits Starting/Running), so this never mis-fires during warm-up.
+            if matches!(snap.state, EngineState::Idle | EngineState::Error) {
+                terminal::remove_legacy_pid();
+                self.clear_terminal_state();
+                return;
+            }
+            // A live snapshot → the terminal miner is alive; re-arm staleness + fold in.
             self.last_terminal_activity = Some(now);
             self.on_snapshot(snap);
         }
@@ -1584,12 +1631,15 @@ impl MinerApp {
         if let Ok(cli_path) = terminal::resolve_cli_path() {
             let _ = terminal::spawn_cli_stop(&cli_path, 8);
         }
-        // Remove the telemetry file so a stale Running snapshot isn't re-read while the
-        // CLI winds down; keep `terminal_lane` set so `state()` reads Stopping until the
-        // staleness sweep (≥ the CLI's 8s graceful window) clears it.
-        if let Some(path) = &self.terminal_telemetry_path {
-            let _ = std::fs::remove_file(path);
-        }
+        // Do NOT delete the telemetry file here. The CLI writes a FINAL idle `Snapshot`
+        // on its way out, and that idle snapshot — together with the CLI/child pid files
+        // disappearing — is exactly how `poll_terminal_telemetry` + `state()` detect the
+        // stop has converged and return to Idle. (The old delete raced the CLI RE-creating
+        // the file with its final idle snapshot; every subsequent poll re-read it and
+        // re-armed the staleness clock, so it never went stale and the UI stayed at
+        // `Stopping…` forever — the M4-Max report.) Keep `terminal_lane` set so `state()`
+        // reads Stopping until the pid files vanish / that final idle snapshot lands / the
+        // staleness window elapses.
         self.terminal_stopping = true;
         self.last_terminal_activity = Some(Instant::now());
     }
@@ -2800,6 +2850,135 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             app.poll_terminal_telemetry();
             assert!(app.terminal_lane.is_none(), "stale sweep clears terminal state");
         }
+    }
+
+    /// A minimal terminal `Snapshot` in a given state, for the stop-convergence tests.
+    fn terminal_snapshot(state: EngineState) -> Snapshot {
+        Snapshot {
+            state,
+            device: None,
+            lane: Some(Lane::GpuPrl),
+            hashrate_hs: if state == EngineState::Running { Some(1.0e6) } else { None },
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
+            shares_accepted: 0,
+            shares_rejected: 0,
+            endpoint: None,
+            worker_id: None,
+            uptime_s: 0,
+            failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
+            dual: false,
+            lanes: Vec::new(),
+            last_line: None,
+            message: None,
+            prl_payout: None,
+        }
+    }
+
+    /// STOP CONVERGENCE (the M4-Max "stuck at Stopping" fix): `stop_terminal_miner` must
+    /// NOT delete the telemetry file — the CLI's final idle snapshot written there is how
+    /// the poll loop learns the stop completed. (The old delete raced the CLI re-creating
+    /// it, which re-armed staleness forever and stranded the UI at Stopping…).
+    #[test]
+    fn stop_terminal_miner_preserves_telemetry_file() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        let dir = std::env::temp_dir().join(format!(
+            "alice-gui-stopkeep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tf = dir.join("miner-cli.snapshot.json");
+        std::fs::write(&tf, b"{\"state\":\"running\",\"shares_accepted\":0,\"shares_rejected\":0,\"uptime_s\":0,\"failovers\":0,\"dual\":false}").unwrap();
+        app.terminal_lane = Some(Lane::Xmr);
+        app.terminal_telemetry_path = Some(tf.clone());
+        app.last_terminal_activity = Some(Instant::now());
+        // resolve_cli_path() finds no sibling CLI under the test binary, so no process is
+        // spawned — the behaviour under test is purely that the file is not deleted.
+        app.stop_terminal_miner();
+        assert!(app.terminal_stopping, "stop arms the stopping state");
+        assert!(
+            tf.exists(),
+            "stop must NOT delete the telemetry file (the CLI writes its final idle snapshot there)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// STOP CONVERGENCE end-to-end (pid-file + final-idle-snapshot paths). Serialized on
+    /// the shared env lock because it sets `$ALICE_IDENTITY_DIR` (which the pid/telemetry
+    /// paths resolve through) — never the real `~/.alice`.
+    #[test]
+    fn terminal_stop_converges_to_idle() {
+        use alice_miner_core::terminal;
+        let _g = PRL_PAYOUT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_dir = std::env::var("ALICE_IDENTITY_DIR").ok();
+        let dir = std::env::temp_dir().join(format!(
+            "alice-gui-stopconv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+
+        let mut app = MinerApp::new().expect("engine spawns");
+        let tf = terminal::telemetry_path();
+        app.terminal_lane = Some(Lane::GpuPrl);
+        app.terminal_telemetry_path = Some(tf.clone());
+        app.last_terminal_activity = Some(Instant::now());
+        app.snapshot = None;
+        app.terminal_stopping = true;
+
+        // Both pid files present → NOT converged → the UI reads Stopping (wind-down).
+        std::fs::write(terminal::cli_pid_path(), "111").unwrap();
+        terminal::write_child_pid(222, std::path::Path::new("/x/xmrig"));
+        assert!(!app.terminal_stop_has_converged());
+        assert_eq!(app.state(), EngineState::Stopping, "pids present + stopping → Stopping");
+
+        // A live snapshot mid-stop must NOT prematurely idle (still Stopping).
+        std::fs::write(&tf, serde_json::to_vec(&terminal_snapshot(EngineState::Running)).unwrap())
+            .unwrap();
+        app.last_terminal_poll = None;
+        app.poll_terminal_telemetry();
+        assert_eq!(app.state(), EngineState::Stopping, "a live snapshot mid-stop stays Stopping");
+
+        // The CLI writes its FINAL idle snapshot (pids still present) → poll returns Idle,
+        // WITHOUT deleting the file.
+        std::fs::write(&tf, serde_json::to_vec(&terminal_snapshot(EngineState::Idle)).unwrap())
+            .unwrap();
+        app.last_terminal_poll = None;
+        app.poll_terminal_telemetry();
+        assert!(app.terminal_lane.is_none(), "final idle snapshot clears terminal tracking");
+        assert_eq!(app.state(), EngineState::Idle);
+        assert!(tf.exists(), "the final idle snapshot file is preserved, not deleted");
+
+        // Convergence path: re-arm a stopping terminal, then BOTH pid files vanish (a
+        // graceful CLI exit) → converged → Idle, and a residual legacy miner.pid is swept.
+        app.terminal_lane = Some(Lane::GpuPrl);
+        app.terminal_telemetry_path = Some(tf.clone());
+        app.last_terminal_activity = Some(Instant::now());
+        app.snapshot = None;
+        app.terminal_stopping = true;
+        let _ = std::fs::remove_file(terminal::cli_pid_path());
+        let _ = std::fs::remove_file(terminal::child_pid_path());
+        std::fs::write(terminal::legacy_pid_path(), "333").unwrap();
+        assert!(app.terminal_stop_has_converged(), "both pid files gone + stopping → converged");
+        assert_eq!(app.state(), EngineState::Idle, "convergence → Idle even with a fresh clock");
+        app.poll_terminal_telemetry();
+        assert!(app.terminal_lane.is_none(), "convergence clears terminal tracking");
+        assert!(
+            !terminal::legacy_pid_path().exists(),
+            "a residual legacy miner.pid is swept on convergence"
+        );
+
+        match prev_dir {
+            Some(v) => std::env::set_var("ALICE_IDENTITY_DIR", v),
+            None => std::env::remove_var("ALICE_IDENTITY_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Cancelling the unlock prompt zeroizes+drops the captured password and closes
