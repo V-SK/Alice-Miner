@@ -2809,18 +2809,35 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
     /// On the CLI-in-terminal path, `state()` reads Running the moment the terminal is
     /// launched — BEFORE the first telemetry snapshot lands — so pressing Start never
     /// shows a misleading Idle; and `clear_terminal_state` returns it cleanly to Idle.
+    /// Env-locked (sets `$ALICE_IDENTITY_DIR`) because the Stopping assertion now needs
+    /// the CLI/child pid files PRESENT — otherwise their absence is a valid stop
+    /// convergence and the state correctly reads Idle, not Stopping.
     #[test]
     fn terminal_lane_without_snapshot_reads_running_then_idle_on_clear() {
+        use alice_miner_core::terminal;
+        let _g = PRL_PAYOUT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_dir = std::env::var("ALICE_IDENTITY_DIR").ok();
+        let dir = std::env::temp_dir().join(format!(
+            "alice-gui-termlane-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+
         let mut app = MinerApp::new().expect("engine spawns");
-        // Simulate a just-launched terminal miner (no snapshot yet).
+        // Simulate a just-launched terminal miner (no snapshot yet). Its pid files exist
+        // while the external miner runs.
+        std::fs::write(terminal::cli_pid_path(), "111").unwrap();
+        terminal::write_child_pid(222, std::path::Path::new("/x/xmrig"));
         app.terminal_lane = Some(Lane::GpuPrl);
-        app.terminal_telemetry_path = Some(std::path::PathBuf::from("/tmp/x.json"));
+        app.terminal_telemetry_path = Some(terminal::telemetry_path());
         app.last_terminal_activity = Some(Instant::now());
         app.snapshot = None;
         assert_eq!(app.state(), EngineState::Running, "launched but pre-snapshot → Running");
         assert!(app.is_mining());
 
-        // Stop pressed → Stopping until the telemetry goes stale.
+        // Stop pressed, pid files still present (CLI winding down) → Stopping.
         app.terminal_stopping = true;
         assert_eq!(app.state(), EngineState::Stopping);
 
@@ -2828,6 +2845,12 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         app.clear_terminal_state();
         assert_eq!(app.state(), EngineState::Idle);
         assert!(!app.is_mining());
+
+        match prev_dir {
+            Some(v) => std::env::set_var("ALICE_IDENTITY_DIR", v),
+            None => std::env::remove_var("ALICE_IDENTITY_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Stale telemetry (the terminal was closed / the CLI died — no update for >10s)
