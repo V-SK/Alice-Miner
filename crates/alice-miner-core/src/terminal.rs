@@ -151,6 +151,81 @@ pub fn terminal_pids_absent() -> bool {
     !cli_pid_path().exists() && !child_pid_path().exists()
 }
 
+/// Read the CLI **parent** pid (`miner-cli.pid`, line 1), if the file exists + parses.
+/// The counterpart of [`read_child_pid`] for the CLI-parent rendezvous.
+pub fn read_cli_pid() -> Option<u32> {
+    let body = fs::read_to_string(cli_pid_path()).ok()?;
+    body.lines().next()?.trim().parse::<u32>().ok()
+}
+
+/// Whether the external terminal miner has a **LIVE process**: either the CLI parent
+/// (`miner-cli.pid`) or the engine child (`miner-child.pid`) names a pid that is CURRENTLY
+/// running. This is stronger than [`terminal_pids_absent`] (which only checks that the pid
+/// *files* exist): it also rejects a STALE pid file a crashed / SIGKILL'd process left
+/// behind. Path-independent — it NEVER looks at the process's on-disk bundle path, so a
+/// miner running from a macOS AppTranslocation mount (a `.app` launched straight from
+/// `~/Downloads`) is recognised exactly like one under `/Applications`. Best-effort +
+/// fail-SAFE: an indeterminate liveness probe reports ALIVE, so a running miner is never
+/// falsely declared dead.
+pub fn terminal_pids_alive() -> bool {
+    if let Some(pid) = read_cli_pid() {
+        if pid_is_alive(pid) {
+            return true;
+        }
+    }
+    if let Some(pid) = read_child_pid() {
+        if pid_is_alive(pid) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether process `pid` is currently alive. Uses `kill(pid, 0)` on unix (Ok / `EPERM` =
+/// the process exists; `ESRCH` = no such process) — the same primitive the CLI's `pidfile`
+/// module uses, bound directly to avoid a `libc` dependency on this crate. On non-unix we
+/// can't cheaply probe, so we fail-SAFE to ALIVE (never falsely declare a miner dead).
+pub fn pid_is_alive(pid: u32) -> bool {
+    // A pid of 0 is never a single miner process: on unix `kill(0, 0)` addresses the
+    // caller's whole process group (a false-positive "alive"), and on Windows it is not a
+    // valid target either. Guard before the platform probe so both branches agree that
+    // pid 0 is NOT a live miner. This is the one contractual sentinel — real pids still
+    // flow to the platform probe, where an indeterminate result fail-SAFEs to ALIVE.
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        unsafe { libc_kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Age (`now − mtime`) of the CLI→GUI telemetry snapshot file at `path`, or `None` when the
+/// file is absent / its mtime can't be read. Lets the GUI judge freshness by the CLI's OWN
+/// write clock (the file's mtime) rather than the GUI's poll clock — so a GUI-side stall
+/// (macOS App Nap, an occluded window, repaint starvation, a stretch of failed reads) can
+/// never make a still-updating miner look stale. Fail-SAFE toward "fresh": a future / equal
+/// mtime (clock jitter around a just-written file) reports `Duration::ZERO`, not an error.
+pub fn snapshot_age_at(path: &Path) -> Option<std::time::Duration> {
+    let mtime = fs::metadata(path).ok()?.modified().ok()?;
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(mtime)
+            .unwrap_or(std::time::Duration::ZERO),
+    )
+}
+
+/// Age of the CANONICAL telemetry snapshot (`<alice-dir>/miner-cli.snapshot.json`).
+/// See [`snapshot_age_at`].
+pub fn snapshot_age() -> Option<std::time::Duration> {
+    snapshot_age_at(&telemetry_path())
+}
+
 /// Best-effort remove of a residual legacy `miner.pid` (see [`LEGACY_PID_FILE_NAME`]).
 /// Called on stop-convergence so an old-build leftover can't linger. A missing file is
 /// fine; any error is ignored (this is pure hygiene, never load-bearing).
@@ -424,6 +499,15 @@ fn spawn_detached(program: &str, argv: &[String]) -> Result<(), String> {
         .map_err(|e| format!("failed to open a terminal via `{program}`: {e}"))
 }
 
+// ── Minimal libc binding (unix) ───────────────────────────────────────────────
+// [`pid_is_alive`] needs only `kill(2)`; binding it directly avoids adding a `libc` /
+// `nix` dependency (mirrors the CLI's `pidfile` module, which does the same).
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +766,92 @@ mod tests {
         assert_eq!(CLI_PID_FILE_NAME, "miner-cli.pid");
         assert_eq!(LEGACY_PID_FILE_NAME, "miner.pid");
         std::env::remove_var("ALICE_IDENTITY_DIR");
+    }
+
+    /// `pid_is_alive` detects THIS process as alive and a very high unused pid as dead
+    /// (unix); pid 0 (a process-group address, never a single miner) reports not-alive.
+    #[test]
+    fn pid_is_alive_detects_self_and_missing() {
+        assert!(pid_is_alive(std::process::id()), "our own pid is alive");
+        assert!(!pid_is_alive(0), "pid 0 is a group address, not a live miner");
+        #[cfg(unix)]
+        {
+            // A pid near the top of the space is (essentially certainly) unused.
+            assert!(!pid_is_alive(0x7FFF_FFFE), "a very high pid is not alive");
+        }
+    }
+
+    /// `terminal_pids_alive` is TRUE iff the CLI-parent OR engine-child pid file names a
+    /// LIVE process — stronger than `terminal_pids_absent` (file existence only): a STALE
+    /// pid file from a dead process reads as NOT alive. It never inspects a bundle path,
+    /// so an AppTranslocation-mounted engine is recognised the same as any other.
+    /// Unix-only: the "dead pid → not alive" leg relies on `kill(pid, 0)`; on non-unix the
+    /// probe fail-safes to always-alive (a different, intentionally weaker contract).
+    #[cfg(unix)]
+    #[test]
+    fn terminal_pids_alive_requires_a_live_process_not_just_a_file() {
+        let _g = crate::IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = temp_dir("pids-alive");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
+
+        // No files → not alive.
+        assert!(!terminal_pids_alive(), "no pid files → not alive");
+
+        // A STALE cli-pid file naming a dead process → still NOT alive (the crash/kill
+        // case: the file lingers but nothing runs). 2147483646 (0x7FFF_FFFE) is unused.
+        std::fs::write(cli_pid_path(), "2147483646\n").unwrap();
+        assert!(!terminal_pids_alive(), "a dead pid in the file → not alive");
+
+        // Our OWN pid in the CLI-parent file → alive (a live parent counts). The child-pid
+        // path also records an engine binary path we DON'T inspect for liveness.
+        std::fs::write(cli_pid_path(), format!("{}\n", std::process::id())).unwrap();
+        assert!(terminal_pids_alive(), "a live cli-parent pid → alive");
+
+        // Only a live CHILD (engine) pid, no cli-parent file → alive via the child path.
+        std::fs::remove_file(cli_pid_path()).unwrap();
+        write_child_pid(
+            std::process::id(),
+            std::path::Path::new(
+                "/private/var/folders/xx/AppTranslocation/ABC/d/AliceMiner.app/Contents/MacOS/xmrig",
+            ),
+        );
+        assert!(
+            terminal_pids_alive(),
+            "a live engine-child pid at an AppTranslocation path → alive (path never inspected)"
+        );
+
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `snapshot_age_at` reports `None` for a missing file and a small, non-None age for a
+    /// just-written one — the CLI's own write clock (the file mtime) the GUI reads instead
+    /// of its own poll clock. `snapshot_age` resolves the canonical path under the override.
+    #[test]
+    fn snapshot_age_tracks_file_mtime() {
+        let _g = crate::IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = temp_dir("snap-age");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let f = tmp.join("miner-cli.snapshot.json");
+
+        // Missing file → None (nothing to attach to).
+        assert!(snapshot_age_at(&f).is_none(), "missing file → None");
+
+        // Just written → a small, non-None age (well under any staleness window).
+        std::fs::write(&f, b"{}").unwrap();
+        let age = snapshot_age_at(&f).expect("a written file has an age");
+        assert!(age < std::time::Duration::from_secs(5), "a fresh file reads fresh: {age:?}");
+
+        // The canonical `snapshot_age()` resolves through `$ALICE_IDENTITY_DIR` (never real
+        // `~/.alice`): with the override set to our temp dir and the file present there, it
+        // returns the same fresh age.
+        std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
+        assert_eq!(telemetry_path(), f);
+        assert!(snapshot_age().is_some(), "canonical age resolves under the override");
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// `terminal_pids_absent` is the stop-convergence signal: TRUE only when NEITHER the
