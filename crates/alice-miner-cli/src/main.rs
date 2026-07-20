@@ -2501,8 +2501,8 @@ fn snapshot_fingerprint(snap: &Snapshot) -> (u64, u64, u64, u64) {
 fn resolve_lane(s: &str, cap: &alice_miner_core::CapabilityProfile) -> Result<Lane, i32> {
     match s.to_ascii_lowercase().as_str() {
         "xmr" | "cpu" => Ok(Lane::Xmr),
-        // `gpu` means the GPU **mainline** = PRL (pearlhash). `rvn` selects the
-        // legacy KawPoW lane explicitly.
+        // `gpu` means the GPU **mainline** = PRL (pearlhash). (`rvn`/KawPoW is not
+        // shipped this release — gated below.)
         "gpu" | "prl" => Ok(Lane::GpuPrl),
         // `alpha` = the AlphaMiner pearlhash lane (V100/Volta — where SRBMiner can't run).
         "alpha" => Ok(Lane::GpuAlpha),
