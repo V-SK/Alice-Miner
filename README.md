@@ -4,9 +4,9 @@ One CLI to **mine** and to **join the Alice AI network**.
 
 `alice-miner` detects your device, manages your Alice reward identity, and puts your
 hardware to work in whatever way it can: mine on your **CPU** (RandomX / XMR) or your
-**GPU** (pearlhash / PRL), or join the **AI network** — serve consumer inference on your
-GPU, contribute to a sharded big model, or run an RLVR training worker. It drives the same
-engine as the desktop app, so the two never drift.
+**GPU** (pearlhash / PRL), or join the **AI network** — contribute to a sharded big model
+or run an RLVR training worker. It drives the same engine as the desktop app, so the two
+never drift.
 
 > **Credit-only.** Rewards accrue as **credit (积分)** — a cumulative accepted-work count.
 > This is **not** cash, and this tool makes **no** earnings, payout, or profit claims. Credit
@@ -34,7 +34,7 @@ engine as the desktop app, so the two never drift.
 ### Option A — download the signed release (desktop app)
 
 The signed releases are published at
-**https://github.com/V-SK/Alice-Miner/releases** (latest: **v0.5.0**). Each release
+**https://github.com/V-SK/Alice-Miner/releases/latest**. Each release
 ships the **Alice Miner desktop app** for your platform, plus a `SHA256SUMS` manifest and
 an ed25519 signature (`latest.json.sig` / `SHA256SUMS.sig`) verified against a key embedded
 in the binary.
@@ -98,7 +98,7 @@ alice-miner setup                 # 1. guided first-run: detect hardware → set
 alice-miner start --lane auto     # 2. mine on the recommended lane (Ctrl-C to stop)
 alice-miner balance               # 3. check your credit / PRL / ALICE buckets
 alice-miner service --install     # 4. keep mining after you close the window
-alice-miner service --logs        # 5. see what the background miner is doing
+alice-miner service --status      # 5. check the background miner is installed & running
 ```
 
 Running the bare binary (`alice-miner`) on a fresh machine launches the same `setup` wizard;
@@ -146,14 +146,16 @@ Prefer the interactive prompt or `--password-stdin` over `--password` on the com
 alice-miner service --install                 # install + start the background agent (CPU-XMR)
 alice-miner service --install --at-login      # ...and restart it at login/boot
 alice-miner service --status                  # is it installed / running?
-alice-miner service --logs                    # last 50 lines of the background log
-alice-miner service --logs --follow           # keep tailing until Ctrl-C
 alice-miner service --uninstall               # stop + remove it
 ```
 
 Backgrounding a **GPU** lane needs an OS keyring (macOS Keychain / Windows Credential Manager
 / Linux Secret Service) to hold the wallet unlock; it is refused on a box with no keyring
 (e.g. a headless Linux rig — keep the window open there, or background CPU-XMR instead).
+
+The background agent writes its output to `…/AliceMiner/logs/miner.background.log` (macOS
+`~/Library/Application Support/…`, Linux `~/.local/share/…`, Windows `%LOCALAPPDATA%\…`);
+`tail -f` that file to watch it live.
 
 **Watch several rigs** reporting to the same address as one local roster:
 
@@ -178,38 +180,13 @@ alice-miner companion --lane alpha --device volta1 # ...for a Volta / V100 rig
 
 ## Join the AI network
 
-Your GPU can also join the Alice AI network for **credit** (no hashrate, no earnings). Start
-with the wizard — it detects your hardware, asks the network what this machine can do, and
-lets you pick and confirm a way to contribute:
-
-```sh
-alice-miner ai --menu
-```
-
-There are three roles. The wizard sets you up for the one that fits your hardware; the
-commands below are the direct entry points.
-
-### Serve — single-GPU consumer inference (proven: Linux + NVIDIA)
-
-Run one model on **your single GPU** and answer consumer chat jobs. This is **outbound-only**
-— the worker dials the gateway, nothing dials you, so there is no port to open. It spawns the
-local Python `alice_acp.worker_client`, so it needs a checkout of the `alice-acp` worker and
-**Python 3.11+** with a CUDA `llama-cpp` backend. On first run it downloads the model weights
-to `~/.cache/alice/local-models`.
-
-```sh
-# You usually pick the model via `alice-miner ai --menu` first, which saves the choice.
-alice-miner serve --worker-dir /path/to/alice-acp-minerai
-alice-miner serve --worker-dir /path/to/alice-acp-minerai --auto   # probe VRAM, pick+download the largest fitting tier
-```
-
-> **Platform:** serving is proven on **Linux + NVIDIA**. macOS / Apple-Silicon (MLX) serving
-> is **untested** — treat it as experimental.
+Your GPU can also join the Alice AI network for **credit** (no hashrate, no earnings). The CLI
+exposes two roles — each has a direct command below.
 
 ### Shard — a stage of a big sharded model (advanced; needs setup)
 
 Run your GPU as one **pipeline-parallel stage** of a large model coordinated by the Alice
-scheduling center. Unlike serving, this has a **public `host:port`** the swarm dials, so you
+scheduling center. Unlike the other roles, this has a **public `host:port`** the swarm dials, so you
 must set up NAT / port-forwarding. It needs a checkout of the shard engine (`phase0/pipeline.py`).
 
 ```sh
@@ -221,16 +198,15 @@ alice-miner ai --endpoint <public-host:port> --engine-dir /path/to/alice-shard-e
 
 Lease a coding task, solve it with your own GPU + model, and submit the candidate; the
 coordinator re-executes it against hidden tests and folds a credit weight. Needs a checkout of
-the training harness (`run_m0.py` + `code_exec.py`) and, for the default 30B-A3B base, a
-~24 GB card with `--four-bit`.
+the training harness (`run_m0.py` + `code_exec.py`).
 
 ```sh
 alice-miner train --trainer-dir /path/to/training-mint-m0
-alice-miner train --trainer-dir /path/to/training-mint-m0 --four-bit   # QLoRA-class NF4, ~24 GB floor
+alice-miner train --trainer-dir /path/to/training-mint-m0 --base-model <hf-id-or-path>   # pick the base model
 ```
 
-> The `serve` / `ai` / `train` commands save your resolved flags, so a later bare
-> `alice-miner serve` (or `ai` / `train`) replays them. All three are **credit-only**.
+> The `ai` and `train` commands save your resolved flags, so a later bare `alice-miner ai`
+> (or `alice-miner train`) replays them. Both are **credit-only**.
 
 ---
 
@@ -242,7 +218,6 @@ fix**. It exits non-zero on any FAIL, so a script can gate `start` on a clean pr
 ```sh
 alice-miner doctor                 # diagnose the recommended mining lane
 alice-miner doctor --lane gpu      # scope to a specific lane
-alice-miner doctor --serve         # diagnose the single-GPU serving role
 alice-miner doctor --ai            # diagnose the shard-stage inference role
 alice-miner doctor --train         # diagnose the RLVR training role
 alice-miner doctor --fix           # apply the SAFE auto-repairs (re-download engine, recreate config)
@@ -255,8 +230,8 @@ as manual steps.
 Common things it catches:
 
 - **No identity yet** → run `alice-miner setup` or `alice-miner identity --create`.
-- **Python floor for AI roles** → serving needs **Python 3.11+** with the worker package and a
-  `llama-cpp` CUDA backend importable; `doctor --serve` checks this.
+- **Python floor for AI roles** → the `ai` (shard) and `train` roles need **python3** with the
+  engine / trainer dependencies (e.g. torch) importable; `doctor --ai` / `doctor --train` checks this.
 - **GPU not seen** → make sure `nvidia-smi` works; list the miner's own device ids with
   `alice-miner gpu-devices`.
 - **Headless box, no keyring** → you can't background a GPU lane there; keep the window open or
@@ -268,7 +243,9 @@ Common things it catches:
   launching. From the next release the miner switches the console to UTF-8 automatically.
   在繁體中文 Windows 上,v0.6.0 及更早版本的 `cmd.exe` / PowerShell 可能將中文輸出顯示為亂碼;
   啟動前先執行 `chcp 65001` 即可,下個版本起程式會自動將主控台切換為 UTF-8。
-- **Background logs** → `alice-miner service --logs` (add `--follow` to tail).
+- **Background logs** → the agent writes to `…/AliceMiner/logs/miner.background.log` (macOS
+  `~/Library/Application Support/…`, Linux `~/.local/share/…`, Windows `%LOCALAPPDATA%\…`); `tail
+  -f` that file, and check `alice-miner service --status` for installed/running state.
 
 Check for a newer signed version any time:
 
@@ -336,7 +313,7 @@ alice-miner setup                 # 1. 首次引导:检测硬件 → 设置地�
 alice-miner start --lane auto     # 2. 用推荐 lane 挖矿(Ctrl-C 停止)
 alice-miner balance               # 3. 查看积分 / PRL / ALICE 三个奖励桶
 alice-miner service --install     # 4. 后台挖矿(关窗后继续)
-alice-miner service --logs        # 5. 查看后台日志
+alice-miner service --status      # 5. 查看后台是否已安装 / 运行中
 ```
 
 **挖矿 lane:** `--lane xmr`(CPU)、`--lane gpu`(GPU pearlhash)、`--lane auto`(推荐)、
@@ -348,11 +325,11 @@ alice-miner service --logs        # 5. 查看后台日志
 第三方矿机持有所有权证明(PoP),它**绝不启动矿机**;你的矿机用登录名 `<你的地址>.<设备名>`
 + 任意密码连接。完整步骤见[挖矿指南](docs/mining-guide.md#三自带第三方-prl-矿机重点)。
 
-**加入 AI 网络:** 先运行 `alice-miner ai --menu`(检测硬件 → 网络菜单 → 选择)。三种角色:
-`serve`(单卡消费推理,已在 Linux+NVIDIA 验证;需 Python 3.11+)、`ai`(大模型分片,需公网端口)、
-`train`(RLVR 训练)。都是仅记积分。
+**加入 AI 网络:** CLI 提供两种角色,都是仅记积分:`alice-miner ai`(大模型分片,需公网端口 +
+shard 引擎 checkout)、`alice-miner train`(RLVR 训练,需训练 harness checkout)。诊断用
+`alice-miner doctor --ai` / `--train`。
 
-**诊断:** `alice-miner doctor`(挖矿)、`doctor --serve` / `--ai` / `--train`(AI 角色)、
+**诊断:** `alice-miner doctor`(挖矿)、`doctor --ai` / `--train`(AI 角色)、
 `doctor --fix`(安全自动修复,绝不动身份 / keystore)。
 
 **Windows 中文亂碼:** v0.6.0 及更早版本在繁體中文 Windows 的 `cmd.exe` / PowerShell 下,
