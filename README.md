@@ -4,9 +4,9 @@ One CLI to **mine** and to **join the Alice AI network**.
 
 `alice-miner` detects your device, manages your Alice reward identity, and puts your
 hardware to work in whatever way it can: mine on your **CPU** (RandomX / XMR) or your
-**GPU** (pearlhash / PRL), or join the **AI network** — serve consumer inference on your
-GPU, contribute to a sharded big model, or run an RLVR training worker. It drives the same
-engine as the desktop app, so the two never drift.
+**GPU** (pearlhash / PRL), or join the **AI network** — contribute to a sharded big model
+or run an RLVR training worker. It drives the same engine as the desktop app, so the two
+never drift.
 
 > **Credit-only.** Rewards accrue as **credit (积分)** — a cumulative accepted-work count.
 > This is **not** cash, and this tool makes **no** earnings, payout, or profit claims. Credit
@@ -186,7 +186,7 @@ exposes two roles — each has a direct command below.
 ### Shard — a stage of a big sharded model (advanced; needs setup)
 
 Run your GPU as one **pipeline-parallel stage** of a large model coordinated by the Alice
-scheduling center. Unlike serving, this has a **public `host:port`** the swarm dials, so you
+scheduling center. Unlike the other roles, this has a **public `host:port`** the swarm dials, so you
 must set up NAT / port-forwarding. It needs a checkout of the shard engine (`phase0/pipeline.py`).
 
 ```sh
