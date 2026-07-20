@@ -431,6 +431,14 @@ struct IdentityArgs {
     /// command line — the secure non-interactive path for scripts/pipes.
     #[arg(long, conflicts_with = "password")]
     password_stdin: bool,
+    /// Skip the "a keystore already exists — overwrite?" confirmation that
+    /// `--create` shows before replacing an existing wallet (the old key is
+    /// backed up to a `.bak-…` either way). REQUIRED for non-interactive
+    /// automation: without it, a `--create` over an existing keystore prompts
+    /// y/N on a TTY and REFUSES on a non-TTY, so a mistaken re-run can never
+    /// silently swap your wallet.
+    #[arg(long, visible_alias = "yes")]
+    force: bool,
     /// Machine-readable output (the resulting identity / active address as JSON).
     #[arg(long)]
     json: bool,
@@ -1695,6 +1703,17 @@ fn cmd_identity(args: IdentityArgs) -> i32 {
         return cmd_show_prl_payout(args.json);
     }
 
+    // Overwrite guard: `--create` mints a FRESH random wallet, so a mistaken
+    // re-run over an existing keystore would replace the active signing key
+    // (backed up to a `.bak-…`, but a silent swap is still a footgun). Ask for
+    // an explicit y/N first; `--force`/`--yes` skips it for automation, and a
+    // non-interactive run without `--force` REFUSES rather than clobbering.
+    // Runs BEFORE `build_identity_spec` so we never prompt for a passphrase only
+    // to abort. Reuses `keystore_status` (public read; no secret touched).
+    if let Some(code) = identity_overwrite_gate(args.create, args.force) {
+        return code;
+    }
+
     let spec = match build_identity_spec(
         args.create,
         args.import,
@@ -1762,6 +1781,123 @@ fn cmd_identity(args: IdentityArgs) -> i32 {
         Err(_) => {
             eprintln!("error: timed out establishing identity");
             EXIT_RUNTIME
+        }
+    }
+}
+
+/// The overwrite decision for `--create`, factored out of all IO so it can be
+/// unit-tested exhaustively. Given whether this is a `--create` over an EXISTING
+/// keystore, whether `--force` was passed, TTY-ness, and (on a TTY) the user's
+/// answer line, decide whether create proceeds or aborts.
+#[derive(Debug, PartialEq, Eq)]
+enum OverwriteDecision {
+    /// Proceed with create: no existing keystore, `--force`, or an explicit y/yes.
+    Proceed,
+    /// Abort with this exit code: a non-TTY refusal (`EXIT_USAGE`) or a decline
+    /// (`EXIT_OK` — the user chose not to overwrite; that is not an error).
+    Abort(i32),
+}
+
+/// Pure overwrite policy (no IO). Only a `--create` over an existing keystore is
+/// guarded; every other case (import, paste, no existing key, or `--force`)
+/// proceeds exactly as before, so behaviour is unchanged unless you are about to
+/// clobber a wallet. `answer` is the raw prompt line (only consulted on a TTY).
+fn decide_overwrite(
+    create: bool,
+    force: bool,
+    exists: bool,
+    is_tty: bool,
+    answer: Option<&str>,
+) -> OverwriteDecision {
+    if !create || force || !exists {
+        return OverwriteDecision::Proceed;
+    }
+    if !is_tty {
+        // Never silently swap a wallet in a non-interactive run: require --force.
+        return OverwriteDecision::Abort(EXIT_USAGE);
+    }
+    match answer.map(|a| a.trim().to_ascii_lowercase()) {
+        Some(a) if a == "y" || a == "yes" => OverwriteDecision::Proceed,
+        _ => OverwriteDecision::Abort(EXIT_OK),
+    }
+}
+
+/// Interactive/IO wrapper around [`decide_overwrite`]. Returns `Some(exit_code)`
+/// when the caller must ABORT the create (declined, or non-interactive without
+/// `--force`) and `None` when create may proceed. Shows the existing reward
+/// address and the projected `.bak-…` path (reusing `keystore_status` +
+/// `load_pointer`; both are public reads — no secret is touched).
+fn identity_overwrite_gate(create: bool, force: bool) -> Option<i32> {
+    use std::io::{IsTerminal, Write};
+    // Fast path: nothing is at risk unless this is a create over an existing
+    // keystore and `--force` was not given. Keep the keystore/TTY probes out of
+    // every other identity invocation.
+    if !create || force {
+        return None;
+    }
+    let status = alice_miner_core::identity::keystore_status();
+    if !status.exists {
+        return None;
+    }
+
+    // Surface what would be replaced so the user knows this is a real wallet.
+    eprintln!();
+    eprintln!(
+        "  {}",
+        tr!("A miner keystore already exists:", "已存在一个矿工密钥库:")
+    );
+    eprintln!("    {}", status.path.display());
+    if let Some(addr) = alice_miner_core::identity::load_pointer().map(|p| p.address) {
+        eprintln!(
+            "    {} {addr}",
+            tr!("active reward address:", "当前奖励地址:")
+        );
+    }
+    if let Some(bak) = status.projected_backup_path() {
+        eprintln!(
+            "  {} {}",
+            tr!(
+                "Creating a new identity backs up the old key to:",
+                "创建新身份会先把旧密钥备份到:"
+            ),
+            bak.display()
+        );
+    }
+
+    let is_tty = std::io::stdin().is_terminal();
+    let answer = if is_tty {
+        eprint!(
+            "  {} [y/N] ",
+            tr!("Overwrite and create a new identity?", "覆盖并创建新身份?")
+        );
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return Some(EXIT_RUNTIME);
+        }
+        Some(line)
+    } else {
+        None
+    };
+
+    match decide_overwrite(create, force, status.exists, is_tty, answer.as_deref()) {
+        OverwriteDecision::Proceed => None,
+        OverwriteDecision::Abort(code) => {
+            if is_tty {
+                eprintln!(
+                    "  {}",
+                    tr!("aborted — keystore unchanged.", "已取消 — 密钥库未改动。")
+                );
+            } else {
+                eprintln!(
+                    "  {}",
+                    tr!(
+                        "not a terminal — re-run with --force to overwrite (the old key is backed up).",
+                        "非终端 — 请加 --force 重新运行以覆盖(旧密钥会被备份)。"
+                    )
+                );
+            }
+            Some(code)
         }
     }
 }
@@ -3412,6 +3548,61 @@ mod tests {
         assert_eq!(
             build_identity_spec(false, None, None, None, None, None, false).unwrap_err(),
             EXIT_USAGE
+        );
+    }
+
+    /// The `--create` overwrite guard (`decide_overwrite`). The three required
+    /// cases: (1) existing keystore + no `--force` + non-interactive → REFUSE
+    /// (never silently clobber); (2) `--force` → overwrite as before; (3) no
+    /// existing keystore → proceed as before. Plus the TTY y/N branches and the
+    /// proof that non-create modes (import/paste) are never gated.
+    #[test]
+    fn decide_overwrite_guards_create_over_existing_keystore() {
+        use OverwriteDecision::{Abort, Proceed};
+
+        // (1) exists + no --force + NON-interactive → refuse with a usage code,
+        //     so an automation script cannot silently swap a wallet.
+        assert_eq!(
+            decide_overwrite(true, false, true, false, None),
+            Abort(EXIT_USAGE)
+        );
+
+        // (2) --force ALWAYS proceeds (interactive or not, existing or not) —
+        //     the non-interactive automation escape hatch, behaviour unchanged.
+        assert_eq!(decide_overwrite(true, true, true, false, None), Proceed);
+        assert_eq!(decide_overwrite(true, true, true, true, None), Proceed);
+
+        // (3) no existing keystore → proceed exactly as before (nothing to back up).
+        assert_eq!(decide_overwrite(true, false, false, true, None), Proceed);
+        assert_eq!(decide_overwrite(true, false, false, false, None), Proceed);
+
+        // Interactive prompt branches (exists, no --force, TTY):
+        assert_eq!(
+            decide_overwrite(true, false, true, true, Some("y\n")),
+            Proceed
+        );
+        assert_eq!(
+            decide_overwrite(true, false, true, true, Some("  YES ")),
+            Proceed
+        );
+        // Anything that is not y/yes (incl. empty ⇒ the safe default) → abort,
+        // and a decline is EXIT_OK (the user chose safety, not an error).
+        assert_eq!(
+            decide_overwrite(true, false, true, true, Some("n\n")),
+            Abort(EXIT_OK)
+        );
+        assert_eq!(
+            decide_overwrite(true, false, true, true, Some("\n")),
+            Abort(EXIT_OK)
+        );
+        assert_eq!(decide_overwrite(true, false, true, true, None), Abort(EXIT_OK));
+
+        // Non-create modes are NEVER gated even over an existing keystore, so
+        // import/paste behaviour is untouched by this change.
+        assert_eq!(
+            decide_overwrite(false, false, true, false, None),
+            Proceed,
+            "import/paste must not be gated by the create guard"
         );
     }
 
