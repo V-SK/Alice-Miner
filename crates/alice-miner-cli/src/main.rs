@@ -1966,29 +1966,58 @@ fn cmd_start_with_unlock(
     // the engine starts (it reads the setting when it builds the region plan). A
     // usage error on an unknown value (never a silent no-op). Omitting the flag keeps
     // whatever was remembered.
+    // Capture the lock state BEFORE applying `--region`, so we can tell whether THIS run is
+    // the one that newly established a lock (→ the one-time reminder below) vs a restart that
+    // merely inherits a persisted lock (→ no nag).
+    let prior_region_lock = alice_miner_core::settings::load().region_lock;
     if let Some(raw) = args.region.as_deref() {
         if let Err(code) = apply_region_flag(raw, args.json) {
             return code;
         }
     }
-    // Human path only: label the effective region MODE (locked vs auto + last-good) AND
-    // the effective endpoint order, so the user always knows whether the lane will
-    // auto-failover and exactly which relays it will use — for the GPU-PRL lane, where
-    // region applies. Computed probe-free (the engine runs the one real probe at start).
-    if !args.json && !args.from_service && lane == Lane::GpuPrl {
+    // Region transparency for the GPU-PRL lane: label the effective MODE (locked vs auto +
+    // last-good) AND the effective endpoint order, so the user always knows whether the lane
+    // will auto-failover and exactly which relays it will use. Computed probe-free (the engine
+    // runs the one real probe at start). The human banner (stdout) is still suppressed under
+    // `--json` (machine consumers), but NO LONGER under `--from-service` — a service/GUI start
+    // now surfaces the same region story in its own log.
+    if lane == Lane::GpuPrl {
         let view = region::view();
-        println!("{}", view.mode);
-        println!("{}", region::endpoints_line(&view));
-        // A stale binary / `ALICE_MINER_ENDPOINTS_JSON` override that reintroduced the
-        // removed `fi` relay — surface it here too (doctor gives the full diagnosis).
-        if view.has_removed_region {
-            eprintln!(
-                "{}",
-                tr!(
-                    "warning: a removed region host (fi) is in the effective endpoints — run `alice-miner doctor` (likely an old binary or ALICE_MINER_ENDPOINTS_JSON override).",
-                    "警告: 效端点中含已移除的区域主机(fi)— 请运行 `alice-miner doctor`(很可能是旧版 binary 或 ALICE_MINER_ENDPOINTS_JSON 覆盖)。"
-                )
-            );
+        if !args.json {
+            println!("{}", view.mode);
+            println!("{}", region::endpoints_line(&view));
+            // A stale binary / `ALICE_MINER_ENDPOINTS_JSON` override that reintroduced the
+            // removed `fi` relay — surface it here too (doctor gives the full diagnosis).
+            if view.has_removed_region {
+                eprintln!(
+                    "{}",
+                    tr!(
+                        "warning: a removed region host (fi) is in the effective endpoints — run `alice-miner doctor` (likely an old binary or ALICE_MINER_ENDPOINTS_JSON override).",
+                        "警告: 效端点中含已移除的区域主机(fi)— 请运行 `alice-miner doctor`(很可能是旧版 binary 或 ALICE_MINER_ENDPOINTS_JSON 覆盖)。"
+                    )
+                );
+            }
+        }
+        // One-time lock reminder: when THIS run just established a region lock, nudge ONCE on
+        // stderr — which survives `--json`, so it reaches a non-interactive service/GUI start
+        // too — that auto-failover is now off and how to unlock. A plain restart that inherits
+        // the same persisted lock does NOT re-fire (prior == now), so it never nags. `failover_on`
+        // is false ONLY for a valid LOCK, so this is precisely the locked state.
+        if !view.failover_on {
+            let norm = alice_miner_core::lane::gpu_prl::normalize_region_tag;
+            let prior = prior_region_lock.as_deref().and_then(norm);
+            let now = view.region_lock.as_deref().and_then(norm);
+            if now.is_some() && prior != now {
+                let tag = now.unwrap_or("this region");
+                eprintln!(
+                    "{}",
+                    tr!(
+                        "note: GPU-PRL is now locked to {tag} — auto-failover is off. Run `alice-miner start --region auto` any time to unlock and restore automatic nearest-region selection + failover.",
+                        "提示: GPU-PRL 现已锁定到 {tag} — 自动切换已关闭。随时可跑 `alice-miner start --region auto` 解锁,恢复自动最近区域选择 + failover。"
+                    )
+                    .replace("{tag}", tag)
+                );
+            }
         }
     }
 

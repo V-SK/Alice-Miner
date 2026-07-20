@@ -193,8 +193,32 @@ fn prl_region_checks(view: &crate::region::RegionView) -> Vec<Check> {
     let not_set = tr!("(not set)", "(未设置)");
     let mut out = Vec::new();
 
-    // (1) Effective MODE (+ failover, embedded in the localized label).
-    out.push(Check::pass("PRL region mode", view.mode.clone()));
+    // (1) Effective MODE (+ failover, embedded in the localized label). A region LOCK is a
+    // WARN, not a PASS: it is not an error, but a tester who pinned `--region <tag>` (or
+    // inherited a persisted lock) otherwise gets ZERO auto-failover with no signal why — so
+    // surface it with the exact unlock step. `failover_on` is false ONLY for a LOCK, so this
+    // is precisely the locked state (a valid, normalizable `region_lock`); every other mode
+    // (auto / operator-override / last-good) keeps auto-failover and stays a PASS.
+    if view.failover_on {
+        out.push(Check::pass("PRL region mode", view.mode.clone()));
+    } else {
+        // When locked the tag is a valid normalized region; fall back to the raw lock value
+        // (then a generic word) so the fix line is never empty even on an unexpected input.
+        let tag = alice_miner_core::lane::gpu_prl::normalize_region_tag(
+            view.region_lock.as_deref().unwrap_or(""),
+        )
+        .or(view.region_lock.as_deref())
+        .unwrap_or("this region");
+        out.push(Check::warn(
+            "PRL region mode",
+            view.mode.clone(),
+            tr!(
+                "Locked to {tag}; run `alice-miner start --region auto` to unlock and restore automatic region selection + failover.",
+                "已锁定 {tag};跑 `alice-miner start --region auto` 解锁,恢复自动选区 + failover。"
+            )
+            .replace("{tag}", tag),
+        ));
+    }
 
     // (2) Per-source breakdown — exactly where the effective region comes from.
     let sources = format!(
@@ -1630,6 +1654,13 @@ mod tests {
         let sources = checks.iter().find(|c| c.name == "PRL region sources").unwrap();
         assert!(sources.detail.contains("region_lock=asia"));
         assert!(sources.detail.contains(alice_miner_core::endpoint::ENDPOINTS_ENV));
+        // A LOCK turns the mode line into a WARN carrying the exact unlock step (the tester
+        // signal for "why is there no failover?"). Structural + language-independent tokens.
+        let mode = checks.iter().find(|c| c.name == "PRL region mode").unwrap();
+        assert_eq!(mode.status, Status::Warn, "a region lock is a WARN, not a PASS");
+        assert!(!mode.fix.is_empty(), "the lock WARN carries an unlock fix");
+        assert!(mode.fix.contains("asia"), "the unlock fix names the locked region: {}", mode.fix);
+        assert!(mode.fix.contains("--region auto"), "the unlock fix is the exact step: {}", mode.fix);
         let eff = checks.iter().find(|c| c.name == "PRL effective endpoints").unwrap();
         assert_eq!(eff.status, Status::Pass);
         assert!(eff.detail.contains("asia.aliceprotocol.org:3340"));
@@ -1642,6 +1673,10 @@ mod tests {
         let sources = checks.iter().find(|c| c.name == "PRL region sources").unwrap();
         assert!(sources.detail.contains("region_lock="));
         assert!(!sources.detail.contains("region_lock=us") && !sources.detail.contains("region_lock=asia"));
+        // The unlocked (auto) mode line stays a PASS — only a LOCK is a WARN.
+        let mode = checks.iter().find(|c| c.name == "PRL region mode").unwrap();
+        assert_eq!(mode.status, Status::Pass, "auto (failover on) is a PASS");
+        assert!(mode.fix.is_empty(), "a PASS mode line carries no fix");
         let eff = checks.iter().find(|c| c.name == "PRL effective endpoints").unwrap();
         assert_eq!(eff.status, Status::Pass);
         assert!(eff.detail.contains("us.aliceprotocol.org:3340 -> asia.aliceprotocol.org:3340"));
