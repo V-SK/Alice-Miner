@@ -480,9 +480,15 @@ fn refresh_loop(ctx: RefreshCtx) -> i32 {
                 // A watch-only key was already rejected up front; a failure HERE is a
                 // transient relay/network issue on the FIRST cycle, or a mid-run blip.
                 // On `--once` it's fatal; otherwise log + retry sooner than the cadence.
+                // The raw handshake string now ALSO goes through the shared friendly
+                // renderer (an actionable next step — network / region / identity —
+                // instead of a bare technical dump; the raw detail stays available under
+                // ALICE_MINER_VERBOSE=1). Presentation only: the retry / exit semantics
+                // are unchanged.
                 eprintln!(
-                    "{}: {e}",
-                    tr!("proof refresh failed (will retry)", "证明刷新失败(将重试)")
+                    "{}\n{}",
+                    tr!("proof refresh failed (will retry)", "证明刷新失败(将重试)"),
+                    crate::errmsg::render_error(&e)
                 );
                 if ctx.once {
                     return EXIT_RUNTIME;

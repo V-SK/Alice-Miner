@@ -660,7 +660,17 @@ fn run_loop(
         &settings.region,
         secrets,
     ) {
-        eprintln!("error: could not register this stage with the center: {e}");
+        // Route the raw register failure through the shared friendly renderer so the
+        // user gets an actionable next step (network / region / identity) instead of a
+        // bare technical string; the raw detail stays available under
+        // ALICE_MINER_VERBOSE=1. The "enroll/register" wording classifies it to the
+        // enroll guidance. Presentation only — this stays fatal (nothing to serve).
+        eprintln!(
+            "{}",
+            crate::errmsg::render_error(&format!(
+                "could not enroll/register this inference stage with the center: {e}"
+            ))
+        );
         return EXIT_RUNTIME;
     }
     status.state = AiState::WaitingAssignment;
