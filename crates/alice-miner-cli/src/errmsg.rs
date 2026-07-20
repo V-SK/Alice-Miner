@@ -109,6 +109,34 @@ fn classify(raw: &str) -> Classified {
         };
     }
 
+    // Enroll / registration with a relay allowlist or a scheduling center — the
+    // `companion` PoP-refresh handshake and the `ai` / `train` register step. Distinct
+    // from a bare PoP rejection above (checked first): these carry an enroll / allowlist
+    // / m4-challenge signature and want NETWORK + REGION + identity guidance. The tokens
+    // are unambiguous (they never appear in a GPU/engine/stratum error), and the m4 /
+    // register endpoints are HTTPS — so the stratum-port advice of the generic network
+    // branch below would be wrong here.
+    if lower.contains("enroll")
+        || lower.contains("allowlist")
+        || lower.contains("code:24")
+        || lower.contains("/m4/")
+        || lower.contains("challenge")
+        || lower.contains("unsafe region host")
+    {
+        return Classified {
+            what: tr!(
+                "Could not enroll with the relay / center (the (address, device) pair was not allow-listed), so this lane would not be credited.",
+                "无法在中继 / 中心完成注册((地址,设备)未进入允许名单),因此此通道不会计入积分。"
+            )
+            .into(),
+            action: tr!(
+                "check you're online and the `--region` relay/center is reachable (a VPN, captive portal, or firewall can block it), and that your reward identity holds its signing key (import the mnemonic/seed if it is watch-only). `alice-miner doctor` tests relay reachability.",
+                "请检查网络连接,确认 `--region` 对应的中继/中心可达(VPN、强制门户或防火墙可能拦截),并确保奖励身份持有签名密钥(若为仅观察请导入助记词/种子)。`alice-miner doctor` 可测试中继可达性。"
+            )
+            .into(),
+        };
+    }
+
     // GPU-not-found / unrunnable GPU lane (compute-capability, no CUDA card, no binary).
     if (lower.contains("gpu") || lower.contains("cuda") || lower.contains("compute capability"))
         && (lower.contains("no ")
@@ -263,6 +291,59 @@ mod tests {
             assert!(render_error("no reward address: create/import/paste an identity first")
                 .to_lowercase()
                 .contains("identity"));
+        });
+    }
+
+    /// The enroll / register / possession-handshake failures (the `companion` PoP
+    /// refresh and the `ai` / `train` register step) classify to the enroll guidance,
+    /// which names the actionable fix (network / region / reachability), NOT a bare dump.
+    #[test]
+    fn classifies_enroll_and_register_failures() {
+        with_verbose(false, || {
+            // The exact strings the `ai` / `train` register sites route (they inject the
+            // "enroll/register" wording so classification is unambiguous).
+            for raw in [
+                "could not enroll/register this inference stage with the center: POST https://api.aliceprotocol.org/v1/shard/stage/register: HTTP 403: forbidden",
+                "could not enroll/register this training worker with the center: POST https://api/register: connection refused",
+                // Companion PoP-refresh handshake errors from `pop::establish_pop`.
+                "POST https://asia.aliceprotocol.org/m4/challenge: HTTP 429: rate limited",
+                "challenge response missing challenge_nonce/nonce",
+                "unsafe region host: \"bad host\"",
+                "(address, device) not on the allowlist yet (code:24)",
+            ] {
+                let msg = render_error(raw);
+                assert!(msg.contains("→"), "has an action arrow: {msg}");
+                let low = msg.to_lowercase();
+                // The enroll guidance names the reachable-relay/region next step.
+                assert!(
+                    low.contains("enroll") || low.contains("allow-listed") || low.contains("reachable"),
+                    "routed to enroll guidance: {msg}"
+                );
+                assert!(low.contains("region") || low.contains("relay"), "names region/relay: {msg}");
+                // Never leaks a fiat/paid token.
+                for forbidden in ["$", "usd", "paid", "earned", "payout"] {
+                    assert!(!low.contains(forbidden), "leaked `{forbidden}`: {low}");
+                }
+            }
+        });
+    }
+
+    /// The new enroll branch must not REGRESS the existing GPU / engine / network / PoP
+    /// classifications (its tokens are chosen to never appear in those errors).
+    #[test]
+    fn enroll_branch_does_not_shadow_other_categories() {
+        with_verbose(false, || {
+            // GPU error mentioning "registers" (a CUDA compile phrase) is still GPU.
+            assert!(render_error("CUDA: too many registers used, cannot run on this GPU")
+                .to_lowercase()
+                .contains("gpu"));
+            // A plain mining-relay reachability error is still the network branch.
+            let net = render_error("cannot reach the relay hk.aliceprotocol.org:3333: connection refused");
+            assert!(net.to_lowercase().contains("relay") || net.to_lowercase().contains("network"));
+            // A bare PoP rejection still classifies as possession (checked before enroll).
+            assert!(render_error("proof-of-possession rejected by relay")
+                .to_lowercase()
+                .contains("possession"));
         });
     }
 
