@@ -151,7 +151,6 @@ enum Command {
         \n\
         --lane xmr   CPU RandomX/XMR lane\n\
         --lane gpu   NVIDIA/AMD pearlhash/PRL lane (the GPU mainline)\n\
-        --lane rvn   NVIDIA KawPoW/RVN lane (legacy)\n\
         --lane auto  the recommended lane for this device\n\
         --dual       run BOTH lanes (needs >=2 viable lanes; refuses honestly otherwise)\n\
         --json       emit one Snapshot JSON line per tick (suppresses the credit\n\
@@ -440,7 +439,8 @@ struct IdentityArgs {
 struct StartArgs {
     /// Which lane to mine: `xmr` (CPU/RandomX), `gpu`/`prl` (NVIDIA/AMD pearlhash via
     /// SRBMiner — the GPU mainline, CC≥7.5), `alpha` (pearlhash via AlphaMiner — the
-    /// Volta/V100 path, where SRBMiner can't run), `rvn` (legacy KawPoW), or `auto`.
+    /// Volta/V100 path, where SRBMiner can't run), or `auto`. (The `rvn`/KawPoW lane
+    /// is not yet released — coming in M7.)
     #[arg(long, default_value = "auto", value_name = "LANE")]
     lane: String,
     /// Override the reward address (defaults to the active ~/.alice identity).
@@ -2506,14 +2506,27 @@ fn resolve_lane(s: &str, cap: &alice_miner_core::CapabilityProfile) -> Result<La
         "gpu" | "prl" => Ok(Lane::GpuPrl),
         // `alpha` = the AlphaMiner pearlhash lane (V100/Volta — where SRBMiner can't run).
         "alpha" => Ok(Lane::GpuAlpha),
-        "rvn" => Ok(Lane::GpuRvn),
+        // The RVN (KawPoW) lane is NOT shipped in this release — its miner binary is a
+        // packaging placeholder pinned for M7. Reject `--lane rvn` here with a clear,
+        // actionable message instead of resolving it and letting the run fail deep in
+        // binary resolution with an opaque "binary unavailable" error.
+        "rvn" => {
+            eprintln!(
+                "error: {}",
+                tr!(
+                    "the RVN (KawPoW) lane is not available in this release — it is coming in M7. Use `--lane gpu` (PRL) or `--lane xmr` for now.",
+                    "RVN(KawPoW)通道本版尚未发布 — 预计 M7 上线。请暂用 `--lane gpu`(PRL)或 `--lane xmr`。"
+                )
+            );
+            Err(EXIT_USAGE)
+        }
         "auto" => Ok(cap.recommended_lane()),
         other => {
             eprintln!(
                 "error: {}",
                 tr!(
-                    "unknown lane `{lane}` (use: xmr | gpu | prl | alpha | rvn | auto)",
-                    "未知通道 `{lane}`(可用: xmr | gpu | prl | alpha | rvn | auto)"
+                    "unknown lane `{lane}` (use: xmr | gpu | prl | alpha | auto)",
+                    "未知通道 `{lane}`(可用: xmr | gpu | prl | alpha | auto)"
                 )
                 .replace("{lane}", other)
             );
@@ -3358,14 +3371,24 @@ mod tests {
         let cap = alice_miner_core::CapabilityProfile::detect();
         assert_eq!(resolve_lane("xmr", &cap).unwrap(), Lane::Xmr);
         assert_eq!(resolve_lane("cpu", &cap).unwrap(), Lane::Xmr);
-        // `gpu` now means the GPU mainline (PRL); `rvn` selects the legacy lane.
+        // `gpu` now means the GPU mainline (PRL).
         assert_eq!(resolve_lane("gpu", &cap).unwrap(), Lane::GpuPrl);
         assert_eq!(resolve_lane("prl", &cap).unwrap(), Lane::GpuPrl);
         assert_eq!(resolve_lane("alpha", &cap).unwrap(), Lane::GpuAlpha);
         assert_eq!(resolve_lane("ALPHA", &cap).unwrap(), Lane::GpuAlpha);
-        assert_eq!(resolve_lane("rvn", &cap).unwrap(), Lane::GpuRvn);
         assert_eq!(resolve_lane("AUTO", &cap).unwrap(), cap.recommended_lane());
         assert!(resolve_lane("bogus", &cap).is_err());
+    }
+
+    /// The RVN (KawPoW) lane is not shipped in this release (its miner binary is an
+    /// M7 packaging placeholder). `--lane rvn` must be rejected with a clean usage
+    /// error (the "coming in M7" message) rather than resolved to `Lane::GpuRvn` and
+    /// left to fail opaquely in binary resolution. Case-insensitive.
+    #[test]
+    fn resolve_lane_gates_rvn_with_usage_error() {
+        let cap = alice_miner_core::CapabilityProfile::detect();
+        assert_eq!(resolve_lane("rvn", &cap).unwrap_err(), EXIT_USAGE);
+        assert_eq!(resolve_lane("RVN", &cap).unwrap_err(), EXIT_USAGE);
     }
 
     /// build_identity_spec maps each flag and errors when none is given.
