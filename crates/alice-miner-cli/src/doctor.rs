@@ -28,6 +28,35 @@ use alice_miner_core::binaries::{self, MinerKind};
 use alice_miner_core::tr;
 use alice_miner_core::{CapabilityProfile, EndpointPlan, Lane};
 
+// ── Build stamp (diagnostics-only) ───────────────────────────────────────────
+// The running binary's version + the exact target it was compiled for. Printed in
+// the `doctor` header, the `--json` report, and `--version` so a field bug report
+// pins the precise artifact (which OS build, which arch) instead of guessing. The
+// triple + OS come from `build.rs` (`TARGET` / `CARGO_CFG_TARGET_OS`), so they are
+// correct even for a cross-compiled release artifact. It NEVER includes the identity
+// keystore path (privacy) — only the build's own coordinates.
+
+/// The running binary's semantic version (`CARGO_PKG_VERSION`).
+pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The exact target triple this artifact was compiled for, e.g.
+/// `aarch64-apple-darwin` (from `build.rs` → cargo's `TARGET`).
+pub const BUILD_TARGET: &str = env!("ALICE_TARGET_TRIPLE");
+/// The target OS, e.g. `macos` / `linux` / `windows` (from `build.rs` →
+/// `CARGO_CFG_TARGET_OS`).
+pub const BUILD_OS: &str = env!("ALICE_TARGET_OS");
+
+/// One-line build stamp for `--version` (clap prefixes the bin name): version +
+/// target triple + OS. Diagnostics-only; carries no reward/secret token by
+/// construction (a unit test scans it).
+pub const VERSION_LINE: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " ",
+    env!("ALICE_TARGET_TRIPLE"),
+    " (",
+    env!("ALICE_TARGET_OS"),
+    ")"
+);
+
 /// The outcome of one diagnostic check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -729,6 +758,11 @@ pub fn render_report(checks: &[Check], lane: Lane) -> String {
         tr!("Alice Miner doctor — lane", "Alice Miner doctor — 通道"),
         lane.cli_lane_arg()
     ));
+    // Build stamp: version + target triple + OS (never the identity path — privacy).
+    s.push_str(&format!(
+        "{}: v{BUILD_VERSION} · {BUILD_TARGET} ({BUILD_OS})\n",
+        tr!("build", "构建")
+    ));
     s.push_str("─────────────────────────────────────────────\n");
     for c in checks {
         s.push_str(&format!("  [{}] {} — {}\n", c.status.word(), c.name, c.detail));
@@ -777,6 +811,12 @@ pub fn render_json(checks: &[Check], lane: Lane) -> String {
     serde_json::json!({
         "lane": lane.cli_lane_arg(),
         "ready": fails == 0,
+        // Build stamp: version + target triple + OS (never the identity path — privacy).
+        "build": {
+            "version": BUILD_VERSION,
+            "target": BUILD_TARGET,
+            "os": BUILD_OS,
+        },
         "checks": arr,
     })
     .to_string()
@@ -1815,6 +1855,47 @@ mod tests {
         // The human report names the relay endpoint host (public) — and ONLY that
         // public host, never an upstream pool / core IP.
         assert!(human.contains("doctor"), "header present");
+    }
+
+    /// The build stamp (version + target triple + OS) appears in the human header,
+    /// the `--json` report, and the `--version` line — and it NEVER leaks the identity
+    /// keystore path (privacy). Locks the "which artifact am I running?" field-support
+    /// affordance against regression.
+    #[test]
+    fn build_stamp_present_and_path_free() {
+        // The constants are all populated (build.rs wired the triple + OS through).
+        assert_eq!(BUILD_VERSION, env!("CARGO_PKG_VERSION"));
+        assert!(!BUILD_TARGET.is_empty() && BUILD_TARGET != "unknown", "target: {BUILD_TARGET}");
+        assert!(!BUILD_OS.is_empty() && BUILD_OS != "unknown", "os: {BUILD_OS}");
+        // The one-line `--version` stamp carries all three fields.
+        assert!(VERSION_LINE.contains(BUILD_VERSION));
+        assert!(VERSION_LINE.contains(BUILD_TARGET));
+        assert!(VERSION_LINE.contains(BUILD_OS));
+
+        let checks = run_checks(Lane::Xmr, &cap());
+        let human = render_report(&checks, Lane::Xmr);
+        let json = render_json(&checks, Lane::Xmr);
+
+        // Human header shows the stamp.
+        assert!(human.contains(BUILD_VERSION), "human report missing version");
+        assert!(human.contains(BUILD_TARGET), "human report missing target triple");
+        assert!(human.contains(BUILD_OS), "human report missing os");
+
+        // JSON exposes a structured `build` object with the three fields.
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(v["build"]["version"], BUILD_VERSION);
+        assert_eq!(v["build"]["target"], BUILD_TARGET);
+        assert_eq!(v["build"]["os"], BUILD_OS);
+
+        // Privacy: the stamp itself must NOT drag along the identity keystore path.
+        // (Scoped to the stamp pieces — other doctor checks legitimately name config
+        // files; the decision was only that the BUILD STAMP omits the identity path.)
+        for stamp in [BUILD_VERSION, BUILD_TARGET, BUILD_OS, VERSION_LINE] {
+            let lower = stamp.to_ascii_lowercase();
+            for path_token in ["identity", "/.alice", "\\.alice", "keystore", ".json"] {
+                assert!(!lower.contains(path_token), "build stamp `{stamp}` leaked path `{path_token}`");
+            }
+        }
     }
 
     /// `has_blocking_failure` mirrors the presence of a FAIL (drives the exit code).
