@@ -83,7 +83,9 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[command(
     name = "alice-miner",
     bin_name = "alice-miner",
-    version,
+    // `--version` prints version + target triple + OS (the build stamp), so a field
+    // bug report pins the exact artifact. clap prefixes the bin name.
+    version = doctor::VERSION_LINE,
     about = "Alice Miner — headless client (credit-only).",
     long_about = "Alice Miner — the headless front-end for the Alice one-click miner.\n\
         \n\
