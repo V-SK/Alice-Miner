@@ -1066,6 +1066,8 @@ mod tests {
             }],
             last_line: Some("net accepted (142/1) diff 100".into()),
             message: None,
+            message_key: None,
+            message_args: None,
             prl_payout: None,
         }
     }
@@ -1125,6 +1127,8 @@ mod tests {
             ],
             last_line: Some("Speed 25.00 Mh/s gpu0".into()),
             message: None,
+            message_key: None,
+            message_args: None,
             prl_payout: None,
         }
     }
@@ -1313,6 +1317,8 @@ mod tests {
             lanes: vec![],
             last_line: None,
             message: None,
+            message_key: None,
+            message_args: None,
             prl_payout: None,
         };
         assert_eq!(render_lane_table(&idle, false), "");
@@ -1844,6 +1850,8 @@ mod tests {
             }],
             last_line: None,
             message: None,
+            message_key: None,
+            message_args: None,
             prl_payout: Some(disp),
         }
     }

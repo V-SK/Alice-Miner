@@ -18,6 +18,13 @@ mod shot;
 mod ui;
 mod update;
 
+/// Process-global-language test serialization lock. The current UI language is a
+/// PROCESS global (in `alice-miner-core`), so ANY test in this binary that mutates it
+/// via `i18n::set_lang` must hold this lock — the parallel test runner otherwise
+/// interleaves two languages and flakes. Test-only.
+#[cfg(test)]
+pub(crate) static LANG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 

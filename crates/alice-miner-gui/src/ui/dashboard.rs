@@ -1705,6 +1705,8 @@ mod tests {
             lanes,
             last_line: None,
             message: None,
+            message_key: None,
+            message_args: None,
             prl_payout: None,
         }
     }

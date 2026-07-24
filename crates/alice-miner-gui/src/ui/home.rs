@@ -367,20 +367,56 @@ const STALL_WARN_SECS: u64 = 300;
 
 fn status_line(ui: &mut egui::Ui, app: &MinerApp) {
     let blink = app.motion_enabled();
-    let (tone, text) = match app.state() {
+    let (tone, text, tooltip) = status_content(app);
+    let dot_blink = matches!(tone, Tone::Live | Tone::Warn) && blink;
+
+    // A FIXED-height, FIXED-width status band: a one- vs two-line status (a long
+    // short-line wraps WITHIN the band) never nudges the surrounding card layout,
+    // and the full endpoint / explanation lives in the hover tooltip rather than
+    // crowding + skewing the line (UI doc §"UI 换行建议": keep the status area a
+    // stable size — wrap, don't overflow).
+    const STATUS_BAND_H: f32 = 34.0; // ~2 lines at 12.5pt
+    const STATUS_TEXT_W: f32 = 300.0;
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), STATUS_BAND_H),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            widgets::center_row(ui, |ui| {
+                widgets::status_dot(ui, tone.fg(), 8.0, dot_blink);
+                ui.add_space(9.0);
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                ui.set_max_width(STATUS_TEXT_W);
+                let resp = ui
+                    .add(egui::Label::new(RichText::new(text.clone()).size(12.5).color(THEME.text2)));
+                if let Some(tip) = &tooltip {
+                    resp.on_hover_text(tip.clone());
+                }
+            });
+        },
+    );
+}
+
+/// The status line's tone, SHORT localized text, and optional hover tooltip (full
+/// endpoint + explanation). Layer-B failover / endpoint-lock statuses are rendered
+/// from the snapshot's structured `message_key` + `message_args` in the CURRENT UI
+/// language (see [`localized_status`]) — so switching EN/中 relocalizes them live and
+/// a `zh`-produced status never bleeds through an `en` UI.
+fn status_content(app: &MinerApp) -> (Tone, String, Option<String>) {
+    match app.state() {
         // Running but no hashrate yet → connecting/warming up (not a confident
         // green "live" next to 0.00 kH/s).
         EngineState::Running if app.is_warming_up() => {
-            (Tone::Warn, tr!("Connecting to the relay…", "正在连接中继…").to_string())
+            (Tone::Warn, tr!("Connecting to the relay…", "正在连接中继…").to_string(), None)
         }
         EngineState::Running => {
-            // A transient warning pushed while STILL mining (e.g. the PoP-refresh
-            // "crediting may pause" note) must be visible — a full-hashrate lane can be
-            // earning nothing. Show it in a Warn tone rather than a confident green
-            // "Mining". Next, a stall: hashing but no NEW share for a while (a stalled
-            // pool feed reads healthy otherwise). Otherwise the calm share line.
-            if let Some(msg) = app.snapshot.as_ref().and_then(|s| s.message.clone()) {
-                (Tone::Warn, msg)
+            // A transient warning pushed while STILL mining (a failover / endpoint-lock
+            // status, or the PoP-refresh "crediting may pause" note) must be visible — a
+            // full-hashrate lane can be earning nothing. Show it in a Warn tone rather
+            // than a confident green "Mining". Next, a stall: hashing but no NEW share
+            // for a while (a stalled pool feed reads healthy otherwise). Otherwise the
+            // calm share line.
+            if let Some((text, tip)) = app.snapshot.as_ref().and_then(localized_status) {
+                (Tone::Warn, text, tip)
             } else if let Some(secs) = app.share_stall_secs().filter(|s| *s >= STALL_WARN_SECS) {
                 (
                     Tone::Warn,
@@ -389,31 +425,72 @@ fn status_line(ui: &mut egui::Ui, app: &MinerApp) {
                         "已 {m} 分钟没有新 share —— 仍在哈希,正在检查矿池"
                     )
                     .replace("{m}", &(secs / 60).to_string()),
+                    None,
                 )
             } else {
                 let a = app.snapshot.as_ref().map(|s| s.shares_accepted).unwrap_or(0);
                 let r = app.snapshot.as_ref().map(|s| s.shares_rejected).unwrap_or(0);
-                (Tone::Live, format!("{} · {a}/{r} shares", tr!("Mining", "挖矿中")))
+                (Tone::Live, format!("{} · {a}/{r} shares", tr!("Mining", "挖矿中")), None)
             }
         }
-        EngineState::Starting => (Tone::Warn, tr!("Connecting to the relay…", "正在连接中继…").to_string()),
-        EngineState::Stopping => (Tone::Warn, tr!("Stopping the miner…", "正在停止矿工…").to_string()),
-        EngineState::Error => (
-            Tone::Danger,
-            app.snapshot
-                .as_ref()
-                .and_then(|s| s.message.clone())
-                .or_else(|| app.error.clone())
-                .unwrap_or_else(|| tr!("The mining lane stopped. You can start again.", "挖矿通道已停止。你可以重新开始。").to_string()),
-        ),
-        EngineState::Idle => (Tone::Off, tr!("Idle — press Start to begin", "空闲 —— 点击 Start 开始").to_string()),
-    };
-    let dot_blink = matches!(tone, Tone::Live | Tone::Warn) && blink;
-    centered(ui, |ui| {
-        widgets::status_dot(ui, tone.fg(), 8.0, dot_blink);
-        ui.add_space(9.0);
-        ui.label(RichText::new(text.clone()).size(12.5).color(THEME.text2));
-    });
+        EngineState::Starting => {
+            (Tone::Warn, tr!("Connecting to the relay…", "正在连接中继…").to_string(), None)
+        }
+        EngineState::Stopping => {
+            (Tone::Warn, tr!("Stopping the miner…", "正在停止矿工…").to_string(), None)
+        }
+        EngineState::Error => {
+            if let Some((text, tip)) = app.snapshot.as_ref().and_then(localized_status) {
+                (Tone::Danger, text, tip)
+            } else {
+                (
+                    Tone::Danger,
+                    app.error.clone().unwrap_or_else(|| {
+                        tr!(
+                            "The mining lane stopped. You can start again.",
+                            "挖矿通道已停止。你可以重新开始。"
+                        )
+                        .to_string()
+                    }),
+                    None,
+                )
+            }
+        }
+        EngineState::Idle => {
+            (Tone::Off, tr!("Idle — press Start to begin", "空闲 —— 点击 Start 开始").to_string(), None)
+        }
+    }
+}
+
+/// Localize a snapshot's Layer-B status for display. Prefers the structured
+/// `message_key` + `message_args` — rendered in the CURRENT UI language (fix A, the
+/// robust path). Falls back to parsing a legacy raw `message` (fix B — an OLD CLI's
+/// snapshot carries only the baked, already-localized string), and finally shows the
+/// raw string unchanged when it matches nothing known. Returns the SHORT line plus an
+/// optional full-detail tooltip; `None` only when the snapshot carries no status at
+/// all (so the caller falls through to the stall / share line).
+fn localized_status(
+    snapshot: &alice_miner_core::engine::Snapshot,
+) -> Option<(String, Option<String>)> {
+    use alice_miner_core::supervise as sv;
+    // Fix A: a machine key → render in the current language, with a full tooltip.
+    if let Some(key) = snapshot.message_key.as_deref() {
+        let args = snapshot.message_args.clone().unwrap_or_default();
+        let text = sv::status_short(key, &args);
+        if !text.is_empty() {
+            return Some((text, sv::status_tooltip(key, &args)));
+        }
+    }
+    // Fix B: no key (older stream) → try to recover key + args from the raw message.
+    let msg = snapshot.message.as_deref()?;
+    if let Some((key, args)) = sv::status_from_legacy(msg) {
+        let text = sv::status_short(&key, &args);
+        if !text.is_empty() {
+            return Some((text, sv::status_tooltip(&key, &args)));
+        }
+    }
+    // Unknown message → surface it verbatim (never hide an honest status).
+    Some((msg.to_string(), None))
 }
 
 /// A danger banner that surfaces `app.error` whenever it is set — UNLESS the
@@ -879,4 +956,125 @@ fn footer(ui: &mut egui::Ui) {
     centered(ui, |ui| {
         ui.label(RichText::new(strings::footer_line_2()).size(10.5).color(THEME.text3));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::localized_status;
+    use alice_miner_core::engine::Snapshot;
+    use alice_miner_core::i18n::{set_lang, Lang};
+    use alice_miner_core::supervise::StatusArgs;
+    use alice_miner_core::EngineState;
+
+    fn has_cjk(s: &str) -> bool {
+        s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+    }
+
+    /// A minimal Error-state snapshot carrying only a status (all other fields empty)
+    /// — enough to drive [`localized_status`]. `Snapshot::idle()` is core-private, so
+    /// this builds the literal directly (every field is `pub`).
+    fn status_snapshot(
+        message: Option<&str>,
+        key: Option<&str>,
+        args: Option<StatusArgs>,
+    ) -> Snapshot {
+        Snapshot {
+            state: EngineState::Error,
+            device: None,
+            lane: None,
+            hashrate_hs: None,
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
+            shares_accepted: 0,
+            shares_rejected: 0,
+            endpoint: None,
+            worker_id: None,
+            uptime_s: 0,
+            failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
+            dual: false,
+            lanes: Vec::new(),
+            last_line: None,
+            message: message.map(|m| m.to_string()),
+            message_key: key.map(|k| k.to_string()),
+            message_args: args,
+            prl_payout: None,
+        }
+    }
+
+    /// Fix A: a snapshot carrying the structured `message_key` + args renders in the
+    /// CURRENT UI language (EN → no Chinese; 中 → short Chinese), and the tooltip
+    /// carries the full endpoint that the crowded status line omits.
+    #[test]
+    fn gui_renders_structured_status_in_current_language() {
+        let _g = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A Chinese-baked raw message (as a zh CLI would write) — must be IGNORED in
+        // favour of the structured key when the UI is EN.
+        let snap = status_snapshot(
+            Some("节点 hk.aliceprotocol.org:3333 已锁定 …"),
+            Some("endpoint_locked"),
+            Some(StatusArgs {
+                endpoint: Some("hk.aliceprotocol.org:3333".into()),
+                region: Some("HK".into()),
+                to_region: None,
+                stalled_s: Some(600),
+            }),
+        );
+
+        set_lang(Lang::En);
+        let (en, tip) = localized_status(&snap).expect("renders a status");
+        assert!(!has_cjk(&en), "EN status shows NO Chinese: {en:?}");
+        assert!(en.contains("locked"), "EN status names the lock: {en:?}");
+        assert!(en.len() <= 48, "EN status stays short: {en:?}");
+        assert!(
+            tip.expect("tooltip present").contains("hk.aliceprotocol.org:3333"),
+            "tooltip carries the full endpoint"
+        );
+
+        set_lang(Lang::Zh);
+        let (zh, _) = localized_status(&snap).expect("renders a status");
+        assert!(zh.contains("已锁定"), "中文 shows a short lock sentence: {zh:?}");
+
+        set_lang(Lang::En);
+    }
+
+    /// Fix B: an OLDER snapshot with NO structured key — only a Chinese-baked raw
+    /// `message` — is still re-localized + shortened by the GUI (it parses the raw
+    /// string). This is the exact reported bug: EN mode must not show Chinese.
+    #[test]
+    fn gui_relocalizes_legacy_chinese_message_in_en_mode() {
+        let _g = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // No message_key (an old CLI) — only the baked ZH raw message.
+        let snap = status_snapshot(
+            Some("区域 hk.aliceprotocol.org:3333 已锁定 — 仅重试该区域、不自动切换(已 600s 无进展)"),
+            None,
+            None,
+        );
+        set_lang(Lang::En);
+        let (en, _) = localized_status(&snap).expect("renders a status");
+        assert!(!has_cjk(&en), "EN GUI must not surface Chinese from a zh message: {en:?}");
+        assert!(en.contains("locked"), "{en:?}");
+        assert!(en.len() <= 48, "{en:?}");
+        set_lang(Lang::En);
+    }
+
+    /// A free-form / unknown message is surfaced verbatim (an honest status is never
+    /// hidden) and has no tooltip.
+    #[test]
+    fn gui_shows_unknown_message_verbatim() {
+        let snap = status_snapshot(Some("miner exited (code 1)"), None, None);
+        let (text, tip) = localized_status(&snap).expect("renders a status");
+        assert_eq!(text, "miner exited (code 1)");
+        assert!(tip.is_none());
+    }
+
+    /// No message at all → no status (the caller falls through to the share line).
+    #[test]
+    fn gui_no_message_yields_none() {
+        let snap = status_snapshot(None, None, None);
+        assert!(localized_status(&snap).is_none());
+    }
 }

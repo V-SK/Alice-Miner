@@ -132,14 +132,18 @@ macro_rules! tr {
     };
 }
 
+/// Process-global-language test serialization lock. The current language is a
+/// PROCESS global (`CURRENT`), so any test — in ANY module of this crate — that
+/// mutates it via [`set_lang`] must hold this lock, or the parallel test runner can
+/// interleave two languages and flake. Shared by the `i18n`, `supervise`, and
+/// `engine` status tests. Test-only.
+#[cfg(test)]
+pub(crate) static LANG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
+    use super::LANG_TEST_LOCK;
     use super::*;
-
-    /// Tests here mutate the PROCESS-GLOBAL language, so they must not run
-    /// concurrently with each other. Funnel them through one mutex (Rust runs a
-    /// crate's tests in parallel).
-    static LANG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn default_lang_is_english() {

@@ -29,6 +29,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use alice_supervise::child::{spawn_supervised, LogLine, LogStream, OwnedChild};
@@ -92,6 +93,34 @@ const NVIDIA_TELEMETRY_TIMEOUT: Duration = Duration::from_secs(4);
 pub type RebuildFn =
     Arc<dyn Fn(&[Endpoint]) -> Result<(std::path::PathBuf, Vec<String>), String> + Send + Sync>;
 
+/// Structured arguments for a machine-keyed lane status ([`LaneStats::message_key`]
+/// / [`crate::engine::Snapshot::message_key`]). Carried ALONGSIDE the human
+/// `message` string so a front-end can (re)render the status in ITS OWN language at
+/// draw time instead of being stuck with the locale the string was baked in — the
+/// i18n boundary fix (a `zh` CLI must not force `zh` text into an `en` GUI). Every
+/// field is optional + `skip`-when-`None`, so the wire JSON is additive and an older
+/// stream (no key) deserializes cleanly to `None` (the GUI then falls back to
+/// parsing the raw `message`). See [`status_short`] / [`status_tooltip`] /
+/// [`status_from_legacy`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StatusArgs {
+    /// The full active endpoint (`host:port`) — for the tooltip / diagnostics, never
+    /// the crowded first status line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// A SHORT label for the (primary / stalled) region or pool — a region tag
+    /// (`us` / `asia`) for a PRL region relay, else the endpoint's first host label
+    /// upper-cased (`hk.aliceprotocol.org` → `HK`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// The SHORT label for the failover TARGET region (auto-failover only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_region: Option<String>,
+    /// The no-progress window that tripped the watchdog, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_s: Option<u64>,
+}
+
 /// A point-in-time, UI-safe snapshot of a lane's child. Cloneable + secret-free
 /// so the engine can read it every tick. (Generalized from the Wallet
 /// `MinerStats`, plus the lane tag + start instant for uptime + the M4 endpoint /
@@ -118,8 +147,16 @@ pub struct LaneStats {
     pub rejected: u64,
     /// Last process exit code, when it has exited.
     pub last_exit_code: Option<i32>,
-    /// Short, sanitised reason for the current state, if any.
+    /// Short, sanitised reason for the current state, if any (human, baked at the
+    /// locale that produced it — use [`Self::message_key`] to re-localize).
     pub message: Option<String>,
+    /// Machine key for a re-localizable status ([`status_short`] keys), when the
+    /// current `message` is one of the Layer-B failover / endpoint-lock statuses;
+    /// `None` for a free-form message. Lets a front-end render the status in ITS own
+    /// language regardless of the locale that produced `message`.
+    pub message_key: Option<String>,
+    /// Structured arguments for [`Self::message_key`].
+    pub message_args: Option<StatusArgs>,
     /// Last sanitised output line (an at-a-glance "what is it doing" hint).
     pub last_line: String,
     /// Seconds since the current run started (0 when stopped).
@@ -156,6 +193,8 @@ impl LaneStats {
             rejected: 0,
             last_exit_code: None,
             message: None,
+            message_key: None,
+            message_args: None,
             last_line: String::new(),
             uptime_s: 0,
             endpoint: None,
@@ -190,6 +229,11 @@ struct Inner {
     pid: Option<u32>,
     last_exit_code: Option<i32>,
     message: Option<String>,
+    /// Machine key + args mirroring `message` for a re-localizable Layer-B status
+    /// (see [`LaneStats::message_key`]). Kept in lock-step with `message`: set together
+    /// where a failover / lock status is produced, cleared together on recovery / restart.
+    message_key: Option<String>,
+    message_args: Option<StatusArgs>,
     hashrate_hs: Option<f64>,
     /// The 60s + 15m hashrate windows (H/s), populated ONLY for an engine that
     /// actually reports them — xmrig's `speed 10s/60s/15m` line. `None` for every
@@ -266,6 +310,27 @@ struct Inner {
     pending_good_region: Option<String>,
 }
 
+impl Inner {
+    /// Set the human `message` AND its structured, re-localizable `message_key` +
+    /// `message_args` in ONE step, so the two never drift. Used for the Layer-B
+    /// failover / endpoint-lock statuses a front-end may re-render in its own
+    /// language (see [`status_short`]).
+    fn set_status(&mut self, text: String, key: &str, args: StatusArgs) {
+        self.message = Some(text);
+        self.message_key = Some(key.to_string());
+        self.message_args = Some(args);
+    }
+
+    /// Set (or clear, with `None`) a FREE-FORM message that carries no re-localizable
+    /// key — always clears any prior `message_key` / `message_args` so a stale key can
+    /// never outlive the message it described.
+    fn set_freeform(&mut self, text: Option<String>) {
+        self.message = text;
+        self.message_key = None;
+        self.message_args = None;
+    }
+}
+
 impl LaneSupervisor {
     /// A supervisor with the lane's DEFAULT endpoint plan (relay-only, plus any
     /// operator `ALICE_MINER_ENDPOINTS_JSON` override). The common path.
@@ -302,6 +367,8 @@ impl LaneSupervisor {
                 pid: None,
                 last_exit_code: None,
                 message: None,
+                message_key: None,
+                message_args: None,
                 hashrate_hs: None,
                 hashrate_60s_hs: None,
                 hashrate_15m_hs: None,
@@ -354,11 +421,11 @@ impl LaneSupervisor {
 
     /// Surface a transient PoP-status note in the lane snapshot (e.g. an OOB
     /// re-verify failure) so the GUI/CLI shows it instead of the lane silently
-    /// dropping out of the relay allowlist. `None` clears it. Only touches
-    /// `message`; the watchdog's failover/error messages still take over on a
-    /// real failure.
+    /// dropping out of the relay allowlist. `None` clears it. A FREE-FORM note (no
+    /// re-localizable key) — clears any stale failover `message_key`/`args`; the
+    /// watchdog's failover/error statuses still take over on a real failure.
     pub fn note_message(&self, msg: Option<String>) {
-        self.inner.lock().expect("mutex").message = msg;
+        self.inner.lock().expect("mutex").set_freeform(msg);
     }
 
     /// The endpoint the lane is currently targeting (`host:port`).
@@ -390,6 +457,8 @@ impl LaneSupervisor {
             rejected: g.rejected,
             last_exit_code: g.last_exit_code,
             message: g.message.clone(),
+            message_key: g.message_key.clone(),
+            message_args: g.message_args.clone(),
             last_line: g.last_line.clone(),
             uptime_s,
             endpoint: Some(g.endpoint_plan.current().host_port()),
@@ -478,7 +547,7 @@ impl LaneSupervisor {
                 return Err("lane is already running".into());
             }
             g.state = ProcState::Starting;
-            g.message = None;
+            g.set_freeform(None);
             g.stop_requested = false;
             g.forced_error = false;
             g.hashrate_hs = None;
@@ -528,7 +597,7 @@ impl LaneSupervisor {
             Err(e) => {
                 let mut g = self.inner.lock().expect("mutex");
                 g.state = ProcState::Error;
-                g.message = Some(format!("failed to start miner: {e}"));
+                g.set_freeform(Some(format!("failed to start miner: {e}")));
                 return Err(g.message.clone().unwrap());
             }
         };
@@ -638,7 +707,7 @@ impl LaneSupervisor {
                         ProcState::Error
                     };
                     if !g.stop_requested && g.message.is_none() {
-                        g.message = Some(format!("miner exited (code {code})"));
+                        g.set_freeform(Some(format!("miner exited (code {code})")));
                     }
                 }
                 return;
@@ -671,7 +740,7 @@ impl LaneSupervisor {
                     } else {
                         // A normal user Stop.
                         g.state = ProcState::Stopped;
-                        g.message = None;
+                        g.set_freeform(None);
                     }
                 }
                 return;
@@ -729,10 +798,17 @@ impl LaneSupervisor {
                     // Budget exhausted → clean Error, no thrash. Mark `forced_error`
                     // so the supervision loop reaps the child but lands in Error
                     // (not Stopped) and keeps this message.
-                    g.message = Some(format!(
-                        "no progress for {}s and the failover budget is exhausted; stopped to avoid a restart storm",
-                        window.as_secs()
-                    ));
+                    g.set_status(
+                        format!(
+                            "no progress for {}s and the failover budget is exhausted; stopped to avoid a restart storm",
+                            window.as_secs()
+                        ),
+                        "budget_exhausted",
+                        StatusArgs {
+                            stalled_s: Some(window.as_secs()),
+                            ..Default::default()
+                        },
+                    );
                     g.forced_error = true;
                     g.stop_requested = true; // let supervise_until_exit reap the child
                     g.state = ProcState::Stopping; // transitional; loop → Error
@@ -842,16 +918,57 @@ impl LaneSupervisor {
                                     if changed {
                                         g.failovers += 1;
                                     }
-                                    g.message = Some(if changed {
+                                    let secs = window.as_secs();
+                                    if changed {
                                         // auto-failover: <from> → <to>
-                                        failover_status(&from, target, true, window)
+                                        g.set_status(
+                                            failover_status(&from, target, true, window),
+                                            "auto_failover",
+                                            StatusArgs {
+                                                endpoint: Some(target.host_port()),
+                                                region: Some(short_region_label(&from)),
+                                                to_region: Some(short_region_label(target)),
+                                                stalled_s: Some(secs),
+                                            },
+                                        );
                                     } else if locked {
-                                        // region <r> locked — retrying, no auto-failover
-                                        failover_status(&from, target, false, window)
+                                        // A LOCKED / single-endpoint plan retries in place. A PRL
+                                        // REGION relay (us/asia) keeps the region-lock wording (it
+                                        // has real region-failover semantics, merely disabled by
+                                        // the lock); a FIXED pool endpoint (XMR/RVN, or an operator
+                                        // override — NOT a region) gets a GENERIC "endpoint locked"
+                                        // status, never PRL-style "region … no auto-failover".
+                                        let (key, text) = if is_region_relay(&from) {
+                                            (
+                                                "region_locked_no_failover",
+                                                failover_status(&from, target, false, window),
+                                            )
+                                        } else {
+                                            ("endpoint_locked", endpoint_locked_status(&from, window))
+                                        };
+                                        g.set_status(
+                                            text,
+                                            key,
+                                            StatusArgs {
+                                                endpoint: Some(from.host_port()),
+                                                region: Some(short_region_label(&from)),
+                                                to_region: None,
+                                                stalled_s: Some(secs),
+                                            },
+                                        );
                                     } else {
                                         // auto plan resuming the (recovered) same region
-                                        region_resumed_status(target, window)
-                                    });
+                                        g.set_status(
+                                            region_resumed_status(target, window),
+                                            "region_recovered",
+                                            StatusArgs {
+                                                endpoint: Some(target.host_port()),
+                                                region: Some(short_region_label(target)),
+                                                to_region: None,
+                                                stalled_s: Some(secs),
+                                            },
+                                        );
+                                    }
                                     launched = true;
                                     break;
                                 }
@@ -864,7 +981,16 @@ impl LaneSupervisor {
                                     log_verbose("failover relaunch failed", &e);
                                     let mut g = self.inner.lock().expect("mutex");
                                     g.state = ProcState::Error;
-                                    g.message = Some(region_retry_message());
+                                    g.set_status(
+                                        region_retry_message(),
+                                        "region_retrying",
+                                        StatusArgs {
+                                            endpoint: Some(target.host_port()),
+                                            region: Some(short_region_label(target)),
+                                            to_region: None,
+                                            stalled_s: Some(window.as_secs()),
+                                        },
+                                    );
                                     return;
                                 }
                             },
@@ -882,7 +1008,16 @@ impl LaneSupervisor {
                                 if g.generation != gen {
                                     return;
                                 }
-                                g.message = Some(region_retry_message());
+                                g.set_status(
+                                    region_retry_message(),
+                                    "region_retrying",
+                                    StatusArgs {
+                                        endpoint: Some(target.host_port()),
+                                        region: Some(short_region_label(target)),
+                                        to_region: None,
+                                        stalled_s: Some(window.as_secs()),
+                                    },
+                                );
                                 // fall through to the next target
                             }
                         }
@@ -898,11 +1033,26 @@ impl LaneSupervisor {
                             return;
                         }
                         g.state = ProcState::Error;
-                        g.message = Some(if locked {
-                            region_retry_message()
+                        let secs = window.as_secs();
+                        if locked {
+                            g.set_status(
+                                region_retry_message(),
+                                "region_retrying",
+                                StatusArgs {
+                                    stalled_s: Some(secs),
+                                    ..Default::default()
+                                },
+                            );
                         } else {
-                            all_regions_unreachable_message()
-                        });
+                            g.set_status(
+                                all_regions_unreachable_message(),
+                                "all_regions_unavailable",
+                                StatusArgs {
+                                    stalled_s: Some(secs),
+                                    ..Default::default()
+                                },
+                            );
+                        }
                     }
                     // On a successful relaunch this watchdog's generation is now stale
                     // (spawn_run bumped it) and the NEW run owns its own watchdog; on the
@@ -1150,6 +1300,188 @@ fn all_regions_unreachable_message() -> String {
         "所有区域节点暂时不可用;通道已停止 — 请重新启动重试"
     )
     .to_string()
+}
+
+/// The user-facing status for a LOCKED / single-endpoint plan that is NOT a PRL
+/// region relay (a fixed pool endpoint — XMR/RVN, or an operator override). Generic
+/// "endpoint locked" wording; it deliberately does NOT borrow the PRL region-failover
+/// language ("no auto-failover") because a fixed pool has no region-failover concept
+/// to disable. Localized via [`crate::tr!`].
+fn endpoint_locked_status(ep: &Endpoint, window: Duration) -> String {
+    let secs = window.as_secs();
+    let e = ep.host_port();
+    crate::tr!(
+        format!("endpoint {e} locked — retrying this endpoint (no progress for {secs}s)"),
+        format!("节点 {e} 已锁定 — 正在重试该节点(已 {secs}s 无进展)")
+    )
+}
+
+/// Is this endpoint a PRL region relay (a known `us` / `asia` tag)? A fixed pool
+/// endpoint (XMR/RVN) or operator override is NOT — it has no region-failover
+/// semantics, so its lock status uses generic "endpoint locked" wording.
+fn is_region_relay(ep: &Endpoint) -> bool {
+    crate::lane::gpu_prl::region_tag_for_host(&ep.host).is_some()
+}
+
+/// A SHORT status-line label for an endpoint: the region tag (`US` / `ASIA`) for a
+/// PRL region relay, else the endpoint host's first DNS label upper-cased
+/// (`hk.aliceprotocol.org:3333` → `HK`). Never the full crowded `host:port`.
+fn short_region_label(ep: &Endpoint) -> String {
+    match crate::lane::gpu_prl::region_tag_for_host(&ep.host) {
+        Some(tag) => tag.to_ascii_uppercase(),
+        None => short_host_label(&ep.host),
+    }
+}
+
+/// The first DNS label of a host, upper-cased (`hk.aliceprotocol.org` → `HK`). Accepts
+/// a bare `host` or a `host:port` (the port is dropped).
+fn short_host_label(host: &str) -> String {
+    host.split(':')
+        .next()
+        .unwrap_or(host)
+        .split('.')
+        .next()
+        .unwrap_or(host)
+        .to_ascii_uppercase()
+}
+
+/// Render a SHORT, single-glance, LOCALIZED status line from a machine status key
+/// ([`StatusArgs`]) produced by the Layer-B watchdog. Uses the PROCESS-GLOBAL
+/// language ([`crate::i18n`]), so a front-end that mirrors its own language toggle
+/// into [`crate::i18n::set_lang`] and calls this at DRAW time re-localizes the status
+/// live — the fix for a `zh`-produced status bleeding through an `en` UI. An unknown
+/// key returns an empty string so the caller can fall back to the raw `message`.
+///
+/// Keys: `region_locked_no_failover`, `endpoint_locked`, `auto_failover`,
+/// `region_recovered`, `region_retrying`, `all_regions_unavailable`,
+/// `budget_exhausted`.
+pub fn status_short(key: &str, args: &StatusArgs) -> String {
+    let region = args.region.clone().unwrap_or_default();
+    let to = args.to_region.clone().unwrap_or_default();
+    let secs = args.stalled_s.unwrap_or(0);
+    match key {
+        "region_locked_no_failover" => crate::tr!(
+            format!("{region} locked · no failover · {secs}s stalled"),
+            format!("区域已锁定:仅 {region} · {secs}s 无进展")
+        ),
+        "endpoint_locked" => crate::tr!(
+            format!("Endpoint locked · {secs}s stalled"),
+            format!("节点已锁定 · {secs}s 无进展")
+        ),
+        "auto_failover" => crate::tr!(
+            format!("Failover: {region} → {to} · {secs}s stalled"),
+            format!("切换区域:{region} → {to} · {secs}s 无进展")
+        ),
+        "region_recovered" => crate::tr!(
+            format!("{region} recovered · resuming"),
+            format!("{region} 已恢复 · 继续运行")
+        ),
+        "region_retrying" => crate::tr!(
+            "Endpoint unreachable · retrying".to_string(),
+            "节点不可达 · 正在重试".to_string()
+        ),
+        "all_regions_unavailable" => crate::tr!(
+            "All relays unavailable · stopped".to_string(),
+            "所有中继不可用 · 已停止".to_string()
+        ),
+        "budget_exhausted" => crate::tr!(
+            "No progress · stopped to avoid a restart storm".to_string(),
+            "长时间无进展 · 已停止以避免频繁重启".to_string()
+        ),
+        _ => String::new(),
+    }
+}
+
+/// The FULL, localized tooltip for a status key — the complete endpoint + the honest
+/// explanation the crowded one-line status omits (UI doc: full detail belongs in the
+/// tooltip, not the status line). `None` when a key has nothing extra to add.
+pub fn status_tooltip(key: &str, args: &StatusArgs) -> Option<String> {
+    let ep = args.endpoint.clone().unwrap_or_default();
+    let to = args.to_region.clone().unwrap_or_default();
+    let secs = args.stalled_s.unwrap_or(0);
+    match key {
+        "region_locked_no_failover" | "endpoint_locked" if !ep.is_empty() => Some(crate::tr!(
+            format!(
+                "Locked to {ep}. The miner will retry this endpoint only and will not fail over automatically."
+            ),
+            format!("已锁定到 {ep}。矿工只会重试此节点,不会自动切换。")
+        )),
+        "auto_failover" => Some(crate::tr!(
+            format!("No progress for {secs}s — switched to {to}."),
+            format!("已 {secs}s 无进展 —— 已切换到 {to}。")
+        )),
+        _ => None,
+    }
+}
+
+/// BACKWARD-COMPAT (fix "B"): recover a machine key + [`StatusArgs`] from a RAW
+/// (already-localized) Layer-B lock `message` string — EN **or** ZH — so a NEW GUI
+/// paired with an OLD CLI (whose snapshot carries only the baked `message`, no
+/// `message_key`) can still re-localize + shorten it. Recognizes the region-lock /
+/// endpoint-lock family (the reported case); returns `None` for anything else (the
+/// caller then shows the raw string unchanged). Newer snapshots carry `message_key`
+/// directly and never reach this path.
+pub fn status_from_legacy(msg: &str) -> Option<(String, StatusArgs)> {
+    let secs = extract_stalled_secs(msg);
+    // Region / endpoint LOCK, both languages. The label sits between the lead-in
+    // (`region ` / `区域 ` / `endpoint ` / `节点 `) and `locked` / `已锁定`.
+    let lock_label = between(msg, "region ", " locked")
+        .or_else(|| between(msg, "区域 ", " 已锁定"))
+        .or_else(|| between(msg, "endpoint ", " locked"))
+        .or_else(|| between(msg, "节点 ", " 已锁定"));
+    if let Some(label) = lock_label {
+        // A bare region tag (`us`/`asia`) → PRL region-lock wording; a `host:port`
+        // fixed pool (e.g. the XMR relay) → generic endpoint-lock wording (checkpoint
+        // ③: a fixed pool must not read like a PRL region failover).
+        let looks_like_host = label.contains('.') || label.contains(':');
+        let (key, region) = if looks_like_host {
+            ("endpoint_locked", short_host_label(label))
+        } else {
+            ("region_locked_no_failover", label.to_ascii_uppercase())
+        };
+        return Some((
+            key.to_string(),
+            StatusArgs {
+                endpoint: Some(label.to_string()),
+                region: Some(region),
+                to_region: None,
+                stalled_s: secs,
+            },
+        ));
+    }
+    None
+}
+
+/// The substring between the first `start` and the following `end` (trimmed); `None`
+/// if either marker is absent.
+fn between<'a>(s: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let i = s.find(start)? + start.len();
+    let rest = &s[i..];
+    let j = rest.find(end)?;
+    Some(rest[..j].trim())
+}
+
+/// Extract the no-progress seconds from a raw status string: the first run of digits
+/// immediately followed by an ASCII `s` (both the EN `…for 600s…` and ZH `…已 600s…`
+/// shapes). A `host:port`'s digits are followed by `)`/space, not `s`, so they are
+/// skipped. `None` if no such token exists.
+fn extract_stalled_secs(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < b.len() && b[i] == b's' {
+                return s[start..i].parse().ok();
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// Echo a raw internal error to STDERR ONLY when the verbose env is set
@@ -2535,6 +2867,124 @@ mod tests {
             region_label(&Endpoint::plaintext("hk.aliceprotocol.org", 3333)),
             "hk.aliceprotocol.org:3333"
         );
+    }
+
+    // ── i18n boundary: re-localizable Layer-B status (fix/region-lock-i18n) ──────
+
+    /// True if `s` contains any CJK Unified Ideograph (the EN-status "no Chinese"
+    /// guard the UI regression test asserts).
+    fn has_cjk(s: &str) -> bool {
+        s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+    }
+
+    /// `short_host_label` reduces a host / host:port to its first label, upper-cased.
+    #[test]
+    fn short_host_label_takes_first_label_uppercased() {
+        assert_eq!(short_host_label("hk.aliceprotocol.org:3333"), "HK");
+        assert_eq!(short_host_label("us.aliceprotocol.org"), "US");
+        assert_eq!(short_host_label("localhost"), "LOCALHOST");
+    }
+
+    /// `extract_stalled_secs` finds the `<n>s` no-progress token, not a host's port
+    /// digits (which are followed by `)`/space, not `s`).
+    #[test]
+    fn extract_stalled_secs_finds_progress_token_not_port() {
+        assert_eq!(
+            extract_stalled_secs("region us locked — no auto-failover (no progress for 600s)"),
+            Some(600)
+        );
+        assert_eq!(
+            extract_stalled_secs(
+                "区域 hk.aliceprotocol.org:3333 已锁定 — 仅重试该区域、不自动切换(已 720s 无进展)"
+            ),
+            Some(720)
+        );
+        assert_eq!(extract_stalled_secs("no numbers-with-s here 3333)"), None);
+    }
+
+    /// THE reported bug: a Chinese-baked region-lock snapshot `message` must render as
+    /// SHORT, Chinese-free ENGLISH when the UI language is EN, and as a short Chinese
+    /// sentence when 中文 — regardless of the locale that produced the raw string.
+    /// (checkpoint ③: the reported endpoint is a FIXED XMR pool → generic
+    /// "Endpoint locked", never PRL-style "region … no auto-failover".)
+    #[test]
+    fn region_locked_message_relocalizes_even_when_snapshot_is_chinese() {
+        let _g = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let raw = "区域 hk.aliceprotocol.org:3333 已锁定 — 仅重试该区域、不自动切换(已 600s 无进展)";
+        let (key, args) = status_from_legacy(raw).expect("parses the legacy region-lock string");
+        // hk is a fixed pool (host:port), not a us/asia region → endpoint_locked.
+        assert_eq!(key, "endpoint_locked");
+        assert_eq!(args.stalled_s, Some(600));
+        assert_eq!(args.endpoint.as_deref(), Some("hk.aliceprotocol.org:3333"));
+
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let en = status_short(&key, &args);
+        assert!(!has_cjk(&en), "EN status must contain no Chinese: {en:?}");
+        assert!(en.contains("locked"), "EN status names the lock: {en:?}");
+        assert!(en.len() <= 48, "EN status stays short (≤48 bytes): {en:?} = {}", en.len());
+
+        crate::i18n::set_lang(crate::i18n::Lang::Zh);
+        let zh = status_short(&key, &args);
+        assert!(zh.contains("已锁定"), "ZH status is a short lock sentence: {zh:?}");
+        assert!(zh.chars().count() <= 24, "ZH status stays short: {zh:?}");
+
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+    }
+
+    /// A LOCKED PRL region relay (a bare `us`/`asia` tag) parses to the region-lock
+    /// key (keeps the "no failover" semantics) — distinct from a fixed pool endpoint.
+    #[test]
+    fn legacy_parse_distinguishes_region_relay_from_fixed_pool() {
+        let region = status_from_legacy(
+            "region us locked — retrying, no auto-failover (no progress for 600s)",
+        )
+        .expect("parses region-lock");
+        assert_eq!(region.0, "region_locked_no_failover");
+        assert_eq!(region.1.region.as_deref(), Some("US"));
+
+        let pool = status_from_legacy(
+            "endpoint hk.aliceprotocol.org:3333 locked — retrying this endpoint (no progress for 600s)",
+        )
+        .expect("parses endpoint-lock");
+        assert_eq!(pool.0, "endpoint_locked");
+        assert_eq!(pool.1.region.as_deref(), Some("HK"));
+
+        // A free-form message is not a lock status → no key (caller shows it raw).
+        assert!(status_from_legacy("miner exited (code 1)").is_none());
+    }
+
+    /// Every `status_short` key renders a non-empty, Chinese-free EN line, and an
+    /// unknown key returns empty (so the caller falls back to the raw message).
+    #[test]
+    fn status_short_covers_all_keys_and_localizes() {
+        let _g = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let args = StatusArgs {
+            endpoint: Some("us.aliceprotocol.org:3340".into()),
+            region: Some("US".into()),
+            to_region: Some("ASIA".into()),
+            stalled_s: Some(600),
+        };
+        let keys = [
+            "region_locked_no_failover",
+            "endpoint_locked",
+            "auto_failover",
+            "region_recovered",
+            "region_retrying",
+            "all_regions_unavailable",
+            "budget_exhausted",
+        ];
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        for k in keys {
+            let en = status_short(k, &args);
+            assert!(!en.is_empty(), "EN {k} renders");
+            assert!(!has_cjk(&en), "EN {k} has no Chinese: {en:?}");
+        }
+        crate::i18n::set_lang(crate::i18n::Lang::Zh);
+        for k in keys {
+            assert!(!status_short(k, &args).is_empty(), "ZH {k} renders");
+        }
+        assert!(status_short("totally_unknown_key", &args).is_empty());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
     }
 
     #[test]

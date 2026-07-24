@@ -430,6 +430,8 @@ fn demo_mining_snapshot() -> Snapshot {
         lanes: Vec::new(),
         last_line: Some("accepted (142/1) diff 32001 (12 ms)".into()),
         message: None,
+        message_key: None,
+        message_args: None,
         prl_payout: None,
     }
 }
@@ -522,6 +524,8 @@ fn demo_state_snapshot(state: EngineState, message: Option<&str>) -> Snapshot {
         lanes: Vec::new(),
         last_line: None,
         message: message.map(|m| m.to_string()),
+        message_key: None,
+        message_args: None,
         prl_payout: None,
     }
 }
@@ -789,6 +793,8 @@ fn demo_dual_snapshot() -> Snapshot {
         ],
         last_line: Some("accepted (142/1) diff 32001 (12 ms)".into()),
         message: None,
+        message_key: None,
+        message_args: None,
         prl_payout: None,
     }
 }
@@ -949,6 +955,8 @@ fn demo_prl_snapshot() -> Snapshot {
         }],
         last_line: Some("accepted (64/0) pearlhash".into()),
         message: None,
+        message_key: None,
+        message_args: None,
         prl_payout: Some(disp),
     }
 }
