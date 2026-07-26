@@ -327,6 +327,21 @@ pub fn remove_child_pid(pid: u32) {
 /// `EXIT_UNVERIFIED` by a test on that side (this crate cannot depend on the CLI).
 pub const EXIT_STOP_UNVERIFIED: i32 = 3;
 
+/// The CLI `stop` exit code that means **"the miner stopped, but I could not scan
+/// this system for leftover engine processes"** — everything actually probed was
+/// confirmed, so this is a SUCCESS, just one with a smaller claim ("Miner stopped."
+/// without "No orphan left.").
+///
+/// Round 3. Round 2 correctly stopped treating a missing scan CAPABILITY as evidence
+/// of a leftover — but it then exited 0, and 0 is indistinguishable from a fully
+/// verified stop, so a miner on a locked-down box (AppLocker, a hardened container)
+/// was never told that one check had been skipped. The reason this is a code rather
+/// than a phrase matched in stderr: the CLI's stderr is bilingual (`tr!`), so any
+/// prose match would silently fail for a Chinese-locale miner.
+///
+/// Kept in sync with the CLI's own `EXIT_SCAN_GAP` by a test on that side.
+pub const EXIT_STOP_SCAN_GAP: i32 = 4;
+
 /// What the detached CLI `stop` reported when it finished.
 ///
 /// **Why this exists (round 2).** `spawn_cli_stop` used to null all stdio and drop the
@@ -347,6 +362,14 @@ impl CliStopReport {
     /// interrupting the user for — the engine may still be running.
     pub fn unverified(&self) -> bool {
         self.code == Some(EXIT_STOP_UNVERIFIED)
+    }
+
+    /// Did the CLI stop the miner but fail to SCAN for leftover engine processes?
+    /// A confirmed stop with one check missing — worth a calm line, never an alarm,
+    /// and strictly weaker than [`Self::unverified`] (the two are different codes,
+    /// so they can never both be true).
+    pub fn scan_gap(&self) -> bool {
+        self.code == Some(EXIT_STOP_SCAN_GAP)
     }
 
     /// A short, human-readable reason for the UI: the first few stderr lines, minus

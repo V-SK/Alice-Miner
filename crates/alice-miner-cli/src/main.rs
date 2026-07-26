@@ -75,6 +75,21 @@ const EXIT_USAGE: i32 = 2;
 /// its "could not confirm" warning off exactly this code
 /// (`core::terminal::EXIT_STOP_UNVERIFIED`, kept in sync by a test below).
 const EXIT_UNVERIFIED: i32 = 3;
+/// `stop` only: **the miner stopped and everything we probed was confirmed — but the
+/// last-resort sweep for leftover engine processes could not RUN** (no `pgrep` / a
+/// `pgrep` that failed / PowerShell blocked by AppLocker or an execution policy).
+///
+/// Why its own code rather than 0 (round 3). The stop itself is a success and stays
+/// one — round 2 deliberately stopped crying wolf here — but the CLI drops the
+/// "No orphan left" half of its claim, and the GUI had no way to learn that: it reads
+/// only the exit code and the CLI's stderr, and that stderr is BILINGUAL (`tr!`), so
+/// matching on its prose would silently do nothing for a Chinese-locale miner. A code
+/// is the only channel that survives translation. The GUI shows it as a calm one-line
+/// note, never the red banner — nothing here says the miner is still running (that is
+/// what [`EXIT_UNVERIFIED`] is for), only that one check could not be performed.
+///
+/// For scripts: `0` and `4` both mean **stopped**; `3` means may-still-be-running.
+const EXIT_SCAN_GAP: i32 = 4;
 
 /// ONE crate-wide lock for every test that mutates the process-global
 /// `$ALICE_IDENTITY_DIR` (or other shared env). Rust runs a crate's tests in
@@ -3034,7 +3049,10 @@ fn cmd_stop(args: StopArgs) -> i32 {
             );
         } else {
             println!("{}", tr!("Miner stopped.", "矿工已停止。"));
-            println!(
+            // The caveat goes to STDERR, not stdout: it is a diagnostic, not the
+            // result — and the GUI nulls our stdout while capturing stderr, so on
+            // stdout the miner running the app would never see these words at all.
+            eprintln!(
                 "{}",
                 tr!(
                     "(This system could not be scanned for leftover engine processes; if your task \
@@ -3061,7 +3079,7 @@ fn cmd_stop(args: StopArgs) -> i32 {
             );
         }
     }
-    stop_exit_code(acted, had_error, !unverified.is_empty())
+    stop_exit_code(acted, had_error, !unverified.is_empty(), scan_gap)
 }
 
 /// May `stop` print "**No orphan left**"? Only when the last-resort sweep actually
@@ -3076,12 +3094,22 @@ fn claims_no_orphan(scan_gap: bool) -> bool {
 ///     gets its OWN code ([`EXIT_UNVERIFIED`]) so a caller (the GUI) can tell "the
 ///     miner may still be running" apart from every other non-zero result;
 ///   * "no running miner found" is not an error per se, but stays non-zero so scripts
-///     can branch on it — unchanged behaviour.
-fn stop_exit_code(acted: bool, had_error: bool, unverified: bool) -> i32 {
+///     can branch on it — unchanged behaviour;
+///   * a confirmed stop whose orphan SWEEP could not run is still a success, but it is
+///     a success with a smaller claim, so it gets [`EXIT_SCAN_GAP`] instead of 0 — the
+///     only translation-proof way to tell the GUI (round 3).
+///
+/// Precedence is the honesty order: "may still be running" outranks "something went
+/// wrong", which outranks "one check could not be performed", which outranks clean.
+/// A scan gap NEVER masks a worse outcome — when anything else was unconfirmed the
+/// gap is folded into the `unverified` list by the caller and this returns 3.
+fn stop_exit_code(acted: bool, had_error: bool, unverified: bool, scan_gap: bool) -> i32 {
     if unverified {
         EXIT_UNVERIFIED
     } else if had_error || !acted {
         EXIT_RUNTIME
+    } else if scan_gap {
+        EXIT_SCAN_GAP
     } else {
         EXIT_OK
     }
@@ -3135,6 +3163,16 @@ fn engine_pid_candidates(needle: &str) -> Option<String> {
         // `-f` matches the FULL command line; the exact absolute path means only
         // processes actually running OUR engine can appear — and we STILL re-verify.
         let out = Command::new("pgrep").arg("-f").arg(needle).output().ok()?;
+        // ROUND 3 — the ANSWER is the exit status, not the stdout. This branch used to
+        // read stdout and nothing else, so a `pgrep` that ran and FAILED (no readable
+        // `/proc` in a hardened container, a restricted session) printed nothing and
+        // "nothing" became a positive "no orphans" — the unix twin of the Windows
+        // false success closed in round 2, in the same function, four lines apart.
+        // `PgrepScan` keeps the third answer: exit 1 ("no match") is still a real
+        // result, only ≥2 / signal-killed is a scan gap.
+        if !alice_miner_core::proc::classify_pgrep(out.status.code()).ran() {
+            return None; // pgrep ran but FAILED → we did NOT scan
+        }
         Some(String::from_utf8_lossy(&out.stdout).to_string())
     }
     #[cfg(windows)]
@@ -3189,6 +3227,16 @@ enum ChildIdentity {
 /// still decline to kill, but only the latter is a clean outcome — the former is
 /// reported to the user, because on Windows 11 (no `wmic`) it was the NORMAL case and
 /// silently produced a false "no orphan left".
+///
+/// **BACKLOG (known, not fixed here) — pid reuse with no start-time token.** The
+/// command-line comparison narrows the window but does not close it: if the OS reuses
+/// our recorded pid for a process that happens to run the SAME engine path (a second
+/// Alice install, the user launching the bundled engine by hand), we classify it
+/// `Ours` and stop it — and then report success for stopping something that was never
+/// ours. The fix is to record the process START TIME alongside the pid and require
+/// both to match; every platform exposes it (`ps -o lstart=`, `Win32_Process.CreationDate`).
+/// Same gap on unix and Windows. Deliberately left for its own change: it touches the
+/// pid-file FORMAT and every reader of it.
 fn identify_child_pid(cpid: u32, needle: Option<&str>) -> ChildIdentity {
     let Some(needle) = needle else {
         return ChildIdentity::Unknown; // nothing to compare against
@@ -3731,19 +3779,25 @@ mod tests {
     /// behind "better to say 'check Task Manager' than to promise a clean stop".
     #[test]
     fn unverified_stop_never_reports_success() {
-        // The only path to EXIT_OK: we acted, no error, nothing unverified.
-        assert_eq!(stop_exit_code(true, false, false), EXIT_OK);
+        // The only path to EXIT_OK: we acted, no error, nothing unverified, and the
+        // orphan sweep actually RAN.
+        assert_eq!(stop_exit_code(true, false, false, false), EXIT_OK);
         // Acted AND fully "successful", but something could not be confirmed → its OWN
         // non-zero code, so the GUI can single out "the miner may still be running".
-        assert_eq!(stop_exit_code(true, false, true), EXIT_UNVERIFIED);
-        assert_eq!(stop_exit_code(true, true, true), EXIT_UNVERIFIED);
+        assert_eq!(stop_exit_code(true, false, true, false), EXIT_UNVERIFIED);
+        assert_eq!(stop_exit_code(true, true, true, false), EXIT_UNVERIFIED);
         // Errors and "nothing found" stay non-zero as before, on the generic code.
-        assert_eq!(stop_exit_code(true, true, false), EXIT_RUNTIME);
-        assert_eq!(stop_exit_code(false, false, false), EXIT_RUNTIME);
+        assert_eq!(stop_exit_code(true, true, false, false), EXIT_RUNTIME);
+        assert_eq!(stop_exit_code(false, false, false, false), EXIT_RUNTIME);
         // Whatever else changes: unverified is never 0, and never the same code as the
         // ordinary "nothing to stop" result (which the GUI must NOT alarm about).
         assert_ne!(EXIT_UNVERIFIED, EXIT_OK);
         assert_ne!(EXIT_UNVERIFIED, EXIT_RUNTIME);
+        // A scan gap must never MASK a worse answer: whatever else is true, the
+        // unverified/error codes win over it.
+        assert_eq!(stop_exit_code(true, false, true, true), EXIT_UNVERIFIED);
+        assert_eq!(stop_exit_code(true, true, false, true), EXIT_RUNTIME);
+        assert_eq!(stop_exit_code(false, false, false, true), EXIT_RUNTIME);
     }
 
     /// The GUI decides whether to alarm the miner purely from this exit code, so the
@@ -3758,18 +3812,113 @@ mod tests {
 
     /// ROUND 2 (noise): a machine where the orphan SWEEP cannot run (PowerShell blocked
     /// by AppLocker / an execution policy, no `pgrep`) must not turn every ordinary,
-    /// fully-confirmed stop into a warning + non-zero exit. The scan gap costs us the
-    /// "No orphan left" CLAIM (which is about the scan) — not the success.
+    /// fully-confirmed stop into a WARNING. The scan gap costs us the "No orphan left"
+    /// CLAIM (which is about the scan) — not the success.
+    ///
+    /// ROUND 3 refines the second half: the outcome is still a success, but it is no
+    /// longer reported as plain `EXIT_OK`. It carries its own code so the GUI can say
+    /// the one true, calm sentence about it, without ever entering the alarm channel.
     #[test]
     fn a_scan_gap_alone_downgrades_the_claim_not_the_outcome() {
         // No scan ⇒ we do not claim "No orphan left"…
         assert!(!claims_no_orphan(true));
         assert!(claims_no_orphan(false));
-        // …but with everything we DID probe confirmed, the stop still exits 0.
-        assert_eq!(stop_exit_code(true, false, false), EXIT_OK);
+        // …and with everything we DID probe confirmed, the stop remains a SUCCESS —
+        // simply one with a smaller claim, so it gets its own code and NOT the "may
+        // still be running" one.
+        assert_eq!(stop_exit_code(true, false, false, true), EXIT_SCAN_GAP);
+        assert_ne!(EXIT_SCAN_GAP, EXIT_UNVERIFIED);
+        // With no gap at all, nothing changed: a clean stop is still exactly 0.
+        assert_eq!(stop_exit_code(true, false, false, false), EXIT_OK);
         // And if anything else was unconfirmed, the gap is listed with it and the
         // outcome is unverified (that path pushes the gap into `unverified`).
-        assert_eq!(stop_exit_code(true, false, true), EXIT_UNVERIFIED);
+        assert_eq!(stop_exit_code(true, false, true, true), EXIT_UNVERIFIED);
+    }
+
+    /// ROUND 3 — the scan gap needed a channel of its own. The CLI exited plain 0 on a
+    /// confirmed stop it could not sweep after, so the GUI (which alarms only on 3)
+    /// showed the miner NOTHING: a check had been skipped and nobody said so. The fix
+    /// is a dedicated code, because the alternative — matching the CLI's stderr — means
+    /// matching BILINGUAL prose, which would silently do nothing on a Chinese locale.
+    ///
+    /// The contract pinned here: distinct from every other code, never confusable with
+    /// "may still be running", and identical to the constant the GUI watches for.
+    #[test]
+    fn scan_gap_has_its_own_code_and_the_gui_watches_for_that_exact_value() {
+        assert_eq!(
+            EXIT_SCAN_GAP,
+            alice_miner_core::terminal::EXIT_STOP_SCAN_GAP,
+            "the two crates' constants must not drift (core cannot depend on the CLI)"
+        );
+        // Distinct from every other stop outcome, or the GUI cannot tell them apart.
+        for other in [EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, EXIT_UNVERIFIED] {
+            assert_ne!(EXIT_SCAN_GAP, other);
+        }
+        // The two report predicates are mutually exclusive BY CONSTRUCTION.
+        let gap = alice_miner_core::terminal::CliStopReport {
+            code: Some(EXIT_SCAN_GAP),
+            stderr: String::new(),
+        };
+        assert!(gap.scan_gap());
+        assert!(
+            !gap.unverified(),
+            "a scan gap is a confirmed stop — it must never trip the alarm surface"
+        );
+    }
+
+    /// ROUND 3 — the orphan sweep's THREE-way contract, against the REAL OS query tool
+    /// on both unix (`pgrep`) and Windows (PowerShell/CIM):
+    ///   * a needle that matches a LIVE process → `Some(pids)` containing it;
+    ///   * a needle that matches nothing → `Some(vec![])` — "we looked and found none",
+    ///     which is precisely what lets an ordinary stop say "No orphan left."
+    ///
+    /// The second half guards against OVER-correcting the unix fix: `pgrep` exits 1
+    /// when it matches nothing, and folding that status into "could not scan" would
+    /// make every clean stop on every unix report a scan gap — a cry-wolf note on the
+    /// most common path. (`None`, a genuine gap, cannot be provoked here without
+    /// breaking the tool, so it is pinned as a pure table in `core::proc::classify_pgrep`.)
+    /// A machine that genuinely cannot scan is a SUPPORTED state, not a test failure
+    /// (that is the entire point of `Option` here), so the assertions are made only
+    /// where the premise holds. On unix that is always — `pgrep` is POSIX and present
+    /// on both CI legs, which is exactly where the bug being fixed lived. On Windows
+    /// the sweep needs PowerShell, which a hardened runner may refuse; there we assert
+    /// when it ran and stay quiet when it did not, rather than fail CI over the
+    /// environment.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn orphan_sweep_reports_found_none_not_a_scan_gap() {
+        let (mut child, prog) = long_lived_child();
+        let pid = child.id();
+
+        let found = orphaned_engine_pids(&prog);
+        // A path NOTHING is running: if the scan ran, this must be an EMPTY list, never
+        // `None`. `None` means "could not scan", and claiming it here would cost every
+        // stop on this machine the "No orphan left" it has every right to say — the
+        // over-correction this test exists to prevent (`pgrep` exits 1 on no match).
+        let empty = orphaned_engine_pids(FOREIGN_ENGINE_PATH);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        #[cfg(unix)]
+        let (found, empty) = (
+            Some(found.expect("`pgrep` is POSIX — it is present here")),
+            Some(empty.expect("exit 1 is 'no match' — an ANSWER, not a scan failure")),
+        );
+
+        if let Some(found) = found {
+            assert!(
+                found.contains(&pid),
+                "a live process running the exact needle path must be found \
+                 (needle {prog}, pid {pid})"
+            );
+        }
+        if let Some(empty) = empty {
+            assert!(
+                empty.is_empty(),
+                "nothing is running {FOREIGN_ENGINE_PATH}; got {empty:?}"
+            );
+        }
     }
 
     /// The layer-2 backstop's identity gate: `identify_child_pid` says `Ours` only when

@@ -405,6 +405,13 @@ pub struct MinerApp {
     /// outcome it could NOT verify, the miner is TOLD (the engine may still be
     /// running) instead of the warning going to a nulled stderr.
     pub terminal_stop_report: Option<std::sync::mpsc::Receiver<CliStopReport>>,
+    /// A calm, non-alarming one-liner for Home — currently only "the stop worked, but
+    /// this system could not be scanned for leftover engine processes"
+    /// (`EXIT_STOP_SCAN_GAP`). Deliberately NOT `error`: that surface is red and means
+    /// something went wrong, and a routine, unfixable-by-the-user platform limitation
+    /// rendered as a failure is how a warning stops being read. Cleared on the next
+    /// Start / Stop like `error` is.
+    pub notice: Option<String>,
 }
 
 /// The external terminal miner is considered STALE only once its telemetry SNAPSHOT FILE
@@ -519,6 +526,7 @@ impl MinerApp {
             last_terminal_poll: None,
             terminal_stopping: false,
             terminal_stop_report: None,
+            notice: None,
         })
     }
 
@@ -1409,6 +1417,8 @@ impl MinerApp {
 
     pub fn start_mining(&mut self) {
         self.error = None;
+        // The last stop's note is about the last stop; starting again retires it.
+        self.notice = None;
         // Single owner: don't start a foreground miner while the background service
         // is active — two miners to the same address only waste the machine. Point
         // the user to Settings to turn it off first.
@@ -1752,6 +1762,8 @@ impl MinerApp {
     /// show `Stopping…` until the telemetry goes stale (the CLI exited). Best-effort.
     fn stop_terminal_miner(&mut self) {
         use alice_miner_core::terminal;
+        // A fresh stop supersedes whatever the previous one had to say.
+        self.notice = None;
         if let Ok(cli_path) = terminal::resolve_cli_path() {
             // Keep the receiver: the CLI's "could not confirm the miner stopped"
             // warning used to be discarded with its stderr, so a miner whose engine
@@ -1785,6 +1797,16 @@ impl MinerApp {
     /// Only the UNVERIFIED code raises an alarm. Every other non-zero result is
     /// ordinary (most often "no running miner found", which the GUI fires routinely on
     /// exit) and must stay silent, or the warning becomes noise nobody reads.
+    ///
+    /// **Round-3 addition — the scan gap was invisible here.** On a locked-down box
+    /// (AppLocker / an execution policy / a hardened container) the CLI stops the miner,
+    /// confirms everything it could probe, and then honestly declines to claim
+    /// "No orphan left" because the sweep could not run. That is a SUCCESS, so it exits
+    /// 0-class, and the GUI — which only alarms on 3 — said nothing at all, leaving the
+    /// miner unaware a check had been skipped. It now has its own code
+    /// (`EXIT_STOP_SCAN_GAP`) and its own calm surface (`notice`, one line, no red
+    /// banner). Not stderr text: the CLI is bilingual, so a prose match would silently
+    /// fail for a Chinese-locale miner.
     pub fn poll_terminal_stop_report(&mut self) {
         let Some(rx) = self.terminal_stop_report.as_ref() else {
             return;
@@ -1794,6 +1816,8 @@ impl MinerApp {
                 self.terminal_stop_report = None;
                 if let Some(msg) = terminal_stop_warning(&report) {
                     self.error = Some(msg);
+                } else if let Some(msg) = terminal_stop_notice(&report) {
+                    self.notice = Some(msg);
                 }
             }
             // Still running → keep waiting. Disconnected (the CLI vanished without a
@@ -2205,6 +2229,32 @@ fn terminal_stop_warning(report: &CliStopReport) -> Option<String> {
     } else {
         format!("{head}\n{detail}")
     })
+}
+
+/// The CALM counterpart (round 3): the stop was confirmed, but this system could not
+/// be scanned for leftover engine processes. Pure and mutually exclusive with
+/// [`terminal_stop_warning`] by construction — they key off different exit codes.
+///
+/// The wording leads with the good news, because that is the true part: the miner did
+/// stop. The gap is stated as a fact about the machine (it is a platform restriction
+/// the miner usually cannot change), with the one action that resolves it. No alarm
+/// language: nothing here is evidence of a leftover — only the absence of evidence,
+/// which round 2 established is not the same thing.
+fn terminal_stop_notice(report: &CliStopReport) -> Option<String> {
+    use alice_miner_core::tr;
+    if !report.scan_gap() {
+        return None;
+    }
+    Some(
+        tr!(
+            "Miner stopped. This system does not allow scanning for leftover mining \
+             processes, so that last check was skipped — if your task manager still \
+             shows xmrig / SRBMiner, end it manually.",
+            "矿工已停止。本机不允许扫描遗留的挖矿进程,因此跳过了最后一项检查 —— \
+             如果任务管理器中仍有 xmrig / SRBMiner,请手动结束它。"
+        )
+        .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -3269,6 +3319,17 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             "'nothing to stop' must never alarm the user"
         );
         assert!(terminal_stop_warning(&rep(None, "")).is_none(), "signalled");
+        // ROUND 3: a stop that WORKED on a machine that forbids scanning is a success
+        // with a smaller claim. It gets a calm note (below), never the red banner.
+        assert!(
+            terminal_stop_warning(&rep(
+                Some(alice_miner_core::terminal::EXIT_STOP_SCAN_GAP),
+                "(This system could not be scanned for leftover engine processes…)"
+            ))
+            .is_none(),
+            "a confirmed stop must not enter the alarm channel just because one \
+             OPTIONAL check could not run"
+        );
 
         // The one loud case: the engine may still be mining.
         let w = terminal_stop_warning(&rep(
@@ -3288,6 +3349,45 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         ))
         .expect("still warns");
         assert!(!bare.trim().is_empty());
+    }
+
+    /// ROUND 3 — the OTHER half of the split, and the reason it exists. On a locked-down
+    /// machine the CLI stops the miner, confirms everything it probed, and honestly
+    /// declines to claim "No orphan left" because the sweep could not run. That is a
+    /// success, so it never reached the GUI's exit-code-3 alarm — and the miner was
+    /// told nothing at all. It now has its own code and its own calm surface.
+    ///
+    /// The two rules pinned here: the notice fires on EXACTLY that code (nothing else,
+    /// or it becomes noise on every ordinary stop), and it never overlaps the warning.
+    #[test]
+    fn a_scan_gap_is_a_notice_not_a_warning() {
+        let rep = |code: Option<i32>| CliStopReport {
+            code,
+            stderr: String::new(),
+        };
+        let gap = rep(Some(alice_miner_core::terminal::EXIT_STOP_SCAN_GAP));
+
+        let note = terminal_stop_notice(&gap).expect("the skipped check must be surfaced");
+        assert!(!note.trim().is_empty());
+        // It leads with the TRUE part — the miner did stop — and never uses the
+        // alarm phrasing reserved for "it may still be running".
+        assert!(
+            !note.to_lowercase().contains("could not confirm"),
+            "the stop WAS confirmed; only the optional sweep was skipped: {note}"
+        );
+        // Mutually exclusive with the warning, in both directions.
+        assert!(terminal_stop_warning(&gap).is_none());
+        assert!(
+            terminal_stop_notice(&rep(Some(
+                alice_miner_core::terminal::EXIT_STOP_UNVERIFIED
+            )))
+            .is_none(),
+            "an unverified stop is an ALARM, never a calm note"
+        );
+        // Every ordinary outcome stays silent on this surface too.
+        assert!(terminal_stop_notice(&rep(Some(0))).is_none(), "clean stop");
+        assert!(terminal_stop_notice(&rep(Some(1))).is_none(), "nothing to stop");
+        assert!(terminal_stop_notice(&rep(None)).is_none(), "signalled");
     }
 
     /// …and the poll wiring: the report arrives asynchronously, so `poll` must be a
@@ -3329,6 +3429,47 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         app.poll_terminal_stop_report();
         assert!(app.error.is_none(), "a disconnected channel is not an outcome");
         assert!(app.terminal_stop_report.is_none());
+
+        // ROUND 3 — the scan gap lands on the CALM surface, and only there. Before this
+        // it landed nowhere at all (the CLI exited 0-class and the GUI only read 3).
+        let (tx4, rx4) = std::sync::mpsc::channel();
+        app.terminal_stop_report = Some(rx4);
+        app.error = None;
+        app.notice = None;
+        tx4.send(CliStopReport {
+            code: Some(alice_miner_core::terminal::EXIT_STOP_SCAN_GAP),
+            stderr: String::new(),
+        })
+        .unwrap();
+        app.poll_terminal_stop_report();
+        assert!(
+            app.notice.is_some(),
+            "the miner must be told a check was skipped"
+        );
+        assert!(
+            app.error.is_none(),
+            "…but never through the red banner: the stop itself was confirmed"
+        );
+        assert!(app.terminal_stop_report.is_none());
+
+        // Every other outcome leaves the calm surface untouched too.
+        let (tx5, rx5) = std::sync::mpsc::channel();
+        app.terminal_stop_report = Some(rx5);
+        app.notice = None;
+        tx5.send(CliStopReport { code: Some(0), stderr: String::new() }).unwrap();
+        app.poll_terminal_stop_report();
+        assert!(app.notice.is_none(), "a clean stop says nothing at all");
+    }
+
+    /// The notice is about the LAST stop, so it must not outlive it: pressing Start
+    /// retires it. (A stale "one check was skipped" line sitting under a running miner
+    /// is a small lie of its own — it describes a stop that is no longer the situation.)
+    #[test]
+    fn starting_again_retires_the_stop_notice() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.notice = Some("a note from the previous stop".into());
+        app.start_mining();
+        assert!(app.notice.is_none());
     }
 
     /// STOP CONVERGENCE (the M4-Max "stuck at Stopping" fix): `stop_terminal_miner` must

@@ -133,6 +133,56 @@ pub fn tasklist_csv_has_pid(stdout: &str, pid: u32) -> bool {
     })
 }
 
+/// What one `pgrep -f <needle>` run established — the **unix twin of
+/// [`classify_tasklist`]**, and it exists for the same reason.
+///
+/// `pgrep` puts its answer in the EXIT STATUS, and the `stop` orphan sweep used to
+/// ignore it completely: it read stdout and nothing else. A `pgrep` that ran and
+/// FAILED (a hardened/containerised environment with no readable `/proc`, a
+/// restricted session, a `pgrep` that rejects the invocation) prints nothing, and
+/// "nothing" parsed as an empty pid list — i.e. a POSITIVE "there are no orphans",
+/// after which `stop` printed *"No orphan left."* over a possibly still-mining
+/// engine. That is exactly the false success round 2 closed on the Windows side;
+/// unix was left asymmetric, and this closes it.
+///
+/// The trap in the OTHER direction is exit **1**. For `pgrep` (BSD and procps
+/// alike) `1` means "no process matched" — the ordinary, correct "there are no
+/// orphans" — so folding `1` into a failure would turn every clean stop on every
+/// unix into a permanent, cry-wolf scan gap. Both folds are lies. The status is a
+/// three-way answer and is kept as one.
+///
+/// Pure + compiled on every OS, so the Windows CI leg covers this table too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgrepScan {
+    /// Exit 0 — at least one process matched; stdout carries the candidate pids.
+    Matched,
+    /// Exit 1 — the scan RAN and matched nothing. A real, usable answer.
+    NoMatch,
+    /// Exit ≥ 2 (2 = usage/syntax error, 3 = fatal error, 126/127 = could not
+    /// execute) or killed by a signal — `pgrep` did not answer. We know NOTHING
+    /// about leftover engines and must not claim otherwise.
+    Failed,
+}
+
+impl PgrepScan {
+    /// Did the scan actually RUN? (`Matched` or `NoMatch`.) The only question the
+    /// caller asks: a scan that ran may back a "no orphan left" claim — including
+    /// when it found none — and one that did not, may not.
+    pub fn ran(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+}
+
+/// Classify a finished `pgrep` by its exit status (`None` = killed by a signal).
+/// See [`PgrepScan`] for why `1` is an answer and `2` is not.
+pub fn classify_pgrep(code: Option<i32>) -> PgrepScan {
+    match code {
+        Some(0) => PgrepScan::Matched,
+        Some(1) => PgrepScan::NoMatch,
+        _ => PgrepScan::Failed,
+    }
+}
+
 /// [`liveness`], but a **zombie counts as Dead** — the answer to use at decision
 /// points ("may I take over this pid file?", "did it really stop?").
 ///
@@ -285,6 +335,37 @@ mod tests {
             classify_tasklist("\"a.exe\",\"999\",\"Console\",\"1\",\"1 K\"\r\n", true, 1234),
             Liveness::Dead
         );
+    }
+
+    /// ROUND-3 REGRESSION — the UNIX TWIN of the tasklist false success. The orphan
+    /// sweep read `pgrep`'s stdout and ignored its exit status, so a `pgrep` that ran
+    /// and failed (empty stdout) was indistinguishable from "scanned, found nothing"
+    /// and `stop` went on to claim "No orphan left." over a possibly live engine.
+    ///
+    /// The test pins BOTH directions, because over-correcting is its own bug: exit 1
+    /// is `pgrep`'s ordinary "no match" and must stay a usable answer, or every clean
+    /// stop on every unix reports a scan gap nobody would read twice.
+    #[test]
+    fn pgrep_failure_is_not_an_empty_result_and_no_match_is_not_a_failure() {
+        // The table.
+        assert_eq!(classify_pgrep(Some(0)), PgrepScan::Matched);
+        assert_eq!(classify_pgrep(Some(1)), PgrepScan::NoMatch);
+        assert_eq!(classify_pgrep(Some(2)), PgrepScan::Failed); // usage / syntax
+        assert_eq!(classify_pgrep(Some(3)), PgrepScan::Failed); // fatal
+        assert_eq!(classify_pgrep(Some(126)), PgrepScan::Failed); // not executable
+        assert_eq!(classify_pgrep(Some(127)), PgrepScan::Failed); // not found
+        assert_eq!(classify_pgrep(None), PgrepScan::Failed); // killed by a signal
+        // The load-bearing split: "we looked and found none" backs the claim;
+        // "we could not look" does not.
+        assert!(classify_pgrep(Some(0)).ran());
+        assert!(
+            classify_pgrep(Some(1)).ran(),
+            "exit 1 is pgrep's NORMAL 'no match' — treating it as a failure would \
+             make every clean unix stop cry scan-gap"
+        );
+        assert!(!classify_pgrep(Some(2)).ran());
+        assert!(!classify_pgrep(Some(3)).ran());
+        assert!(!classify_pgrep(None).ran());
     }
 
     /// `liveness_settled` never claims a live process is finished.
