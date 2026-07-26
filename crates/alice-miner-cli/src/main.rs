@@ -69,6 +69,12 @@ const EXIT_OK: i32 = 0;
 const EXIT_RUNTIME: i32 = 1;
 /// Usage / argument error (bad lane, no identity flag, dual refused, …).
 const EXIT_USAGE: i32 = 2;
+/// `stop` only: **we could not confirm the miner stopped** — it may still be mining.
+/// Split out of the generic runtime code (1) so a caller can tell this apart from the
+/// ordinary, harmless "no running miner found", which is also non-zero. The GUI keys
+/// its "could not confirm" warning off exactly this code
+/// (`core::terminal::EXIT_STOP_UNVERIFIED`, kept in sync by a test below).
+const EXIT_UNVERIFIED: i32 = 3;
 
 /// ONE crate-wide lock for every test that mutates the process-global
 /// `$ALICE_IDENTITY_DIR` (or other shared env). Rust runs a crate's tests in
@@ -2973,11 +2979,21 @@ fn cmd_stop(args: StopArgs) -> i32 {
             }
         }
         // We know which engine to look for but could NOT scan (no `pgrep` / no
-        // PowerShell). Everything above may still have succeeded, but we cannot back
-        // the "no orphan left" claim, so we don't make it.
+        // PowerShell — e.g. PowerShell blocked by AppLocker / an execution policy).
+        // Everything above may still have succeeded, but we cannot back the "no orphan
+        // left" claim, so we don't make it.
         Some(None) => scan_gap = true,
     }
-    if scan_gap && acted {
+    // ROUND 2 — a missing CAPABILITY is not evidence of a leftover. A scan gap used to
+    // be pushed into `unverified`, so on a locked-down machine EVERY ordinary, fully
+    // confirmed stop ended in "WARNING: could not confirm the miner stopped" + a
+    // non-zero exit. That is honest about the gap but cries wolf about the outcome, and
+    // a warning that fires every time is a warning nobody reads. The honest split:
+    //   * everything we ACTUALLY probed was confirmed ⇒ this is a success — we just
+    //     drop the part of the claim we cannot back ("No orphan left") and say why.
+    //   * anything else unconfirmed ⇒ it stays a warning, and the scan gap is then
+    //     listed with it, because now it might be hiding something.
+    if scan_gap && !unverified.is_empty() {
         unverified.push(
             tr!(
                 "leftover engine processes could not be scanned for on this system",
@@ -3009,10 +3025,25 @@ fn cmd_stop(args: StopArgs) -> i32 {
             )
         );
     } else if acted {
-        println!(
-            "{}",
-            tr!("Miner stopped. No orphan left.", "矿工已停止。没有遗留孤儿进程。")
-        );
+        // "No orphan left" is a claim about a SCAN we ran. Without the scan we say the
+        // part we verified — the processes we knew about are gone — and name the gap.
+        if claims_no_orphan(scan_gap) {
+            println!(
+                "{}",
+                tr!("Miner stopped. No orphan left.", "矿工已停止。没有遗留孤儿进程。")
+            );
+        } else {
+            println!("{}", tr!("Miner stopped.", "矿工已停止。"));
+            println!(
+                "{}",
+                tr!(
+                    "(This system could not be scanned for leftover engine processes; if your task \
+                     manager still shows xmrig / SRBMiner, end it manually.)",
+                    "(本机无法扫描是否存在遗留的引擎进程;如果任务管理器中仍有 xmrig / SRBMiner,\
+                     请手动结束它。)"
+                )
+            );
+        }
     } else if !had_error {
         eprintln!(
             "{}",
@@ -3033,12 +3064,23 @@ fn cmd_stop(args: StopArgs) -> i32 {
     stop_exit_code(acted, had_error, !unverified.is_empty())
 }
 
-/// The `stop` exit code. Pure, so the ONE rule that matters is directly testable:
-/// an unverified outcome NEVER exits 0, no matter how much else succeeded. ("No
-/// running miner found" is not an error per se, but stays non-zero so scripts can
-/// branch on it — unchanged behaviour.)
+/// May `stop` print "**No orphan left**"? Only when the last-resort sweep actually
+/// RAN. Pure, so the rule is a test rather than a comment: the claim is about a scan,
+/// so no scan ⇒ no claim (we still report the stop itself, which we did verify).
+fn claims_no_orphan(scan_gap: bool) -> bool {
+    !scan_gap
+}
+
+/// The `stop` exit code. Pure, so the rules that matter are directly testable:
+///   * an unverified outcome NEVER exits 0, no matter how much else succeeded, and it
+///     gets its OWN code ([`EXIT_UNVERIFIED`]) so a caller (the GUI) can tell "the
+///     miner may still be running" apart from every other non-zero result;
+///   * "no running miner found" is not an error per se, but stays non-zero so scripts
+///     can branch on it — unchanged behaviour.
 fn stop_exit_code(acted: bool, had_error: bool, unverified: bool) -> i32 {
-    if unverified || had_error || !acted {
+    if unverified {
+        EXIT_UNVERIFIED
+    } else if had_error || !acted {
         EXIT_RUNTIME
     } else {
         EXIT_OK
@@ -3691,12 +3733,43 @@ mod tests {
     fn unverified_stop_never_reports_success() {
         // The only path to EXIT_OK: we acted, no error, nothing unverified.
         assert_eq!(stop_exit_code(true, false, false), EXIT_OK);
-        // Acted AND fully "successful", but something could not be confirmed → non-zero.
-        assert_eq!(stop_exit_code(true, false, true), EXIT_RUNTIME);
-        assert_eq!(stop_exit_code(true, true, true), EXIT_RUNTIME);
-        // Errors and "nothing found" stay non-zero as before.
+        // Acted AND fully "successful", but something could not be confirmed → its OWN
+        // non-zero code, so the GUI can single out "the miner may still be running".
+        assert_eq!(stop_exit_code(true, false, true), EXIT_UNVERIFIED);
+        assert_eq!(stop_exit_code(true, true, true), EXIT_UNVERIFIED);
+        // Errors and "nothing found" stay non-zero as before, on the generic code.
         assert_eq!(stop_exit_code(true, true, false), EXIT_RUNTIME);
         assert_eq!(stop_exit_code(false, false, false), EXIT_RUNTIME);
+        // Whatever else changes: unverified is never 0, and never the same code as the
+        // ordinary "nothing to stop" result (which the GUI must NOT alarm about).
+        assert_ne!(EXIT_UNVERIFIED, EXIT_OK);
+        assert_ne!(EXIT_UNVERIFIED, EXIT_RUNTIME);
+    }
+
+    /// The GUI decides whether to alarm the miner purely from this exit code, so the
+    /// two crates' constants must not drift (the core crate can't depend on the CLI).
+    #[test]
+    fn unverified_exit_code_matches_the_value_the_gui_watches_for() {
+        assert_eq!(
+            EXIT_UNVERIFIED,
+            alice_miner_core::terminal::EXIT_STOP_UNVERIFIED
+        );
+    }
+
+    /// ROUND 2 (noise): a machine where the orphan SWEEP cannot run (PowerShell blocked
+    /// by AppLocker / an execution policy, no `pgrep`) must not turn every ordinary,
+    /// fully-confirmed stop into a warning + non-zero exit. The scan gap costs us the
+    /// "No orphan left" CLAIM (which is about the scan) — not the success.
+    #[test]
+    fn a_scan_gap_alone_downgrades_the_claim_not_the_outcome() {
+        // No scan ⇒ we do not claim "No orphan left"…
+        assert!(!claims_no_orphan(true));
+        assert!(claims_no_orphan(false));
+        // …but with everything we DID probe confirmed, the stop still exits 0.
+        assert_eq!(stop_exit_code(true, false, false), EXIT_OK);
+        // And if anything else was unconfirmed, the gap is listed with it and the
+        // outcome is unverified (that path pushes the gap into `unverified`).
+        assert_eq!(stop_exit_code(true, false, true), EXIT_UNVERIFIED);
     }
 
     /// The layer-2 backstop's identity gate: `identify_child_pid` says `Ours` only when

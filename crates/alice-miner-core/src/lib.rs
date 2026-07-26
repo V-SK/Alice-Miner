@@ -43,6 +43,7 @@ pub mod identity;
 pub mod keyring;
 pub mod lane;
 pub mod pop;
+pub mod proc;
 pub mod prl_payout;
 pub mod service;
 pub mod settings;

@@ -113,133 +113,13 @@ impl Drop for PidGuard {
     }
 }
 
-/// What we could establish about a pid. The three-way answer matters: "I could not
-/// tell" must NEVER be collapsed into either "alive" or "dead", because each
-/// collapse produces a different lie (a phantom owner that blocks the rendezvous,
-/// or a false "stopped cleanly" while the miner runs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Liveness {
-    /// The process exists.
-    Alive,
-    /// The process positively does not exist.
-    Dead,
-    /// We could not probe (no tooling / permission / OS error) — assume nothing.
-    Unknown,
-}
-
-/// Probe whether process `pid` exists.
-#[cfg(unix)]
-pub fn liveness(pid: u32) -> Liveness {
-    // `kill(pid, 0)` performs error checking without sending a signal: Ok = alive
-    // (or a zombie we can still signal), `ESRCH` = no such process, `EPERM` = it
-    // exists but belongs to someone else (still ALIVE for our purposes).
-    if unsafe { libc_kill(pid as i32, 0) } == 0 {
-        return Liveness::Alive;
-    }
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(ESRCH) => Liveness::Dead,
-        Some(EPERM) => Liveness::Alive,
-        _ => Liveness::Unknown,
-    }
-}
-
-/// Probe whether process `pid` exists (Windows).
-///
-/// **Bug fix.** This used to be a hard-coded `true` ("we can't cheaply probe"),
-/// which made every stale pid file immortal — see [`PidGuard::acquire`]. `tasklist`
-/// ships on every supported Windows (unlike `wmic`, which Microsoft removed in
-/// recent Windows 11 builds) and the very same filter is already used by
-/// [`stop_pid`], so this is a real probe with no new dependency: we ask for a
-/// headerless CSV row for exactly this pid and read the PID column back.
-#[cfg(not(unix))]
-pub fn liveness(pid: u32) -> Liveness {
-    use std::process::Command;
-    match Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .output()
-    {
-        // A row for this pid → alive. A run that succeeded but listed nothing
-        // ("INFO: No tasks are running which match…") → positively dead.
-        Ok(out) => {
-            if tasklist_csv_has_pid(&String::from_utf8_lossy(&out.stdout), pid) {
-                Liveness::Alive
-            } else {
-                Liveness::Dead
-            }
-        }
-        // tasklist itself could not be run → we know nothing. NOT "dead".
-        Err(_) => Liveness::Unknown,
-    }
-}
-
-/// Whether process `pid` may be running. Conservative by design: an `Unknown`
-/// counts as alive, so we never *act* as if a process we failed to probe is gone.
-/// Callers that must distinguish "proven gone" (stale-file takeover, stop
-/// verification) use [`liveness_settled`].
-pub fn is_alive(pid: u32) -> bool {
-    liveness(pid) != Liveness::Dead
-}
-
-/// [`liveness`], but a **zombie counts as Dead** — the answer to use at decision
-/// points ("may I take over this pid file?", "did it really stop?").
-///
-/// A process that has been killed but not yet reaped by its parent still answers
-/// `kill(pid, 0)`, so the cheap probe reports it Alive. It is NOT running: it holds
-/// no CPU or GPU and cannot mine. Treating it as alive would produce the two lies
-/// this fix exists to prevent, in mirror image — a "could not confirm it stopped"
-/// warning for a miner that certainly stopped, and a stale pid file that blocks the
-/// rendezvous forever (this is reachable in normal use: the GUI spawns the CLI and
-/// may not `wait()` on it promptly).
-///
-/// Kept separate from [`liveness`] because it costs a `ps` fork: polling loops use
-/// the cheap probe and consult this only when they are about to decide.
-#[cfg(unix)]
-pub fn liveness_settled(pid: u32) -> Liveness {
-    match liveness(pid) {
-        Liveness::Alive if is_zombie(pid) => Liveness::Dead,
-        other => other,
-    }
-}
-
-/// Windows has no zombie state (a terminated process disappears from `tasklist`
-/// once its handles close), so the settled answer is the plain probe.
-#[cfg(not(unix))]
-pub fn liveness_settled(pid: u32) -> Liveness {
-    liveness(pid)
-}
-
-/// Is `pid` a zombie (terminated, awaiting reap)? `ps -o stat=` reports `Z` for it on
-/// both Linux and macOS. Any failure to read the state answers `false` (we do not
-/// claim a process is finished on a guess).
-#[cfg(unix)]
-fn is_zombie(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "stat="])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim_start()
-                .starts_with('Z')
-        })
-        .unwrap_or(false)
-}
-
-/// Does this `tasklist /FO CSV /NH` output contain a row for `pid`?
-///
-/// Parsed as CSV rather than by substring: the raw row also carries the memory
-/// column (`"12,345 K"`) and the session id, so a naive `stdout.contains(pid)` can
-/// match those digits and report a dead pid as alive. Pure + compiled on every OS
-/// so the parser is covered by the macOS/Linux CI runs too, not only Windows.
-#[allow(dead_code)] // used by `liveness` on Windows only; always tested.
-fn tasklist_csv_has_pid(stdout: &str, pid: u32) -> bool {
-    stdout.lines().any(|line| {
-        // `"image.exe","1234","Console","1","12,345 K"` → field 1 is the PID.
-        line.split("\",\"")
-            .nth(1)
-            .map(|f| f.trim_matches('"').trim() == pid.to_string())
-            .unwrap_or(false)
-    })
-}
+// ── Liveness: ONE probe, shared with the GUI/core side. ──────────────────────
+// Round 1 fixed this module's Windows stub but left `core::terminal::pid_is_alive`
+// as a SECOND stub (always-alive off unix). Round 2 moves the probe into
+// `alice_miner_core::proc` and both sides now call it, so the two can never drift
+// apart again — and the Windows decision table is one pure, always-compiled
+// function that the macOS/Linux CI legs execute too.
+pub use alice_miner_core::proc::{is_alive, liveness, liveness_settled, Liveness};
 
 /// The result of a `stop` request.
 ///
@@ -371,11 +251,6 @@ pub fn stop_pid(pid: u32, timeout: Duration) -> StopOutcome {
 const SIGTERM: i32 = 15;
 #[cfg(unix)]
 const SIGKILL: i32 = 9;
-/// `errno` values we interpret from `kill(pid, 0)` (identical on Linux + macOS).
-#[cfg(unix)]
-const EPERM: i32 = 1;
-#[cfg(unix)]
-const ESRCH: i32 = 3;
 
 #[cfg(unix)]
 extern "C" {
@@ -410,40 +285,20 @@ mod tests {
     /// nowhere near this range; unix pids are bounded well below it.)
     const DEAD_PID: u32 = 0x7FFF_FFFE;
 
-    /// liveness/is_alive: this very process is alive; a very high unused pid is
-    /// positively dead. Runs on **every** OS — on Windows this exercises the real
-    /// `tasklist` probe that replaced the hard-coded `true` (Bug 2), so the fix is
-    /// actually covered by CI rather than assumed.
+    /// The probe itself (including the Windows `tasklist` decision table and the
+    /// round-2 "ran but failed → Unknown" rule) is tested at its new home,
+    /// `alice_miner_core::proc` — this module now re-exports it. What stays here is
+    /// what this module still OWNS: the rendezvous file and `stop_pid`.
+    ///
+    /// The one probe fact the rendezvous depends on, asserted where it is used:
+    /// a very high pid must be POSITIVELY dead, or the stale-file takeover below
+    /// silently stops working.
     #[test]
-    fn liveness_detects_self_and_missing() {
+    fn probe_is_wired_to_the_shared_implementation() {
         assert_eq!(liveness(std::process::id()), Liveness::Alive);
         assert!(is_alive(std::process::id()));
-        assert_eq!(
-            liveness(DEAD_PID),
-            Liveness::Dead,
-            "a non-existent pid must be positively Dead, never assumed alive"
-        );
+        assert_eq!(liveness(DEAD_PID), Liveness::Dead);
         assert!(!is_alive(DEAD_PID));
-    }
-
-    /// The `tasklist /FO CSV /NH` row parser (Bug 2). Pure, so it runs on every OS.
-    /// The memory column contains digits too — a substring match would report the
-    /// dead pid 345 as alive off `"12,345 K"`.
-    #[test]
-    fn tasklist_csv_row_is_parsed_by_column_not_substring() {
-        let row = "\"xmrig.exe\",\"1234\",\"Console\",\"1\",\"12,345 K\"\r\n";
-        assert!(tasklist_csv_has_pid(row, 1234));
-        assert!(!tasklist_csv_has_pid(row, 345), "must not match the memory column");
-        assert!(!tasklist_csv_has_pid(row, 1), "must not match the session column");
-        assert!(!tasklist_csv_has_pid(row, 12));
-        // The "no match" output tasklist prints for a dead pid.
-        let none = "INFO: No tasks are running which match the specified criteria.\r\n";
-        assert!(!tasklist_csv_has_pid(none, 1234));
-        assert!(!tasklist_csv_has_pid("", 1234));
-        // Several rows: find the right one.
-        let rows = "\"a.exe\",\"10\",\"Console\",\"1\",\"1 K\"\r\n\"b.exe\",\"20\",\"Console\",\"1\",\"2 K\"\r\n";
-        assert!(tasklist_csv_has_pid(rows, 20));
-        assert!(!tasklist_csv_has_pid(rows, 30));
     }
 
     /// REGRESSION (Bug 2): a STALE pid file left by a crash / power loss must be

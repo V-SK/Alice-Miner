@@ -172,10 +172,8 @@ fn integer_after_keyword(lower: &str, keyword: &str) -> Option<u64> {
 /// `cuda:0` as "accepted = 0" and the `r:` inside `power:120` as "rejected = 120",
 /// so ONE ordinary device/telemetry line from a custom miner (`gpu0 cuda:0
 /// power:120`) silently overwrote the real share counters. The prefix therefore
-/// only counts when it STARTS a word: preceded by the start of the line or by a
-/// character that is neither alphanumeric nor `_`/`.`/`:` (so `cuda:`, `power:`,
-/// `xa:` and `foo.a:` never match, while ` a:42`, `[a:42]`, `(rej:1` do). We scan
-/// EVERY occurrence, not just the first, so a real `a:42` later in a line that also
+/// only counts at a real word start — see [`starts_word`]. We scan EVERY
+/// occurrence, not just the first, so a real `a:42` later in a line that also
 /// contains `cuda:0` is still found.
 fn compact_count(lower: &str, prefix: &str) -> Option<u64> {
     let mut from = 0usize;
@@ -194,16 +192,26 @@ fn compact_count(lower: &str, prefix: &str) -> Option<u64> {
     None
 }
 
-/// Whether byte offset `idx` begins a new "word" — i.e. nothing runs into it from
-/// the left. Used to keep `cuda:0` / `power:120` from matching the `a:` / `r:`
-/// compact-count prefixes.
+/// Whether byte offset `idx` begins a real "word" — the guard that keeps `cuda:0` /
+/// `power:120` from matching the `a:` / `r:` compact-count prefixes.
+///
+/// **Round 2: an ALLOWLIST, not a blocklist.** Round 1 excluded alphanumerics plus
+/// `_`, `.` and `:`, which still let a hyphen through: `gpu-a:0` was read as
+/// accepted = 0 and `core-r:120` as rejected = 120 — the identical false-zero, one
+/// character away. Enumerating the separators that must NOT count is a losing game
+/// (`-`, `=`, `/`, `+`, `#`, …), so we invert it: the prefix counts only when it is
+/// at the start of the line or directly after WHITESPACE or one of a few opening
+/// delimiters. That covers every shape a miner actually prints a compact counter in
+/// (` a:42`, `[a:42]`, `(rej:1`, `,a:5`, `|r:0`) and rejects everything else by
+/// default — which is the right bias here, because a MISSED count leaves the field
+/// `None` ("telemetry unavailable"), while a WRONG one corrupts the user's totals.
 fn starts_word(lower: &str, idx: usize) -> bool {
     if idx == 0 {
         return true;
     }
     match lower[..idx].chars().next_back() {
         None => true,
-        Some(c) => !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':'),
+        Some(c) => c.is_whitespace() || matches!(c, '[' | '(' | '{' | ',' | ';' | '|'),
     }
 }
 
@@ -259,6 +267,44 @@ mod tests {
         // Other glued forms that must stay inert.
         assert_eq!(parse_generic("30.0 mh/s extra:5").unwrap().rejected, None);
         assert_eq!(parse_generic("30.0 mh/s beta:7").unwrap().accepted, None);
+    }
+
+    /// ROUND-2 REGRESSION: the round-1 word boundary was a BLOCKLIST and still let a
+    /// hyphen (and `=`, `/`, `+`, `#`) through, so `gpu-a:0` was read as accepted = 0
+    /// and `core-r:120` as rejected = 120 — the same false zero, one character away.
+    /// Every one of these must leave the counters untouched.
+    #[test]
+    fn separator_glued_device_tokens_are_not_compact_share_counts() {
+        for line in [
+            "gpu-a:0 30.0 mh/s",
+            "core-r:120 30.0 mh/s",
+            "dev=a:0 30.0 mh/s",
+            "opt=r:9 30.0 mh/s",
+            "gpu/a:0 30.0 mh/s",
+            "x+r:5 30.0 mh/s",
+            "#a:3 30.0 mh/s",
+            "temp-a:0 fan-r:80 30.0 mh/s",
+        ] {
+            let s = parse_generic(line).unwrap_or_else(|| panic!("no sample for {line}"));
+            assert_eq!(s.accepted, None, "{line} must not yield an accepted count");
+            assert_eq!(s.rejected, None, "{line} must not yield a rejected count");
+            assert_eq!(s.hashrate_hs, Some(30_000_000.0), "{line} rate still read");
+        }
+    }
+
+    /// …and the genuine forms still read, INCLUDING a real `a:`/`r:` that follows a
+    /// hyphen-glued decoy on the same line (the exact shape the round-1 fix missed).
+    #[test]
+    fn real_compact_counts_still_read_after_a_hyphenated_decoy() {
+        let s = parse_generic("gpu-a:0 core-r:120 shares a:42 r:1").unwrap();
+        assert_eq!(s.accepted, Some(42));
+        assert_eq!(s.rejected, Some(1));
+        // Comma / pipe / brace separated forms are word starts too.
+        assert_eq!(parse_generic("stats,a:5 1.0 mh/s").unwrap().accepted, Some(5));
+        assert_eq!(parse_generic("stats|r:6 1.0 mh/s").unwrap().rejected, Some(6));
+        assert_eq!(parse_generic("{a:8} 1.0 mh/s").unwrap().accepted, Some(8));
+        // Tab-separated (whitespace is a word start, not just ' ').
+        assert_eq!(parse_generic("shares\ta:11 1.0 mh/s").unwrap().accepted, Some(11));
     }
 
     /// The word-boundary guard must NOT break the real compact forms, including a
