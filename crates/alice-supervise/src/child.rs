@@ -70,11 +70,25 @@ pub struct OwnedChild {
     child: Child,
     pid: u32,
     pid_file: Option<PathBuf>,
+    /// Windows: the kill-on-close Job Object this child (and everything it spawns)
+    /// is bound to. Dropping it — including via process death, when the OS closes
+    /// our handles — terminates the whole job. `None` if the OS refused to create
+    /// or assign the job (we then fall back to the taskkill tree walk).
+    #[cfg(windows)]
+    job: Option<job::JobHandle>,
 }
 
 impl OwnedChild {
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Windows: whether this child is bound to a kill-on-close Job Object (i.e.
+    /// whether "parent dies → engine dies" is guaranteed by the OS for this child).
+    /// Exposed for tests / diagnostics.
+    #[cfg(windows)]
+    pub fn job_bound(&self) -> bool {
+        self.job.is_some()
     }
 
     /// Non-blocking poll: `Some(code)` if the child has exited.
@@ -100,7 +114,9 @@ impl OwnedChild {
         {
             // On Windows there is no process group / graceful CTRL_BREAK without a
             // console group, so the graceful phase is just the grace window; the
-            // force path below terminates the whole process TREE.
+            // force path below terminates the whole process TREE, and the Job Object
+            // (dropped with `self` at the end of this fn) is the kernel-enforced
+            // backstop if even that fails.
         }
 
         // Bounded wait for graceful exit.
@@ -170,6 +186,88 @@ impl OwnedChild {
 extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
+/// Windows Job Objects — the OS-enforced "parent dies → engine dies" bond.
+///
+/// **Why this exists (orphan bug).** On unix the engine is a process-group leader
+/// and `kill_on_drop` gives us a Rust-level backstop. Neither helps on Windows:
+///   * `kill_on_drop` runs in `Drop`, and `taskkill /F` (which is how the CLI parent
+///     is actually terminated, because the graceful path cannot stop a windowless
+///     console app) calls `TerminateProcess` — no unwinding, no destructors. So the
+///     engine (xmrig / SRBMiner) survived its parent and kept mining on the user's
+///     GPU while `stop` printed "no orphan left".
+///   * the taskkill tree walk only helps when someone is alive to run it.
+///
+/// A Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` moves the guarantee into
+/// the kernel: when the last handle to the job closes — which the OS does for us
+/// when this process dies, however it dies — every process in the job is terminated.
+/// Processes the engine itself spawns are in the job too, so helper miners cannot
+/// escape either.
+///
+/// Fail-soft: any failure returns `None` and leaves the previous behaviour intact.
+#[cfg(windows)]
+mod job {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+
+    /// An owned job handle. Stored as `usize` (not the raw `HANDLE` pointer) so
+    /// `OwnedChild` stays `Send`/`Sync`; a Windows handle is a process-wide token,
+    /// not a thread-affine pointer, so this is sound.
+    pub struct JobHandle(usize);
+
+    impl Drop for JobHandle {
+        fn drop(&mut self) {
+            // Closing the LAST handle to a kill-on-close job terminates every process
+            // still in it — this is the teardown, not just a cleanup.
+            unsafe { CloseHandle(self.0 as HANDLE) };
+        }
+    }
+
+    /// Create a kill-on-close job and put process `pid` in it. Returns the owning
+    /// handle, which must be kept alive for as long as the child should live.
+    ///
+    /// Safe to call right after spawn: we still hold the child's process handle, so
+    /// the OS cannot recycle `pid` onto a different process in between.
+    pub fn bind(pid: u32) -> Option<JobHandle> {
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() || job == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let guard = JobHandle(job as usize);
+
+            // Ask for kill-on-close.
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == 0
+            {
+                return None; // `guard` drops → handle closed, nothing was assigned yet
+            }
+
+            // Assigning needs SET_QUOTA + TERMINATE on the target process.
+            let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if proc.is_null() {
+                return None;
+            }
+            let assigned = AssignProcessToJobObject(job, proc) != 0;
+            CloseHandle(proc);
+            if !assigned {
+                return None;
+            }
+            Some(guard)
+        }
+    }
 }
 
 /// Spawn `program` with `args`, capturing stdout+stderr line-by-line into
@@ -253,6 +351,13 @@ pub fn spawn_supervised(
         .id()
         .ok_or_else(|| io::Error::other("child has no PID"))?;
 
+    // Windows: bind the child (and everything it spawns) to a kill-on-close Job
+    // Object, so it cannot outlive us even when we are TerminateProcess'd — which is
+    // exactly how `alice-miner stop` ends up terminating the CLI parent. See `mod job`.
+    // We still hold `child`, so `pid` cannot have been recycled here.
+    #[cfg(windows)]
+    let job = job::bind(pid);
+
     if let Some(pf) = pid_file {
         if let Some(parent) = pf.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -273,6 +378,8 @@ pub fn spawn_supervised(
         child,
         pid,
         pid_file: pid_file.map(|p| p.to_path_buf()),
+        #[cfg(windows)]
+        job,
     })
 }
 
@@ -322,9 +429,10 @@ pub fn read_pid_file(pid_file: &Path) -> Option<u32> {
 mod tests {
     use super::*;
     use std::time::Instant;
-    // Only the `#[cfg(unix)]` spawn tests below use this (Windows skips them → the
-    // import would be unused there under `-D warnings`).
-    #[cfg(unix)]
+    // Used by the spawn tests: the `#[cfg(unix)]` ones and the Windows job-binding
+    // one. On a hypothetical third OS neither runs, so the import would be unused
+    // there under `-D warnings`.
+    #[cfg(any(unix, windows))]
     use tokio::sync::mpsc::unbounded_channel;
 
     fn rt() -> tokio::runtime::Runtime {
@@ -478,6 +586,69 @@ mod tests {
             }
             let _ = child.stop(Duration::from_secs(2)).await;
             assert!(ok, "caller-supplied env var must reach the child");
+        });
+    }
+
+    /// Windows: is this pid present according to `tasklist`? (Local to the test —
+    /// the CLI has its own copy for the stop path.)
+    #[cfg(windows)]
+    fn win_pid_present(pid: u32) -> bool {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout).lines().any(|l| {
+                    l.split("\",\"")
+                        .nth(1)
+                        .map(|f| f.trim_matches('"').trim() == pid.to_string())
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// REGRESSION (Bug 1, Windows-only): every spawned engine child must be bound to
+    /// a kill-on-close Job Object. That binding is what makes the engine die when the
+    /// CLI parent is `taskkill /F`'d (TerminateProcess runs no destructors, so
+    /// `kill_on_drop` never fires) — the mechanism behind "stop said no orphan while
+    /// xmrig kept mining". If `bind` ever silently starts returning `None` (wrong
+    /// access rights, API misuse), this fails instead of regressing in the field.
+    ///
+    /// Windows CI is the ONLY place this executes; it cannot be validated on macOS.
+    #[cfg(windows)]
+    #[test]
+    fn spawned_child_is_bound_to_a_kill_on_close_job() {
+        let rt = rt();
+        rt.block_on(async {
+            let (tx, _rx) = unbounded_channel();
+            let mut child = spawn_supervised(
+                Path::new("cmd.exe"),
+                &["/C".to_string(), "ping -n 30 127.0.0.1 > nul".to_string()],
+                &[],
+                None,
+                tx,
+            )
+            .expect("spawn");
+            let pid = child.pid();
+            assert!(pid > 0);
+            assert!(
+                child.job_bound(),
+                "the engine child MUST be in a kill-on-close job — without it a \
+                 force-killed parent leaves the miner orphaned"
+            );
+            assert!(child.try_exit_code().is_none(), "child should still be running");
+
+            let _ = child.stop(Duration::from_secs(3)).await.expect("stop ok");
+            // The whole point: after stop the process is really gone.
+            let mut gone = false;
+            for _ in 0..20 {
+                if !win_pid_present(pid) {
+                    gone = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            assert!(gone, "pid {pid} still present after stop() — orphan left behind");
         });
     }
 

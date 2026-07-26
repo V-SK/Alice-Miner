@@ -10,7 +10,16 @@
 //!     `termination` feature → graceful `Command::Stop`), escalating to `SIGKILL`
 //!     after a timeout if it hasn't exited. Killing the `start` process drops its
 //!     engine + owned child (no orphan).
-//!   * **windows:** a best-effort `taskkill /PID` (graceful), then `/F` (force).
+//!   * **windows:** a best-effort `taskkill /PID /T` (graceful — usually a no-op for
+//!     a windowless console app), then `taskkill /F /T` (force the whole TREE). The
+//!     engine child is additionally bound to a kill-on-close Job Object at spawn
+//!     (`alice-supervise::child`), which is what actually guarantees it cannot
+//!     outlive a force-killed parent.
+//!
+//! **Every outcome here is verified, never assumed.** `Graceful`/`Killed` are only
+//! returned after re-probing the pid and finding it gone; anything we could not
+//! confirm becomes `Error` so the caller can tell the user the truth instead of
+//! printing "stopped cleanly" over a still-running miner.
 //!
 //! The pid file holds only this process's own pid (a public integer) — no secret.
 
@@ -72,14 +81,22 @@ pub struct PidGuard {
 impl PidGuard {
     /// Acquire the rendezvous: record our pid unless a *live* one is already
     /// recorded. Always returns a guard (mining proceeds regardless).
+    ///
+    /// **Stale-file takeover (bug fix).** The decision now turns on a POSITIVE
+    /// [`Liveness::Dead`], not on "not alive". The old code asked `is_alive`, which
+    /// on Windows was hard-coded to `true` — so after ANY crash / power loss / closed
+    /// window the leftover pid file looked like a live owner forever, we declined to
+    /// record our own pid, and every later `stop` aimed at the dead pid and reported
+    /// a clean stop while the real miner kept running. A pid we can PROVE is gone is
+    /// safe to take over; an `Unknown` (we could not probe) still yields to the
+    /// recorded owner, because stealing the rendezvous from a live miner would be the
+    /// worse failure.
     pub fn acquire() -> Self {
-        let existing_live = read_pid().map(is_alive).unwrap_or(false);
-        let owns = if existing_live {
-            // Respect an existing live owner; don't steal the rendezvous.
-            false
-        } else {
-            // No file, or a stale pid → take ownership.
-            write_self()
+        let owns = match read_pid() {
+            // Someone is (or may be) there → don't steal the rendezvous.
+            Some(pid) if liveness_settled(pid) != Liveness::Dead => false,
+            // No file, or a pid we positively know is gone → take ownership.
+            _ => write_self(),
         };
         Self { owns }
     }
@@ -96,28 +113,147 @@ impl Drop for PidGuard {
     }
 }
 
-/// Whether process `pid` is currently alive.
-#[cfg(unix)]
-pub fn is_alive(pid: u32) -> bool {
-    // `kill(pid, 0)` performs error checking without sending a signal: Ok = alive
-    // (or a zombie we can still signal), `ESRCH` = no such process.
-    unsafe { libc_kill(pid as i32, 0) == 0 }
+/// What we could establish about a pid. The three-way answer matters: "I could not
+/// tell" must NEVER be collapsed into either "alive" or "dead", because each
+/// collapse produces a different lie (a phantom owner that blocks the rendezvous,
+/// or a false "stopped cleanly" while the miner runs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// The process exists.
+    Alive,
+    /// The process positively does not exist.
+    Dead,
+    /// We could not probe (no tooling / permission / OS error) — assume nothing.
+    Unknown,
 }
 
+/// Probe whether process `pid` exists.
+#[cfg(unix)]
+pub fn liveness(pid: u32) -> Liveness {
+    // `kill(pid, 0)` performs error checking without sending a signal: Ok = alive
+    // (or a zombie we can still signal), `ESRCH` = no such process, `EPERM` = it
+    // exists but belongs to someone else (still ALIVE for our purposes).
+    if unsafe { libc_kill(pid as i32, 0) } == 0 {
+        return Liveness::Alive;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(ESRCH) => Liveness::Dead,
+        Some(EPERM) => Liveness::Alive,
+        _ => Liveness::Unknown,
+    }
+}
+
+/// Probe whether process `pid` exists (Windows).
+///
+/// **Bug fix.** This used to be a hard-coded `true` ("we can't cheaply probe"),
+/// which made every stale pid file immortal — see [`PidGuard::acquire`]. `tasklist`
+/// ships on every supported Windows (unlike `wmic`, which Microsoft removed in
+/// recent Windows 11 builds) and the very same filter is already used by
+/// [`stop_pid`], so this is a real probe with no new dependency: we ask for a
+/// headerless CSV row for exactly this pid and read the PID column back.
 #[cfg(not(unix))]
-pub fn is_alive(_pid: u32) -> bool {
-    // On non-unix we can't cheaply probe; assume alive and let `stop`'s taskkill
-    // report if it's already gone.
-    true
+pub fn liveness(pid: u32) -> Liveness {
+    use std::process::Command;
+    match Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+    {
+        // A row for this pid → alive. A run that succeeded but listed nothing
+        // ("INFO: No tasks are running which match…") → positively dead.
+        Ok(out) => {
+            if tasklist_csv_has_pid(&String::from_utf8_lossy(&out.stdout), pid) {
+                Liveness::Alive
+            } else {
+                Liveness::Dead
+            }
+        }
+        // tasklist itself could not be run → we know nothing. NOT "dead".
+        Err(_) => Liveness::Unknown,
+    }
+}
+
+/// Whether process `pid` may be running. Conservative by design: an `Unknown`
+/// counts as alive, so we never *act* as if a process we failed to probe is gone.
+/// Callers that must distinguish "proven gone" (stale-file takeover, stop
+/// verification) use [`liveness_settled`].
+pub fn is_alive(pid: u32) -> bool {
+    liveness(pid) != Liveness::Dead
+}
+
+/// [`liveness`], but a **zombie counts as Dead** — the answer to use at decision
+/// points ("may I take over this pid file?", "did it really stop?").
+///
+/// A process that has been killed but not yet reaped by its parent still answers
+/// `kill(pid, 0)`, so the cheap probe reports it Alive. It is NOT running: it holds
+/// no CPU or GPU and cannot mine. Treating it as alive would produce the two lies
+/// this fix exists to prevent, in mirror image — a "could not confirm it stopped"
+/// warning for a miner that certainly stopped, and a stale pid file that blocks the
+/// rendezvous forever (this is reachable in normal use: the GUI spawns the CLI and
+/// may not `wait()` on it promptly).
+///
+/// Kept separate from [`liveness`] because it costs a `ps` fork: polling loops use
+/// the cheap probe and consult this only when they are about to decide.
+#[cfg(unix)]
+pub fn liveness_settled(pid: u32) -> Liveness {
+    match liveness(pid) {
+        Liveness::Alive if is_zombie(pid) => Liveness::Dead,
+        other => other,
+    }
+}
+
+/// Windows has no zombie state (a terminated process disappears from `tasklist`
+/// once its handles close), so the settled answer is the plain probe.
+#[cfg(not(unix))]
+pub fn liveness_settled(pid: u32) -> Liveness {
+    liveness(pid)
+}
+
+/// Is `pid` a zombie (terminated, awaiting reap)? `ps -o stat=` reports `Z` for it on
+/// both Linux and macOS. Any failure to read the state answers `false` (we do not
+/// claim a process is finished on a guess).
+#[cfg(unix)]
+fn is_zombie(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim_start()
+                .starts_with('Z')
+        })
+        .unwrap_or(false)
+}
+
+/// Does this `tasklist /FO CSV /NH` output contain a row for `pid`?
+///
+/// Parsed as CSV rather than by substring: the raw row also carries the memory
+/// column (`"12,345 K"`) and the session id, so a naive `stdout.contains(pid)` can
+/// match those digits and report a dead pid as alive. Pure + compiled on every OS
+/// so the parser is covered by the macOS/Linux CI runs too, not only Windows.
+#[allow(dead_code)] // used by `liveness` on Windows only; always tested.
+fn tasklist_csv_has_pid(stdout: &str, pid: u32) -> bool {
+    stdout.lines().any(|line| {
+        // `"image.exe","1234","Console","1","12,345 K"` → field 1 is the PID.
+        line.split("\",\"")
+            .nth(1)
+            .map(|f| f.trim_matches('"').trim() == pid.to_string())
+            .unwrap_or(false)
+    })
 }
 
 /// The result of a `stop` request.
+///
+/// `Graceful` and `Killed` are both CONFIRMED terminations — each is only returned
+/// after re-probing the pid and finding it gone. Anything we could not confirm is an
+/// `Error` carrying the reason, so the caller can tell the user the truth instead of
+/// printing "stopped cleanly" over a still-running miner.
+#[derive(Debug)]
 pub enum StopOutcome {
-    /// The process exited after SIGTERM within the grace window.
+    /// The process exited after the termination request within the grace window.
     Graceful,
-    /// The process did not exit in time and was SIGKILL'd (no orphan).
+    /// The process did not exit in time, was force-killed, and is CONFIRMED gone.
     Killed,
-    /// We could not signal the process (e.g. not permitted).
+    /// We could not signal the process, or could not confirm that it died.
     Error(String),
 }
 
@@ -147,42 +283,85 @@ pub fn stop_pid(pid: u32, timeout: Duration) -> StopOutcome {
     // 3) Still alive → SIGKILL. The kernel reaps it; its engine + owned child die
     // with it (kill_on_drop), so no orphan is left.
     unsafe { libc_kill(pid as i32, SIGKILL) };
-    // Give the kernel a moment to reap.
+    // Give the kernel a moment to reap — and then VERIFY. `Killed` is a claim that
+    // the process is gone, so we only make it after seeing the pid disappear.
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(2) {
-        if !is_alive(pid) {
-            break;
+        if liveness(pid) == Liveness::Dead {
+            return StopOutcome::Killed;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    StopOutcome::Killed
+    // Still answering `kill(pid, 0)`. A zombie awaiting reap is finished — that IS a
+    // confirmed stop. Anything else, we genuinely could not confirm.
+    match liveness_settled(pid) {
+        Liveness::Dead => StopOutcome::Killed,
+        _ => StopOutcome::Error(format!(
+            "pid {pid} is still present after SIGKILL — could not confirm it stopped"
+        )),
+    }
 }
 
+/// Windows stop. Three corrections over the previous version, all of them about
+/// not lying:
+///   * the force path now passes **`/T`** (kill the whole process TREE). Without it
+///     `taskkill /F` killed only the recorded process and left every helper it had
+///     spawned — the engine — running.
+///   * the outcome is decided by **re-probing the pid**, not by "did `taskkill`
+///     launch". `Command::output()` returning `Ok` only means the *tool* ran; a
+///     taskkill that printed "Access is denied" or "process not found" exits
+///     non-zero and used to be reported as `Killed`.
+///   * a pid we cannot confirm dead yields `Error`, never `Killed`.
+///
+/// The graceful phase stays best-effort: `taskkill` without `/F` posts `WM_CLOSE`,
+/// which a windowless console miner does not process, so it is expected to fail —
+/// the real graceful path is the CLI's own Ctrl-C handling, and the real no-orphan
+/// guarantee is the Job Object the engine child is bound to (see
+/// `alice-supervise::child`).
 #[cfg(not(unix))]
 pub fn stop_pid(pid: u32, timeout: Duration) -> StopOutcome {
     use std::process::Command;
-    // Graceful close request.
-    let _ = Command::new("taskkill").args(["/PID", &pid.to_string()]).output();
+    // Already gone?
+    if liveness(pid) == Liveness::Dead {
+        return StopOutcome::Graceful;
+    }
+    // 1) Graceful close request (best-effort; see the doc comment).
+    let _ = Command::new("taskkill")
+        .args(["/T", "/PID", &pid.to_string()])
+        .output();
+    // 2) Poll for a confirmed exit.
     let start = Instant::now();
     while start.elapsed() < timeout {
-        // taskkill without /F may not stop a console app reliably; re-check by
-        // attempting a no-op query.
-        let alive = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}")])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
-            .unwrap_or(false);
-        if !alive {
+        if liveness(pid) == Liveness::Dead {
             return StopOutcome::Graceful;
         }
         std::thread::sleep(Duration::from_millis(150));
     }
-    // Force.
-    let out = Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
-    match out {
-        Ok(_) => StopOutcome::Killed,
-        Err(e) => StopOutcome::Error(format!("taskkill failed: {e}")),
+    // 3) Force-kill the whole tree.
+    if let Err(e) = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .output()
+    {
+        return StopOutcome::Error(format!("taskkill could not be run: {e}"));
     }
+    // 4) VERIFY. Only a pid we watched disappear counts as killed.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        match liveness(pid) {
+            Liveness::Dead => return StopOutcome::Killed,
+            _ => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    StopOutcome::Error(match liveness(pid) {
+        Liveness::Unknown => format!(
+            "could not verify whether pid {pid} stopped (tasklist unavailable) — \
+             please check Task Manager for xmrig / SRBMiner"
+        ),
+        _ => format!(
+            "pid {pid} is still running after taskkill /F /T — \
+             please check Task Manager for xmrig / SRBMiner"
+        ),
+    })
 }
 
 // ── Minimal libc bindings (unix) ──────────────────────────────────────────────
@@ -192,6 +371,11 @@ pub fn stop_pid(pid: u32, timeout: Duration) -> StopOutcome {
 const SIGTERM: i32 = 15;
 #[cfg(unix)]
 const SIGKILL: i32 = 9;
+/// `errno` values we interpret from `kill(pid, 0)` (identical on Linux + macOS).
+#[cfg(unix)]
+const EPERM: i32 = 1;
+#[cfg(unix)]
+const ESRCH: i32 = 3;
 
 #[cfg(unix)]
 extern "C" {
@@ -222,13 +406,112 @@ mod tests {
         std::env::remove_var("ALICE_IDENTITY_DIR");
     }
 
-    /// is_alive: this very process is alive; a very high unused pid is not (unix).
-    #[cfg(unix)]
+    /// A pid that certainly does not exist. (Windows pids are multiples of 4 and
+    /// nowhere near this range; unix pids are bounded well below it.)
+    const DEAD_PID: u32 = 0x7FFF_FFFE;
+
+    /// liveness/is_alive: this very process is alive; a very high unused pid is
+    /// positively dead. Runs on **every** OS — on Windows this exercises the real
+    /// `tasklist` probe that replaced the hard-coded `true` (Bug 2), so the fix is
+    /// actually covered by CI rather than assumed.
     #[test]
-    fn is_alive_detects_self_and_missing() {
+    fn liveness_detects_self_and_missing() {
+        assert_eq!(liveness(std::process::id()), Liveness::Alive);
         assert!(is_alive(std::process::id()));
-        // PID 0x7FFF_FFFE is extremely unlikely to exist.
-        assert!(!is_alive(0x7FFF_FFFE));
+        assert_eq!(
+            liveness(DEAD_PID),
+            Liveness::Dead,
+            "a non-existent pid must be positively Dead, never assumed alive"
+        );
+        assert!(!is_alive(DEAD_PID));
+    }
+
+    /// The `tasklist /FO CSV /NH` row parser (Bug 2). Pure, so it runs on every OS.
+    /// The memory column contains digits too — a substring match would report the
+    /// dead pid 345 as alive off `"12,345 K"`.
+    #[test]
+    fn tasklist_csv_row_is_parsed_by_column_not_substring() {
+        let row = "\"xmrig.exe\",\"1234\",\"Console\",\"1\",\"12,345 K\"\r\n";
+        assert!(tasklist_csv_has_pid(row, 1234));
+        assert!(!tasklist_csv_has_pid(row, 345), "must not match the memory column");
+        assert!(!tasklist_csv_has_pid(row, 1), "must not match the session column");
+        assert!(!tasklist_csv_has_pid(row, 12));
+        // The "no match" output tasklist prints for a dead pid.
+        let none = "INFO: No tasks are running which match the specified criteria.\r\n";
+        assert!(!tasklist_csv_has_pid(none, 1234));
+        assert!(!tasklist_csv_has_pid("", 1234));
+        // Several rows: find the right one.
+        let rows = "\"a.exe\",\"10\",\"Console\",\"1\",\"1 K\"\r\n\"b.exe\",\"20\",\"Console\",\"1\",\"2 K\"\r\n";
+        assert!(tasklist_csv_has_pid(rows, 20));
+        assert!(!tasklist_csv_has_pid(rows, 30));
+    }
+
+    /// REGRESSION (Bug 2): a STALE pid file left by a crash / power loss must be
+    /// taken over by the next `start`, so the running miner's pid is the one on
+    /// record and a later `stop` aims at a real process. On Windows this used to be
+    /// impossible (`is_alive` was always `true` → we never wrote our pid → `stop`
+    /// targeted a dead pid and falsely reported success). Runs on every OS.
+    #[test]
+    fn acquire_takes_over_a_stale_pid_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "alice-pid-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
+
+        // A crash left a pid file naming a process that no longer exists.
+        std::fs::write(pid_path(), DEAD_PID.to_string()).unwrap();
+        {
+            let _guard = PidGuard::acquire();
+            assert_eq!(
+                read_pid(),
+                Some(std::process::id()),
+                "a stale pid file must be taken over, not treated as a live owner"
+            );
+        }
+        // We owned it → dropped → cleaned up.
+        assert!(read_pid().is_none());
+
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The other side of the takeover rule: a pid file naming a LIVE process (here,
+    /// ourselves) is respected — we neither steal it nor delete it on drop.
+    #[test]
+    fn acquire_yields_to_a_live_owner() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "alice-pid-live-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
+
+        // A live pid that is NOT us would be ideal, but our own pid proves the same
+        // branch (`liveness != Dead` → don't take ownership) without spawning.
+        std::fs::write(pid_path(), std::process::id().to_string()).unwrap();
+        {
+            let _guard = PidGuard::acquire();
+            assert_eq!(read_pid(), Some(std::process::id()));
+        }
+        // NOTE: the file still names our pid, and `Drop` only removes it when the
+        // guard OWNED it. It didn't (a live owner was recorded), but the recorded pid
+        // happens to equal ours, so the drop check cannot distinguish the two here.
+        // The takeover behaviour is what this test pins; ownership-on-drop is covered
+        // by `pid_guard_writes_and_cleans_up`.
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The guard writes our pid then removes it on drop (no stale pid left).
@@ -257,18 +540,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// stop_pid on a definitely-dead pid returns Graceful (ESRCH path), not an
-    /// error — so `stop` after a crash cleans up rather than failing.
-    #[cfg(unix)]
+    /// stop_pid on a definitely-dead pid returns Graceful (ESRCH / "no such task"),
+    /// not an error — so `stop` after a crash cleans up rather than failing. Now runs
+    /// on Windows too, where it must return promptly instead of burning the whole
+    /// grace window on a pid that is already gone.
     #[test]
     fn stop_pid_on_dead_pid_is_graceful() {
-        match stop_pid(0x7FFF_FFFE, Duration::from_millis(200)) {
+        let t0 = Instant::now();
+        match stop_pid(DEAD_PID, Duration::from_millis(200)) {
             StopOutcome::Graceful => {}
-            other => panic!("expected Graceful for a dead pid, got {:?}", match other {
-                StopOutcome::Killed => "Killed",
-                StopOutcome::Error(_) => "Error",
-                StopOutcome::Graceful => "Graceful",
-            }),
+            other => panic!("expected Graceful for a dead pid, got {other:?}"),
         }
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "a dead pid must be resolved without waiting out the force/verify path"
+        );
     }
 }

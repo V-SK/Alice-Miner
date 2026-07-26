@@ -1265,20 +1265,30 @@ fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
         }
         ParserKind::Generic => {
             // An UNKNOWN custom miner: best-effort scan (`<num> <hash-unit>` +
-            // accepted/rejected). Assign each field only when present (cumulative,
-            // last-wins). When a line can't be read every field stays `None`, so the
-            // lane shows "running, telemetry unavailable" — NEVER a fabricated number.
+            // accepted/rejected). Assign each field only when present. When a line
+            // can't be read every field stays `None`, so the lane shows "running,
+            // telemetry unavailable" — NEVER a fabricated number.
+            //
+            // The share counters are folded MONOTONICALLY (max), not last-wins: the
+            // generic scanner reads an arbitrary third-party format, so a single
+            // mis-read line must never be able to walk the user's session totals
+            // BACKWARDS (the `cuda:0 → accepted=0` bug — now also fixed at the
+            // parser, this is the belt to that braces). These counters are cumulative
+            // by contract, so a lower reading is either a mis-parse or an engine that
+            // restarted its own counter; in both cases keeping the high-water mark is
+            // the honest answer for a session total. A genuine reset happens exactly
+            // where it should — `spawn_run` zeroes them on a fresh (non-failover) start.
             if let Some(sample) = parse_generic(&line) {
                 if let Some(hr) = sample.hashrate_hs {
                     g.hashrate_hs = Some(hr);
                     note_hashrate_progress(g, hr);
                 }
                 if let Some(a) = sample.accepted {
-                    g.accepted = a;
-                    note_accepted_progress(g, a);
+                    g.accepted = g.accepted.max(a);
+                    note_accepted_progress(g, g.accepted);
                 }
                 if let Some(r) = sample.rejected {
-                    g.rejected = r;
+                    g.rejected = g.rejected.max(r);
                 }
                 apply_telemetry(g, &sample);
             }
@@ -2005,6 +2015,44 @@ mod tests {
         let st2 = s.stats();
         assert_eq!(st2.hashrate_hs, Some(30_500_000.0), "unreadable line kept the last real rate");
         assert_eq!(st2.accepted, 12, "no fabricated share count");
+    }
+
+    /// REGRESSION (Bug 3): with the GENERIC parser, the cumulative share counters are
+    /// folded monotonically, so a line that fails to yield a real count can never walk
+    /// the user's session totals backwards. Combined with the parser-side word-boundary
+    /// fix, an ordinary `cuda:0 power:120` device line leaves the totals untouched.
+    #[test]
+    fn generic_parser_share_counters_never_go_backwards() {
+        let s = LaneSupervisor::with_backend(
+            Lane::GpuPrl,
+            EndpointPlan::single(Endpoint::plaintext("us.aliceprotocol.org", 3340)),
+            ParserKind::Generic,
+            None,
+        );
+        {
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:100 r:2 30.0 mh/s");
+        }
+        assert_eq!(s.stats().accepted, 100);
+        assert_eq!(s.stats().rejected, 2);
+        {
+            // The exact real-world offender: a device/telemetry line. The parser now
+            // reads NO counts from it, and even if some other format did yield a lower
+            // number, the monotonic fold keeps the high-water mark.
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Generic, "gpu0 cuda:0 power:120 30.0 mh/s");
+            // A genuinely lower cumulative reading (engine restarted its own counter).
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:3 r:0 30.0 mh/s");
+        }
+        assert_eq!(s.stats().accepted, 100, "accepted must never regress");
+        assert_eq!(s.stats().rejected, 2, "rejected must never regress");
+        {
+            // A genuine advance still moves it forward.
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:101 r:3 30.0 mh/s");
+        }
+        assert_eq!(s.stats().accepted, 101);
+        assert_eq!(s.stats().rejected, 3);
     }
 
     /// T5: a supervisor built `with_backend` and an explicit `log_tail` path exposes

@@ -172,6 +172,7 @@ name = "alice-supervise"
 version = "0.6.5"
 dependencies = [
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

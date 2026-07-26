@@ -167,14 +167,43 @@ fn integer_after_keyword(lower: &str, keyword: &str) -> Option<u64> {
 
 /// A compact `<prefix><int>` count (e.g. `a:42`, `rej:1`). The prefix already ends
 /// in `:`. Returns `None` unless a plain integer immediately follows.
+///
+/// **Word boundary (bug fix).** A bare substring search read the `a:` inside
+/// `cuda:0` as "accepted = 0" and the `r:` inside `power:120` as "rejected = 120",
+/// so ONE ordinary device/telemetry line from a custom miner (`gpu0 cuda:0
+/// power:120`) silently overwrote the real share counters. The prefix therefore
+/// only counts when it STARTS a word: preceded by the start of the line or by a
+/// character that is neither alphanumeric nor `_`/`.`/`:` (so `cuda:`, `power:`,
+/// `xa:` and `foo.a:` never match, while ` a:42`, `[a:42]`, `(rej:1` do). We scan
+/// EVERY occurrence, not just the first, so a real `a:42` later in a line that also
+/// contains `cuda:0` is still found.
 fn compact_count(lower: &str, prefix: &str) -> Option<u64> {
-    let idx = lower.find(prefix)?;
-    let rest = &lower[idx + prefix.len()..];
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        None
-    } else {
-        digits.parse().ok()
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(prefix) {
+        let idx = from + rel;
+        if starts_word(lower, idx) {
+            let rest = &lower[idx + prefix.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                return digits.parse().ok();
+            }
+        }
+        // Advance past this occurrence and keep looking.
+        from = idx + prefix.len();
+    }
+    None
+}
+
+/// Whether byte offset `idx` begins a new "word" — i.e. nothing runs into it from
+/// the left. Used to keep `cuda:0` / `power:120` from matching the `a:` / `r:`
+/// compact-count prefixes.
+fn starts_word(lower: &str, idx: usize) -> bool {
+    if idx == 0 {
+        return true;
+    }
+    match lower[..idx].chars().next_back() {
+        None => true,
+        Some(c) => !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':'),
     }
 }
 
@@ -208,6 +237,43 @@ mod tests {
         let c = parse_generic("shares a:100 r:2").unwrap();
         assert_eq!(c.accepted, Some(100));
         assert_eq!(c.rejected, Some(2));
+    }
+
+    /// REGRESSION (Bug 3): a device / telemetry token whose tail merely CONTAINS
+    /// the compact prefix must never be read as a share count. `cuda:0` contains
+    /// `a:0` and `power:120` contains `r:120`; before the word-boundary fix ONE such
+    /// line reset the dashboard's accepted counter to 0 and invented 120 rejects.
+    #[test]
+    fn device_tokens_are_not_read_as_compact_share_counts() {
+        // `cuda:0` must not become accepted=0.
+        let s = parse_generic("gpu0 cuda:0 temp 61c 30.0 mh/s").unwrap();
+        assert_eq!(s.accepted, None, "cuda:0 must not be read as accepted");
+        // `power:120` must not become rejected=120.
+        let p = parse_generic("dev0 power:120 fan 55% 30.0 mh/s").unwrap();
+        assert_eq!(p.rejected, None, "power:120 must not be read as rejected");
+        // Both at once, plus a real rate.
+        let b = parse_generic("worker cuda:0 power:120 speed 30.0 mh/s").unwrap();
+        assert_eq!(b.accepted, None);
+        assert_eq!(b.rejected, None);
+        assert_eq!(b.hashrate_hs, Some(30_000_000.0));
+        // Other glued forms that must stay inert.
+        assert_eq!(parse_generic("30.0 mh/s extra:5").unwrap().rejected, None);
+        assert_eq!(parse_generic("30.0 mh/s beta:7").unwrap().accepted, None);
+    }
+
+    /// The word-boundary guard must NOT break the real compact forms, including a
+    /// genuine `a:`/`r:` that appears AFTER a decoy token on the same line.
+    #[test]
+    fn real_compact_counts_still_read_after_a_decoy_token() {
+        let c = parse_generic("gpu0 cuda:0 shares a:100 r:2").unwrap();
+        assert_eq!(c.accepted, Some(100), "a real a: after cuda: is still found");
+        assert_eq!(c.rejected, Some(2), "a real r: after power-like tokens is still found");
+        // Bracketed / parenthesised prefixes are word starts too.
+        let br = parse_generic("[a:7] [r:1] 1.0 mh/s").unwrap();
+        assert_eq!(br.accepted, Some(7));
+        assert_eq!(br.rejected, Some(1));
+        // Line-initial prefix.
+        assert_eq!(parse_generic("a:9 1.0 mh/s").unwrap().accepted, Some(9));
     }
 
     #[test]

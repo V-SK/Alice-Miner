@@ -14,3 +14,15 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.37.0", features = ["full"] }
+
+# Windows-only: Job Objects, so a spawned engine child dies with us even when this
+# process is TerminateProcess'd (`taskkill /F`), which runs no destructors — see the
+# `job` module in `src/child.rs`. `windows-sys` is already in the workspace tree
+# (alice-miner-core uses it for the console), so this adds no new third-party crate.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
