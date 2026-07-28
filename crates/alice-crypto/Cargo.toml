@@ -1,6 +1,6 @@
 [package]
 name = "alice-crypto"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2021"
 
 # Crypto / keystore primitives shared with the Alice Wallet. The body of
