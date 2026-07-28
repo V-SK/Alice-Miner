@@ -229,6 +229,13 @@ fn hero_card_body(ui: &mut egui::Ui, app: &mut MinerApp) {
     // sets `error = None`).
     error_banner(ui, app);
 
+    // ── Notice line ───────────────────────────────────────────────────────────
+    // The calm surface: something the miner should KNOW but need not act on with
+    // urgency (today: a stop that worked, on a machine that forbids scanning for
+    // leftover engine processes). Rendered muted and unframed precisely so it does
+    // NOT read as a failure — see `notice_line`.
+    notice_line(ui, app);
+
     // ── Stop button + dashboard link while mining/connecting/stopping ─────────
     if matches!(
         state,
@@ -449,6 +456,36 @@ fn error_banner(ui: &mut egui::Ui, app: &MinerApp) {
                 super::icons::show(ui, super::icons::Icon::Alert, 14.0, fg);
                 ui.add_space(7.0);
                 ui.label(RichText::new(err).size(12.5).color(THEME.text));
+            });
+        });
+}
+
+/// A quiet informational line for `app.notice` — the deliberate opposite of
+/// [`error_banner`]: no fill, no stroke, muted text, an Eye rather than an Alert
+/// glyph. It exists because the one thing it currently reports (a stop that the CLI
+/// confirmed on a system that will not let it scan for leftover engine processes) is
+/// TRUE, WORTH KNOWING, and NOT A FAILURE. Rendering it red would put a platform
+/// restriction the miner usually cannot change in the same visual channel as
+/// "something broke" — and a red banner that fires on every stop is a banner nobody
+/// reads by the third time, which is how the real warning gets lost.
+///
+/// Shown alongside the error banner rather than instead of it: they carry different
+/// exit codes and can never describe the same stop.
+fn notice_line(ui: &mut egui::Ui, app: &MinerApp) {
+    let Some(note) = app.notice.as_ref() else {
+        return;
+    };
+    ui.add_space(9.0);
+    let fg = THEME.text3;
+    egui::Frame::NONE
+        .inner_margin(egui::Margin::symmetric(2, 0))
+        .show(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.horizontal(|ui| {
+                // Vector icon, never an emoji (the brand rule + cross-OS rendering).
+                super::icons::show(ui, super::icons::Icon::Eye, 13.0, fg);
+                ui.add_space(7.0);
+                ui.label(RichText::new(note).size(11.5).color(fg));
             });
         });
 }

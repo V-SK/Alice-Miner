@@ -264,6 +264,57 @@ struct Inner {
     /// should persist to settings AFTER releasing the lock (disk I/O off the
     /// stats hot-path). Taken (cleared) by the pump each line.
     pending_good_region: Option<String>,
+
+    /// The GENERIC parser's pending re-baseline candidates for the two cumulative
+    /// share counters — see [`fold_cumulative`]. Only the `Generic` (bring-your-own
+    /// miner) path uses them; the bundled parsers read a known format and assign
+    /// directly.
+    generic_accepted_pending: Option<u64>,
+    generic_rejected_pending: Option<u64>,
+}
+
+/// Fold a new reading of a CUMULATIVE counter (accepted / rejected shares) coming
+/// from the GENERIC parser, which reads an UNKNOWN third-party format and can
+/// therefore mis-read a line in either direction.
+///
+/// **Why not last-wins, and why not plain `max`.** Round 1 replaced last-wins with
+/// `max` because one mis-read (`cuda:0` → "accepted = 0") walked the user's session
+/// totals backwards. But a high-water mark trades a transient lie for a PERMANENT
+/// one: a single spurious HIGH reading then sticks for the whole session, with no
+/// way back. Both are dishonest; the difference is only which direction and for how
+/// long.
+///
+/// So: a RISE is always taken (cumulative counters rise — nothing to doubt), and a
+/// FALL is taken only once CORROBORATED — the next generic reading must also be
+/// below the current value and at or above the first low one, i.e. the miner is
+/// visibly counting up from a new base. One stray line can never move the total
+/// down; two consecutive, mutually consistent readings can, which is exactly the
+/// shape of a real re-baseline (an engine that restarted its own counter) and also
+/// how the session heals from a spurious high value instead of being stuck at it.
+///
+/// `pending` carries the candidate between lines; it is cleared whenever the value
+/// is adopted, so an isolated low reading leaves no residue.
+///
+/// Pure + platform-independent, so the whole decision table is unit-tested.
+fn fold_cumulative(current: u64, pending: &mut Option<u64>, new: u64) -> u64 {
+    if new >= current {
+        *pending = None;
+        return new;
+    }
+    match *pending {
+        // A second consecutive low reading, consistent with counting up from a new
+        // base → the engine really did re-baseline; adopt it.
+        Some(p) if new >= p => {
+            *pending = None;
+            new
+        }
+        // The first low reading (or one that contradicts the pending candidate):
+        // hold the current value and remember this one.
+        _ => {
+            *pending = Some(new);
+            current
+        }
+    }
 }
 
 impl LaneSupervisor {
@@ -328,6 +379,8 @@ impl LaneSupervisor {
                 failover_probe_timeout: FAILOVER_PROBE_TIMEOUT,
                 persisted_good_region: None,
                 pending_good_region: None,
+                generic_accepted_pending: None,
+                generic_rejected_pending: None,
             })),
         }
     }
@@ -500,6 +553,10 @@ impl LaneSupervisor {
                 g.rejected = 0;
                 g.best_hashrate_hs = 0.0;
             }
+            // Either way, drop any half-formed generic re-baseline candidate: it
+            // belonged to the previous child's output stream (see `fold_cumulative`).
+            g.generic_accepted_pending = None;
+            g.generic_rejected_pending = None;
             g.progress_accepted = g.accepted;
             g.last_line.clear();
             g.last_exit_code = None;
@@ -1265,20 +1322,34 @@ fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
         }
         ParserKind::Generic => {
             // An UNKNOWN custom miner: best-effort scan (`<num> <hash-unit>` +
-            // accepted/rejected). Assign each field only when present (cumulative,
-            // last-wins). When a line can't be read every field stays `None`, so the
-            // lane shows "running, telemetry unavailable" — NEVER a fabricated number.
+            // accepted/rejected). Assign each field only when present. When a line
+            // can't be read every field stays `None`, so the lane shows "running,
+            // telemetry unavailable" — NEVER a fabricated number.
+            //
+            // The share counters are folded through [`fold_cumulative`], not
+            // last-wins: the generic scanner reads an arbitrary third-party format,
+            // so a single mis-read line must never walk the user's session totals
+            // BACKWARDS (the `cuda:0 → accepted=0` bug — now also fixed at the
+            // parser, this is the belt to those braces). It is NOT a plain high-water
+            // mark either: a fall is adopted once a SECOND, consistent reading
+            // confirms it, so a spurious high value heals instead of sticking for the
+            // session. A hard reset happens exactly where it should — `spawn_run`
+            // zeroes the counters on a fresh (non-failover) start.
             if let Some(sample) = parse_generic(&line) {
                 if let Some(hr) = sample.hashrate_hs {
                     g.hashrate_hs = Some(hr);
                     note_hashrate_progress(g, hr);
                 }
                 if let Some(a) = sample.accepted {
-                    g.accepted = a;
-                    note_accepted_progress(g, a);
+                    let mut pending = g.generic_accepted_pending;
+                    g.accepted = fold_cumulative(g.accepted, &mut pending, a);
+                    g.generic_accepted_pending = pending;
+                    note_accepted_progress(g, g.accepted);
                 }
                 if let Some(r) = sample.rejected {
-                    g.rejected = r;
+                    let mut pending = g.generic_rejected_pending;
+                    g.rejected = fold_cumulative(g.rejected, &mut pending, r);
+                    g.generic_rejected_pending = pending;
                 }
                 apply_telemetry(g, &sample);
             }
@@ -2005,6 +2076,124 @@ mod tests {
         let st2 = s.stats();
         assert_eq!(st2.hashrate_hs, Some(30_500_000.0), "unreadable line kept the last real rate");
         assert_eq!(st2.accepted, 12, "no fabricated share count");
+    }
+
+    /// The pure fold behind the generic parser's cumulative counters — the whole
+    /// decision table, without spawning anything. ROUND 2: a plain `max` was replaced
+    /// by "a fall needs a second, consistent reading", so neither direction can lie
+    /// permanently.
+    #[test]
+    fn fold_cumulative_takes_rises_and_only_corroborated_falls() {
+        // A rise is always taken, and clears any pending candidate.
+        let mut p = Some(3);
+        assert_eq!(fold_cumulative(100, &mut p, 101), 101);
+        assert_eq!(p, None, "a rise clears the pending candidate");
+
+        // ONE low reading never moves the total (the decoy / mis-parse case).
+        let mut p = None;
+        assert_eq!(fold_cumulative(100, &mut p, 0), 100);
+        assert_eq!(p, Some(0));
+        // …and a rise right after it still wins, leaving no residue.
+        assert_eq!(fold_cumulative(100, &mut p, 100), 100);
+        assert_eq!(p, None);
+
+        // TWO consecutive, mutually consistent low readings DO re-baseline — this is
+        // how a spurious high value heals instead of sticking for the session.
+        let mut p = None;
+        assert_eq!(fold_cumulative(999_999, &mut p, 101), 999_999, "hold on the first");
+        assert_eq!(fold_cumulative(999_999, &mut p, 102), 102, "adopt on the second");
+        assert_eq!(p, None);
+
+        // Two low readings that CONTRADICT each other (falling) do not re-baseline;
+        // the newest becomes the candidate.
+        let mut p = None;
+        assert_eq!(fold_cumulative(100, &mut p, 50), 100);
+        assert_eq!(fold_cumulative(100, &mut p, 10), 100, "a falling pair is noise");
+        assert_eq!(p, Some(10));
+        assert_eq!(fold_cumulative(100, &mut p, 11), 11, "…then a consistent pair adopts");
+
+        // Equal readings are "rises" (no change, nothing pending).
+        let mut p = Some(7);
+        assert_eq!(fold_cumulative(42, &mut p, 42), 42);
+        assert_eq!(p, None);
+    }
+
+    /// REGRESSION (Bug 3): with the GENERIC parser, the cumulative share counters
+    /// cannot be walked backwards by a single mis-read line. Combined with the
+    /// parser-side word-boundary fix, an ordinary `cuda:0 power:120` device line
+    /// leaves the totals untouched.
+    #[test]
+    fn generic_parser_share_counters_never_go_backwards() {
+        let s = LaneSupervisor::with_backend(
+            Lane::GpuPrl,
+            EndpointPlan::single(Endpoint::plaintext("us.aliceprotocol.org", 3340)),
+            ParserKind::Generic,
+            None,
+        );
+        {
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:100 r:2 30.0 mh/s");
+        }
+        assert_eq!(s.stats().accepted, 100);
+        assert_eq!(s.stats().rejected, 2);
+        {
+            // The exact real-world offenders: device/telemetry lines, including the
+            // ROUND-2 hyphenated shape. The parser reads NO counts from either, and
+            // even if some other format did yield a lower number, one line can never
+            // move the totals down.
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Generic, "gpu0 cuda:0 power:120 30.0 mh/s");
+            apply_log_line(&mut g, ParserKind::Generic, "gpu-a:0 core-r:120 30.0 mh/s");
+            // A single lower cumulative reading is held, not adopted.
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:3 r:0 30.0 mh/s");
+        }
+        assert_eq!(s.stats().accepted, 100, "one low line must not regress the total");
+        assert_eq!(s.stats().rejected, 2, "one low line must not regress the total");
+        {
+            // A genuine advance still moves it forward — and clears the candidate.
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:101 r:3 30.0 mh/s");
+        }
+        assert_eq!(s.stats().accepted, 101);
+        assert_eq!(s.stats().rejected, 3);
+    }
+
+    /// The other half of the round-2 rule: the counters must also be able to HEAL.
+    /// A spurious HIGH reading (the generic parser mis-reading an unknown format)
+    /// used to stick for the entire session under a plain high-water mark; two
+    /// consecutive, consistent real readings now re-baseline it.
+    #[test]
+    fn generic_parser_share_counters_heal_from_a_spurious_high_value() {
+        let s = LaneSupervisor::with_backend(
+            Lane::GpuPrl,
+            EndpointPlan::single(Endpoint::plaintext("us.aliceprotocol.org", 3340)),
+            ParserKind::Generic,
+            None,
+        );
+        {
+            let mut g = s.inner.lock().unwrap();
+            // A mis-read line implants an absurd total.
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:999999 r:5000 30.0 mh/s");
+        }
+        assert_eq!(s.stats().accepted, 999_999);
+        {
+            let mut g = s.inner.lock().unwrap();
+            // The engine's real, rising counters: held once, then adopted.
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:11 r:1 30.0 mh/s");
+        }
+        assert_eq!(s.stats().accepted, 999_999, "one reading is not enough to move down");
+        {
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:12 r:2 30.0 mh/s");
+        }
+        assert_eq!(s.stats().accepted, 12, "a corroborated pair re-baselines");
+        assert_eq!(s.stats().rejected, 2);
+        {
+            // And it keeps tracking normally afterwards.
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:13 r:2 30.0 mh/s");
+        }
+        assert_eq!(s.stats().accepted, 13);
     }
 
     /// T5: a supervisor built `with_backend` and an explicit `log_tail` path exposes

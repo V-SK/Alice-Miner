@@ -181,28 +181,72 @@ pub fn terminal_pids_alive() -> bool {
     false
 }
 
-/// Whether process `pid` is currently alive. Uses `kill(pid, 0)` on unix (Ok / `EPERM` =
-/// the process exists; `ESRCH` = no such process) — the same primitive the CLI's `pidfile`
-/// module uses, bound directly to avoid a `libc` dependency on this crate. On non-unix we
-/// can't cheaply probe, so we fail-SAFE to ALIVE (never falsely declare a miner dead).
+/// Whether process `pid` is currently alive, via the ONE shared probe
+/// ([`crate::proc::liveness`]): `kill(pid, 0)` on unix, `tasklist` on Windows.
+///
+/// **Round-2 fix — the second liveness stub.** This used to be `true` on every
+/// non-unix target ("we can't cheaply probe"), so on Windows the GUI believed a
+/// CRASHED miner was still mining forever: `terminal_pids_alive`答 true off a stale
+/// pid file, Home stayed on "Mining", and Stop never converged. The CLI's `pidfile`
+/// had the identical stub and was fixed in round 1; this is that fix's other half,
+/// sharing the same code instead of a second copy that can drift.
+///
+/// The fold stays fail-SAFE toward ALIVE — an `Unknown` (probe unavailable) reports
+/// alive, so a running miner is never falsely declared dead — but a probe that
+/// positively says the pid is gone is now believed on Windows too. `pid == 0` is not
+/// a single miner process and is handled inside the shared probe.
 pub fn pid_is_alive(pid: u32) -> bool {
-    // A pid of 0 is never a single miner process: on unix `kill(0, 0)` addresses the
-    // caller's whole process group (a false-positive "alive"), and on Windows it is not a
-    // valid target either. Guard before the platform probe so both branches agree that
-    // pid 0 is NOT a live miner. This is the one contractual sentinel — real pids still
-    // flow to the platform probe, where an indeterminate result fail-SAFEs to ALIVE.
-    if pid == 0 {
-        return false;
-    }
     #[cfg(unix)]
     {
-        unsafe { libc_kill(pid as i32, 0) == 0 }
+        crate::proc::is_alive(pid)
     }
     #[cfg(not(unix))]
     {
-        let _ = pid;
-        true
+        cached_is_alive(pid)
     }
+}
+
+/// The probe cost, and why the Windows answer is memoised for a fraction of a second.
+///
+/// On unix the probe is one `kill(pid, 0)` syscall, so the GUI can (and does) call it
+/// from `state()` on every repaint. On Windows it SPAWNS `tasklist`, which is tens of
+/// milliseconds — at 60 fps that would be a process launch per frame per pid, i.e. this
+/// fix would have traded a false "still mining" for a stuttering UI. So the Windows
+/// answer is cached per pid for [`PROBE_TTL`].
+///
+/// This is a staleness bound, not a lie: the cached answer is at most a fraction of a
+/// second old, against a telemetry staleness window measured in tens of seconds, and
+/// the DEFINITIVE stop-convergence signal is the pid FILES disappearing
+/// ([`terminal_pids_absent`]), which is not cached at all.
+#[cfg(not(unix))]
+const PROBE_TTL: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// A tiny fixed-size (pid → answer, taken-at) memo. Two pids are ever probed (the CLI
+/// parent and the engine child), so four slots make eviction essentially never happen;
+/// when it does, the oldest entry goes.
+#[cfg(not(unix))]
+fn cached_is_alive(pid: u32) -> bool {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static CACHE: Mutex<Vec<(u32, bool, Instant)>> = Mutex::new(Vec::new());
+    let now = Instant::now();
+    // A poisoned lock must not take the miner's UI down — fall back to a live probe.
+    let Ok(mut cache) = CACHE.lock() else {
+        return crate::proc::is_alive(pid);
+    };
+    if let Some(hit) = cache
+        .iter()
+        .find(|(p, _, at)| *p == pid && now.saturating_duration_since(*at) < PROBE_TTL)
+    {
+        return hit.1;
+    }
+    let answer = crate::proc::is_alive(pid);
+    cache.retain(|(p, _, at)| *p != pid && now.saturating_duration_since(*at) < PROBE_TTL);
+    if cache.len() >= 4 {
+        cache.remove(0);
+    }
+    cache.push((pid, answer, now));
+    answer
 }
 
 /// Age (`now − mtime`) of the CLI→GUI telemetry snapshot file at `path`, or `None` when the
@@ -276,23 +320,118 @@ pub fn remove_child_pid(pid: u32) {
     }
 }
 
+/// The CLI `stop` exit code that means **"I could not confirm the miner stopped"** —
+/// the one outcome a miner MUST be shown, because the engine may still be mining.
+/// Distinct from the CLI's generic runtime failure (1), which `stop` also returns for
+/// the ordinary, harmless "no running miner found". Kept in sync with the CLI's own
+/// `EXIT_UNVERIFIED` by a test on that side (this crate cannot depend on the CLI).
+pub const EXIT_STOP_UNVERIFIED: i32 = 3;
+
+/// The CLI `stop` exit code that means **"the miner stopped, but I could not scan
+/// this system for leftover engine processes"** — everything actually probed was
+/// confirmed, so this is a SUCCESS, just one with a smaller claim ("Miner stopped."
+/// without "No orphan left.").
+///
+/// Round 3. Round 2 correctly stopped treating a missing scan CAPABILITY as evidence
+/// of a leftover — but it then exited 0, and 0 is indistinguishable from a fully
+/// verified stop, so a miner on a locked-down box (AppLocker, a hardened container)
+/// was never told that one check had been skipped. The reason this is a code rather
+/// than a phrase matched in stderr: the CLI's stderr is bilingual (`tr!`), so any
+/// prose match would silently fail for a Chinese-locale miner.
+///
+/// Kept in sync with the CLI's own `EXIT_SCAN_GAP` by a test on that side.
+pub const EXIT_STOP_SCAN_GAP: i32 = 4;
+
+/// What the detached CLI `stop` reported when it finished.
+///
+/// **Why this exists (round 2).** `spawn_cli_stop` used to null all stdio and drop the
+/// handle, so the CLI's careful "WARNING: could not confirm the miner stopped — check
+/// Task Manager" went to `/dev/null` and the miner never saw it. The GUI failed SAFE
+/// (a failed stop leaves the pid file, so Home sat at `Stopping…` rather than a false
+/// `Idle`) — but "the button did nothing" is not a substitute for the warning.
+#[derive(Debug, Clone)]
+pub struct CliStopReport {
+    /// The CLI's exit code (`None` if it was killed by a signal).
+    pub code: Option<i32>,
+    /// The CLI's stderr, trimmed (it carries the human-readable reason).
+    pub stderr: String,
+}
+
+impl CliStopReport {
+    /// Did the CLI report an outcome it could NOT verify? The one case worth
+    /// interrupting the user for — the engine may still be running.
+    pub fn unverified(&self) -> bool {
+        self.code == Some(EXIT_STOP_UNVERIFIED)
+    }
+
+    /// Did the CLI stop the miner but fail to SCAN for leftover engine processes?
+    /// A confirmed stop with one check missing — worth a calm line, never an alarm,
+    /// and strictly weaker than [`Self::unverified`] (the two are different codes,
+    /// so they can never both be true).
+    pub fn scan_gap(&self) -> bool {
+        self.code == Some(EXIT_STOP_SCAN_GAP)
+    }
+
+    /// A short, human-readable reason for the UI: the first few stderr lines, minus
+    /// the `error:` prefixes, capped so a runaway log can't blow up the layout.
+    /// Empty when the CLI said nothing (the caller then shows its own generic text).
+    pub fn summary(&self) -> String {
+        let mut out: Vec<&str> = Vec::new();
+        for line in self.stderr.lines() {
+            let t = line.trim().trim_start_matches("error:").trim();
+            if !t.is_empty() && !out.contains(&t) {
+                out.push(t);
+            }
+            if out.len() == 3 {
+                break;
+            }
+        }
+        let joined = out.join(" ");
+        if joined.chars().count() > 300 {
+            joined.chars().take(300).collect::<String>() + "…"
+        } else {
+            joined
+        }
+    }
+}
+
 /// Run the bundled CLI's `stop --timeout-s <timeout_s>` as a DETACHED background
 /// process (NOT a visible terminal — this is a one-shot control command). It signals
 /// the terminal miner via its pid file (SIGTERM→SIGKILL) plus the child-pid / orphan
-/// backstops, so the GUI's Stop tears down the external miner without a window. Stdio
-/// is nulled and the handle dropped immediately (fire-and-forget). Maps a spawn error
-/// to a clear `Err` (never panics).
-pub fn spawn_cli_stop(cli_path: &Path, timeout_s: u64) -> Result<(), String> {
-    Command::new(cli_path)
+/// backstops, so the GUI's Stop tears down the external miner without a window.
+///
+/// Non-blocking: the returned [`Receiver`] yields exactly one [`CliStopReport`] when
+/// the CLI exits (a helper thread waits on it, which also REAPS it instead of leaving
+/// a zombie the way the old fire-and-forget handle did). The caller polls with
+/// `try_recv` from its normal UI tick and may simply drop the receiver if it does not
+/// care — the thread then ends on the failed send. `stdout` stays nulled (the CLI's
+/// progress chatter is not for the GUI); `stderr` is captured because that is where
+/// the "could not confirm" warning is. Maps a spawn error to a clear `Err` (never
+/// panics).
+pub fn spawn_cli_stop(
+    cli_path: &Path,
+    timeout_s: u64,
+) -> Result<std::sync::mpsc::Receiver<CliStopReport>, String> {
+    let child = Command::new(cli_path)
         .arg("stop")
         .arg("--timeout-s")
         .arg(timeout_s.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .map(|_child| ())
-        .map_err(|e| format!("failed to run the bundled CLI stop: {e}"))
+        .map_err(|e| format!("failed to run the bundled CLI stop: {e}"))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // `wait_with_output` reads stderr to EOF and reaps the child.
+        if let Ok(out) = child.wait_with_output() {
+            let _ = tx.send(CliStopReport {
+                code: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            });
+        }
+    });
+    Ok(rx)
 }
 
 /// The **bundled** engine binary that sits next to the CURRENT executable
@@ -499,14 +638,8 @@ fn spawn_detached(program: &str, argv: &[String]) -> Result<(), String> {
         .map_err(|e| format!("failed to open a terminal via `{program}`: {e}"))
 }
 
-// ── Minimal libc binding (unix) ───────────────────────────────────────────────
-// [`pid_is_alive`] needs only `kill(2)`; binding it directly avoids adding a `libc` /
-// `nix` dependency (mirrors the CLI's `pidfile` module, which does the same).
-#[cfg(unix)]
-extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
-}
+// (The `kill(2)` binding that used to live here moved to `crate::proc`, which is now
+// the single liveness probe for the whole workspace — see `pid_is_alive`.)
 
 #[cfg(test)]
 mod tests {
@@ -768,26 +901,29 @@ mod tests {
         std::env::remove_var("ALICE_IDENTITY_DIR");
     }
 
-    /// `pid_is_alive` detects THIS process as alive and a very high unused pid as dead
-    /// (unix); pid 0 (a process-group address, never a single miner) reports not-alive.
+    /// `pid_is_alive` detects THIS process as alive and a very high unused pid as dead;
+    /// pid 0 (a process-group address, never a single miner) reports not-alive.
+    ///
+    /// ROUND-2: the dead-pid leg no longer carries `#[cfg(unix)]`. It used to, because
+    /// this probe was a `true`-forever stub off unix — the very bug (the GUI believing a
+    /// crashed Windows miner is still mining). Running it on EVERY OS is what makes the
+    /// Windows CI leg prove the stub is gone.
     #[test]
     fn pid_is_alive_detects_self_and_missing() {
         assert!(pid_is_alive(std::process::id()), "our own pid is alive");
         assert!(!pid_is_alive(0), "pid 0 is a group address, not a live miner");
-        #[cfg(unix)]
-        {
-            // A pid near the top of the space is (essentially certainly) unused.
-            assert!(!pid_is_alive(0x7FFF_FFFE), "a very high pid is not alive");
-        }
+        // A pid near the top of the space is (essentially certainly) unused.
+        assert!(!pid_is_alive(0x7FFF_FFFE), "a very high pid is not alive");
     }
 
     /// `terminal_pids_alive` is TRUE iff the CLI-parent OR engine-child pid file names a
     /// LIVE process — stronger than `terminal_pids_absent` (file existence only): a STALE
     /// pid file from a dead process reads as NOT alive. It never inspects a bundle path,
     /// so an AppTranslocation-mounted engine is recognised the same as any other.
-    /// Unix-only: the "dead pid → not alive" leg relies on `kill(pid, 0)`; on non-unix the
-    /// probe fail-safes to always-alive (a different, intentionally weaker contract).
-    #[cfg(unix)]
+    /// ROUND-2: no longer unix-only. The "dead pid → not alive" leg used to rely on
+    /// `kill(pid, 0)` with a fail-safe-to-ALIVE stub off unix; the shared probe now
+    /// answers Windows too, so the stale-file leg is exercised by the Windows CI leg —
+    /// which is precisely the "GUI thinks a crashed miner is still mining" case.
     #[test]
     fn terminal_pids_alive_requires_a_live_process_not_just_a_file() {
         let _g = crate::IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -893,5 +1029,50 @@ mod tests {
 
         std::env::remove_var("ALICE_IDENTITY_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// ROUND 2 — the CLI `stop` result the GUI now reads back. `unverified()` must key
+    /// on the DEDICATED exit code only: a clean stop (0) and the ordinary "no running
+    /// miner found" (1, which the GUI fires on every exit) must NOT raise an alarm, or
+    /// the warning becomes noise and stops being read.
+    #[test]
+    fn cli_stop_report_flags_only_the_unverified_exit_code() {
+        let r = |code: Option<i32>| CliStopReport { code, stderr: String::new() };
+        assert!(r(Some(EXIT_STOP_UNVERIFIED)).unverified());
+        assert!(!r(Some(0)).unverified(), "a clean stop is not a warning");
+        assert!(!r(Some(1)).unverified(), "'no running miner found' is not a warning");
+        assert!(!r(Some(2)).unverified());
+        assert!(!r(None).unverified(), "killed by a signal: nothing to claim");
+        assert_eq!(EXIT_STOP_UNVERIFIED, 3);
+    }
+
+    /// The stderr summary is what the miner actually reads, so it must keep the CLI's
+    /// words (not a paraphrase), drop the `error:` noise, de-duplicate, cap at three
+    /// lines and stay bounded — a runaway log must never blow up the alert.
+    #[test]
+    fn cli_stop_report_summary_is_readable_and_bounded() {
+        let r = CliStopReport {
+            code: Some(EXIT_STOP_UNVERIFIED),
+            stderr: "error: pid 42 is still running after taskkill /F /T\n\n\
+                     error: pid 42 is still running after taskkill /F /T\n\
+                     WARNING: could not confirm the miner stopped.\n\
+                       - an orphaned engine (pid 99)\n\
+                       - one more line that must be dropped\n"
+                .to_string(),
+        };
+        let s = r.summary();
+        assert!(s.contains("pid 42 is still running"), "keeps the CLI's own words");
+        assert!(!s.contains("error:"), "the `error:` prefix is stripped");
+        assert!(!s.contains("one more line"), "capped at three lines");
+        assert_eq!(
+            s.matches("pid 42 is still running").count(),
+            1,
+            "duplicate lines are folded"
+        );
+        // Empty stderr → empty summary (the caller then shows its own generic text).
+        assert!(CliStopReport { code: Some(3), stderr: String::new() }.summary().is_empty());
+        // Bounded.
+        let long = CliStopReport { code: Some(3), stderr: "x".repeat(5000) };
+        assert!(long.summary().chars().count() <= 301);
     }
 }

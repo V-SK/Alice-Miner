@@ -69,6 +69,27 @@ const EXIT_OK: i32 = 0;
 const EXIT_RUNTIME: i32 = 1;
 /// Usage / argument error (bad lane, no identity flag, dual refused, …).
 const EXIT_USAGE: i32 = 2;
+/// `stop` only: **we could not confirm the miner stopped** — it may still be mining.
+/// Split out of the generic runtime code (1) so a caller can tell this apart from the
+/// ordinary, harmless "no running miner found", which is also non-zero. The GUI keys
+/// its "could not confirm" warning off exactly this code
+/// (`core::terminal::EXIT_STOP_UNVERIFIED`, kept in sync by a test below).
+const EXIT_UNVERIFIED: i32 = 3;
+/// `stop` only: **the miner stopped and everything we probed was confirmed — but the
+/// last-resort sweep for leftover engine processes could not RUN** (no `pgrep` / a
+/// `pgrep` that failed / PowerShell blocked by AppLocker or an execution policy).
+///
+/// Why its own code rather than 0 (round 3). The stop itself is a success and stays
+/// one — round 2 deliberately stopped crying wolf here — but the CLI drops the
+/// "No orphan left" half of its claim, and the GUI had no way to learn that: it reads
+/// only the exit code and the CLI's stderr, and that stderr is BILINGUAL (`tr!`), so
+/// matching on its prose would silently do nothing for a Chinese-locale miner. A code
+/// is the only channel that survives translation. The GUI shows it as a calm one-line
+/// note, never the red banner — nothing here says the miner is still running (that is
+/// what [`EXIT_UNVERIFIED`] is for), only that one check could not be performed.
+///
+/// For scripts: `0` and `4` both mean **stopped**; `3` means may-still-be-running.
+const EXIT_SCAN_GAP: i32 = 4;
 
 /// ONE crate-wide lock for every test that mutates the process-global
 /// `$ALICE_IDENTITY_DIR` (or other shared env). Rust runs a crate's tests in
@@ -2777,15 +2798,34 @@ fn apply_region_flag(raw: &str, json: bool) -> Result<(), i32> {
 ///      cleanup. Signalled ONLY after we RE-VERIFY the live pid's command line still
 ///      contains OUR recorded engine path — so a stale pid the OS REUSED for an
 ///      unrelated process (e.g. after a reboot) is never mis-killed.
-///   3. **last resort (unix)** — a still-running orphan of OUR EXACT bundled xmrig
-///      (the sibling binary next to this exe) that neither pid file caught. Each
-///      candidate's command line is re-verified against the exact bundled path AND
-///      its liveness re-checked before we ever signal it — we NEVER kill by the bare
-///      name `xmrig`, and NEVER a non-bundled process.
+///   3. **last resort** — a still-running orphan of OUR EXACT engine binary (the
+///      recorded engine path, else the bundled xmrig beside this exe) that neither pid
+///      file caught. Each candidate's command line is re-verified against that exact
+///      path AND its liveness re-checked before we ever signal it — we NEVER kill by
+///      the bare name `xmrig`, and NEVER a non-bundled process.
+///
+/// **The reporting rule (bug fix): never claim a success we did not verify.** Every
+/// layer can end in "I could not tell" — a pid probe that failed, a command line we
+/// could not read, an orphan scan we could not run. Those used to be silently folded
+/// into the happy path, so `stop` printed "Miner stopped. No orphan left." while
+/// xmrig kept mining (worst on Windows 11, where the `wmic` used to identify the
+/// child no longer exists). Unverifiable outcomes are now collected and reported as
+/// such, with a non-zero exit, telling the user exactly what to check.
 fn cmd_stop(args: StopArgs) -> i32 {
     let timeout = Duration::from_secs(args.timeout_s);
     let mut acted = false; // stopped at least one LIVE process
     let mut had_error = false;
+    // Things we could NOT confirm. Non-empty ⇒ we must not claim a clean stop.
+    let mut unverified: Vec<String> = Vec::new();
+
+    // The exact engine binary this install runs, captured BEFORE layer 2 consumes the
+    // child pid file: the path `core::supervise` recorded (xmrig / SRBMiner /
+    // kawpowminer / AlphaMiner / an env-override engine), else the bundled xmrig beside
+    // us for a legacy pid-only file. Used as the identity needle by layers 2 AND 3, so
+    // the orphan sweep covers whichever engine is actually installed.
+    let engine_needle: Option<String> = alice_miner_core::terminal::read_child_engine_path()
+        .or_else(alice_miner_core::terminal::bundled_xmrig_path)
+        .map(|p| p.to_string_lossy().to_string());
 
     // ── 1) The CLI parent process (`miner-cli.pid`). ─────────────────────────────
     match pidfile::read_pid() {
@@ -2802,11 +2842,13 @@ fn cmd_stop(args: StopArgs) -> i32 {
                     acted = true;
                 }
                 pidfile::StopOutcome::Killed => {
+                    // `Killed` is only returned after re-probing the pid and finding it
+                    // gone, so this is a CONFIRMED termination, not "we sent a signal".
                     println!(
                         "{}",
                         tr!(
-                            "Miner did not exit in time; sent SIGKILL. No orphan left.",
-                            "矿工未按时退出;已发送 SIGKILL。没有遗留孤儿进程。"
+                            "Miner did not exit in time; force-terminated (confirmed stopped).",
+                            "矿工未按时退出;已强制终止(已确认停止)。"
                         )
                     );
                     pidfile::remove();
@@ -2815,6 +2857,13 @@ fn cmd_stop(args: StopArgs) -> i32 {
                 pidfile::StopOutcome::Error(e) => {
                     eprintln!("error: {e}");
                     had_error = true;
+                    // We asked it to stop and could not confirm it did — the engine may
+                    // still be mining. Say so; do NOT delete the pid file (a later stop
+                    // should still find it).
+                    unverified.push(
+                        tr!("the miner process (pid {pid})", "矿工进程(pid {pid})")
+                            .replace("{pid}", &pid.to_string()),
+                    );
                 }
             }
         }
@@ -2838,10 +2887,17 @@ fn cmd_stop(args: StopArgs) -> i32 {
     // Signal it ONLY after re-verifying the live pid's command line still contains OUR
     // recorded engine path — never a stale pid the OS reused for an unrelated process.
     if let Some(cpid) = alice_miner_core::terminal::read_child_pid() {
-        if !pidfile::is_alive(cpid) {
-            // The recorded child is gone — tidy its stale pid file.
+        // `liveness_settled`: a killed-but-unreaped engine (zombie) is finished, not an
+        // orphan — treat it as gone and tidy its pid file rather than warn about it.
+        let identity = if pidfile::liveness_settled(cpid) == pidfile::Liveness::Dead {
+            ChildIdentity::Gone
+        } else {
+            identify_child_pid(cpid, engine_needle.as_deref())
+        };
+        if identity == ChildIdentity::Gone {
+            // The recorded child is positively gone — tidy its stale pid file.
             alice_miner_core::terminal::remove_child_pid(cpid);
-        } else if child_pid_is_our_engine(cpid) {
+        } else if identity == ChildIdentity::Ours {
             // Alive AND its command line is OUR recorded engine → safe to stop.
             println!(
                 "{}",
@@ -2855,11 +2911,17 @@ fn cmd_stop(args: StopArgs) -> i32 {
                 pidfile::StopOutcome::Error(e) => {
                     eprintln!("error: {e}");
                     had_error = true;
+                    unverified.push(
+                        tr!("the mining engine (pid {pid})", "挖矿引擎进程(pid {pid})")
+                            .replace("{pid}", &cpid.to_string()),
+                    );
                 }
-                _ => acted = true,
+                _ => {
+                    acted = true;
+                    alice_miner_core::terminal::remove_child_pid(cpid);
+                }
             }
-            alice_miner_core::terminal::remove_child_pid(cpid);
-        } else {
+        } else if identity == ChildIdentity::Unrelated {
             // Alive, but its command line is NOT our recorded engine: the OS has REUSED
             // this stale pid for an unrelated process. NEVER signal it. Leave the file
             // untouched — a genuine orphan would still verify + be caught on a later
@@ -2872,45 +2934,184 @@ fn cmd_stop(args: StopArgs) -> i32 {
                 )
                 .replace("{pid}", &cpid.to_string())
             );
+        } else {
+            // ChildIdentity::Unknown — the pid is (or may be) alive and we could NOT
+            // read its command line, so we cannot tell an orphaned engine from an
+            // unrelated process that inherited a reused pid. We still refuse to signal
+            // what we cannot identify (the safety red line), but this is precisely the
+            // case that used to be swallowed and reported as "no orphan left": on
+            // Windows 11 `wmic` is gone, so EVERY leftover engine landed here.
+            eprintln!(
+                "{}",
+                tr!(
+                    "Could not identify the recorded engine-child pid {pid} (unable to read its command line); left it untouched.",
+                    "无法识别记录的引擎子进程 pid {pid}(读取其命令行失败);已跳过,不做处理。"
+                )
+                .replace("{pid}", &cpid.to_string())
+            );
+            unverified.push(
+                tr!(
+                    "an unidentifiable recorded engine process (pid {pid})",
+                    "无法识别的引擎进程记录(pid {pid})"
+                )
+                .replace("{pid}", &cpid.to_string()),
+            );
         }
     }
 
-    // ── 3) Last resort (unix): an orphan of OUR EXACT bundled xmrig. ─────────────
-    #[cfg(unix)]
-    for pid in orphaned_bundled_xmrig_pids() {
-        println!(
-            "{}",
-            tr!(
-                "Stopping an orphaned bundled xmrig (pid {pid})…",
-                "正在停止遗留的内置 xmrig 进程(pid {pid})…"
-            )
-            .replace("{pid}", &pid.to_string())
-        );
-        match pidfile::stop_pid(pid, timeout) {
-            pidfile::StopOutcome::Error(e) => {
-                eprintln!("error: {e}");
-                had_error = true;
+    // ── 3) Last resort: an orphan running OUR EXACT engine binary. ───────────────
+    // Now runs on Windows too (via PowerShell's `Get-CimInstance Win32_Process`);
+    // previously the sweep was unix-only, so Windows had NO orphan backstop at all.
+    // `engine_needle == None` means this install has NO engine on record and no
+    // bundled engine beside it — the sweep's contract is "processes running OUR exact
+    // engine path", so with no such path the candidate set is empty BY DEFINITION.
+    // That is not a scan gap and must not raise a warning (a `stop` on a machine with
+    // nothing installed would otherwise cry wolf, which is its own dishonesty).
+    let mut scan_gap = false;
+    match engine_needle.as_deref().map(orphaned_engine_pids) {
+        None => {}
+        Some(Some(pids)) => {
+            for pid in pids {
+                println!(
+                    "{}",
+                    tr!(
+                        "Stopping an orphaned mining engine (pid {pid})…",
+                        "正在停止遗留的挖矿引擎进程(pid {pid})…"
+                    )
+                    .replace("{pid}", &pid.to_string())
+                );
+                match pidfile::stop_pid(pid, timeout) {
+                    pidfile::StopOutcome::Error(e) => {
+                        eprintln!("error: {e}");
+                        had_error = true;
+                        unverified.push(
+                            tr!("an orphaned engine (pid {pid})", "遗留的引擎进程(pid {pid})")
+                                .replace("{pid}", &pid.to_string()),
+                        );
+                    }
+                    _ => acted = true,
+                }
             }
-            _ => acted = true,
         }
+        // We know which engine to look for but could NOT scan (no `pgrep` / no
+        // PowerShell — e.g. PowerShell blocked by AppLocker / an execution policy).
+        // Everything above may still have succeeded, but we cannot back the "no orphan
+        // left" claim, so we don't make it.
+        Some(None) => scan_gap = true,
+    }
+    // ROUND 2 — a missing CAPABILITY is not evidence of a leftover. A scan gap used to
+    // be pushed into `unverified`, so on a locked-down machine EVERY ordinary, fully
+    // confirmed stop ended in "WARNING: could not confirm the miner stopped" + a
+    // non-zero exit. That is honest about the gap but cries wolf about the outcome, and
+    // a warning that fires every time is a warning nobody reads. The honest split:
+    //   * everything we ACTUALLY probed was confirmed ⇒ this is a success — we just
+    //     drop the part of the claim we cannot back ("No orphan left") and say why.
+    //   * anything else unconfirmed ⇒ it stays a warning, and the scan gap is then
+    //     listed with it, because now it might be hiding something.
+    if scan_gap && !unverified.is_empty() {
+        unverified.push(
+            tr!(
+                "leftover engine processes could not be scanned for on this system",
+                "本机无法扫描是否存在遗留的引擎进程"
+            )
+            .to_string(),
+        );
     }
 
     // ── Outcome. ─────────────────────────────────────────────────────────────────
-    if acted {
-        println!(
+    // Honesty first: an unverifiable outcome outranks a partial success. Better to
+    // tell the user to check Task Manager than to promise a clean stop we didn't see.
+    if !unverified.is_empty() {
+        eprintln!(
             "{}",
-            tr!("Miner stopped. No orphan left.", "矿工已停止。没有遗留孤儿进程。")
+            tr!(
+                "WARNING: could not confirm the miner stopped.",
+                "警告:无法确认矿工已停止。"
+            )
         );
-        EXIT_OK
-    } else if had_error {
-        EXIT_RUNTIME
-    } else {
+        for what in &unverified {
+            eprintln!("  - {what}");
+        }
+        eprintln!(
+            "{}",
+            tr!(
+                "Please check your task manager for a running xmrig / SRBMiner and end it manually.",
+                "请在任务管理器中检查是否仍有 xmrig / SRBMiner 在运行,并手动结束它。"
+            )
+        );
+    } else if acted {
+        // "No orphan left" is a claim about a SCAN we ran. Without the scan we say the
+        // part we verified — the processes we knew about are gone — and name the gap.
+        if claims_no_orphan(scan_gap) {
+            println!(
+                "{}",
+                tr!("Miner stopped. No orphan left.", "矿工已停止。没有遗留孤儿进程。")
+            );
+        } else {
+            println!("{}", tr!("Miner stopped.", "矿工已停止。"));
+            // The caveat goes to STDERR, not stdout: it is a diagnostic, not the
+            // result — and the GUI nulls our stdout while capturing stderr, so on
+            // stdout the miner running the app would never see these words at all.
+            eprintln!(
+                "{}",
+                tr!(
+                    "(This system could not be scanned for leftover engine processes; if your task \
+                     manager still shows xmrig / SRBMiner, end it manually.)",
+                    "(本机无法扫描是否存在遗留的引擎进程;如果任务管理器中仍有 xmrig / SRBMiner,\
+                     请手动结束它。)"
+                )
+            );
+        }
+    } else if !had_error {
         eprintln!(
             "{}",
             tr!("No running miner found.", "未找到运行中的矿工。")
         );
-        // Not an error per se, but non-zero so scripts can branch.
+        // We found nothing — but if we also could not run the orphan scan, say so
+        // rather than let "nothing found" imply "nothing is running".
+        if scan_gap {
+            eprintln!(
+                "{}",
+                tr!(
+                    "(Note: this system could not be scanned for leftover engine processes.)",
+                    "(注意:本机无法扫描是否存在遗留的引擎进程。)"
+                )
+            );
+        }
+    }
+    stop_exit_code(acted, had_error, !unverified.is_empty(), scan_gap)
+}
+
+/// May `stop` print "**No orphan left**"? Only when the last-resort sweep actually
+/// RAN. Pure, so the rule is a test rather than a comment: the claim is about a scan,
+/// so no scan ⇒ no claim (we still report the stop itself, which we did verify).
+fn claims_no_orphan(scan_gap: bool) -> bool {
+    !scan_gap
+}
+
+/// The `stop` exit code. Pure, so the rules that matter are directly testable:
+///   * an unverified outcome NEVER exits 0, no matter how much else succeeded, and it
+///     gets its OWN code ([`EXIT_UNVERIFIED`]) so a caller (the GUI) can tell "the
+///     miner may still be running" apart from every other non-zero result;
+///   * "no running miner found" is not an error per se, but stays non-zero so scripts
+///     can branch on it — unchanged behaviour;
+///   * a confirmed stop whose orphan SWEEP could not run is still a success, but it is
+///     a success with a smaller claim, so it gets [`EXIT_SCAN_GAP`] instead of 0 — the
+///     only translation-proof way to tell the GUI (round 3).
+///
+/// Precedence is the honesty order: "may still be running" outranks "something went
+/// wrong", which outranks "one check could not be performed", which outranks clean.
+/// A scan gap NEVER masks a worse outcome — when anything else was unconfirmed the
+/// gap is folded into the `unverified` list by the caller and this returns 3.
+fn stop_exit_code(acted: bool, had_error: bool, unverified: bool, scan_gap: bool) -> i32 {
+    if unverified {
+        EXIT_UNVERIFIED
+    } else if had_error || !acted {
         EXIT_RUNTIME
+    } else if scan_gap {
+        EXIT_SCAN_GAP
+    } else {
+        EXIT_OK
     }
 }
 
@@ -2930,44 +3131,120 @@ fn parse_pid_list(stdout: &str, self_pid: u32) -> Vec<u32> {
     out
 }
 
-/// Find live orphans running OUR EXACT bundled xmrig (the sibling binary next to this
-/// executable). The **safety red line**: we `pgrep -f` the exact bundled path, then
-/// for EACH candidate re-verify (a) it is still alive AND (b) its actual command line
-/// contains that exact path — so a process that merely shares the name `xmrig` (or any
-/// non-bundled xmrig the user runs) can NEVER be matched or killed. Returns the
-/// verified pids (empty when there is no bundled xmrig, no `pgrep`, or nothing matches).
-#[cfg(unix)]
-fn orphaned_bundled_xmrig_pids() -> Vec<u32> {
-    use std::process::Command;
-    let Some(bundled) = alice_miner_core::terminal::bundled_xmrig_path() else {
-        return Vec::new(); // no bundled xmrig beside us → nothing we're allowed to touch
-    };
-    let needle = bundled.to_string_lossy().to_string();
-    // `-f` matches the FULL command line; the exact absolute bundled path means only
-    // processes actually running OUR xmrig can appear — and we STILL re-verify below.
-    let Ok(out) = Command::new("pgrep").arg("-f").arg(&needle).output() else {
-        return Vec::new(); // no pgrep available → skip the last resort (layers 1–2 stand)
-    };
-    parse_pid_list(&String::from_utf8_lossy(&out.stdout), std::process::id())
-        .into_iter()
-        .filter(|&pid| pidfile::is_alive(pid))
-        .filter(|&pid| process_cmdline_contains(pid, &needle))
-        .collect()
+/// Find live orphans running OUR EXACT engine binary (`needle` — the recorded engine
+/// path, else the bundled xmrig beside this executable).
+///
+/// The **safety red line** is unchanged: we ask the OS for candidates by the exact
+/// absolute path, then for EACH candidate re-verify (a) it is still alive AND (b) its
+/// actual command line contains that exact path — so a process that merely shares the
+/// name `xmrig` (or any non-bundled xmrig the user runs) can NEVER be matched or
+/// killed.
+///
+/// `None` means **we could not scan** (the OS query tool is unavailable) — distinct
+/// from `Some(vec![])`, "we scanned and found none". The caller must not claim "no
+/// orphan left" on a `None`.
+fn orphaned_engine_pids(needle: &str) -> Option<Vec<u32>> {
+    let stdout = engine_pid_candidates(needle)?;
+    Some(
+        parse_pid_list(&stdout, std::process::id())
+            .into_iter()
+            .filter(|&pid| pidfile::is_alive(pid))
+            .filter(|&pid| process_cmdline_contains(pid, needle))
+            .collect(),
+    )
 }
 
-/// True iff live process `cpid`'s command line contains OUR recorded engine binary
-/// path — the path `core::supervise` wrote next to the child pid (engine-agnostic:
-/// xmrig / SRBMiner / kawpowminer / AlphaMiner / an env-override engine). Falls back to
-/// the bundled xmrig path for a legacy pid-only child file. The hard guard that the
-/// layer-2 child-pid backstop can NEVER signal an unrelated process that merely
-/// inherited a reused pid; returns `false` when we cannot positively identify the
-/// process, so we decline to kill what we cannot verify.
-fn child_pid_is_our_engine(cpid: u32) -> bool {
-    let needle = alice_miner_core::terminal::read_child_engine_path()
-        .or_else(alice_miner_core::terminal::bundled_xmrig_path);
-    match needle {
-        Some(path) => process_cmdline_contains(cpid, &path.to_string_lossy()),
-        None => false,
+/// Ask the OS for pids whose command line contains `needle`, as newline-separated
+/// text. `None` when the query tool is unavailable / failed.
+fn engine_pid_candidates(needle: &str) -> Option<String> {
+    use std::process::Command;
+    #[cfg(unix)]
+    {
+        // `-f` matches the FULL command line; the exact absolute path means only
+        // processes actually running OUR engine can appear — and we STILL re-verify.
+        let out = Command::new("pgrep").arg("-f").arg(needle).output().ok()?;
+        // ROUND 3 — the ANSWER is the exit status, not the stdout. This branch used to
+        // read stdout and nothing else, so a `pgrep` that ran and FAILED (no readable
+        // `/proc` in a hardened container, a restricted session) printed nothing and
+        // "nothing" became a positive "no orphans" — the unix twin of the Windows
+        // false success closed in round 2, in the same function, four lines apart.
+        // `PgrepScan` keeps the third answer: exit 1 ("no match") is still a real
+        // result, only ≥2 / signal-killed is a scan gap.
+        if !alice_miner_core::proc::classify_pgrep(out.status.code()).ran() {
+            return None; // pgrep ran but FAILED → we did NOT scan
+        }
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+    #[cfg(windows)]
+    {
+        // `Get-CimInstance Win32_Process` is the supported replacement for `wmic`
+        // (removed in recent Windows 11). The needle is passed through the ENVIRONMENT
+        // and compared with `.Contains()`, never interpolated into the script text and
+        // never treated as a wildcard pattern — so a path containing quotes, `$`, or
+        // `[` `]` can neither break the command nor widen the match.
+        let out = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-CimInstance Win32_Process | \
+                 Where-Object { $_.CommandLine -and $_.CommandLine.Contains($env:ALICE_STOP_NEEDLE) } | \
+                 ForEach-Object { $_.ProcessId }",
+            ])
+            .env("ALICE_STOP_NEEDLE", needle)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None; // PowerShell ran but failed → we did NOT scan
+        }
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = needle;
+        None
+    }
+}
+
+/// What we could establish about the recorded engine-child pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildIdentity {
+    /// Alive and its command line is OUR recorded engine → safe to stop.
+    Ours,
+    /// Alive but positively NOT our engine (the OS reused the pid) → never signal it.
+    Unrelated,
+    /// Positively gone.
+    Gone,
+    /// We could not read its command line → we neither signal it NOR claim it is gone.
+    Unknown,
+}
+
+/// Classify the recorded engine-child pid against `needle` (our exact engine path).
+///
+/// The hard guard that the layer-2 backstop can NEVER signal an unrelated process
+/// that merely inherited a reused pid. The change from the old boolean: "could not
+/// identify" is no longer indistinguishable from "identified as someone else". Both
+/// still decline to kill, but only the latter is a clean outcome — the former is
+/// reported to the user, because on Windows 11 (no `wmic`) it was the NORMAL case and
+/// silently produced a false "no orphan left".
+///
+/// **BACKLOG (known, not fixed here) — pid reuse with no start-time token.** The
+/// command-line comparison narrows the window but does not close it: if the OS reuses
+/// our recorded pid for a process that happens to run the SAME engine path (a second
+/// Alice install, the user launching the bundled engine by hand), we classify it
+/// `Ours` and stop it — and then report success for stopping something that was never
+/// ours. The fix is to record the process START TIME alongside the pid and require
+/// both to match; every platform exposes it (`ps -o lstart=`, `Win32_Process.CreationDate`).
+/// Same gap on unix and Windows. Deliberately left for its own change: it touches the
+/// pid-file FORMAT and every reader of it.
+fn identify_child_pid(cpid: u32, needle: Option<&str>) -> ChildIdentity {
+    let Some(needle) = needle else {
+        return ChildIdentity::Unknown; // nothing to compare against
+    };
+    match process_cmdline(cpid) {
+        Some(cmd) if cmd.contains(needle) => ChildIdentity::Ours,
+        Some(_) => ChildIdentity::Unrelated,
+        None => ChildIdentity::Unknown,
     }
 }
 
@@ -2977,33 +3254,50 @@ fn child_pid_is_our_engine(cpid: u32) -> bool {
 /// can only ever hit OUR engine. Returns `false` on any failure to read the command
 /// line, so a process we cannot positively identify is never killed.
 fn process_cmdline_contains(pid: u32, needle: &str) -> bool {
+    process_cmdline(pid).map(|c| c.contains(needle)).unwrap_or(false)
+}
+
+/// Read live process `pid`'s full command line. `None` when it cannot be read (no
+/// such process, no permission, or the query tool is missing) — the caller must treat
+/// that as "unknown", never as "not ours".
+fn process_cmdline(pid: u32) -> Option<String> {
+    use std::process::Command;
     #[cfg(unix)]
     {
-        use std::process::Command;
-        Command::new("ps")
+        let out = Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "command="])
             .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(needle))
-            .unwrap_or(false)
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
     }
     #[cfg(windows)]
     {
-        use std::process::Command;
-        // WMIC exposes the FULL command line for a pid. A missing / failed WMIC (e.g.
-        // removed on very recent Windows) yields `false`, so we conservatively DECLINE
-        // to signal a pid we cannot positively identify.
-        Command::new("wmic")
-            .args(["process", "where", &format!("ProcessId={pid}"), "get", "CommandLine", "/value"])
+        // `wmic` was the old source and is REMOVED on current Windows 11, which is the
+        // root of the false "no orphan left" report: every lookup failed, so every
+        // leftover engine looked "unidentifiable" and was silently skipped. PowerShell's
+        // CIM query is the supported replacement and ships with every supported Windows.
+        let out = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"
+                ),
+            ])
             .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(needle))
-            .unwrap_or(false)
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (pid, needle);
-        false
+        let _ = pid;
+        None
     }
 }
 
@@ -3415,40 +3709,228 @@ mod tests {
     /// backstops re-check. We spawn a real child via an ABSOLUTE program path (exactly
     /// how the engine is launched: `Command::new(<abs engine path>)`), so its command
     /// line contains that path, and confirm a DIFFERENT path never matches it.
-    #[cfg(unix)]
-    #[test]
-    fn process_cmdline_contains_matches_only_the_exact_path() {
+    /// Spawn a long-lived child from an ABSOLUTE program path (exactly how the engine
+    /// is launched), returning it plus that path — so its command line provably
+    /// contains the path. Cross-platform so the stop-path tests below run on Windows
+    /// CI too, where every one of these code paths was previously untested.
+    #[cfg(any(unix, windows))]
+    fn long_lived_child() -> (std::process::Child, String) {
         use std::process::{Command, Stdio};
-        let sleep = if std::path::Path::new("/bin/sleep").exists() {
-            "/bin/sleep"
-        } else {
-            "/usr/bin/sleep"
-        };
-        let mut child = Command::new(sleep)
-            .arg("30")
+        #[cfg(unix)]
+        let (prog, args): (String, Vec<String>) = (
+            if std::path::Path::new("/bin/sleep").exists() {
+                "/bin/sleep".to_string()
+            } else {
+                "/usr/bin/sleep".to_string()
+            },
+            vec!["30".to_string()],
+        );
+        #[cfg(windows)]
+        let (prog, args): (String, Vec<String>) = (
+            format!(
+                "{}\\System32\\cmd.exe",
+                std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string())
+            ),
+            vec!["/C".to_string(), "ping -n 30 127.0.0.1".to_string()],
+        );
+        let child = Command::new(&prog)
+            .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn sleep");
+            .expect("spawn long-lived test child");
+        (child, prog)
+    }
+
+    /// A path that is certainly not any live process's program.
+    #[cfg(any(unix, windows))]
+    const FOREIGN_ENGINE_PATH: &str = if cfg!(windows) {
+        "C:\\Program Files\\AliceMiner\\xmrig.exe"
+    } else {
+        "/opt/AliceMiner/Contents/MacOS/xmrig"
+    };
+
+    /// `process_cmdline_contains` matches a LIVE process ONLY when its command line
+    /// actually carries the exact engine path — the defense-in-depth guard both stop
+    /// backstops re-check. On Windows this also exercises the PowerShell/CIM lookup
+    /// that replaced `wmic` (removed in current Windows 11), which is the whole reason
+    /// the orphan backstop silently failed there.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn process_cmdline_contains_matches_only_the_exact_path() {
+        let (mut child, prog) = long_lived_child();
         let pid = child.id();
         // Positive: the child's command line DOES contain its exact program path.
-        assert!(process_cmdline_contains(pid, sleep));
+        assert!(
+            process_cmdline_contains(pid, &prog),
+            "a live process must be identifiable by its own program path \
+             (on Windows: the PowerShell CIM lookup must work — wmic is gone)"
+        );
         // Negative (the pid-reuse guard): a DIFFERENT engine path is NOT in its command
         // line, so a reused pid can never be mistaken for our engine.
-        assert!(!process_cmdline_contains(pid, "/opt/AliceMiner/Contents/MacOS/xmrig"));
+        assert!(!process_cmdline_contains(pid, FOREIGN_ENGINE_PATH));
         let _ = child.kill();
         let _ = child.wait();
     }
 
-    /// The layer-2 backstop's identity gate: `child_pid_is_our_engine` returns TRUE only
-    /// when the LIVE recorded pid actually runs the engine path we recorded, and FALSE
-    /// when the pid is alive but running SOMETHING ELSE (the OS reused a stale pid) — the
-    /// exact reboot/SIGKILL mis-kill this fix closes. Isolated under `$ALICE_IDENTITY_DIR`.
-    #[cfg(unix)]
+    /// The honesty rule, isolated and pinned: an outcome we could not verify NEVER
+    /// exits 0 — regardless of how many layers reported success. This is the invariant
+    /// behind "better to say 'check Task Manager' than to promise a clean stop".
     #[test]
-    fn child_pid_is_our_engine_rejects_a_reused_pid() {
-        use std::process::{Command, Stdio};
+    fn unverified_stop_never_reports_success() {
+        // The only path to EXIT_OK: we acted, no error, nothing unverified, and the
+        // orphan sweep actually RAN.
+        assert_eq!(stop_exit_code(true, false, false, false), EXIT_OK);
+        // Acted AND fully "successful", but something could not be confirmed → its OWN
+        // non-zero code, so the GUI can single out "the miner may still be running".
+        assert_eq!(stop_exit_code(true, false, true, false), EXIT_UNVERIFIED);
+        assert_eq!(stop_exit_code(true, true, true, false), EXIT_UNVERIFIED);
+        // Errors and "nothing found" stay non-zero as before, on the generic code.
+        assert_eq!(stop_exit_code(true, true, false, false), EXIT_RUNTIME);
+        assert_eq!(stop_exit_code(false, false, false, false), EXIT_RUNTIME);
+        // Whatever else changes: unverified is never 0, and never the same code as the
+        // ordinary "nothing to stop" result (which the GUI must NOT alarm about).
+        assert_ne!(EXIT_UNVERIFIED, EXIT_OK);
+        assert_ne!(EXIT_UNVERIFIED, EXIT_RUNTIME);
+        // A scan gap must never MASK a worse answer: whatever else is true, the
+        // unverified/error codes win over it.
+        assert_eq!(stop_exit_code(true, false, true, true), EXIT_UNVERIFIED);
+        assert_eq!(stop_exit_code(true, true, false, true), EXIT_RUNTIME);
+        assert_eq!(stop_exit_code(false, false, false, true), EXIT_RUNTIME);
+    }
+
+    /// The GUI decides whether to alarm the miner purely from this exit code, so the
+    /// two crates' constants must not drift (the core crate can't depend on the CLI).
+    #[test]
+    fn unverified_exit_code_matches_the_value_the_gui_watches_for() {
+        assert_eq!(
+            EXIT_UNVERIFIED,
+            alice_miner_core::terminal::EXIT_STOP_UNVERIFIED
+        );
+    }
+
+    /// ROUND 2 (noise): a machine where the orphan SWEEP cannot run (PowerShell blocked
+    /// by AppLocker / an execution policy, no `pgrep`) must not turn every ordinary,
+    /// fully-confirmed stop into a WARNING. The scan gap costs us the "No orphan left"
+    /// CLAIM (which is about the scan) — not the success.
+    ///
+    /// ROUND 3 refines the second half: the outcome is still a success, but it is no
+    /// longer reported as plain `EXIT_OK`. It carries its own code so the GUI can say
+    /// the one true, calm sentence about it, without ever entering the alarm channel.
+    #[test]
+    fn a_scan_gap_alone_downgrades_the_claim_not_the_outcome() {
+        // No scan ⇒ we do not claim "No orphan left"…
+        assert!(!claims_no_orphan(true));
+        assert!(claims_no_orphan(false));
+        // …and with everything we DID probe confirmed, the stop remains a SUCCESS —
+        // simply one with a smaller claim, so it gets its own code and NOT the "may
+        // still be running" one.
+        assert_eq!(stop_exit_code(true, false, false, true), EXIT_SCAN_GAP);
+        assert_ne!(EXIT_SCAN_GAP, EXIT_UNVERIFIED);
+        // With no gap at all, nothing changed: a clean stop is still exactly 0.
+        assert_eq!(stop_exit_code(true, false, false, false), EXIT_OK);
+        // And if anything else was unconfirmed, the gap is listed with it and the
+        // outcome is unverified (that path pushes the gap into `unverified`).
+        assert_eq!(stop_exit_code(true, false, true, true), EXIT_UNVERIFIED);
+    }
+
+    /// ROUND 3 — the scan gap needed a channel of its own. The CLI exited plain 0 on a
+    /// confirmed stop it could not sweep after, so the GUI (which alarms only on 3)
+    /// showed the miner NOTHING: a check had been skipped and nobody said so. The fix
+    /// is a dedicated code, because the alternative — matching the CLI's stderr — means
+    /// matching BILINGUAL prose, which would silently do nothing on a Chinese locale.
+    ///
+    /// The contract pinned here: distinct from every other code, never confusable with
+    /// "may still be running", and identical to the constant the GUI watches for.
+    #[test]
+    fn scan_gap_has_its_own_code_and_the_gui_watches_for_that_exact_value() {
+        assert_eq!(
+            EXIT_SCAN_GAP,
+            alice_miner_core::terminal::EXIT_STOP_SCAN_GAP,
+            "the two crates' constants must not drift (core cannot depend on the CLI)"
+        );
+        // Distinct from every other stop outcome, or the GUI cannot tell them apart.
+        for other in [EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, EXIT_UNVERIFIED] {
+            assert_ne!(EXIT_SCAN_GAP, other);
+        }
+        // The two report predicates are mutually exclusive BY CONSTRUCTION.
+        let gap = alice_miner_core::terminal::CliStopReport {
+            code: Some(EXIT_SCAN_GAP),
+            stderr: String::new(),
+        };
+        assert!(gap.scan_gap());
+        assert!(
+            !gap.unverified(),
+            "a scan gap is a confirmed stop — it must never trip the alarm surface"
+        );
+    }
+
+    /// ROUND 3 — the orphan sweep's THREE-way contract, against the REAL OS query tool
+    /// on both unix (`pgrep`) and Windows (PowerShell/CIM):
+    ///   * a needle that matches a LIVE process → `Some(pids)` containing it;
+    ///   * a needle that matches nothing → `Some(vec![])` — "we looked and found none",
+    ///     which is precisely what lets an ordinary stop say "No orphan left."
+    ///
+    /// The second half guards against OVER-correcting the unix fix: `pgrep` exits 1
+    /// when it matches nothing, and folding that status into "could not scan" would
+    /// make every clean stop on every unix report a scan gap — a cry-wolf note on the
+    /// most common path. (`None`, a genuine gap, cannot be provoked here without
+    /// breaking the tool, so it is pinned as a pure table in `core::proc::classify_pgrep`.)
+    /// A machine that genuinely cannot scan is a SUPPORTED state, not a test failure
+    /// (that is the entire point of `Option` here), so the assertions are made only
+    /// where the premise holds. On unix that is always — `pgrep` is POSIX and present
+    /// on both CI legs, which is exactly where the bug being fixed lived. On Windows
+    /// the sweep needs PowerShell, which a hardened runner may refuse; there we assert
+    /// when it ran and stay quiet when it did not, rather than fail CI over the
+    /// environment.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn orphan_sweep_reports_found_none_not_a_scan_gap() {
+        let (mut child, prog) = long_lived_child();
+        let pid = child.id();
+
+        let found = orphaned_engine_pids(&prog);
+        // A path NOTHING is running: if the scan ran, this must be an EMPTY list, never
+        // `None`. `None` means "could not scan", and claiming it here would cost every
+        // stop on this machine the "No orphan left" it has every right to say — the
+        // over-correction this test exists to prevent (`pgrep` exits 1 on no match).
+        let empty = orphaned_engine_pids(FOREIGN_ENGINE_PATH);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        #[cfg(unix)]
+        let (found, empty) = (
+            Some(found.expect("`pgrep` is POSIX — it is present here")),
+            Some(empty.expect("exit 1 is 'no match' — an ANSWER, not a scan failure")),
+        );
+
+        if let Some(found) = found {
+            assert!(
+                found.contains(&pid),
+                "a live process running the exact needle path must be found \
+                 (needle {prog}, pid {pid})"
+            );
+        }
+        if let Some(empty) = empty {
+            assert!(
+                empty.is_empty(),
+                "nothing is running {FOREIGN_ENGINE_PATH}; got {empty:?}"
+            );
+        }
+    }
+
+    /// The layer-2 backstop's identity gate: `identify_child_pid` says `Ours` only when
+    /// the LIVE recorded pid actually runs the engine path we recorded, `Unrelated` when
+    /// the pid is alive but running SOMETHING ELSE (the OS reused a stale pid — the
+    /// mis-kill this guard closes), and `Unknown` when we cannot read the command line
+    /// at all. The `Unknown` case is the one that matters for honest reporting: it must
+    /// NOT be indistinguishable from `Unrelated`, because on Windows 11 it was the
+    /// normal outcome and produced a false "no orphan left". Runs on Windows too.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn identify_child_pid_separates_ours_reused_and_unknown() {
         let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!(
             "alice-childguard-{}-{}",
@@ -3461,40 +3943,37 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
 
-        let sleep = if std::path::Path::new("/bin/sleep").exists() {
-            "/bin/sleep"
-        } else {
-            "/usr/bin/sleep"
-        };
-        let mut child = Command::new(sleep)
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sleep");
+        let (mut child, prog) = long_lived_child();
         let pid = child.id();
 
-        // Record the SAME live pid but a MISMATCHED engine path (models a reused pid:
-        // the process is alive, but it is NOT our engine) → the guard must REFUSE it.
-        alice_miner_core::terminal::write_child_pid(
-            pid,
-            std::path::Path::new("/opt/AliceMiner/Contents/MacOS/xmrig"),
-        );
-        assert!(
-            !child_pid_is_our_engine(pid),
+        // A live pid whose command line is NOT the recorded engine (models a reused
+        // pid) → Unrelated: known not to be ours, so never signalled AND not a warning.
+        assert_eq!(
+            identify_child_pid(pid, Some(FOREIGN_ENGINE_PATH)),
+            ChildIdentity::Unrelated,
             "a live pid running something OTHER than the recorded engine must never verify"
         );
 
-        // Record the pid with the CORRECT engine path it is actually running → verifies.
-        alice_miner_core::terminal::write_child_pid(pid, std::path::Path::new(sleep));
-        assert!(
-            child_pid_is_our_engine(pid),
+        // The pid running exactly the recorded engine path → Ours.
+        assert_eq!(
+            identify_child_pid(pid, Some(&prog)),
+            ChildIdentity::Ours,
             "a live pid running the recorded engine path must verify"
         );
 
+        // No recorded engine path to compare against → Unknown (never "not ours").
+        assert_eq!(identify_child_pid(pid, None), ChildIdentity::Unknown);
+
         let _ = child.kill();
         let _ = child.wait();
+
+        // A pid that does not exist: its command line cannot be read → Unknown, NOT
+        // Unrelated. (Liveness is checked by the caller before this is consulted.)
+        assert_eq!(
+            identify_child_pid(0x7FFF_FFFE, Some(&prog)),
+            ChildIdentity::Unknown
+        );
+
         std::env::remove_var("ALICE_IDENTITY_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
     }
