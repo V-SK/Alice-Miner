@@ -2356,6 +2356,8 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             lanes: vec![],
             last_line: None,
             message: None,
+            message_key: None,
+            message_args: None,
             prl_payout: None,
         });
         app.credit_state = CreditState::Confirmed {
@@ -2646,6 +2648,8 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             lanes: Vec::new(),
             last_line: None,
             message: None,
+            message_key: None,
+            message_args: None,
             prl_payout: None,
         }
     }
@@ -3297,6 +3301,8 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             lanes: Vec::new(),
             last_line: None,
             message: None,
+            message_key: None,
+            message_args: None,
             prl_payout: None,
         }
     }

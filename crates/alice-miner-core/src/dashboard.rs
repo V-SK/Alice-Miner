@@ -1362,6 +1362,8 @@ mod tests {
             }],
             last_line: Some("accepted (142/1)".into()),
             message: None,
+            message_key: None,
+            message_args: None,
             prl_payout: None,
         }
     }

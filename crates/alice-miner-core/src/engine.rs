@@ -224,9 +224,22 @@ pub struct Snapshot {
     /// Last sanitised engine output line (an at-a-glance hint).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_line: Option<String>,
-    /// Short, sanitised reason for an `Error`/`Stopping` state, if any.
+    /// Short, sanitised reason for an `Error`/`Stopping` state, if any (human text,
+    /// baked at the locale that produced it — prefer [`Self::message_key`] to
+    /// re-localize).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Machine key for a re-localizable Layer-B status ([`crate::supervise::status_short`]
+    /// keys), mirroring `message` when it is one of the failover / endpoint-lock
+    /// statuses. Lets a front-end render the status in ITS OWN language at draw time
+    /// (the i18n boundary fix: a `zh` CLI must not force `zh` text into an `en` GUI).
+    /// Additive + `skip`-when-`None`, so the JSON stays backward-compatible and an
+    /// older stream (no key) deserializes to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_key: Option<String>,
+    /// Structured arguments for [`Self::message_key`] (endpoint / region / stalled_s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_args: Option<crate::supervise::StatusArgs>,
     /// GPU-PRL **15% PRL 返还** display block (A2c): a render-ready, **credit-only**
     /// status for the dashboard's "15% PRL 返还" panel — the enrolled flag, the
     /// user's MASKED `prl1p…` payout address, an honest "pending" text, and a
@@ -316,6 +329,8 @@ impl Snapshot {
             lanes: Vec::new(),
             last_line: None,
             message: None,
+            message_key: None,
+            message_args: None,
             prl_payout: None,
         }
     }
@@ -1489,6 +1504,8 @@ fn build_snapshot(
         snap.util_pct = st.util_pct;
         snap.fan_pct = st.fan_pct;
         snap.message = st.message.clone();
+        snap.message_key = st.message_key.clone();
+        snap.message_args = st.message_args.clone();
         if !st.last_line.is_empty() {
             snap.last_line = Some(st.last_line);
         }
@@ -1669,6 +1686,16 @@ mod tests {
             ],
             last_line: Some("net accepted (7/1)".into()),
             message: None,
+            // Exercise the additive structured-status fields in the credit-only JSON
+            // honesty check too (none of their keys/values contain a forbidden
+            // payout substring).
+            message_key: Some("endpoint_locked".into()),
+            message_args: Some(crate::supervise::StatusArgs {
+                endpoint: Some("hk.aliceprotocol.org:3333".into()),
+                region: Some("HK".into()),
+                to_region: None,
+                stalled_s: Some(600),
+            }),
             // A2c: a populated PRL display block must NOT leak any payout/paid
             // substring into the wire JSON (it is `#[serde(skip)]`). Set it here so
             // the credit-only JSON assertion below exercises the skip.
@@ -1689,6 +1716,41 @@ mod tests {
                 "Snapshot JSON must not contain `{forbidden}`: {json}"
             );
         }
+    }
+
+    /// The re-localizable status fields (`message_key` + `message_args`) round-trip
+    /// through JSON, and — crucially — an OLDER stream that predates them (no such
+    /// keys) still deserializes cleanly, with both fields `None`. This is what lets a
+    /// NEW GUI localize a NEW CLI's status via the key while STILL accepting an OLD
+    /// CLI's key-less snapshot (which the GUI then re-localizes by parsing `message`).
+    #[test]
+    fn snapshot_status_key_round_trips_and_is_backward_compatible() {
+        // Round-trip a populated key + args.
+        let mut snap = Snapshot::idle();
+        snap.state = EngineState::Error;
+        snap.message = Some("区域 hk.aliceprotocol.org:3333 已锁定 …".into());
+        snap.message_key = Some("endpoint_locked".into());
+        snap.message_args = Some(crate::supervise::StatusArgs {
+            endpoint: Some("hk.aliceprotocol.org:3333".into()),
+            region: Some("HK".into()),
+            to_region: None,
+            stalled_s: Some(600),
+        });
+        let json = serde_json::to_string(&snap).expect("serialize");
+        assert!(json.contains("message_key"), "structured key is serialized: {json}");
+        assert!(json.contains("stalled_s"), "structured args are serialized: {json}");
+        let back: Snapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.message_key.as_deref(), Some("endpoint_locked"));
+        assert_eq!(back.message_args.and_then(|a| a.stalled_s), Some(600));
+
+        // A minimal OLDER snapshot with NO message_key/message_args keys still loads.
+        let legacy = r#"{"state":"error","shares_accepted":0,"shares_rejected":0,
+            "uptime_s":0,"failovers":0,"dual":false,
+            "message":"region us locked — no auto-failover (no progress for 600s)"}"#;
+        let old: Snapshot = serde_json::from_str(legacy).expect("legacy snapshot deserializes");
+        assert!(old.message_key.is_none(), "legacy stream has no structured key");
+        assert!(old.message_args.is_none(), "legacy stream has no structured args");
+        assert!(old.message.is_some(), "legacy raw message is preserved for fix-B parsing");
     }
 
     /// A2c / Piece 3: `build_snapshot` attaches the credit-only "15% PRL 返还"

@@ -4266,6 +4266,8 @@ mod tests {
             lanes: vec![],
             last_line: None,
             message: Some(TERMINAL_REASON_NEVER_RUNNING.to_string()),
+            message_key: None,
+            message_args: None,
             prl_payout: None,
         };
         let wire = serde_json::to_string(&snap).unwrap();

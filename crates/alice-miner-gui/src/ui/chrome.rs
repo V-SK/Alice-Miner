@@ -313,11 +313,13 @@ mod tests {
     }
 
     /// The titlebar status pill LOCALIZES with the shared i18n language: English under
-    /// EN, 中文 under 中 — the concrete "中文模式下 pill 仍是英文" fix. (No other GUI test
-    /// mutates the process-global language, so setting + restoring it here is safe.)
+    /// EN, 中文 under 中 — the concrete "中文模式下 pill 仍是英文" fix. Holds the
+    /// binary-wide language lock (the process-global language is shared with the
+    /// `home` status tests).
     #[test]
     fn status_pill_label_localizes_with_language() {
         use alice_miner_core::i18n::{set_lang, Lang};
+        let _g = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let app = MinerApp::new().expect("engine spawns"); // Idle (no snapshot)
         set_lang(Lang::En);
         let (_t, en, _b) = status_for(&app);

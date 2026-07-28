@@ -484,6 +484,8 @@ mod tests {
             lanes: vec![],
             last_line: Some("net accepted (142/1) diff 100".into()),
             message: None,
+            message_key: None,
+            message_args: None,
             prl_payout: None,
         }
     }
@@ -543,6 +545,8 @@ mod tests {
             ],
             last_line: None,
             message: None,
+            message_key: None,
+            message_args: None,
             prl_payout: None,
         }
     }
