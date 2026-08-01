@@ -2284,6 +2284,31 @@ fn cmd_start_with_unlock(
     // to find us, and Ctrl-C still works.
     let pid_guard = pidfile::PidGuard::acquire();
 
+    // Two `alice-miner start` processes on one machine is a real, silent failure mode
+    // (shared engine/log directory, each overwriting the other's telemetry snapshot,
+    // and `stop` able to reach only the recorded one — so the survivor keeps the GPU
+    // busy while the UI reports "stopped"). We do not refuse to mine, but we say it
+    // out loud with the pid, so it is one line to diagnose instead of an afternoon.
+    if let Some(other) = pid_guard.other_instance() {
+        if !args.json {
+            eprintln!(
+                "{}",
+                tr!(
+                    format!(
+                        "warning: another alice-miner start is already running on this machine (pid {other}).\n\
+                         Two instances share one engine directory and both report telemetry, and `alice-miner stop`\n\
+                         can only reach the first — stop the other one, or close this window."
+                    ),
+                    format!(
+                        "警告:本机已有另一个 alice-miner start 在运行(进程号 {other})。\n\
+                         两个实例会共用同一个引擎目录并各自上报遥测,而 `alice-miner stop` 只能停掉先注册的那个 ——\n\
+                         请先停止另一个实例,或关闭本窗口。"
+                    )
+                )
+            );
+        }
+    }
+
     // A pearlhash lane needs the wallet password to unlock the signing key for the OOB
     // M4 PoP. Resolve it (stdin / flag / interactive prompt) when a pearlhash lane is in
     // play: a single GpuPrl OR GpuAlpha start, or a dual-mine whose GPU partner is

@@ -1695,6 +1695,7 @@ mod tests {
                 region: Some("HK".into()),
                 to_region: None,
                 stalled_s: Some(600),
+                ..Default::default()
             }),
             // A2c: a populated PRL display block must NOT leak any payout/paid
             // substring into the wire JSON (it is `#[serde(skip)]`). Set it here so
@@ -1735,6 +1736,7 @@ mod tests {
             region: Some("HK".into()),
             to_region: None,
             stalled_s: Some(600),
+            ..Default::default()
         });
         let json = serde_json::to_string(&snap).expect("serialize");
         assert!(json.contains("message_key"), "structured key is serialized: {json}");

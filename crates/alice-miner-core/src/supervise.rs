@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use alice_supervise::child::{spawn_supervised, LogLine, LogStream, OwnedChild};
-use alice_supervise::{sanitize_log_line, ProcState, RestartPolicy};
+use alice_supervise::{sanitize_log_line, ProcState, RestartPolicy, RetryLadder};
 
 use crate::endpoint::{Endpoint, EndpointPlan};
 use crate::lane::Lane;
@@ -119,6 +119,24 @@ pub struct StatusArgs {
     /// The no-progress window that tripped the watchdog, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stalled_s: Option<u64>,
+    /// The engine child's RAW exit code for a crash status. Kept as the number (not a
+    /// baked sentence) so a front-end can translate it in ITS OWN language via
+    /// [`exit_code_explanation`] — same reason `message_key` exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Seconds until the PENDING automatic retry fires. Counts down while the lane
+    /// waits, so "stopped" is never silent — the user always sees the next attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_in_s: Option<u64>,
+    /// The 1-based number of the pending retry attempt (the escalating-backoff rung).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// How many times the ENGINE has exited on its own since this lane was started —
+    /// the third-party-engine crash counter (SRBMiner's heap-corruption aborts are the
+    /// observed case), so a support report / the telemetry snapshot carries a frequency
+    /// and not just "it died once".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crashes: Option<u64>,
 }
 
 /// A point-in-time, UI-safe snapshot of a lane's child. Cloneable + secret-free
@@ -178,6 +196,13 @@ pub struct LaneStats {
     pub util_pct: Option<f64>,
     /// GPU fan speed percent (0..=100), same sourcing as [`Self::temp_c`].
     pub fan_pct: Option<f64>,
+    /// How many times the ENGINE child exited on its own (crashed / self-exited)
+    /// since this lane was started. Never reset by an automatic restart — it is the
+    /// third-party-engine crash FREQUENCY, which is the number worth reporting.
+    pub crashes: u64,
+    /// Seconds until the pending automatic restart fires, when one is scheduled.
+    /// `None` when the lane is not waiting to retry.
+    pub retry_in_s: Option<u64>,
 }
 
 impl LaneStats {
@@ -203,6 +228,8 @@ impl LaneStats {
             power_w: None,
             util_pct: None,
             fan_pct: None,
+            crashes: 0,
+            retry_in_s: None,
         }
     }
 }
@@ -263,6 +290,35 @@ struct Inner {
     /// keep the watchdog's explanatory message. Distinguishes a user Stop (→
     /// Stopped) from a forced failover-exhaustion stop (→ Error).
     forced_error: bool,
+
+    // ── BUG#4: automatic, never-terminal recovery ───────────────────────────────
+    /// The escalating backoff for AUTOMATIC restarts after a crash / stall. Unlike
+    /// [`Self::restart_policy`] (a bounded budget that gates the FAST failover loop)
+    /// this one never runs out — it only gets slower, and is walked back down by real
+    /// mining. See [`alice_supervise::RetryLadder`].
+    retry_ladder: RetryLadder,
+    /// The launch plan of the CURRENT/last run, so an automatic restart can relaunch
+    /// even without a `rebuild` closure (`start_simple`). When `rebuild` IS present it
+    /// wins — a GPU-PRL argv carries a region-bound PoP token that must be re-minted,
+    /// so replaying a stale argv would be rejected by the relay.
+    last_launch: Option<(std::path::PathBuf, Vec<String>)>,
+    /// The pid of the engine child of the run that just ended, so the retry task can
+    /// VERIFY the process tree is really gone before spawning a replacement (never
+    /// two engines on one GPU).
+    last_child_pid: Option<u32>,
+    /// Monotonic token identifying the CURRENTLY-pending automatic retry. Any new
+    /// `spawn_run`, or a user `request_stop`, bumps it — which is how a pending retry
+    /// is cancelled without racing (the retry task re-checks it under the lock).
+    retry_token: u64,
+    /// When the pending automatic retry is due (drives the visible countdown), and
+    /// whether one is pending at all.
+    retry_at: Option<Instant>,
+    /// How many times the ENGINE child exited on its own since this lane was started.
+    crashes: u64,
+    /// Override for the automatic-restart backoff. `None` ⇒ use the [`RetryLadder`]
+    /// (production). `Some(d)` ⇒ a fixed, tiny delay so the crash-recovery tests can
+    /// exercise several restarts without waiting out the real 5s…30min ladder.
+    retry_backoff_override: Option<Duration>,
     /// Generation counter; bumped on every start/stop so a stale supervision
     /// loop from a previous child can't clobber newer state.
     generation: u64,
@@ -433,6 +489,13 @@ impl LaneSupervisor {
                 started_at: None,
                 stop_requested: false,
                 forced_error: false,
+                retry_ladder: RetryLadder::new(),
+                last_launch: None,
+                last_child_pid: None,
+                retry_token: 0,
+                retry_at: None,
+                crashes: 0,
+                retry_backoff_override: None,
                 generation: 0,
                 endpoint_plan,
                 restart_policy: RestartPolicy::new(),
@@ -466,6 +529,16 @@ impl LaneSupervisor {
         // `*.invalid` host still returns fast; a real host that doesn't answer within
         // this is treated as unreachable → the plain fallback rotation kicks in).
         g.failover_probe_timeout = backoff.max(Duration::from_millis(50));
+    }
+
+    /// Test/operator hook: fix the AUTOMATIC-restart backoff to `delay` instead of
+    /// walking the real [`alice_supervise::RetryLadder`] (5s … 30min). Lets the
+    /// crash-recovery tests drive several restarts in milliseconds. The ladder itself
+    /// still escalates, so the attempt counter and the healthy-run credit behave
+    /// exactly as in production.
+    #[doc(hidden)]
+    pub fn set_retry_timing(&self, delay: Duration) {
+        self.inner.lock().expect("mutex").retry_backoff_override = Some(delay);
     }
 
     pub fn lane(&self) -> Lane {
@@ -520,7 +593,24 @@ impl LaneSupervisor {
             power_w: g.telem_power_w,
             util_pct: g.telem_util_pct,
             fan_pct: g.telem_fan_pct,
+            crashes: g.crashes,
+            retry_in_s: g
+                .retry_at
+                .map(|t| t.saturating_duration_since(Instant::now()).as_secs()),
         }
+    }
+
+    /// How many times the ENGINE child has exited on its own since this lane was
+    /// started (the third-party-engine crash counter).
+    pub fn engine_crashes(&self) -> u64 {
+        self.inner.lock().expect("mutex").crashes
+    }
+
+    /// Seconds until the pending automatic restart, when one is scheduled.
+    pub fn retry_in_s(&self) -> Option<u64> {
+        let g = self.inner.lock().expect("mutex");
+        g.retry_at
+            .map(|t| t.saturating_duration_since(Instant::now()).as_secs())
     }
 
     pub fn is_active(&self) -> bool {
@@ -554,6 +644,8 @@ impl LaneSupervisor {
             let mut g = self.inner.lock().expect("mutex");
             g.endpoint_plan.reset();
             g.restart_policy.reset();
+            g.retry_ladder.reset();
+            g.crashes = 0;
             g.rebuild = Some(rebuild);
             g.failovers = 0;
         }
@@ -573,6 +665,8 @@ impl LaneSupervisor {
             let mut g = self.inner.lock().expect("mutex");
             g.endpoint_plan.reset();
             g.restart_policy.reset();
+            g.retry_ladder.reset();
+            g.crashes = 0;
             g.rebuild = None;
             g.failovers = 0;
         }
@@ -603,6 +697,12 @@ impl LaneSupervisor {
             g.set_freeform(None);
             g.stop_requested = false;
             g.forced_error = false;
+            // Any (re)spawn supersedes a pending automatic retry: bumping the token
+            // makes the waiting task a no-op the moment it next checks, so a user Start
+            // during a backoff can never race a second engine onto the same GPU.
+            g.retry_token = g.retry_token.wrapping_add(1);
+            g.retry_at = None;
+            g.last_launch = Some((program.clone(), args.clone()));
             g.hashrate_hs = None;
             g.hashrate_60s_hs = None;
             g.hashrate_15m_hs = None;
@@ -663,6 +763,7 @@ impl LaneSupervisor {
         {
             let mut g = self.inner.lock().expect("mutex");
             g.pid = Some(pid);
+            g.last_child_pid = Some(pid);
             g.state = ProcState::Running;
         }
         // Record the ENGINE CHILD's pid AND its exact engine path (the real
@@ -746,26 +847,74 @@ impl LaneSupervisor {
             if let Some(code) = owned.try_exit_code() {
                 // The engine child exited on its own — clear its pid backstop file.
                 crate::terminal::remove_child_pid(child_pid);
-                let mut g = self.inner.lock().expect("mutex");
-                if g.generation == gen {
-                    g.last_exit_code = Some(code);
-                    g.pid = None;
-                    g.hashrate_hs = None;
-                    g.hashrate_60s_hs = None;
-                    g.hashrate_15m_hs = None;
-                    g.telem_temp_c = None;
-                    g.telem_power_w = None;
-                    g.telem_util_pct = None;
-                    g.telem_fan_pct = None;
-                    g.started_at = None;
-                    g.state = if g.stop_requested {
-                        ProcState::Stopped
-                    } else {
-                        ProcState::Error
-                    };
-                    if !g.stop_requested && g.message.is_none() {
-                        g.set_freeform(Some(format!("miner exited (code {code})")));
+                // `Some((token, delay, attempt))` once the automatic retry is armed —
+                // armed under the SAME lock that flips the state, so the lane is never
+                // observable as a bare `Error` with no pending restart.
+                let mut armed: Option<(u64, Duration, u32)> = None;
+                {
+                    let mut g = self.inner.lock().expect("mutex");
+                    if g.generation == gen {
+                        g.last_exit_code = Some(code);
+                        g.pid = None;
+                        g.hashrate_hs = None;
+                        g.hashrate_60s_hs = None;
+                        g.hashrate_15m_hs = None;
+                        g.telem_temp_c = None;
+                        g.telem_power_w = None;
+                        g.telem_util_pct = None;
+                        g.telem_fan_pct = None;
+                        // How long this run actually MINED (kept landing progress) —
+                        // the currency that buys back retry budget. Read before
+                        // `started_at` is cleared below.
+                        let healthy_for = g
+                            .last_progress_at
+                            .zip(g.started_at)
+                            .map(|(p, s)| p.saturating_duration_since(s))
+                            .unwrap_or_default();
+                        g.started_at = None;
+                        if g.stop_requested {
+                            g.state = ProcState::Stopped;
+                        } else {
+                            // ── BUG#4 ──────────────────────────────────────────────
+                            // The engine died on its own. This used to be a TERMINAL
+                            // `Error`: no restart, ever, so one SRBMiner heap-corruption
+                            // abort (`0xC0000374`) left the CLI running, the GPU idle
+                            // and the miner earning nothing until a human noticed. A
+                            // crash is now a normal, recoverable event: count it, credit
+                            // the healthy time this run earned, and schedule an automatic
+                            // restart on the escalating (never-terminal) ladder. The
+                            // state stays `Error` on the wire — but it is a WAITING error
+                            // that always carries "retrying in N", never a dead end.
+                            g.state = ProcState::Error;
+                            g.crashes += 1;
+                            g.restart_policy.credit_healthy_run(healthy_for);
+                            g.retry_ladder.credit_healthy_run(healthy_for);
+                            // `old_pid` stays `None` here on purpose: `try_exit_code`
+                            // returning a code means the OS has already REAPED this
+                            // child, so it is definitively gone — and probing a freed
+                            // pid risks reading a REUSED one as "still alive" and
+                            // blocking the restart for nothing. The liveness probe is
+                            // reserved for the teardown path, where a stop can time out.
+                            armed = Some(arm_retry_locked(&mut g, &RetryReason::EngineExit(code)));
+                        }
                     }
+                }
+                if let Some((token, delay, attempt)) = armed {
+                    // Drop the child handle FIRST: on Windows that closes the
+                    // kill-on-close Job Object, which terminates anything the engine
+                    // spawned. The retry additionally VERIFIES the pid is gone before
+                    // it relaunches (`await_child_gone`), so a restart can never stack
+                    // a second engine on top of a surviving tree.
+                    drop(owned);
+                    self.spawn_retry_task(
+                        gen,
+                        token,
+                        delay,
+                        attempt,
+                        RetryReason::EngineExit(code),
+                        // Already reaped by `try_exit_code` — nothing left to probe.
+                        None,
+                    );
                 }
                 return;
             }
@@ -852,24 +1001,32 @@ impl LaneSupervisor {
                 // endpoint, and (b) is there restart budget?
                 let now = Instant::now();
                 if !g.restart_policy.may_restart(now) {
-                    // Budget exhausted → clean Error, no thrash. Mark `forced_error`
-                    // so the supervision loop reaps the child but lands in Error
-                    // (not Stopped) and keeps this message.
-                    g.set_status(
-                        format!(
-                            "no progress for {}s and the failover budget is exhausted; stopped to avoid a restart storm",
-                            window.as_secs()
-                        ),
-                        "budget_exhausted",
-                        StatusArgs {
-                            stalled_s: Some(window.as_secs()),
-                            ..Default::default()
-                        },
-                    );
+                    // ── BUG#4 ──────────────────────────────────────────────────────
+                    // The FAST failover budget is spent. That used to end the lane for
+                    // good — `GiveUp`, a terminal `Error`, no further attempt ever. It
+                    // is the right answer to a restart STORM and the wrong answer to a
+                    // temporarily sick relay: the miner simply stopped earning, silently,
+                    // until someone re-ran it by hand. Now we back OFF instead of giving
+                    // up: tear the stalled child down and retry on the escalating ladder
+                    // (5s → … → 30min, capped), with a visible countdown the whole time.
+                    // Credit whatever healthy mining this run did before it stalled, so a
+                    // rig that worked for hours retries quickly.
+                    let healthy_for = g
+                        .last_progress_at
+                        .zip(g.started_at)
+                        .map(|(p, s)| p.saturating_duration_since(s))
+                        .unwrap_or_default();
+                    g.restart_policy.credit_healthy_run(healthy_for);
+                    g.retry_ladder.credit_healthy_run(healthy_for);
                     g.forced_error = true;
                     g.stop_requested = true; // let supervise_until_exit reap the child
                     g.state = ProcState::Stopping; // transitional; loop → Error
-                    WatchAction::GiveUp
+                    // ARM the retry here, under the same lock that condemns the child:
+                    // the teardown below flips the lane to `Error`, and by then the
+                    // pending restart + its countdown are already published.
+                    let reason = RetryReason::Stalled(window.as_secs());
+                    let (token, delay, attempt) = arm_retry_locked(&mut g, &reason);
+                    WatchAction::GiveUp { reason, token, delay, attempt }
                 } else {
                     // A stall with budget remaining. Record the restart against the
                     // budget, then hand the CHOICE to the post-lock stage: it
@@ -897,7 +1054,23 @@ impl LaneSupervisor {
             };
 
             match action {
-                WatchAction::GiveUp => return,
+                WatchAction::GiveUp { reason, token, delay, attempt } => {
+                    // Reap the stalled child (bounded) — the retry was already armed
+                    // under the decision lock — then hand the countdown to its task.
+                    // Tearing down first is what makes the restart safe: the replacement
+                    // is only spawned once this engine is gone.
+                    self.teardown_current_child(gen).await;
+                    // The teardown is BOUNDED, so it can return with the child still
+                    // recorded. Only then does the retry get a pid to probe — a reaped
+                    // child needs no probe, and probing a freed pid could read a REUSED
+                    // one as alive and stall the restart for no reason.
+                    let unconfirmed = {
+                        let g = self.inner.lock().expect("mutex");
+                        if g.generation == gen { g.pid } else { None }
+                    };
+                    self.spawn_retry_task(gen, token, delay, attempt, reason, unconfirmed);
+                    return;
+                }
                 WatchAction::Failover {
                     from,
                     candidates,
@@ -986,6 +1159,7 @@ impl LaneSupervisor {
                                                 region: Some(short_region_label(&from)),
                                                 to_region: Some(short_region_label(target)),
                                                 stalled_s: Some(secs),
+                                                ..Default::default()
                                             },
                                         );
                                     } else if locked {
@@ -1011,6 +1185,7 @@ impl LaneSupervisor {
                                                 region: Some(short_region_label(&from)),
                                                 to_region: None,
                                                 stalled_s: Some(secs),
+                                                ..Default::default()
                                             },
                                         );
                                     } else {
@@ -1023,6 +1198,7 @@ impl LaneSupervisor {
                                                 region: Some(short_region_label(target)),
                                                 to_region: None,
                                                 stalled_s: Some(secs),
+                                                ..Default::default()
                                             },
                                         );
                                     }
@@ -1033,21 +1209,14 @@ impl LaneSupervisor {
                                     // A spawn/exec failure (the miner binary itself couldn't
                                     // launch) is region-independent — another region won't
                                     // help — and `spawn_run` already bumped the generation
-                                    // (this watchdog is now stale) and set Error. Surface a
-                                    // clear status and stop; raw detail stays in verbose log.
+                                    // (this watchdog is now stale) and set Error. Raw detail
+                                    // stays in the verbose log. BUG#4: this is no longer the
+                                    // end of the road — arm the escalating retry against the
+                                    // CURRENT generation (`None`) so a transient exec failure
+                                    // (an AV scanner holding the binary, a busy mount) heals
+                                    // itself instead of parking the rig.
                                     log_verbose("failover relaunch failed", &e);
-                                    let mut g = self.inner.lock().expect("mutex");
-                                    g.state = ProcState::Error;
-                                    g.set_status(
-                                        region_retry_message(),
-                                        "region_retrying",
-                                        StatusArgs {
-                                            endpoint: Some(target.host_port()),
-                                            region: Some(short_region_label(target)),
-                                            to_region: None,
-                                            stalled_s: Some(window.as_secs()),
-                                        },
-                                    );
+                                    self.schedule_retry(None, RetryReason::RelaunchFailed);
                                     return;
                                 }
                             },
@@ -1073,6 +1242,7 @@ impl LaneSupervisor {
                                         region: Some(short_region_label(target)),
                                         to_region: None,
                                         stalled_s: Some(window.as_secs()),
+                                        ..Default::default()
                                     },
                                 );
                                 // fall through to the next target
@@ -1082,34 +1252,25 @@ impl LaneSupervisor {
 
                     if !launched {
                         // Every region tried this round failed to (re)build/relaunch — all
-                        // relays are currently unreachable/unhealthy. Land in a clear, honest
-                        // Error (bounded: the budget was charged once, so no restart storm).
-                        // A locked plan keeps its existing single-region give-up wording.
-                        let mut g = self.inner.lock().expect("mutex");
-                        if g.generation != gen {
-                            return;
+                        // relays are currently unreachable/unhealthy. BUG#4: this used to be
+                        // a TERMINAL Error ("restart to retry"), i.e. a relay outage longer
+                        // than one round permanently parked the miner. Arm the escalating
+                        // retry instead — it is still bounded (the delay only grows), but it
+                        // comes back on its own when the relays do.
+                        {
+                            let g = self.inner.lock().expect("mutex");
+                            if g.generation != gen {
+                                return;
+                            }
                         }
-                        g.state = ProcState::Error;
-                        let secs = window.as_secs();
-                        if locked {
-                            g.set_status(
-                                region_retry_message(),
-                                "region_retrying",
-                                StatusArgs {
-                                    stalled_s: Some(secs),
-                                    ..Default::default()
-                                },
-                            );
-                        } else {
-                            g.set_status(
-                                all_regions_unreachable_message(),
-                                "all_regions_unavailable",
-                                StatusArgs {
-                                    stalled_s: Some(secs),
-                                    ..Default::default()
-                                },
-                            );
-                        }
+                        self.schedule_retry(
+                            Some(gen),
+                            if locked {
+                                RetryReason::RelaunchFailed
+                            } else {
+                                RetryReason::AllRegionsDown
+                            },
+                        );
                     }
                     // On a successful relaunch this watchdog's generation is now stale
                     // (spawn_run bumped it) and the NEW run owns its own watchdog; on the
@@ -1152,11 +1313,288 @@ impl LaneSupervisor {
 
     /// Request a graceful stop. The supervision loop performs the actual
     /// SIGTERM→SIGKILL teardown on its next tick; `kill_on_drop` is the backstop.
+    ///
+    /// A Stop issued while the lane is WAITING to auto-restart (BUG#4's backoff) also
+    /// cancels that pending retry and lands the lane in `Stopped` — the user's Stop is
+    /// the one thing that IS terminal, and it must not be silently undone a few minutes
+    /// later by a timer nobody could see.
     pub fn request_stop(&self) {
         let mut g = self.inner.lock().expect("mutex");
         if matches!(g.state, ProcState::Running | ProcState::Starting) {
             g.stop_requested = true;
             g.state = ProcState::Stopping;
+            // Also invalidate any retry armed by an earlier crash in this run.
+            g.retry_token = g.retry_token.wrapping_add(1);
+            g.retry_at = None;
+        } else if g.retry_at.is_some() {
+            g.retry_token = g.retry_token.wrapping_add(1);
+            g.retry_at = None;
+            g.stop_requested = true;
+            g.forced_error = false;
+            g.state = ProcState::Stopped;
+            g.set_freeform(None);
+        }
+    }
+
+    // ── BUG#4: the automatic, never-terminal restart ────────────────────────────
+
+    /// Arm the automatic restart after a crash / stall / failed relaunch.
+    ///
+    /// `gen` is the generation the caller believes it owns; `None` binds to whatever
+    /// the CURRENT generation is (used after `spawn_run` itself failed and already
+    /// bumped it). Takes the next rung off the [`RetryLadder`], publishes the waiting
+    /// status immediately (so the lane is never a silent `Error`), and spawns the task
+    /// that counts down and relaunches.
+    fn schedule_retry(&self, gen: Option<u64>, reason: RetryReason) {
+        let (gen, token, delay, attempt, old_pid) = {
+            let mut g = self.inner.lock().expect("mutex");
+            let gen = match gen {
+                Some(want) if want != g.generation => return, // superseded
+                Some(want) => want,
+                None => g.generation,
+            };
+            let (token, delay, attempt) = arm_retry_locked(&mut g, &reason);
+            g.state = ProcState::Error;
+            g.pid = None;
+            g.started_at = None;
+            (gen, token, delay, attempt, g.last_child_pid)
+        };
+        self.spawn_retry_task(gen, token, delay, attempt, reason, old_pid);
+    }
+
+    /// Spawn the task that counts the armed retry down and relaunches. Split from
+    /// [`Self::schedule_retry`] so a caller that ARMED the retry under its own lock
+    /// (the crash + watchdog paths, where arming must be atomic with the state change)
+    /// can still hand the waiting off here.
+    fn spawn_retry_task(
+        &self,
+        gen: u64,
+        token: u64,
+        delay: Duration,
+        attempt: u32,
+        reason: RetryReason,
+        old_pid: Option<u32>,
+    ) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.retry_after(gen, token, delay, attempt, reason, old_pid).await;
+        });
+    }
+
+    /// Refresh the "waiting to retry" status for `remaining`, unless this retry has been
+    /// superseded (a newer generation / token). Returns `false` when superseded, so the
+    /// countdown loop knows to stop.
+    fn publish_retry_status(
+        &self,
+        gen: u64,
+        token: u64,
+        reason: &RetryReason,
+        remaining: Duration,
+        attempt: u32,
+    ) -> bool {
+        let mut g = self.inner.lock().expect("mutex");
+        if g.generation != gen || g.retry_token != token {
+            return false;
+        }
+        set_retry_status_locked(&mut g, reason, remaining, attempt);
+        true
+    }
+
+    /// Wait out `delay` with a visible, second-by-second countdown, confirm the old
+    /// engine's process tree is really gone, then relaunch. Never gives up: a relaunch
+    /// that fails arms the NEXT (longer) rung instead of parking the lane.
+    async fn retry_after(
+        &self,
+        gen: u64,
+        token: u64,
+        delay: Duration,
+        attempt: u32,
+        reason: RetryReason,
+        old_pid: Option<u32>,
+    ) {
+        let deadline = Instant::now() + delay;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !self.publish_retry_status(gen, token, &reason, remaining, attempt) {
+                return; // superseded by a user Start / Stop, or a newer run
+            }
+            if remaining.is_zero() {
+                break;
+            }
+            // Tick at most once a second so the countdown the user reads is real.
+            tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+        }
+
+        // ⑤ Job Object / process-group teardown is only half the contract — the other
+        // half is not spawning until it has actually taken effect. Confirm the old
+        // engine pid is gone before we put another one on the same GPU.
+        if let Some(pid) = old_pid {
+            if !await_child_gone(pid).await {
+                log_verbose("retry deferred", &format!("engine pid {pid} still alive"));
+                self.reschedule_retry(gen, token, RetryReason::EngineStillAlive);
+                return;
+            }
+        }
+
+        // Rebuild the argv when we can: a GPU-PRL launch plan carries a region-bound
+        // PoP token, so replaying the old argv after a long backoff would be rejected
+        // by the relay. Fall back to the last plan for a `start_simple` lane.
+        let plan = {
+            let g = self.inner.lock().expect("mutex");
+            if g.generation != gen || g.retry_token != token {
+                return;
+            }
+            match g.rebuild.clone() {
+                Some(rebuild) => Ok((rebuild, g.endpoint_plan.ordered_from_cursor())),
+                None => Err(g.last_launch.clone()),
+            }
+        };
+        let launch = match plan {
+            Ok((rebuild, order)) => match rebuild(&order) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    log_verbose("retry plan rebuild failed", &e);
+                    None
+                }
+            },
+            Err(last) => last,
+        };
+        let Some((program, args)) = launch else {
+            self.reschedule_retry(gen, token, RetryReason::RelaunchFailed);
+            return;
+        };
+
+        // FINAL gate, immediately before the spawn. The rebuild above performs a real
+        // network handshake and can take seconds; a user Start landing in that window
+        // would already have bumped the generation/token, and an automatic restart must
+        // never stack a second engine on top of it.
+        {
+            let g = self.inner.lock().expect("mutex");
+            if g.generation != gen || g.retry_token != token || g.state.is_active() {
+                return;
+            }
+        }
+        // `is_failover = true`: keep the user's cumulative session shares across an
+        // automatic restart (the rig kept mining; only the engine process is new) and
+        // skip the "already running" guard — we know it is not.
+        if let Err(e) = self.spawn_run(program, args, true) {
+            log_verbose("retry spawn failed", &e);
+            // `spawn_run` bumped the generation on its way out, so bind to the current
+            // one and arm the next rung. Still never terminal.
+            self.schedule_retry(None, RetryReason::RelaunchFailed);
+        }
+    }
+
+    /// Arm the NEXT rung after a retry attempt could not even launch. Guarded on the
+    /// same `(gen, token)` the attempt owned, so a user Start/Stop that landed while we
+    /// were probing wins.
+    fn reschedule_retry(&self, gen: u64, token: u64, reason: RetryReason) {
+        {
+            let g = self.inner.lock().expect("mutex");
+            if g.generation != gen || g.retry_token != token {
+                return;
+            }
+        }
+        self.schedule_retry(Some(gen), reason);
+    }
+}
+
+/// Arm the next automatic retry **under the caller's lock**, so the moment the lane
+/// can be observed as `Error` it ALREADY carries "retrying in N". (Arming afterwards
+/// left a window in which a poll saw a bare, hopeless-looking Error — exactly the
+/// experience BUG#4 is about.) Consumes one rung of the ladder and publishes the
+/// status. Returns `(token, delay, attempt)` for the waiting task.
+fn arm_retry_locked(g: &mut Inner, reason: &RetryReason) -> (u64, Duration, u32) {
+    let (ladder_delay, attempt) = g.retry_ladder.next_backoff();
+    let delay = g.retry_backoff_override.unwrap_or(ladder_delay);
+    g.retry_token = g.retry_token.wrapping_add(1);
+    g.retry_at = Some(Instant::now() + delay);
+    set_retry_status_locked(g, reason, delay, attempt);
+    (g.retry_token, delay, attempt)
+}
+
+/// Write the retry status (message + machine key + args) into `g`. Caller holds the lock
+/// and has already checked the generation/token.
+fn set_retry_status_locked(g: &mut Inner, reason: &RetryReason, remaining: Duration, attempt: u32) {
+    let crashes = g.crashes;
+    let args = StatusArgs {
+        endpoint: Some(g.endpoint_plan.current().host_port()),
+        region: Some(short_region_label(g.endpoint_plan.current())),
+        to_region: None,
+        stalled_s: reason.stalled_s(),
+        exit_code: reason.exit_code(),
+        retry_in_s: Some(remaining.as_secs()),
+        attempt: Some(attempt),
+        crashes: (crashes > 0).then_some(crashes),
+    };
+    g.set_status(retry_message(reason, remaining, attempt), reason.key(), args);
+}
+
+/// How long [`await_child_gone`] waits for the previous engine's process tree to
+/// disappear before it stops holding the restart back.
+const CHILD_GONE_BOUND: Duration = Duration::from_secs(10);
+const CHILD_GONE_POLL: Duration = Duration::from_millis(250);
+
+/// Wait (bounded) for the previous engine `pid` to be gone, so an automatic restart can
+/// never stack a second engine on the same GPU. `true` ⇒ clear to relaunch.
+///
+/// The decision is asymmetric on purpose:
+///   * `Dead` — clear immediately (the normal path: the child was reaped and, on
+///     Windows, its kill-on-close Job Object went with the dropped handle);
+///   * `Alive` — keep waiting, and if it is STILL provably alive when the bound
+///     elapses, refuse: two engines is worse than a late restart;
+///   * `Unknown` — wait out the full bound, then proceed. Refusing forever on a box
+///     whose liveness probe never answers would recreate the exact "never recovers"
+///     failure this whole fix exists to remove, and we would be blocking on a guess.
+async fn await_child_gone(pid: u32) -> bool {
+    let ticks = (CHILD_GONE_BOUND.as_millis() / CHILD_GONE_POLL.as_millis()).max(1);
+    for _ in 0..ticks {
+        if crate::proc::liveness_settled(pid) == crate::proc::Liveness::Dead {
+            return true;
+        }
+        tokio::time::sleep(CHILD_GONE_POLL).await;
+    }
+    crate::proc::liveness_settled(pid) != crate::proc::Liveness::Alive
+}
+
+/// Why an automatic restart is pending. Drives the status key + wording, and carries
+/// the one machine fact a front-end needs to explain it in its own language (the raw
+/// engine exit code / the stall window) — never a pre-baked sentence.
+#[derive(Debug, Clone, Copy)]
+enum RetryReason {
+    /// The engine child exited on its own with this code (a crash, or a self-exit).
+    EngineExit(i32),
+    /// The Layer-B watchdog saw no progress for N seconds and spent its fast budget.
+    Stalled(u64),
+    /// Every region failed to (re)build/relaunch in one failover round.
+    AllRegionsDown,
+    /// A relaunch attempt could not be built or spawned at all.
+    RelaunchFailed,
+    /// The previous engine's process tree was still alive at retry time, so the
+    /// relaunch was deliberately deferred rather than risk two engines on one GPU.
+    EngineStillAlive,
+}
+
+impl RetryReason {
+    fn key(self) -> &'static str {
+        match self {
+            RetryReason::EngineExit(_) => "engine_crashed_retrying",
+            RetryReason::Stalled(_) => "stall_retrying",
+            RetryReason::AllRegionsDown => "all_regions_retrying",
+            RetryReason::RelaunchFailed => "relaunch_retrying",
+            RetryReason::EngineStillAlive => "engine_still_alive_retrying",
+        }
+    }
+    fn exit_code(self) -> Option<i32> {
+        match self {
+            RetryReason::EngineExit(c) => Some(c),
+            _ => None,
+        }
+    }
+    fn stalled_s(self) -> Option<u64> {
+        match self {
+            RetryReason::Stalled(s) => Some(s),
+            _ => None,
         }
     }
 }
@@ -1164,8 +1602,16 @@ impl LaneSupervisor {
 /// What the watchdog decided to do this tick (computed under the lock, executed
 /// after releasing it).
 enum WatchAction {
-    /// Budget exhausted — the lane was put into `Error`; stop watching.
-    GiveUp,
+    /// The fast failover budget is spent. The child is torn down and the lane hands
+    /// over to the escalating retry ladder — it does NOT stop for good (BUG#4). The
+    /// retry is ARMED under the decision lock (so `Error` and "retrying in N" become
+    /// visible together); these fields carry it to the waiting task.
+    GiveUp {
+        reason: RetryReason,
+        token: u64,
+        delay: Duration,
+        attempt: u32,
+    },
     /// A stall with budget remaining. The post-lock stage pre-flights `candidates`
     /// (after `backoff`), then tries to relaunch on them in a RECOVERY order —
     /// reachable-first, remembered `last_good` first — advancing to the NEXT region
@@ -1349,14 +1795,172 @@ fn region_resumed_status(to: &Endpoint, window: Duration) -> String {
 }
 
 /// The status shown when EVERY region failed to (re)build/relaunch in one failover round
-/// — all relays are currently unreachable/unhealthy — so the lane lands in a clear Error
-/// rather than silently claiming to keep retrying. Honest + actionable + bilingual.
+/// — all relays are currently unreachable/unhealthy. Honest + bilingual. It no longer
+/// says "restart to retry": since BUG#4 the lane retries by itself, and the caller
+/// appends the countdown ([`retry_message`]), so telling the user to intervene would be
+/// a lie in the other direction.
 fn all_regions_unreachable_message() -> String {
     crate::tr!(
-        "All region relays are temporarily unavailable; the lane stopped — restart to retry",
-        "所有区域节点暂时不可用;通道已停止 — 请重新启动重试"
+        "all region relays are temporarily unavailable",
+        "所有区域节点暂时不可用"
     )
     .to_string()
+}
+
+// ── BUG#4: the "waiting to restart" wording ─────────────────────────────────────
+
+/// A short, localized delay ("45s" / "5m" / "1m 30s"). Used in the retry countdown, so
+/// a waiting lane always answers the only question the user has: *when*.
+fn human_delay(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        return crate::tr!(format!("{s}s"), format!("{s} 秒"));
+    }
+    let (m, r) = (s / 60, s % 60);
+    if r == 0 {
+        crate::tr!(format!("{m}m"), format!("{m} 分钟"))
+    } else {
+        crate::tr!(format!("{m}m {r}s"), format!("{m} 分 {r} 秒"))
+    }
+}
+
+/// Render an engine exit code the way the platform wrote it: a Windows NTSTATUS
+/// (`0xC0000374`) in hex, an ordinary status in decimal. The hex form is what the
+/// user will find in Event Viewer / a web search, so it must match.
+fn fmt_exit_code(code: i32) -> String {
+    let raw = code as u32;
+    if raw >= 0x8000_0000 {
+        format!("0x{raw:08X}")
+    } else {
+        code.to_string()
+    }
+}
+
+/// Translate an engine exit code into a plain-language cause, when we know one.
+///
+/// **Why this is worth code.** The reported failure carried `state: error` and nothing
+/// else; the miner had no way to tell "Alice broke" from "the third-party engine
+/// aborted itself". `0xC0000374` is Windows' heap-corruption abort raised *inside*
+/// SRBMiner — the user can neither cause nor fix it, and we should say so plainly
+/// instead of showing a bare number. `None` for a code we have no honest explanation
+/// for: we print the raw code rather than invent a story about it.
+///
+/// Covers the Windows NTSTATUS aborts a mining engine actually hits, plus the
+/// `128 + signal` shell convention for the unix side.
+pub fn exit_code_explanation(code: i32) -> Option<String> {
+    let third_party = crate::tr!(
+        " — a fault inside the third-party mining engine, not in Alice",
+        "(第三方挖矿引擎自身的缺陷,不是 Alice 的问题)"
+    );
+    let s = match code as u32 {
+        0xC000_0374 => crate::tr!(
+            format!("heap corruption{third_party}"),
+            format!("堆内存损坏{third_party}")
+        ),
+        0xC000_0005 => crate::tr!(
+            format!("invalid memory access{third_party}"),
+            format!("非法内存访问{third_party}")
+        ),
+        0xC000_0409 => crate::tr!(
+            format!("stack buffer overrun{third_party}"),
+            format!("栈缓冲区溢出{third_party}")
+        ),
+        0xC000_00FD => crate::tr!(
+            format!("stack overflow{third_party}"),
+            format!("栈溢出{third_party}")
+        ),
+        0xC000_001D => crate::tr!(
+            "illegal instruction — the engine build may not match this CPU/GPU".to_string(),
+            "非法指令 —— 该引擎版本可能与此 CPU/GPU 不匹配".to_string()
+        ),
+        0xC000_0094 => crate::tr!(
+            format!("integer divide by zero{third_party}"),
+            format!("整数除以零{third_party}")
+        ),
+        0xC000_0135 | 0xC000_0139 => crate::tr!(
+            "a required system library is missing — reinstall the engine / the Visual C++ runtime"
+                .to_string(),
+            "缺少所需的系统库 —— 请重新安装引擎或 Visual C++ 运行库".to_string()
+        ),
+        0xC000_013A | 0x4001_0005 => crate::tr!(
+            "terminated by Ctrl-C / a console close".to_string(),
+            "被 Ctrl-C 或控制台关闭终止".to_string()
+        ),
+        _ => return unix_signal_explanation(code),
+    };
+    Some(s)
+}
+
+/// The unix side of [`exit_code_explanation`]: a shell reports a signal death as
+/// `128 + signal`, and a child we could not read a code from at all comes back as `-1`.
+fn unix_signal_explanation(code: i32) -> Option<String> {
+    let s = match code {
+        134 => crate::tr!("aborted (SIGABRT)".to_string(), "被中止(SIGABRT)".to_string()),
+        139 => crate::tr!(
+            "segmentation fault (SIGSEGV)".to_string(),
+            "段错误(SIGSEGV)".to_string()
+        ),
+        137 => crate::tr!(
+            "killed (SIGKILL) — often the OS out-of-memory killer".to_string(),
+            "被强制杀死(SIGKILL)—— 常见于系统内存不足".to_string()
+        ),
+        136 => crate::tr!(
+            "floating-point exception (SIGFPE)".to_string(),
+            "浮点异常(SIGFPE)".to_string()
+        ),
+        132 => crate::tr!(
+            "illegal instruction (SIGILL)".to_string(),
+            "非法指令(SIGILL)".to_string()
+        ),
+        -1 => crate::tr!(
+            "terminated by a signal (no exit code was reported)".to_string(),
+            "被信号终止(没有退出码)".to_string()
+        ),
+        _ => return None,
+    };
+    Some(s)
+}
+
+/// The cause half of a crash retry status: what the engine did, in plain language.
+fn engine_exit_cause(code: i32) -> String {
+    let shown = fmt_exit_code(code);
+    match exit_code_explanation(code) {
+        Some(why) => crate::tr!(
+            format!("the mining engine crashed: {why} (exit code {shown})"),
+            format!("挖矿引擎崩溃:{why}(退出码 {shown})")
+        ),
+        None => crate::tr!(
+            format!("the mining engine exited unexpectedly (exit code {shown})"),
+            format!("挖矿引擎意外退出(退出码 {shown})")
+        ),
+    }
+}
+
+/// The FULL, localized status line for a pending automatic restart: what happened, and
+/// when the next attempt is. Both halves are mandatory — the whole point of BUG#4's fix
+/// is that a stopped lane can never again be silent about either.
+fn retry_message(reason: &RetryReason, remaining: Duration, attempt: u32) -> String {
+    let when = human_delay(remaining);
+    let cause = match reason {
+        RetryReason::EngineExit(code) => engine_exit_cause(*code),
+        RetryReason::Stalled(secs) => crate::tr!(
+            format!("no progress for {secs}s on this endpoint"),
+            format!("该节点已 {secs}s 无进展")
+        ),
+        RetryReason::AllRegionsDown => all_regions_unreachable_message(),
+        RetryReason::RelaunchFailed => crate::tr!(
+            "the mining engine could not be relaunched".to_string(),
+            "挖矿引擎无法重新启动".to_string()
+        ),
+        RetryReason::EngineStillAlive => crate::tr!(
+            "the previous engine process has not exited yet".to_string(),
+            "上一个引擎进程尚未退出".to_string()
+        ),
+    };
+    crate::tr!(
+        format!("{cause} — restarting automatically in {when} (attempt {attempt})"),
+        format!("{cause} —— 将在 {when}后自动重启(第 {attempt} 次尝试)")
+    )
 }
 
 /// The user-facing status for a LOCKED / single-endpoint plan that is NOT a PRL
@@ -1445,8 +2049,51 @@ pub fn status_short(key: &str, args: &StatusArgs) -> String {
             "No progress · stopped to avoid a restart storm".to_string(),
             "长时间无进展 · 已停止以避免频繁重启".to_string()
         ),
+        // ── BUG#4: a lane that is WAITING to restart itself ─────────────────────
+        "engine_crashed_retrying" => {
+            let when = human_delay(Duration::from_secs(args.retry_in_s.unwrap_or(0)));
+            crate::tr!(
+                format!("Engine crashed · retrying in {when}"),
+                format!("引擎崩溃 · {when}后重试")
+            )
+        }
+        "stall_retrying" => {
+            let when = human_delay(Duration::from_secs(args.retry_in_s.unwrap_or(0)));
+            crate::tr!(
+                format!("No progress · retrying in {when}"),
+                format!("无进展 · {when}后重试")
+            )
+        }
+        "all_regions_retrying" => {
+            let when = human_delay(Duration::from_secs(args.retry_in_s.unwrap_or(0)));
+            crate::tr!(
+                format!("All relays unavailable · retrying in {when}"),
+                format!("所有中继不可用 · {when}后重试")
+            )
+        }
+        "relaunch_retrying" | "engine_still_alive_retrying" => {
+            let when = human_delay(Duration::from_secs(args.retry_in_s.unwrap_or(0)));
+            crate::tr!(
+                format!("Could not relaunch · retrying in {when}"),
+                format!("重启未成功 · {when}后重试")
+            )
+        }
         _ => String::new(),
     }
+}
+
+/// Is this status key one of the BUG#4 "an automatic restart is pending" family? A
+/// front-end can use it to render a WAITING look (a countdown) rather than a dead
+/// error, without hard-coding the key list.
+pub fn status_is_retrying(key: &str) -> bool {
+    matches!(
+        key,
+        "engine_crashed_retrying"
+            | "stall_retrying"
+            | "all_regions_retrying"
+            | "relaunch_retrying"
+            | "engine_still_alive_retrying"
+    )
 }
 
 /// The FULL, localized tooltip for a status key — the complete endpoint + the honest
@@ -1467,6 +2114,35 @@ pub fn status_tooltip(key: &str, args: &StatusArgs) -> Option<String> {
             format!("No progress for {secs}s — switched to {to}."),
             format!("已 {secs}s 无进展 —— 已切换到 {to}。")
         )),
+        // ── BUG#4: the full story behind a pending automatic restart ────────────
+        "engine_crashed_retrying" => {
+            let code = args.exit_code.unwrap_or(0);
+            let when = human_delay(Duration::from_secs(args.retry_in_s.unwrap_or(0)));
+            let attempt = args.attempt.unwrap_or(1);
+            let mut s = crate::tr!(
+                format!("{}. Restarting automatically in {when} (attempt {attempt}).", engine_exit_cause(code)),
+                format!("{}。将在 {when}后自动重启(第 {attempt} 次尝试)。", engine_exit_cause(code))
+            );
+            if let Some(n) = args.crashes.filter(|n| *n > 1) {
+                s.push_str(&crate::tr!(
+                    format!(" The engine has crashed {n} times since this run started."),
+                    format!(" 本次运行以来引擎已崩溃 {n} 次。")
+                ));
+            }
+            Some(s)
+        }
+        key if status_is_retrying(key) => {
+            let when = human_delay(Duration::from_secs(args.retry_in_s.unwrap_or(0)));
+            let attempt = args.attempt.unwrap_or(1);
+            Some(crate::tr!(
+                format!(
+                    "Mining stopped on {ep}. The miner is retrying by itself in {when} (attempt {attempt}) — no action needed; use Stop if you want it to stay stopped."
+                ),
+                format!(
+                    "{ep} 上的挖矿已停止。矿工会在 {when}后自动重试(第 {attempt} 次尝试)—— 无需手动操作;若希望保持停止,请点击停止。"
+                )
+            ))
+        }
         _ => None,
     }
 }
@@ -1503,6 +2179,7 @@ pub fn status_from_legacy(msg: &str) -> Option<(String, StatusArgs)> {
                 region: Some(region),
                 to_region: None,
                 stalled_s: secs,
+                ..Default::default()
             },
         ));
     }
@@ -2078,9 +2755,8 @@ pub fn parse_share_counts(line: &str) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Only the `#[cfg(unix)]` failover tests below use these atomics (Windows skips
-    // those tests → the import would be unused there under `-D warnings`).
-    #[cfg(unix)]
+    // Used by the failover tests (unix-only — they script `/bin/sh`) AND by the
+    // crash-recovery tests, which run on EVERY OS, so this import is never unused.
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -2094,11 +2770,25 @@ mod tests {
     /// `terminal::tests` child-pid test sets that var (under this SAME lock) and asserts on
     /// the file, so an unguarded spawn here would write its own pid into that test's dir and
     /// flake its assertion. Holding `IDENTITY_ENV_LOCK` for the spawn test's duration keeps
-    /// the two from ever overlapping. Gated `#[cfg(unix)]` — the only callers are the unix
-    /// spawn tests, so an unconditional definition would be dead code on Windows (`-D warnings`).
-    #[cfg(unix)]
+    /// the two from ever overlapping. UN-gated: the crash-recovery tests spawn on Windows
+    /// too — BUG#4 was reported on Windows, so its regression tests must actually RUN
+    /// there. A unix-only suite is coverage theatre for a Windows bug.
     fn spawn_env_guard() -> std::sync::MutexGuard<'static, ()> {
         crate::IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A child that exits with `code` as soon as it starts — a "crashing engine" — on
+    /// every OS. `/bin/sh` on unix, `cmd /C` on Windows (both resolve via PATH, which
+    /// the spawned child's env allowlist keeps).
+    /// `cfg!` (not `#[cfg]`) on purpose: BOTH arms are type-checked and compiled on
+    /// EVERY platform, so the Windows path can never rot unnoticed behind a cfg the
+    /// local build never sees — the coverage-theatre trap this fix is meant to avoid.
+    fn crashing_child(code: i32) -> (std::path::PathBuf, Vec<String>) {
+        if cfg!(windows) {
+            (std::path::PathBuf::from("cmd"), vec!["/C".into(), format!("exit {code}")])
+        } else {
+            (std::path::PathBuf::from("/bin/sh"), vec!["-c".into(), format!("exit {code}")])
+        }
     }
 
     /// A no-op rebuild closure for tests that don't exercise failover (keeps the
@@ -2654,14 +3344,16 @@ mod tests {
         });
     }
 
-    #[cfg(unix)]
+    /// An unexpected child exit lands in `Error` — but (BUG#4) an Error that is
+    /// WAITING, not dead: the crash is counted, an automatic restart is armed with a
+    /// visible countdown, and the status says so in words. It must NOT restart-storm
+    /// (the first rung is seconds away, not instant).
     #[test]
-    fn unexpected_exit_lands_in_error_not_restart_loop() {
+    fn unexpected_exit_lands_in_error_and_arms_a_visible_retry() {
         let _env = spawn_env_guard();
         let rt = rt();
         rt.block_on(async {
-            let program = std::path::PathBuf::from("/bin/sh");
-            let args = vec!["-c".into(), "echo starting; exit 1".into()];
+            let (program, args) = crashing_child(1);
             let s = LaneSupervisor::new(Lane::Xmr);
             s.start_simple(program, args).expect("start");
             let mut reached_error = false;
@@ -2674,7 +3366,244 @@ mod tests {
             }
             assert!(reached_error, "unexpected exit should land in Error");
             assert!(!s.is_active());
+
+            // The crash is COUNTED and a retry is ARMED — the old behaviour was a
+            // terminal Error with neither.
+            let st = s.stats();
+            assert_eq!(st.crashes, 1, "the engine crash must be counted");
+            let retry_in = st.retry_in_s.expect("an automatic retry must be armed");
+            assert!(
+                retry_in <= alice_supervise::RETRY_BACKOFF_LADDER[0].as_secs(),
+                "the first rung is the fastest one: {retry_in}s"
+            );
+            // …and it is VISIBLE: a machine key a front-end can render, plus words.
+            assert_eq!(st.message_key.as_deref(), Some("engine_crashed_retrying"));
+            assert!(status_is_retrying(st.message_key.as_deref().unwrap()));
+            let msg = st.message.clone().unwrap_or_default();
+            assert!(
+                msg.contains("restarting automatically"),
+                "the status must announce the pending restart: {msg:?}"
+            );
+            assert_eq!(st.message_args.as_ref().and_then(|a| a.attempt), Some(1));
+
+            // A user Stop while WAITING cancels the retry and is honoured (the user's
+            // Stop is the one terminal action).
+            s.request_stop();
+            let st = s.stats();
+            assert_eq!(st.state, ProcState::Stopped, "Stop wins over a pending retry");
+            assert_eq!(st.retry_in_s, None, "the pending retry is cancelled");
+            // And it STAYS stopped — the timer must not resurrect the lane.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(s.stats().state, ProcState::Stopped);
         });
+    }
+
+    /// THE BUG#4 REGRESSION: an engine that exits on its own is restarted
+    /// automatically — the whole point. A child that dies immediately used to leave
+    /// the lane in a permanent `Error` with SRBMiner gone and the CLI still polling.
+    #[test]
+    fn engine_crash_restarts_automatically() {
+        let _env = spawn_env_guard();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::Xmr);
+            // Shrink the ladder for the test: `set_retry_timing` fixes every rung.
+            s.set_retry_timing(Duration::from_millis(60));
+
+            // Every spawn dies immediately (a "crashing engine"); the rebuild closure
+            // counts the relaunches nobody asked for.
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls2 = calls.clone();
+            let rebuild: RebuildFn = Arc::new(move |_eps: &[Endpoint]| {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                Ok(crashing_child(3))
+            });
+            let (program, args) = crashing_child(3);
+            s.start(program, args, rebuild).expect("start");
+
+            // It comes BACK by itself, more than once — no user action anywhere.
+            let mut relaunches = 0;
+            for _ in 0..200 {
+                relaunches = calls.load(Ordering::SeqCst);
+                if relaunches >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                relaunches >= 2,
+                "the engine must be restarted automatically after it exits (got {relaunches})"
+            );
+            assert!(s.engine_crashes() >= 2, "every crash is counted");
+
+            s.request_stop();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+    }
+
+    /// Repeated crashes ESCALATE the wait instead of giving up: the armed delay grows
+    /// (and never becomes "never"). This is the "back off, don't stop" contract.
+    #[test]
+    fn repeated_crashes_back_off_instead_of_giving_up() {
+        let _env = spawn_env_guard();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::Xmr);
+            // The real ladder would take an hour to walk; the rung VALUES are asserted in
+            // `alice_supervise`, so here we only prove the level keeps rising and that a
+            // retry is always armed.
+            s.set_retry_timing(Duration::from_millis(40));
+            let rebuild: RebuildFn = Arc::new(move |_eps: &[Endpoint]| Ok(crashing_child(7)));
+            let (program, args) = crashing_child(7);
+            s.start(program, args, rebuild).expect("start");
+
+            // Let it crash well past the OLD give-up point (MAX_RESTARTS = 3).
+            let mut crashes = 0;
+            for _ in 0..300 {
+                crashes = s.engine_crashes();
+                if crashes > alice_supervise::MAX_RESTARTS as u64 + 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            assert!(
+                crashes > alice_supervise::MAX_RESTARTS as u64,
+                "retries must continue past the old fixed budget (got {crashes})"
+            );
+            // A retry is STILL armed — there is no terminal state without a next step.
+            let st = s.stats();
+            assert!(
+                st.retry_in_s.is_some() || st.state == ProcState::Running || st.state == ProcState::Starting,
+                "the lane is either mining or waiting to retry — never silently dead: {st:?}"
+            );
+            let attempt = st.message_args.as_ref().and_then(|a| a.attempt).unwrap_or(0);
+            assert!(
+                st.retry_in_s.is_none() || attempt > 1,
+                "the attempt counter escalates with each retry"
+            );
+
+            s.request_stop();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+    }
+
+    /// The engine's process tree must be CONFIRMED gone before a restart puts another
+    /// engine on the same GPU (the Job Object / process-group teardown is only half the
+    /// contract). `await_child_gone` answers `true` only for a positively-dead pid.
+    #[test]
+    fn retry_waits_for_the_old_process_tree_to_be_gone() {
+        let rt = rt();
+        rt.block_on(async {
+            // A pid that cannot exist → positively Dead → cleared to relaunch.
+            assert!(
+                await_child_gone(u32::MAX - 1).await,
+                "a pid that is positively gone clears the relaunch"
+            );
+            // OUR OWN pid is alive → the probe must NOT clear a relaunch. (Bounded: the
+            // helper polls for a few seconds, which is exactly the wait we want.)
+            let me = std::process::id();
+            let t0 = std::time::Instant::now();
+            assert!(
+                !await_child_gone(me).await,
+                "a still-live engine must block the relaunch, not be assumed dead"
+            );
+            assert!(t0.elapsed() >= Duration::from_secs(1), "it actually waited");
+        });
+    }
+
+    /// Exit codes become plain language (④): the reported SRBMiner heap-corruption
+    /// abort names itself, is attributed to the third-party engine, and prints the hex
+    /// form the user will see in Event Viewer. A code we have no honest explanation for
+    /// stays a bare number — we never invent a cause.
+    #[test]
+    fn crash_exit_codes_are_translated_into_plain_language() {
+        let _g = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+
+        const HEAP_CORRUPTION: i32 = 0xC000_0374u32 as i32;
+        let en = exit_code_explanation(HEAP_CORRUPTION).expect("0xC0000374 is explained");
+        assert!(en.to_lowercase().contains("heap corruption"), "{en:?}");
+        assert!(en.contains("third-party"), "attributed to the engine, not Alice: {en:?}");
+        assert!(!has_cjk(&en));
+        // The rendered code is the hex form (what a web search / Event Viewer shows).
+        assert_eq!(fmt_exit_code(HEAP_CORRUPTION), "0xC0000374");
+        assert!(engine_exit_cause(HEAP_CORRUPTION).contains("0xC0000374"));
+        // An ordinary status stays decimal.
+        assert_eq!(fmt_exit_code(1), "1");
+
+        // Other engine-realistic aborts.
+        assert!(exit_code_explanation(0xC000_0005u32 as i32).is_some(), "access violation");
+        assert!(exit_code_explanation(0xC000_0409u32 as i32).is_some(), "stack overrun");
+        assert!(exit_code_explanation(0xC000_0135u32 as i32).is_some(), "missing DLL");
+        // The unix `128 + signal` convention.
+        assert!(exit_code_explanation(139).unwrap().contains("SIGSEGV"));
+        assert!(exit_code_explanation(134).unwrap().contains("SIGABRT"));
+        assert!(exit_code_explanation(-1).is_some(), "signal death with no code");
+        // No invention for a code we do not know.
+        assert_eq!(exit_code_explanation(3), None);
+        assert!(engine_exit_cause(3).contains("exited unexpectedly"));
+
+        // ZH renders too, and carries no English cause text.
+        crate::i18n::set_lang(crate::i18n::Lang::Zh);
+        let zh = exit_code_explanation(HEAP_CORRUPTION).expect("zh");
+        assert!(has_cjk(&zh), "{zh:?}");
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+    }
+
+    /// Healthy mining buys retry budget back (③): the elapsed-progress time of a run is
+    /// credited to BOTH the fast budget and the escalating ladder, so a rig that mined
+    /// for hours before one crash retries fast instead of inheriting an old escalation.
+    #[test]
+    fn healthy_mining_time_restores_the_retry_budget() {
+        use alice_supervise::HEALTHY_RUN_STEP;
+        let s = LaneSupervisor::new(Lane::Xmr);
+        {
+            let mut g = s.inner.lock().unwrap();
+            // Escalate: three retries armed, fast budget spent.
+            for _ in 0..3 {
+                g.retry_ladder.next_backoff();
+                g.restart_policy.record(Instant::now());
+            }
+            assert_eq!(g.retry_ladder.level(), 3);
+            assert!(!g.restart_policy.may_restart(Instant::now()));
+
+            // A run that made NO progress buys nothing…
+            g.retry_ladder.credit_healthy_run(Duration::from_secs(0));
+            g.restart_policy.credit_healthy_run(Duration::from_secs(0));
+            assert_eq!(g.retry_ladder.level(), 3, "no progress, no refund");
+
+            // …but 20 minutes of real mining walks both back by two steps.
+            g.retry_ladder.credit_healthy_run(HEALTHY_RUN_STEP * 2);
+            g.restart_policy.credit_healthy_run(HEALTHY_RUN_STEP * 2);
+            assert_eq!(g.retry_ladder.level(), 1);
+            assert!(g.restart_policy.may_restart(Instant::now()), "budget re-armed");
+        }
+    }
+
+    /// The healthy-run credit is measured from real PROGRESS, not mere uptime: a lane
+    /// whose process stayed up for hours without landing a single share earns nothing.
+    #[test]
+    fn healthy_credit_counts_progress_not_uptime() {
+        let s = LaneSupervisor::new(Lane::Xmr);
+        let mut g = s.inner.lock().unwrap();
+        let start = Instant::now() - Duration::from_secs(3 * 3600);
+        g.started_at = Some(start);
+        // No progress since the run began → `last_progress_at` is still the start mark.
+        g.last_progress_at = Some(start);
+        let healthy = g
+            .last_progress_at
+            .zip(g.started_at)
+            .map(|(p, s)| p.saturating_duration_since(s))
+            .unwrap_or_default();
+        assert_eq!(healthy, Duration::ZERO, "3h of dead uptime is 0 healthy time");
+        // A share landed an hour in → one hour of healthy mining.
+        g.last_progress_at = Some(start + Duration::from_secs(3600));
+        let healthy = g
+            .last_progress_at
+            .zip(g.started_at)
+            .map(|(p, s)| p.saturating_duration_since(s))
+            .unwrap_or_default();
+        assert_eq!(healthy, Duration::from_secs(3600));
     }
 
     /// CRASH ISOLATION (the M4 gate): two supervised children in their OWN
@@ -2880,10 +3809,20 @@ mod tests {
                 "relaunches must be bounded by the budget (no restart storm)"
             );
             // The error message explains the bounded-failover stop.
-            let msg = s.stats().message.unwrap_or_default();
+            let st = s.stats();
+            let msg = st.message.clone().unwrap_or_default();
             assert!(
-                msg.contains("budget is exhausted") || msg.contains("no progress"),
+                msg.contains("no progress"),
                 "Error message should explain the bounded failover: {msg:?}"
+            );
+            // BUG#4: exhausting the FAST budget backs off — it does not give up. The
+            // lane is waiting on the escalating ladder with a visible countdown, and
+            // says so, instead of the old silent terminal Error.
+            assert_eq!(st.message_key.as_deref(), Some("stall_retrying"));
+            assert!(st.retry_in_s.is_some(), "a long-backoff retry must be armed");
+            assert!(
+                msg.contains("restarting automatically"),
+                "the status must announce the pending restart: {msg:?}"
             );
 
             // Settle into Error and stay there — no further rotation (assert the
@@ -3152,6 +4091,10 @@ mod tests {
             region: Some("US".into()),
             to_region: Some("ASIA".into()),
             stalled_s: Some(600),
+            exit_code: Some(-1073740940), // 0xC0000374
+            retry_in_s: Some(300),
+            attempt: Some(4),
+            crashes: Some(3),
         };
         let keys = [
             "region_locked_no_failover",
@@ -3161,6 +4104,12 @@ mod tests {
             "region_retrying",
             "all_regions_unavailable",
             "budget_exhausted",
+            // BUG#4: the "an automatic restart is pending" family.
+            "engine_crashed_retrying",
+            "stall_retrying",
+            "all_regions_retrying",
+            "relaunch_retrying",
+            "engine_still_alive_retrying",
         ];
         crate::i18n::set_lang(crate::i18n::Lang::En);
         for k in keys {
@@ -3309,8 +4258,9 @@ mod tests {
 
     /// (b): REGION LOCK. A locked / single-region plan never auto-fails-over to
     /// another region — the watchdog RETRIES the same region in place (bounded by the
-    /// restart budget), labels the status as a locked retry, and eventually lands in a
-    /// clear Error, all with the failover counter at 0 (no region ever switched).
+    /// restart budget), labels the status as a locked retry, and once that budget is
+    /// spent hands over to the escalating retry ladder — an `Error` that is still
+    /// WAITING (BUG#4), never a dead end — all with the failover counter at 0.
     #[cfg(unix)]
     #[test]
     fn locked_region_retries_in_place_then_clear_error() {
@@ -3351,6 +4301,14 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             assert!(errored, "a locked region that stays dead must land in a clear Error");
+            // …but an Error with a next step: a retry is armed and named.
+            let st = s.stats();
+            assert!(st.retry_in_s.is_some(), "a locked lane must still retry itself");
+            assert!(
+                status_is_retrying(st.message_key.as_deref().unwrap_or("")),
+                "the status must be one of the retrying family: {:?}",
+                st.message_key
+            );
             assert_eq!(s.failovers(), 0, "a lock must NEVER count a region failover");
             assert!(saw_locked, "the status must label the locked retry at least once");
             assert!(
@@ -3510,9 +4468,10 @@ mod tests {
     }
 
     /// When EVERY region's rebuild fails in one round (all relays' control planes down),
-    /// the auto lane lands in a clear Error with the honest "all regions unavailable"
+    /// the auto lane lands in an Error carrying the honest "all regions unavailable"
     /// status — NOT the "retrying other regions" line (which would be a lie once there
-    /// is nothing left to try) — and it does so bounded (no restart storm).
+    /// is nothing left to try in THIS round) — bounded (no restart storm), and (BUG#4)
+    /// with an automatic retry armed so a relay outage no longer parks the rig forever.
     #[cfg(unix)]
     #[test]
     fn auto_failover_all_regions_unhealthy_lands_clear_error() {
@@ -3553,11 +4512,19 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             assert!(errored, "all-regions-unhealthy must land in a clear Error");
-            let msg = s.stats().message.unwrap_or_default();
+            let st = s.stats();
+            let msg = st.message.clone().unwrap_or_default();
             assert!(
                 msg.contains("unavailable") || msg.contains("不可用"),
-                "the terminal status must be the honest all-regions-unavailable line: {msg:?}"
+                "the status must be the honest all-regions-unavailable line: {msg:?}"
             );
+            // It must NOT tell the user to restart by hand — the lane retries itself.
+            assert!(
+                !msg.contains("restart to retry"),
+                "the lane recovers on its own; the old 'restart to retry' line is a lie now: {msg:?}"
+            );
+            assert_eq!(st.message_key.as_deref(), Some("all_regions_retrying"));
+            assert!(st.retry_in_s.is_some(), "an automatic retry must be armed");
             // Bounded — no restart storm (failovers never counted a phantom switch).
             assert_eq!(s.failovers(), 0, "no region ever actually switched");
 

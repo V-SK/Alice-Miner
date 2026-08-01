@@ -448,7 +448,16 @@ fn status_content(app: &MinerApp) -> (Tone, String, Option<String>) {
         }
         EngineState::Error => {
             if let Some((text, tip)) = app.snapshot.as_ref().and_then(localized_status) {
-                (Tone::Danger, text, tip)
+                // BUG#4: an Error that is WAITING to restart itself is not a dead end —
+                // it reads "retrying in N" and needs no user action, so it gets the Warn
+                // tone. Reserve Danger for an Error with nothing pending.
+                let waiting = app
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| s.message_key.as_deref())
+                    .map(alice_miner_core::supervise::status_is_retrying)
+                    .unwrap_or(false);
+                (if waiting { Tone::Warn } else { Tone::Danger }, text, tip)
             } else {
                 (
                     Tone::Danger,
@@ -1058,6 +1067,7 @@ mod tests {
                 region: Some("HK".into()),
                 to_region: None,
                 stalled_s: Some(600),
+                ..Default::default()
             }),
         );
 

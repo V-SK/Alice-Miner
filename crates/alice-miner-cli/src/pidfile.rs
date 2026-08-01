@@ -76,6 +76,12 @@ pub struct PidGuard {
     /// Whether THIS guard wrote the file (only then do we remove it on drop, so
     /// we never delete another live instance's pid).
     owns: bool,
+    /// The pid of an ALREADY-RUNNING `alice-miner start` we found holding the
+    /// rendezvous, if any. We still run (declining to mine would be worse), but the
+    /// caller must SAY so: two instances on one machine both drive the same engine
+    /// directory, both write telemetry, and `stop` can only reach the first — which
+    /// looks exactly like "stop did nothing" / "my poll rate doubled".
+    other: Option<u32>,
 }
 
 impl PidGuard {
@@ -92,13 +98,48 @@ impl PidGuard {
     /// recorded owner, because stealing the rendezvous from a live miner would be the
     /// worse failure.
     pub fn acquire() -> Self {
-        let owns = match read_pid() {
-            // Someone is (or may be) there → don't steal the rendezvous.
-            Some(pid) if liveness_settled(pid) != Liveness::Dead => false,
-            // No file, or a pid we positively know is gone → take ownership.
-            _ => write_self(),
-        };
-        Self { owns }
+        let (take, other) = classify_owner(read_pid(), std::process::id(), liveness_settled);
+        let owns = if take { write_self() } else { false };
+        Self { owns, other }
+    }
+
+    /// The pid of another LIVE `alice-miner start` that already held the rendezvous
+    /// when we came up, if any. `None` on the normal single-instance path.
+    ///
+    /// Two instances are not blocked (we would rather mine than refuse), but they are
+    /// genuinely harmful and invisible: they share one engine/log directory, each
+    /// mirrors its own telemetry snapshot over the other's, and `alice-miner stop`
+    /// reaches only the recorded one — so the survivor keeps the GPU busy while the UI
+    /// says "stopped". Surfacing the pid turns that into a one-line diagnosis.
+    pub fn other_instance(&self) -> Option<u32> {
+        self.other
+    }
+}
+
+/// The rendezvous decision, pure so the whole table is testable without spawning a
+/// second miner: given the `recorded` pid (if any), our own pid, and a liveness probe,
+/// answer `(take_ownership, other_live_instance)`.
+///
+/// * no file, or a pid we can PROVE is gone ⇒ take it (the stale-file takeover);
+/// * a pid that is (or might be) alive ⇒ yield — stealing from a live miner is the
+///   worse failure;
+/// * a pid we can prove is alive and is NOT us ⇒ additionally report it, because that
+///   is a genuine second instance and the user needs to be told.
+///
+/// `Unknown` deliberately yields WITHOUT reporting: we do not accuse the user of
+/// running two miners on a probe we could not complete.
+fn classify_owner(
+    recorded: Option<u32>,
+    me: u32,
+    probe: impl Fn(u32) -> Liveness,
+) -> (bool, Option<u32>) {
+    match recorded {
+        Some(pid) => match probe(pid) {
+            Liveness::Dead => (true, None),
+            Liveness::Alive if pid != me => (false, Some(pid)),
+            _ => (false, None),
+        },
+        None => (true, None),
     }
 }
 
@@ -367,6 +408,37 @@ mod tests {
         // by `pid_guard_writes_and_cleans_up`.
         std::env::remove_var("ALICE_IDENTITY_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// DUAL-INSTANCE DIAGNOSIS: the rendezvous decision table, including the new
+    /// "another live miner is already here" report. Pure, so every branch is covered on
+    /// every OS without spawning a second miner.
+    #[test]
+    fn classify_owner_reports_a_second_live_instance() {
+        const ME: u32 = 4242;
+        const OTHER: u32 = 909;
+
+        // No file → take it, nothing to report.
+        assert_eq!(classify_owner(None, ME, |_| Liveness::Dead), (true, None));
+        // A pid we can PROVE is gone → stale-file takeover (the Windows bug fix).
+        assert_eq!(classify_owner(Some(OTHER), ME, |_| Liveness::Dead), (true, None));
+        // A LIVE pid that is not us → yield AND report it: this is the second instance
+        // the user needs to hear about.
+        assert_eq!(
+            classify_owner(Some(OTHER), ME, |_| Liveness::Alive),
+            (false, Some(OTHER)),
+            "a second live miner must be surfaced, not silently tolerated"
+        );
+        // The recorded pid is OURS (e.g. a re-acquire) → yield, but that is not a
+        // second instance.
+        assert_eq!(classify_owner(Some(ME), ME, |_| Liveness::Alive), (false, None));
+        // Un-probeable → yield to the recorded owner, but do NOT accuse the user of
+        // running two miners on an answer we never got.
+        assert_eq!(
+            classify_owner(Some(OTHER), ME, |_| Liveness::Unknown),
+            (false, None),
+            "an Unknown probe must not be reported as a second instance"
+        );
     }
 
     /// The guard writes our pid then removes it on drop (no stale pid left).
