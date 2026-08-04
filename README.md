@@ -59,9 +59,16 @@ shasum -a 256 AliceMiner-macos-arm64.zip
 Get-FileHash AliceMiner-windows-x86_64.zip -Algorithm SHA256
 ```
 
-On macOS the app is ad-hoc signed (no paid Apple certificate), so the first launch needs
-**right-click → Open** to get past Gatekeeper. On Windows the CPU engine is fetched on first
-run and may trip Defender's PUA heuristic (see the release notes for the exclusion step).
+On macOS the build is **Apple Silicon only** (`aarch64-apple-darwin`; Intel Macs are not
+supported). **Drag `AliceMiner.app` into `/Applications` before the first launch** — run from
+`~/Downloads` it is App-Translocated to a random read-only path and appears not to start.
+The app is ad-hoc signed (no paid Apple certificate), so the first launch is refused: dismiss
+the dialog, then **System Settings → Privacy & Security → Open Anyway** (macOS 15 Sequoia
+removed the old `right-click → Open` override). Or, once it is in `/Applications`:
+`xattr -dr com.apple.quarantine /Applications/AliceMiner.app`. See
+[`docs/mining-guide.md`](docs/mining-guide.md) for the full macOS section. On Windows the CPU
+engine is fetched on first run and may trip Defender's PUA heuristic (see the release notes
+for the exclusion step).
 
 > **Note:** the release assets above are the **desktop app**. A standalone signed
 > `alice-miner` CLI binary is not yet a separate release artifact — to run the headless CLI

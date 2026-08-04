@@ -346,8 +346,36 @@ alice-miner doctor --json          # machine-readable report
 
 ### macOS
 
-- **Gatekeeper.** The app is ad-hoc signed (no paid Apple Developer certificate), so
-  the first launch needs **right-click → Open**.
+- **Apple Silicon only.** The macOS artifact is `aarch64-apple-darwin` and nothing
+  else — there is no Intel (x86_64) macOS build, and Rosetta does not help (it
+  translates Intel binaries *for* Apple Silicon, not the reverse). On an Intel Mac
+  the app cannot open at all; mine from a Linux or Windows box instead. Minimum
+  macOS 11 Big Sur.
+- **Install it into `/Applications` — this is required.** Unzip
+  `AliceMiner-macos-arm64.zip`, then **drag `AliceMiner.app` into
+  `/Applications`** before the first launch. Launched from `~/Downloads`, a
+  quarantined app is **App-Translocated**: macOS runs it from a randomized
+  read-only mount, which is the usual cause of "it opens and does nothing" and of
+  settings not persisting between launches. Moving the bundle clears translocation.
+- **Gatekeeper.** The app is ad-hoc signed (no paid Apple Developer certificate),
+  so the first launch is refused with "cannot verify the developer". Dismiss that
+  dialog, then **System Settings → Privacy & Security → Open Anyway** (confirm with
+  *Open*). It launches normally from then on. Equivalent one-liner, **after** the
+  app is in `/Applications`:
+
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/AliceMiner.app
+  ```
+
+  > **`right-click → Open` no longer works.** macOS 15 (Sequoia) removed that
+  > Gatekeeper override for apps without a developer certificate. Any guide still
+  > teaching it — including earlier revisions of this one — is out of date; use
+  > Privacy & Security → Open Anyway.
+- **The CLI lives inside the bundle.** There is no separate macOS CLI download:
+
+  ```bash
+  /Applications/AliceMiner.app/Contents/MacOS/alice-miner-cli start --lane xmr
+  ```
 - **App Nap → ~0 H/s.** A hidden window can throttle mining to near zero. The
   packaged app defeats this automatically; a raw CLI binary can be wrapped with
   `caffeinate -dimsu alice-miner start …`.
@@ -564,8 +592,31 @@ alice-miner doctor --lane prl                                  # 含 "companion 
 - **Windows 远程桌面白屏:** 通过 RDP / AnyDesk / TeamViewer / 向日葵 驱动机器时桌面
   应用若开成纯白,见 [`remote-desktop.md`](remote-desktop.md) —— 设
   `ALICE_GUI_RENDERER=wgpu`。无界面 CLI 不受此影响,也是无头矿机的推荐路径。
-- **macOS Gatekeeper:** 应用是 ad-hoc 签名(无付费 Apple 证书),首次启动需**右键 →
-  打开**。
+- **macOS 仅支持 Apple 芯片:** macOS 产物只有 `aarch64-apple-darwin`,没有 Intel
+  (x86_64)构建;Rosetta 也帮不上忙(它是把 Intel 程序翻译到 Apple 芯片上跑,反过来
+  不行)。Intel Mac 上这个 App 根本打不开 —— 请改用 Linux 或 Windows 的机器挖矿。最低
+  系统 macOS 11 Big Sur。
+- **macOS 必须装进 `/Applications`:** 解压 `AliceMiner-macos-arm64.zip` 后,**先把
+  `AliceMiner.app` 拖进 `/Applications`** 再首次打开。若直接从 `~/下载` 打开,带隔离
+  标记的 App 会被 **App Translocation**(应用位置随机化)从一个随机只读挂载点运行 ——
+  这正是「点了没反应」和「设置每次都丢」的常见根因。移动 App 包即可解除。
+- **macOS Gatekeeper:** 应用是 ad-hoc 签名(无付费 Apple 证书),首次启动会被拒绝并提示
+  「无法验证开发者」。关掉该提示,然后打开**系统设置 → 隐私与安全性 → 仍要打开**(再确认
+  一次「打开」),之后即可正常启动。等效的一条命令(**须在 App 已移入 `/Applications`
+  之后**执行):
+
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/AliceMiner.app
+  ```
+
+  > **「右键 → 打开」已经失效。** macOS 15(Sequoia)取消了对无开发者证书 App 的这条
+  > Gatekeeper 捷径。任何仍这样教的文档 —— 包括本文的早期版本 —— 都已过时,请用
+  > 「隐私与安全性 → 仍要打开」。
+- **macOS 的 CLI 就在 App 包里:** 没有单独的 macOS CLI 下载:
+
+  ```bash
+  /Applications/AliceMiner.app/Contents/MacOS/alice-miner-cli start --lane xmr
+  ```
 - **macOS App Nap → 约 0 H/s:** 隐藏窗口会把算力压到近零;打包版自动规避,裸 CLI 可用
   `caffeinate -dimsu alice-miner start …` 包一层。
 - **macOS 上的 PRL / Alpha:** 没有 macOS SRBMiner pearlhash 构建,所以 Apple Silicon
