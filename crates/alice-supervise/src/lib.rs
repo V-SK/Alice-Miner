@@ -232,6 +232,58 @@ pub fn sanitize_log_line(raw: &str) -> String {
     .to_string()
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// AM-SEC-007 — sanitising REMOTE strings before they reach a CLI/UI/log surface
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Default length bound for a remote identifier (`model_id`, `role`, `reason_code`,
+/// `task_id`, …). Generous for any legitimate value, tiny next to a screenful.
+pub const REMOTE_ID_MAX: usize = 96;
+
+/// The characters an identifier coming off the wire may keep. Everything else is
+/// replaced with `?` — including every control character, so an ANSI/OSC escape can
+/// never survive, and including quotes/backticks so a value cannot fake structure in
+/// a rendered line.
+fn remote_id_char_ok(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '+' | '=' | '@' | ' ')
+}
+
+/// Sanitise a remote **identifier** for display: allowlist charset + hard length
+/// bound. Use this for `model_id` / `role` / `reason_code` / `task_id` /
+/// `lease_id` / `entry_point` / `held_out_commitment` — values that are structured
+/// enough to allowlist, and whose exact characters matter to the reader (a hash must
+/// stay a hash, so [`sanitize_log_line`]'s long-hex redaction is deliberately NOT
+/// applied here).
+///
+/// Empty in ⇒ empty out. An over-long value is truncated with `…` so the reader can
+/// see that it was cut rather than silently believing a prefix is the whole value.
+pub fn sanitize_remote_id(raw: &str, max: usize) -> String {
+    let mut out: String = raw
+        .chars()
+        .map(|c| if remote_id_char_ok(c) { c } else { '?' })
+        .collect();
+    if out.chars().count() > max {
+        out = out.chars().take(max).collect::<String>() + "…";
+    }
+    out
+}
+
+/// Sanitise remote **free text** (a server error body, a `message` field) for
+/// display. Delegates to [`sanitize_log_line`] — same ANSI stripping, control-char
+/// removal, long-hex redaction and length bound the engine log panel already uses —
+/// then applies a caller-chosen tighter bound.
+///
+/// Free text is where a hostile body would try to paint a fake "✔ enrolled" over the
+/// real output; stripping ESC + all control chars is what stops that.
+pub fn sanitize_remote_text(raw: &str, max: usize) -> String {
+    let s = sanitize_log_line(raw);
+    if s.chars().count() > max {
+        s.chars().take(max).collect::<String>() + "…"
+    } else {
+        s
+    }
+}
+
 fn strip_ansi(s: &str) -> String {
     // Minimal CSI escape stripper: drop ESC '[' ... terminator.
     let mut out = String::with_capacity(s.len());
@@ -422,6 +474,68 @@ mod tests {
         assert!(s.contains("12345"));
         assert!(s.contains("0xabcd"));
         assert!(!s.contains("[redacted-hex]"));
+    }
+
+    // ── AM-SEC-007: remote strings can never repaint / forge terminal output ──
+
+    /// The concrete attacks a hostile (or MITM'd) control plane would try through a
+    /// `model_id` / `role` / `reason_code`: colour + cursor control to overwrite the
+    /// real status, a CR to rewrite the current line, an OSC-8 hyperlink to a phishing
+    /// site, and a bell. None of it may survive.
+    #[test]
+    fn remote_id_neutralises_terminal_control_payloads() {
+        let attacks = [
+            "glm-4.5\u{1b}[2K\rALL SYSTEMS OK",          // erase-line + CR overwrite
+            "\u{1b}[31mFAILED\u{1b}[0m",                 // colour
+            "\u{1b}]8;;https://evil.tld\u{7}click\u{1b}]8;;\u{7}", // OSC-8 hyperlink
+            "head\u{7}\u{8}\u{0}",                       // bell / backspace / NUL
+            "role\nrole: tail",                          // fake extra dashboard line
+            "a\u{9b}31m",                                // 8-bit CSI
+        ];
+        for a in attacks {
+            let out = sanitize_remote_id(a, REMOTE_ID_MAX);
+            assert!(
+                !out.chars().any(char::is_control),
+                "a control char survived {a:?} → {out:?}"
+            );
+            assert!(!out.contains('\u{1b}') && !out.contains('\u{9b}'), "ESC survived: {out:?}");
+            assert!(!out.contains('\n') && !out.contains('\r'), "line break survived: {out:?}");
+        }
+        // Legitimate identifiers are untouched.
+        for ok in [
+            "GLM-4.5-Air",
+            "head",
+            "train_worker_not_registered",
+            "tasks/humaneval_042.py",
+            "sha256:0123456789abcdef",
+            "cuda:0",
+            "2026-08-04T12:00:00+00:00",
+        ] {
+            assert_eq!(sanitize_remote_id(ok, REMOTE_ID_MAX), ok, "mangled a legit id: {ok}");
+        }
+    }
+
+    #[test]
+    fn remote_id_is_length_bounded_and_says_so() {
+        let out = sanitize_remote_id(&"m".repeat(5000), 32);
+        assert_eq!(out.chars().count(), 33, "32 + the truncation marker");
+        assert!(out.ends_with('…'), "truncation is VISIBLE, not silent: {out}");
+    }
+
+    #[test]
+    fn remote_text_strips_escapes_and_bounds() {
+        // A hostile HTTP error body trying to paint a fake success over the output.
+        let body = "\u{1b}[2J\u{1b}[H{\"reason_code\":\"ok\"}\u{1b}[32m ENROLLED \u{1b}[0m";
+        let out = sanitize_remote_text(body, 200);
+        assert!(!out.contains('\u{1b}'));
+        assert!(!out.chars().any(|c| c.is_control() && c != '\t'));
+        // The words survive — we sanitise, we do not silently swallow the server's
+        // reason (that would be its own kind of dishonesty).
+        assert!(out.contains("reason_code"));
+
+        let out = sanitize_remote_text(&"y".repeat(5000), 64);
+        assert!(out.chars().count() <= 65);
+        assert!(out.ends_with('…'));
     }
 
     #[test]

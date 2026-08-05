@@ -1796,19 +1796,38 @@ mod tests {
     fn credit_line_renders_upgrade_required() {
         let state = alice_miner_core::dashboard::parse_credit_envelope(
             r#"{"found":true,"paid_acu":"0","min_supported_version":"999.0.0",
-                "client_download_url":"https://example.test/dl"}"#,
+                "client_download_url":"https://github.com/V-SK/Alice-Miner/releases/latest"}"#,
         );
         let line = render_credit_line(&state).unwrap();
         assert!(line.to_lowercase().contains("update required"), "names the gate: {line}");
         assert!(line.contains("999.0.0"), "names the required version: {line}");
-        assert!(line.contains("https://example.test/dl"), "names the download URL: {line}");
+        assert!(
+            line.contains("https://github.com/V-SK/Alice-Miner/releases/latest"),
+            "names the download URL: {line}"
+        );
         assert!(!line.contains("shares"), "no count on an upgrade gate: {line}");
+    }
+
+    /// AM-SEC-006 at the RENDER surface: a hostile `client_download_url` never reaches
+    /// the human-readable line — the built-in official page is printed instead.
+    #[test]
+    fn credit_line_never_prints_a_non_allowlisted_download_url() {
+        let state = alice_miner_core::dashboard::parse_credit_envelope(
+            r#"{"found":true,"paid_acu":"0","min_supported_version":"999.0.0",
+                "client_download_url":"https://alice-miner-updates.test/get"}"#,
+        );
+        let line = render_credit_line(&state).unwrap();
+        assert!(
+            !line.contains("alice-miner-updates.test"),
+            "a phishing download URL must never be printed: {line}"
+        );
+        assert!(line.contains(alice_miner_core::dashboard::RELEASES_PAGE_DEFAULT));
     }
 
     // ── Piece 3: the 15% PRL 返还 (credit-only) dashboard line ──────────────────
 
-    /// A legal-shaped masked return wallet for the display block.
-    const PAYOUT_OK: &str = "prl1pexamplewalletexamplewalletexamplewallet";
+    /// A legal-shaped, CHECKSUM-VALID masked return wallet for the display block.
+    const PAYOUT_OK: &str = "prl1pqzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn57kr3mc";
 
     /// A snapshot carrying a populated PRL display block (the engine attaches this
     /// for a PRL-earning lane). `prl_payout` is `#[serde(skip)]` on `Snapshot`, so it

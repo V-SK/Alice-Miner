@@ -471,6 +471,14 @@ impl AssignmentView {
 /// renderer). CREDIT-ONLY: no hashrate, no earnings; the credit-only label mirrors
 /// the rest of the CLI. Pure over its input so a test can assert the honest surface.
 pub fn render_status(s: &AiStatus) -> String {
+    // AM-SEC-007 — the LAST barrier before remote text hits the terminal. Everything
+    // below that originated with the center (`model_id`, `role`, `endpoint`, and any
+    // `last_message` built from a server error body) is stripped of ANSI/OSC escapes
+    // and control characters and length-bounded here, so no control-plane response can
+    // repaint the dashboard, forge a "connected" line, or scroll a warning off screen.
+    // Ingest-time sanitising in `shard.rs` is the primary defence; this is belt.
+    use alice_miner_core::alice_supervise::{sanitize_remote_id, sanitize_remote_text, REMOTE_ID_MAX};
+    let sid = |v: &str| sanitize_remote_id(v, REMOTE_ID_MAX);
     let mut out = String::new();
     out.push_str(&format!(
         "{}\n  {}: {}\n",
@@ -481,14 +489,19 @@ pub fn render_status(s: &AiStatus) -> String {
         tr!("state", "状态"),
         s.state.label()
     ));
-    out.push_str(&format!("  {}: {}\n", tr!("endpoint", "端点"), s.endpoint));
-    out.push_str(&format!("  {}: {}\n", tr!("center", "调度中心"), s.center_url));
+    out.push_str(&format!("  {}: {}\n", tr!("endpoint", "端点"), sid(&s.endpoint)));
+    out.push_str(&format!("  {}: {}\n", tr!("center", "调度中心"), sid(&s.center_url)));
     match &s.assignment {
         Some(a) => {
             out.push_str(&format!(
                 "  {}: model {} · stage {}/{} ({}) · layers [{}:{}]\n",
                 tr!("assignment", "分配"),
-                a.model_id, a.stage_index, a.n_stages, a.role, a.layer_lo, a.layer_hi
+                sid(&a.model_id),
+                a.stage_index,
+                a.n_stages,
+                sid(&a.role),
+                a.layer_lo,
+                a.layer_hi
             ));
         }
         None => out.push_str(&format!(
@@ -515,7 +528,11 @@ pub fn render_status(s: &AiStatus) -> String {
         None => {}
     }
     if let Some(m) = &s.last_message {
-        out.push_str(&format!("  {}: {m}\n", tr!("note", "提示")));
+        out.push_str(&format!(
+            "  {}: {}\n",
+            tr!("note", "提示"),
+            sanitize_remote_text(m, 300)
+        ));
     }
     out
 }
@@ -1028,6 +1045,52 @@ mod tests {
         assert!(s.vram_gb > 0.0, "allow-cpu advertises a positive hint");
         assert!(s.allow_cpu);
         let _ = std::fs::remove_dir_all(&engine);
+    }
+
+    /// AM-SEC-007 at the RENDER surface: even if a hostile string somehow reached an
+    /// `AiStatus` (a future code path that skips the ingest sanitiser), the rendered
+    /// dashboard frame must still contain NO control characters — a control-plane
+    /// response can never repaint the terminal, forge a "serving-ready" line, or hide
+    /// a warning by scrolling it away.
+    #[test]
+    fn render_status_never_emits_terminal_control_sequences() {
+        // ESC / CR / BEL / NUL built from escapes so this source file stays clean.
+        let esc = '\u{1b}';
+        let bel = '\u{7}';
+        let nul = '\u{0}';
+        let s = AiStatus {
+            state: AiState::ServingReady,
+            endpoint: format!("203.0.113.7:29501{esc}[2K\rALL OK"),
+            center_url: format!("https://api.aliceprotocol.org{esc}]8;;https://evil.tld{bel}"),
+            assignment: Some(AssignmentView {
+                model_id: format!("Qwen{esc}[32m"),
+                stage_index: 1,
+                n_stages: 3,
+                layer_lo: 12,
+                layer_hi: 24,
+                role: "middle\nassignment: head".into(),
+            }),
+            session_ready: Some(true),
+            engine_uptime_s: 42,
+            restarts: 0,
+            last_heartbeat_ok: Some(false),
+            last_message: Some(format!("{esc}[2J{esc}[Hheartbeat ok{nul}")),
+        };
+        let out = render_status(&s);
+        assert!(!out.contains(esc), "an ESC reached the terminal: {out:?}");
+        assert!(!out.contains('\u{7}') && !out.contains('\u{0}'), "BEL/NUL reached the terminal");
+        assert!(!out.contains('\r'), "a CR could overwrite the line above: {out:?}");
+        // The frame keeps exactly the lines render_status writes — the injected "\n"
+        // in `role` must not have manufactured an extra dashboard row. (The injected
+        // TEXT may survive as inert characters on its own line; what must not happen
+        // is a NEW line that reads like a real dashboard row.)
+        assert!(
+            !out.lines().any(|l| l.trim_start().starts_with("assignment: head")),
+            "an injected newline forged a dashboard row: {out}"
+        );
+        assert_eq!(out.lines().count(), 9, "exactly the rows render_status writes: {out}");
+        // And it is still an honest frame, not a blanked one.
+        assert!(out.contains("credit-only") && out.contains("FAILED"));
     }
 
     #[test]

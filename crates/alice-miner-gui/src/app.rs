@@ -379,6 +379,12 @@ pub struct MinerApp {
     /// Guards the one-shot lazy load of the stored PRL return address (so we read
     /// the small public pointer file once, not every frame).
     pub prl_payout_loaded: bool,
+    /// AM-SEC-008: a FULL-validated address awaiting the human's explicit "yes, that
+    /// is my address" confirmation. While this is `Some`, the panel shows the address
+    /// **unmasked** (grouped) with Confirm/Cancel and NOTHING has been written to disk
+    /// — the confirmation is what stands between a mistyped wallet and an enroll
+    /// signature that sends the 15% return to a stranger.
+    pub prl_payout_pending: Option<String>,
 
     // ── CLI-in-terminal mining (the GPU-persistence path) ─────────────────────
     /// `Some(lane)` while a headless CLI miner is running in an EXTERNAL terminal we
@@ -520,6 +526,7 @@ impl MinerApp {
             prl_payout_masked: None,
             prl_payout_error: None,
             prl_payout_loaded: false,
+            prl_payout_pending: None,
             terminal_lane: None,
             terminal_telemetry_path: None,
             last_terminal_activity: None,
@@ -548,12 +555,14 @@ impl MinerApp {
         }
     }
 
-    /// Save the PRL return address the user typed in Settings: shape-validate via
-    /// [`alice_miner_core::prl_payout::validate_payout_shape`] (a typo is REJECTED
-    /// inline, never written), then persist with
-    /// [`alice_miner_core::prl_payout::save_payout_address`] and refresh the masked
-    /// display. The address is PUBLIC — fine to store + show masked. An empty field
-    /// is a no-op with a gentle hint (use the CLI `--set-prl-payout` to clear).
+    /// Step 1 of saving the PRL return address the user typed in Settings (AM-SEC-008).
+    /// FULL-validates it (shape **+ bech32m checksum** via
+    /// [`alice_miner_core::prl_payout::validate_payout_address`]) — a one-character typo
+    /// is REJECTED inline and never written — then parks it in
+    /// [`Self::prl_payout_pending`] so the UI can show the **whole, unmasked** address
+    /// for the human to compare before [`Self::confirm_prl_payout`] writes it. Nothing
+    /// touches disk here. An empty field is a no-op with a gentle hint (use the CLI
+    /// `--set-prl-payout` to clear).
     pub fn save_prl_payout(&mut self) {
         use alice_miner_core::prl_payout;
         self.prl_payout_error = None;
@@ -563,17 +572,34 @@ impl MinerApp {
                 Some("Enter your prl1p… return address (or leave it unset to forgo the 15% return).".into());
             return;
         }
-        if let Err(e) = prl_payout::validate_payout_shape(&buf) {
+        if let Err(e) = prl_payout::validate_payout_address(&buf) {
             self.prl_payout_error = Some(e);
+            self.prl_payout_pending = None;
             return;
         }
-        match prl_payout::save_payout_address(&buf) {
+        self.prl_payout_pending = Some(buf);
+    }
+
+    /// Step 2: the human confirmed the full address shown by the pending panel — write
+    /// it. Re-validates (the pending value cannot have changed, but this is the last
+    /// step before the address becomes signable, so it costs nothing to be sure).
+    pub fn confirm_prl_payout(&mut self) {
+        use alice_miner_core::prl_payout;
+        let Some(addr) = self.prl_payout_pending.take() else { return };
+        self.prl_payout_error = None;
+        match prl_payout::save_payout_address(&addr) {
             Ok(_) => {
-                self.prl_payout_masked = Some(prl_payout::mask_payout(&buf));
+                self.prl_payout_masked = Some(prl_payout::mask_payout(&addr));
                 self.form_prl_payout.clear();
             }
             Err(e) => self.prl_payout_error = Some(e),
         }
+    }
+
+    /// Step 2': the human said "that is not my address" — drop the pending value and
+    /// leave the typed text in place so they can fix it. Nothing was written.
+    pub fn cancel_prl_payout(&mut self) {
+        self.prl_payout_pending = None;
     }
 
     /// Lazily query + cache the background-mining service state. Spawns
@@ -3916,9 +3942,11 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
     /// payout tests through this lock so parallel test threads can't race.
     static PRL_PAYOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// `save_prl_payout` shape-validates: a typo shows the inline error and is NEVER
-    /// written; a legal prl1p… address is stored, the masked display updates, and the
-    /// edit field clears. `load_prl_payout` reads it back masked.
+    /// `save_prl_payout` FULL-validates (shape + bech32m checksum, AM-SEC-008): a typo
+    /// shows the inline error and is NEVER written; a valid address is only PARKED for
+    /// confirmation, and nothing reaches disk until `confirm_prl_payout`. After the
+    /// confirmation the masked display updates and the edit field clears;
+    /// `load_prl_payout` reads it back masked.
     #[test]
     fn prl_payout_save_validates_and_masks() {
         let _g = PRL_PAYOUT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -3960,11 +3988,34 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         assert!(app.prl_payout_error.is_some());
         assert!(app.prl_payout_masked.is_none());
 
-        // A legal prl1p… address saves, masks, and clears the field.
-        let good = format!("prl1p{}", "q".repeat(40));
+        // Shape-legal but checksum-INVALID (the one-character-typo case the old
+        // shape-only gate would have accepted, stored, and later SIGNED).
+        app.form_prl_payout = format!("prl1p{}", "q".repeat(40));
+        app.save_prl_payout();
+        assert!(app.prl_payout_error.is_some(), "a bad bech32m checksum is rejected");
+        assert!(app.prl_payout_pending.is_none(), "and never even reaches confirmation");
+        assert!(app.prl_payout_masked.is_none(), "and is never stored");
+
+        // A FULLY valid address is only PARKED — nothing is written until the human
+        // confirms the unmasked address.
+        let good = "prl1pqzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn57kr3mc".to_string();
         app.form_prl_payout = good.clone();
         app.save_prl_payout();
-        assert!(app.prl_payout_error.is_none(), "a legal address saves cleanly");
+        assert!(app.prl_payout_error.is_none(), "a valid address validates cleanly");
+        assert_eq!(app.prl_payout_pending.as_deref(), Some(good.as_str()), "parked for confirmation");
+        assert!(app.prl_payout_masked.is_none(), "NOTHING is written before confirmation");
+        assert_eq!(app.form_prl_payout, good, "the field is untouched until confirmed");
+
+        // Cancelling drops it, still writing nothing and keeping the typed text.
+        app.cancel_prl_payout();
+        assert!(app.prl_payout_pending.is_none());
+        assert!(app.prl_payout_masked.is_none(), "cancel must not write");
+        assert_eq!(app.form_prl_payout, good, "the text stays so the user can fix it");
+
+        // Confirming writes it, masks it, and clears the field.
+        app.save_prl_payout();
+        app.confirm_prl_payout();
+        assert!(app.prl_payout_error.is_none(), "a confirmed address saves cleanly");
         let masked = app.prl_payout_masked.clone().expect("masked value set");
         assert!(masked.starts_with("prl1p") && masked.contains('…'), "shown masked: {masked}");
         assert!(app.form_prl_payout.is_empty(), "the edit field clears after save");

@@ -577,6 +577,55 @@ pub const RELEASES_PAGE_DEFAULT: &str =
 /// `min_supported_version` is omitted.
 pub const REASON_CLIENT_BELOW_MIN: &str = "client_below_min_supported";
 
+// ════════════════════════════════════════════════════════════════════════════
+// AM-SEC-006 — download-URL host allowlist
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The ONLY hosts a server-supplied `client_download_url` may point at. The read
+/// API is a remote party: whatever it returns lands on an "update now" button the
+/// GUI hands straight to the OS browser, so an unconstrained value is a one-hop
+/// route from "read API compromised / MITM'd / misconfigured" to "miner downloads a
+/// trojaned alice-miner from a look-alike site".
+///
+/// Matching is EXACT on the host (no suffix matching — `github.com.evil.tld` and
+/// `notgithub.com` must both fail) and the scheme must be `https`.
+const DOWNLOAD_HOST_ALLOWLIST: &[&str] = &["github.com", "www.github.com"];
+
+/// Accept a server-supplied download URL only if it is `https://` on an exactly
+/// allowlisted host ([`DOWNLOAD_HOST_ALLOWLIST`]); otherwise `None`, and the caller
+/// substitutes [`RELEASES_PAGE_DEFAULT`]. Public so the UI layer can re-check
+/// immediately before handing a URL to the OS browser (defense in depth: the value
+/// travels through a `CreditState` that a future edit could populate elsewhere).
+///
+/// Deliberately a hand-rolled parse (no `url` dep, matching this crate's discipline)
+/// and deliberately strict about the authority: userinfo (`https://github.com@evil`)
+/// is REJECTED outright rather than "handled", because the only thing a legitimate
+/// releases URL ever needs is `host[:port]`.
+pub fn download_url_allowed(raw: &str) -> Option<String> {
+    let url = raw.trim();
+    // Reject control chars/whitespace anywhere (a `\n` could split a rendered line;
+    // a raw ESC could repaint a terminal).
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let rest = url.strip_prefix("https://")?;
+    // authority = everything before the first '/', '?' or '#'.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return None; // no userinfo — the classic "looks like github" trick
+    }
+    // Strip an explicit port; only the default 443 is acceptable for a public page.
+    let host = match authority.rsplit_once(':') {
+        Some((h, "443")) => h,
+        Some(_) => return None,
+        None => authority,
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    DOWNLOAD_HOST_ALLOWLIST
+        .contains(&host.as_str())
+        .then(|| url.to_string())
+}
+
 /// This client's own semantic version (the crate version), used to evaluate the
 /// server's `min_supported_version` floor. Bumping the workspace version bumps this.
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -623,13 +672,15 @@ fn upgrade_gate(env: &CreditEnvelope) -> Option<CreditState> {
     let below_floor = floor.map(|f| !version_meets_min(CLIENT_VERSION, f)).unwrap_or(false);
     if explicit || below_floor {
         let min_supported = floor.unwrap_or(CLIENT_VERSION).to_string();
+        // AM-SEC-006: the server's URL is only used when it is https on an exactly
+        // allowlisted host. Anything else is IGNORED (not surfaced, not clicked) and
+        // we fall back to the built-in official releases page — an upgrade prompt
+        // must never be able to steer a miner to an attacker-chosen download.
         let download_url = env
             .client_download_url
             .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(RELEASES_PAGE_DEFAULT)
-            .to_string();
+            .and_then(download_url_allowed)
+            .unwrap_or_else(|| RELEASES_PAGE_DEFAULT.to_string());
         return Some(CreditState::UpgradeRequired { min_supported, download_url });
     }
     None
@@ -1988,12 +2039,71 @@ mod tests {
         let body = r#"{
             "found": true, "paid_acu": "0",
             "min_supported_version": "999.0.0",
-            "client_download_url": "https://example.test/download"
+            "client_download_url": "https://github.com/V-SK/Alice-Miner/releases/tag/v999.0.0"
         }"#;
         let state = parse_credit_envelope(body);
         let (min, url) = state.upgrade_required().expect("below-floor → UpgradeRequired");
         assert_eq!(min, "999.0.0");
-        assert_eq!(url, "https://example.test/download");
+        assert_eq!(url, "https://github.com/V-SK/Alice-Miner/releases/tag/v999.0.0");
+    }
+
+    // ── AM-SEC-006: the server may not steer the update button off github.com ──
+
+    /// The exact envelope from the audit finding: a hostile/compromised read API hands
+    /// back a phishing download page. It must be IGNORED and replaced by the built-in
+    /// official releases page — the miner must never be pointed at an attacker's site.
+    #[test]
+    fn upgrade_gate_ignores_a_non_allowlisted_download_url() {
+        for hostile in [
+            "https://example.test/download",
+            "https://alice-miner-updates.test/get",
+            // Look-alikes that a naive `contains`/suffix check would wave through.
+            "https://github.com.evil.tld/V-SK/alice-miner/releases",
+            "https://notgithub.com/V-SK/alice-miner/releases",
+            "https://evil.tld/github.com/releases",
+            // Userinfo trick: the authority is `evil.tld`, not github.com.
+            "https://github.com@evil.tld/releases",
+            // Wrong scheme / no scheme / non-web scheme.
+            "http://github.com/V-SK/alice-miner/releases",
+            "github.com/V-SK/alice-miner/releases",
+            "file:///tmp/evil.sh",
+            "javascript:alert(1)",
+            // Odd port on the right host is still not the official page.
+            "https://github.com:8443/V-SK/alice-miner/releases",
+            // Control chars / whitespace.
+            "https://github.com/V-SK\n/releases",
+            " https://evil.tld/x",
+        ] {
+            let body = format!(
+                r#"{{"found":true,"paid_acu":"0","min_supported_version":"999.0.0","client_download_url":{}}}"#,
+                serde_json::to_string(hostile).unwrap()
+            );
+            let state = parse_credit_envelope(&body);
+            let (_min, url) = state.upgrade_required().expect("below-floor → UpgradeRequired");
+            assert_eq!(
+                url, RELEASES_PAGE_DEFAULT,
+                "a non-allowlisted download_url must be ignored: {hostile}"
+            );
+        }
+    }
+
+    /// The allowlist is not so tight that legitimate official URLs break.
+    #[test]
+    fn download_allowlist_accepts_official_github_forms() {
+        for ok in [
+            "https://github.com/V-SK/Alice-Miner/releases/latest",
+            "https://github.com/V-SK/Alice-Miner/releases/download/v0.6.7/alice-miner.zip",
+            "https://www.github.com/V-SK/Alice-Miner/releases",
+            "https://GitHub.com/V-SK/Alice-Miner/releases", // host compare is case-insensitive
+            "https://github.com:443/V-SK/Alice-Miner/releases",
+            RELEASES_PAGE_DEFAULT,
+        ] {
+            assert_eq!(
+                download_url_allowed(ok).as_deref(),
+                Some(ok),
+                "an official URL must survive: {ok}"
+            );
+        }
     }
 
     /// The top-level `client_below_min_supported` reason_code forces `UpgradeRequired`

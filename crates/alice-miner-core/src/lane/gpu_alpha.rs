@@ -35,7 +35,7 @@ use super::gpu_prl::REGION_HOSTS;
 use super::gpu_rvn::GpuLaunchPlan;
 use super::xmr::{derive_worker_id, MINING_EXECUTION_ALLOWED};
 use super::{GpuSelection, Lane};
-use crate::endpoint::{Endpoint, EndpointPlan};
+use crate::endpoint::{Endpoint, EndpointPlan, Transport};
 
 /// Client-facing stratum port for the GPU-Alpha lane on the region relays (the
 /// pearl/v1 transparent-proxy listener, distinct from GPU-PRL's `:3340`).
@@ -161,8 +161,32 @@ pub fn build_alphaminer_launch_plan_for(
     let Some(active) = ordered.first() else {
         return Err("gpu-alpha launch plan needs at least one endpoint".into());
     };
-    let authority = format!("{}:{}", active.host, active.port);
+    let authority = alpha_pool_target(active)?;
     build_alphaminer_launch_plan(program, reward_identity, &authority, placeholder, backend, gpus)
+}
+
+/// The `--pool` value for an [`Endpoint`] on the alpha lane, **transport-aware**.
+///
+/// AM-SEC-001 (partial), and deliberately different from the GPU-PRL lane: the REAL
+/// captured alpha-miner v1.8.3 flags take a BARE `host:port` in `--pool` (there is no
+/// scheme in the argv at all), so there is no verified syntax by which we could ask
+/// alpha-miner for TLS. Rather than invent one — or, as v0.6.7 did, ignore the
+/// declaration and mine in the clear while the config says `tls` — a TLS endpoint is
+/// **refused with an honest reason**. This is a fail-closed no-op today (every shipped
+/// alpha endpoint is [`Transport::Plaintext`], so the argv is byte-identical to
+/// v0.6.7's) and becomes a real capability the day alpha-miner's TLS flag is captured
+/// on a live run, exactly like the relay-side work AM-SEC-001 really needs.
+pub fn alpha_pool_target(ep: &Endpoint) -> Result<String, String> {
+    match ep.transport {
+        Transport::Plaintext => Ok(format!("{}:{}", ep.host, ep.port)),
+        Transport::Tls => Err(format!(
+            "gpu-alpha endpoint {}:{} is declared transport=tls, but alpha-miner's TLS \
+             pool syntax has not been verified against a real run — refusing to mine in \
+             plaintext while the config claims TLS. Use a plaintext endpoint, or run the \
+             GPU-PRL (SRBMiner) lane, which does speak stratum+ssl://.",
+            ep.host, ep.port
+        )),
+    }
 }
 
 /// The lane id (for the engine + UI). Always [`Lane::GpuAlpha`].
@@ -309,6 +333,40 @@ mod tests {
     /// bech32-validates `--address` and REJECTS a bad checksum, so an invalid default
     /// silently bricks the V100 lane out-of-box. Self-contained BIP-350 verify (no dep)
     /// so this invariant can never regress (it would have caught the old placeholder).
+    /// AM-SEC-001 (alpha half): a plaintext endpoint yields the unchanged bare
+    /// `host:port` argv, and a TLS-declared endpoint is REFUSED with an honest reason
+    /// rather than silently mined in the clear. We do not invent an alpha-miner TLS
+    /// flag we have never observed on a real run.
+    #[test]
+    fn alpha_pool_target_is_transport_aware_and_fails_closed_on_tls() {
+        let plain = Endpoint::plaintext("us.aliceprotocol.org", ALPHA_RELAY_PORT);
+        assert_eq!(
+            alpha_pool_target(&plain).unwrap(),
+            "us.aliceprotocol.org:3341",
+            "plaintext argv is byte-identical to v0.6.7"
+        );
+
+        let tls = Endpoint::tls("us.aliceprotocol.org", ALPHA_RELAY_PORT);
+        let err = alpha_pool_target(&tls).expect_err("a tls-declared alpha endpoint must be refused");
+        assert!(err.contains("tls"), "the reason names the transport: {err}");
+        assert!(
+            err.contains("plaintext"),
+            "the reason says WHY we refuse (we will not mine in the clear under a tls label): {err}"
+        );
+
+        // …and the refusal propagates through the plan builder (no silent fallback).
+        let plan = EndpointPlan::new(vec![tls]).unwrap();
+        assert!(build_alphaminer_launch_plan_for(
+            PathBuf::from("alpha-miner"),
+            "a2uJXaVk7Zx4fgk9aRLnhiD2RdpAP4usJxKXpN4vh4hDNoP1C",
+            &plan,
+            DEFAULT_ALPHA_PLACEHOLDER,
+            None,
+            &GpuSelection::All,
+        )
+        .is_err());
+    }
+
     #[test]
     fn default_placeholder_is_valid_bech32m() {
         const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";

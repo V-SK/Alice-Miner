@@ -379,6 +379,28 @@ pub fn prl_payout_watch_only() -> &'static str {
     tr!(PRL_PAYOUT_WATCH_ONLY_EN, PRL_PAYOUT_WATCH_ONLY_ZH)
 }
 
+// ── Settings · 15%-PRL return-address CONFIRMATION (AM-SEC-008) ───────────────
+/// Heading of the pre-save confirmation panel. The address below it is shown in
+/// FULL (never masked) — the whole point is that the human can compare it.
+pub const PRL_PAYOUT_CONFIRM_TITLE_EN: &str = "Your 15% PRL return will be sent to THIS address:";
+pub const PRL_PAYOUT_CONFIRM_TITLE_ZH: &str = "你的 15% PRL 返还将发送到此地址:";
+pub fn prl_payout_confirm_title() -> &'static str {
+    tr!(PRL_PAYOUT_CONFIRM_TITLE_EN, PRL_PAYOUT_CONFIRM_TITLE_ZH)
+}
+/// The instruction under the full address.
+pub const PRL_PAYOUT_CONFIRM_BODY_EN: &str =
+    "Compare it against your PRL wallet, character by character. The checksum already \
+     passed, so this IS a real address — but a checksum cannot tell whether it is YOURS.";
+pub const PRL_PAYOUT_CONFIRM_BODY_ZH: &str =
+    "请逐字与你的 PRL 钱包核对。校验和已通过,说明这是一个格式合法的真实地址 —— 但校验和\
+     无法判断它是否属于你。";
+pub fn prl_payout_confirm_body() -> &'static str {
+    tr!(PRL_PAYOUT_CONFIRM_BODY_EN, PRL_PAYOUT_CONFIRM_BODY_ZH)
+}
+/// Confirm / cancel buttons for the pre-save confirmation.
+pub const PRL_PAYOUT_CONFIRM_YES: &str = "Yes, this is my address · 确认是我的地址";
+pub const PRL_PAYOUT_CONFIRM_NO: &str = "Cancel · 取消";
+
 #[cfg(test)]
 mod tests {
     /// The credit-only honesty gate: every user-facing string literal in this

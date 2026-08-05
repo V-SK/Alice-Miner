@@ -1002,7 +1002,11 @@ fn start_one_lane(
                 let Some(active) = eps.first() else {
                     return Err("gpu-prl launch plan needs at least one endpoint".into());
                 };
-                let region_authority = format!("{}:{}", active.host, active.port);
+                // Transport-aware `--pool` target (plaintext today; follows an
+                // endpoint declared `tls` the day a relay terminates TLS). MUST go
+                // through the lane helper — building the string inline here is how the
+                // `transport` field came to be silently ignored in the first place.
+                let region_authority = gpu_prl::endpoint_pool_target(active);
                 // ── T4: region-bound PoP. The token is minted+verified against
                 // the ACTIVE region (a token for region A is rejected by region B),
                 // so on EVERY (re)build — initial start AND a Layer-B failover to a
@@ -1044,7 +1048,9 @@ fn start_one_lane(
                 let Some(active) = eps.first() else {
                     return Err("gpu-alpha launch plan needs at least one endpoint".into());
                 };
-                let authority = format!("{}:{}", active.host, active.port);
+                // Transport-aware (see `gpu_alpha::alpha_pool_target`): a TLS-declared
+                // alpha endpoint is REFUSED rather than silently mined in the clear.
+                let authority = gpu_alpha::alpha_pool_target(active)?;
                 // device_id == the relay worker-tail (`<alice>.<device_id>`) so the
                 // OOB PoP allowlist key matches what the login presents (the device_id
                 // contract that keeps a require_pop=ON relay from locking the miner out).
@@ -1554,16 +1560,32 @@ fn build_prl_payout_display(
     enroll: Option<&Arc<AtomicU8>>,
 ) -> crate::prl_payout::PrlPayoutDisplay {
     // Best-effort, read-only: a configured (env/file) payout address, masked for the
-    // panel. A shape error / unset address → None (the block shows the honest
-    // "未设置返还地址" / "未绑定" text rather than a number).
-    let payout = crate::prl_payout::load_payout_address().ok().flatten();
+    // panel. An unset address → None (the block shows the honest "not set" text).
+    //
+    // A CONFIGURED-BUT-INVALID address is NOT the same thing as "not set", and saying
+    // "not set" would send the user looking for a missing setting instead of the typo
+    // they actually have. Keep the address out of the panel (it cannot be enrolled),
+    // but say WHY.
+    let loaded = crate::prl_payout::load_payout_address();
+    let invalid_reason = loaded.as_ref().err().cloned();
+    let payout = loaded.ok().flatten();
     // `enrolled` is true ONLY when the async enroll task reported ENROLLED; every
     // other state (pending / no-address / watch-only / failed) is honestly NOT
     // enrolled, so the panel never claims a binding that didn't happen.
     let enrolled = enroll
         .map(|s| s.load(Ordering::Relaxed) == enroll_status::ENROLLED)
         .unwrap_or(false);
-    crate::prl_payout::PrlPayoutDisplay::new(enrolled, payout.as_deref())
+    let mut block = crate::prl_payout::PrlPayoutDisplay::new(enrolled, payout.as_deref());
+    if let Some(reason) = invalid_reason {
+        block.pending_text = format!(
+            "{} {reason}",
+            crate::tr!(
+                "the configured PRL return address is NOT usable, so the 15% return is not bound —",
+                "已配置的 PRL 返还地址不可用,15% 返还未绑定 —"
+            )
+        );
+    }
+    block
 }
 
 #[cfg(test)]
@@ -1702,7 +1724,7 @@ mod tests {
             // the credit-only JSON assertion below exercises the skip.
             prl_payout: Some(crate::prl_payout::PrlPayoutDisplay::new(
                 true,
-                Some("prl1pexamplewalletexamplewalletexamplewallet"),
+                Some("prl1pqzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn57kr3mc"),
             )),
         };
         let json = serde_json::to_string(&snap).expect("serialize");

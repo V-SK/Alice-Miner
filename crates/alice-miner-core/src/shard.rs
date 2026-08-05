@@ -91,6 +91,11 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// bytes; 64 KiB is generous yet caps a hostile/runaway response).
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
+/// AM-SEC-007: how much of a server error body may reach a CLI line / log after
+/// sanitisation. A stable `reason_code` is short; 200 chars is plenty and keeps a
+/// hostile body from flooding the miner's screen.
+const REMOTE_BODY_MAX: usize = 200;
+
 /// Reject any non-`https://` URL — fail closed so a PoP signature can never be sent
 /// in the clear.
 fn require_https(url: &str) -> Result<(), String> {
@@ -147,7 +152,13 @@ fn post_json<B: Serialize, R: serde::de::DeserializeOwned>(
                 .into_reader()
                 .take(MAX_RESPONSE_BYTES)
                 .read_to_end(&mut buf);
-            let body = String::from_utf8_lossy(&buf);
+            // AM-SEC-007: the body is REMOTE text that ends up in CLI output and
+            // logs. Strip ANSI/control chars and bound it before it can repaint a
+            // terminal or forge a status line.
+            let body = alice_supervise::sanitize_remote_text(
+                &String::from_utf8_lossy(&buf),
+                REMOTE_BODY_MAX,
+            );
             return Err(format!("POST {url}: HTTP {code}: {body}"));
         }
         Err(e) => return Err(format!("POST {url}: {e}")),
@@ -453,6 +464,20 @@ fn parse_pull(resp: PullResponse) -> Result<PullOutcome, String> {
                 .filter(|m| !m.is_empty())
                 .ok_or("pull said assigned but carried no model_id")?;
             let device = resp.device.unwrap_or_else(|| "cuda".to_string());
+            // AM-SEC-007 — sanitise at INGEST, not at each render site: `model_id`,
+            // `device` and `spec.role` are remote strings that flow into the status
+            // dashboard, the logs AND the engine argv. Cleaning them once here means
+            // no present or future display path can be repainted by an ANSI/OSC
+            // escape smuggled through the control plane.
+            let model_id = alice_supervise::sanitize_remote_id(&model_id, alice_supervise::REMOTE_ID_MAX);
+            let device = alice_supervise::sanitize_remote_id(&device, alice_supervise::REMOTE_ID_MAX);
+            let mut spec = spec;
+            spec.role = alice_supervise::sanitize_remote_id(&spec.role, alice_supervise::REMOTE_ID_MAX);
+            spec.next_endpoint = spec
+                .next_endpoint
+                .map(|e| alice_supervise::sanitize_remote_id(&e, alice_supervise::REMOTE_ID_MAX));
+            spec.alice_address =
+                alice_supervise::sanitize_remote_id(&spec.alice_address, alice_supervise::REMOTE_ID_MAX);
             Ok(PullOutcome::Assigned(Box::new(PullAssignment {
                 model_id,
                 device,
@@ -664,6 +689,50 @@ mod tests {
                 assert_eq!(a.spec.listen_port, 29501);
                 assert_eq!(a.spec.next_endpoint.as_deref(), Some("10.0.0.3:29501"));
                 assert_eq!(a.session_ready, Some(true));
+            }
+            other => panic!("expected assigned, got {other:?}"),
+        }
+    }
+
+    /// AM-SEC-007 at INGEST: a hostile center answers a pull with terminal-control
+    /// payloads in `model_id` / `device` / `role` / `next_endpoint`. They must be
+    /// neutralised here, before they can reach the dashboard, the log, OR the engine
+    /// argv (`engine_argv` copies `model_id` and `next_endpoint` verbatim).
+    #[test]
+    fn parse_pull_sanitises_hostile_remote_strings() {
+        // NB: every escape below is a JSON \u sequence, so this SOURCE file holds no
+        // invisible control bytes; serde_json decodes them into the real ESC/CR/LF/NUL
+        // an attacker would actually put on the wire.
+        let raw = r#"{
+            "status":"assigned",
+            "model_id":"m\u001b[2K\rMINING OK",
+            "device":"cuda\u001b]8;;https://evil.tld\u0007",
+            "launch_spec":{
+                "stage_index":1,"n_stages":3,"alice_address":"a2addr\u0000",
+                "layer_lo":12,"layer_hi":24,"role":"middle\u001b[31m",
+                "listen_port":29501,"next_endpoint":"10.0.0.3:29501\nrole: head"
+            }
+        }"#;
+        let resp: PullResponse = serde_json::from_str(raw).unwrap();
+        match parse_pull(resp).unwrap() {
+            PullOutcome::Assigned(a) => {
+                let surfaces = [
+                    a.model_id.clone(),
+                    a.device.clone(),
+                    a.spec.role.clone(),
+                    a.spec.alice_address.clone(),
+                    a.spec.next_endpoint.clone().unwrap_or_default(),
+                ];
+                for s in &surfaces {
+                    assert!(
+                        !s.chars().any(char::is_control),
+                        "a control char reached a display/argv surface: {s:?}"
+                    );
+                    assert!(!s.contains('\u{1b}'), "ESC survived: {s:?}");
+                }
+                // Also prove it does not reach the engine argv.
+                let argv = engine_argv(&a).join(" ");
+                assert!(!argv.chars().any(char::is_control), "control char in argv: {argv:?}");
             }
             other => panic!("expected assigned, got {other:?}"),
         }

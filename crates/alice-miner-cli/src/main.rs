@@ -440,6 +440,12 @@ struct IdentityArgs {
     /// Print your stored 15%-PRL return address (masked), or `not set`.
     #[arg(long, conflicts_with_all = ["create", "import", "import_seed", "paste", "show", "set_prl_payout"])]
     show_prl_payout: bool,
+    /// `--set-prl-payout` only: "I have compared the FULL address against my PRL
+    /// wallet." Without it, an interactive run prints the whole address and asks
+    /// y/N, and a NON-interactive run REFUSES (we never infer consent for the
+    /// address that decides where your 15% return is sent).
+    #[arg(long, requires = "set_prl_payout")]
+    confirm_payout: bool,
     /// Optional label for the identity.
     #[arg(long)]
     label: Option<String>,
@@ -1720,7 +1726,7 @@ fn cmd_identity(args: IdentityArgs) -> i32 {
     // The 15%-PRL return address ops are pure local file IO (public address, no
     // engine, no secret, never touches the keystore).
     if let Some(addr) = args.set_prl_payout.as_deref() {
-        return cmd_set_prl_payout(addr, args.json);
+        return cmd_set_prl_payout(addr, args.json, args.confirm_payout);
     }
     if args.show_prl_payout {
         return cmd_show_prl_payout(args.json);
@@ -1962,9 +1968,89 @@ fn cmd_identity_show(json: bool) -> i32 {
 }
 
 /// `identity --set-prl-payout <prl1p…>`: store the user's 15%-PRL return address
-/// (public, shape-validated, no engine/secret). Bound to the Alice address on the
-/// next GPU-lane start.
-fn cmd_set_prl_payout(addr: &str, json: bool) -> i32 {
+/// (public, no engine/secret). Bound to the Alice address on the next GPU-lane start.
+///
+/// AM-SEC-008 — two gates run BEFORE anything is written (and therefore long before
+/// the address is ever signed into an enroll):
+///   1. **full bech32m verify** (`validate_payout_address`) — a one-character typo is
+///      caught here with a message that says so, instead of being signed, POSTed and
+///      rejected server-side hours later;
+///   2. **human confirmation of the FULL address** — printed unmasked and grouped, then
+///      y/N on a terminal. Non-interactive runs must pass `--confirm-payout`; we do not
+///      infer consent from a non-TTY.
+fn cmd_set_prl_payout(addr: &str, json: bool, confirm_flag: bool) -> i32 {
+    use alice_miner_core::prl_payout::{self, PayoutConfirm};
+    use std::io::{IsTerminal, Write};
+
+    let trimmed = addr.trim();
+    // (1) Validate first, so a typo is reported as a typo and we never prompt the user
+    //     to confirm an address that could not possibly be theirs.
+    if let Err(e) = prl_payout::validate_payout_address(trimmed) {
+        if json {
+            println!("{}", serde_json::json!({ "set": false, "error": e }));
+        } else {
+            eprintln!("error: {e}");
+        }
+        return EXIT_USAGE;
+    }
+
+    // (2) Confirm the FULL address. `--json` is a machine surface: there is nobody to
+    //     prompt, so it takes the non-interactive path and needs the explicit flag.
+    let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal() && !json;
+    let answer = if !confirm_flag && is_tty {
+        eprintln!();
+        eprintln!(
+            "  {}",
+            tr!(
+                "Your 15% PRL return will be sent to THIS address:",
+                "你的 15% PRL 返还将发送到此地址:"
+            )
+        );
+        eprintln!("    {}", prl_payout::format_for_confirm(trimmed));
+        eprintln!(
+            "  {}",
+            tr!(
+                "Compare it against your PRL wallet, character by character.",
+                "请逐字与你的 PRL 钱包核对。"
+            )
+        );
+        eprint!("  {} [y/N] ", tr!("Is this exactly your address?", "这确实是你的地址吗?"));
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(_) => Some(line),
+            Err(_) => return EXIT_RUNTIME,
+        }
+    } else {
+        None
+    };
+
+    match prl_payout::decide_payout_confirm(is_tty, confirm_flag, answer.as_deref()) {
+        PayoutConfirm::Proceed => {}
+        PayoutConfirm::Declined => {
+            eprintln!(
+                "  {}",
+                tr!("aborted — nothing was stored.", "已取消 — 未存储任何地址。")
+            );
+            return EXIT_USAGE;
+        }
+        PayoutConfirm::NeedsExplicitFlag => {
+            let msg = tr!(
+                "refusing to store an unconfirmed payout address: not a terminal, so nobody could verify it. Re-run with --confirm-payout once you have compared the full address against your PRL wallet.",
+                "拒绝存储未经确认的返还地址: 当前不是终端,无人能核对。请先逐字核对完整地址,再加 --confirm-payout 重新运行。"
+            );
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "set": false, "error": msg, "needs": "--confirm-payout" })
+                );
+            } else {
+                eprintln!("error: {msg}");
+            }
+            return EXIT_USAGE;
+        }
+    }
+
     match alice_miner_core::prl_payout::save_payout_address(addr) {
         Ok(path) => {
             let masked = alice_miner_core::prl_payout::mask_payout(addr.trim());
