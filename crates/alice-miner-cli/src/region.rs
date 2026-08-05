@@ -141,9 +141,11 @@ mod tests {
     // a language so they can't observe each other's value (module convention, mirrors
     // balance.rs / menu.rs). The STRUCTURAL matrix test below needs no lock — its
     // assertions (failover / probed / authorities) are language-independent.
+    // The PROCESS-GLOBAL language is shared by EVERY module's tests in this one test
+    // binary, so they serialize on the CRATE-wide lock (see `main.rs::LANG_TEST_LOCK`) —
+    // a module-private mutex would only order this module against itself.
     fn lang_guard(l: Lang) -> std::sync::MutexGuard<'static, ()> {
-        static LANG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let g = LANG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let g = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         set_lang(l);
         g
     }

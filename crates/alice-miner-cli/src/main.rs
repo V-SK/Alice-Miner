@@ -62,6 +62,18 @@ mod train;
 mod tui;
 mod update;
 
+/// ONE crate-wide serialization lock for tests that pin the PROCESS-GLOBAL language
+/// ([`alice_miner_core::i18n::set_lang`]).
+///
+/// Until now each module kept its own private `LANG_LOCK`, which serializes a module's
+/// tests against *itself* but not against the five other modules doing the same thing —
+/// cargo runs the whole bin's unit tests in one process, on parallel threads, so
+/// `balance`'s EN test could observe the `zh` that `region` had just set. Nothing had
+/// tripped it yet; adding a sixth participant (`errmsg`, whose whole point is an
+/// EN-mode-emits-no-Chinese assertion) makes an actual flake likely. Test-only.
+#[cfg(test)]
+pub(crate) static LANG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ── Exit codes ──────────────────────────────────────────────────────────────
 /// Success.
 const EXIT_OK: i32 = 0;

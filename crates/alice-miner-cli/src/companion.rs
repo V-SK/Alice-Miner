@@ -774,5 +774,8 @@ mod tests {
         )
     }
 
-    static LANG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Alias onto the CRATE-wide language lock: the process-global language is shared
+    // by every module's tests in this one test binary, so a module-private mutex would
+    // only order this module against itself (see `main.rs::LANG_TEST_LOCK`).
+    use crate::LANG_TEST_LOCK as LANG_LOCK;
 }

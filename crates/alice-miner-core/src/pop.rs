@@ -265,11 +265,30 @@ fn post_json<B: Serialize, R: serde::de::DeserializeOwned>(
     // content-type. ureq's `send_json` needs the `json` feature, which the
     // workspace's default-features=false (tls+gzip only) build intentionally omits.
     let payload = serde_json::to_string(body).map_err(|e| format!("serialize: {e}"))?;
-    let resp = agent()
+    let resp = match agent()
         .post(url)
         .set("Content-Type", "application/json")
         .send_string(&payload)
-        .map_err(|e| format!("POST {url}: {e}"))?;
+    {
+        Ok(r) => r,
+        // ureq surfaces a non-2xx as `Error::Status`, whose Display is only
+        // `<url>: status code 403` — the server's own `reason_code` stays locked
+        // inside the unread body. Read it (capped) and put it in the error string,
+        // exactly as `shard.rs` already does, so the CLI renderer can tell the user
+        // WHY the relay refused instead of having to guess. Without this the
+        // `/m4/*` endpoints can never produce a reason, and "the server refused
+        // you, here is its reason" would be unreachable for the PoP lane.
+        Err(ureq::Error::Status(code, resp)) => {
+            let mut buf = Vec::new();
+            let _ = resp
+                .into_reader()
+                .take(MAX_RESPONSE_BYTES)
+                .read_to_end(&mut buf);
+            let body = String::from_utf8_lossy(&buf);
+            return Err(format!("POST {url}: HTTP {code}: {body}"));
+        }
+        Err(e) => return Err(format!("POST {url}: {e}")),
+    };
     let mut buf = Vec::new();
     resp.into_reader()
         .take(MAX_RESPONSE_BYTES)

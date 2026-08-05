@@ -413,9 +413,11 @@ mod tests {
     /// concurrently (Rust runs a crate's tests in parallel). Funnel them through one
     /// mutex + set the language while holding it. Returns the guard so the caller keeps
     /// the lock for the duration of the test.
+    // The PROCESS-GLOBAL language is shared by EVERY module's tests in this one test
+    // binary, so they serialize on the CRATE-wide lock (see `main.rs::LANG_TEST_LOCK`) —
+    // a module-private mutex would only order this module against itself.
     fn lang_guard(l: Lang) -> std::sync::MutexGuard<'static, ()> {
-        static LANG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let g = LANG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_lang(l);
         g
     }
