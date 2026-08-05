@@ -66,24 +66,24 @@ const MAX_LOOKUP_BYTES: u64 = 64 * 1024;
 /// data part (everything after the `prl1` separator) is drawn from this set.
 const BECH32_CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
-/// **Shape-only** validation of a 15%-PRL payout address, mirroring the task's
-/// `^prl1p[<bech32>]{20,110}$`:
+/// **Shape-only** validation of a 15%-PRL payout address, mirroring the server's
+/// `^prl1p[<bech32>]{20,103}$` (`alice_acp.prl_wallet.credentials.PRL_ADDRESS_RE`):
 ///   * begins with the literal `prl1p` (the `prl1` HRP separator + a leading
 ///     bech32 `p`),
-///   * followed by 20..=110 more bech32 charset chars,
-///   * total length therefore `prl1p` (5) + 20..=110.
+///   * followed by 20..=103 more bech32 charset chars,
+///   * total length therefore `prl1p` (5) + 20..=103.
 ///
-/// This is **NOT** a checksum check — payability is the server's authority. We
-/// only reject obvious garbage / wrong-prefix so a typo never gets enrolled, and
-/// stay liberal on length so a server-side HRP/length tweak doesn't brick clients.
+/// This is **NOT** a checksum check and NOT a payability check — it is the cheap
+/// pre-filter. Every write/sign path calls [`validate_payout_address`], which adds
+/// the checksum and the witness-program rule.
 pub fn validate_payout_shape(addr: &str) -> Result<(), String> {
     let rest = addr
         .strip_prefix("prl1p")
         .ok_or_else(|| "payout address must start with 'prl1p'".to_string())?;
     let n = rest.chars().count();
-    if !(20..=110).contains(&n) {
+    if !(20..=103).contains(&n) {
         return Err(format!(
-            "payout address body length {n} out of range (expected 20..=110 bech32 chars)"
+            "payout address body length {n} out of range (expected 20..=103 bech32 chars)"
         ));
     }
     if let Some(bad) = rest.chars().find(|c| !BECH32_CHARSET.contains(*c)) {
@@ -152,12 +152,90 @@ pub fn verify_payout_checksum(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// **Full** validation of a payout address: [`validate_payout_shape`] THEN
-/// [`verify_payout_checksum`]. This is what every write/sign path uses (AM-SEC-008);
-/// `validate_payout_shape` alone remains available for cheap pre-filtering.
+/// Convert a slice of 5-bit bech32 values to 8-bit bytes, **without** padding —
+/// BIP-173 `convertbits(data, 5, 8, false)`. Returns `None` when the leftover bits
+/// are not a strict, zero-valued remainder (i.e. the data part cannot be a whole
+/// number of bytes). This is what makes a "checksum-valid but not a real witness
+/// program" string fail instead of silently truncating.
+fn convert_bits_5_to_8(values: &[u8]) -> Option<Vec<u8>> {
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut out = Vec::with_capacity(values.len() * 5 / 8);
+    for &v in values {
+        if v >> 5 != 0 {
+            return None;
+        }
+        acc = (acc << 5) | u32::from(v);
+        bits += 5;
+        while bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    // Leftover must be < 5 bits AND all zero, else this was never a byte string.
+    if bits >= 5 || ((acc << (8 - bits)) & 0xff) != 0 {
+        return None;
+    }
+    Some(out)
+}
+
+/// Verify the **witness version + program length** — the half of the server's rule
+/// that a checksum alone does not cover.
+///
+/// The server's ONE RULER for "can this address actually be paid" is
+/// `alice_acp.prl_payout.txverify.prl_address_to_script` (also exposed as
+/// `is_payable_prl_address`, and called from the enroll write boundary via
+/// `assert_payable_prl_payout_address`): after the bech32m checksum it requires
+/// **witness version 1 and a 32-byte program** — a BIP-86 Taproot output — because
+/// that is the only script the offline Go signer will ever pay to.
+///
+/// Without this check the client would call a string "valid", store it, and sign an
+/// enroll for it, while the server refused it — i.e. exactly the "the client says OK
+/// and the money still never arrives" failure AM-SEC-008 is about. A checksum-valid
+/// short address (`prl1pqqqqqqqqqqqqqqvapaqa`) is the concrete case: real bech32m,
+/// zero chance of ever being paid.
+pub fn verify_payout_witness_program(addr: &str) -> Result<(), String> {
+    let sep = addr
+        .rfind('1')
+        .ok_or_else(|| "payout address has no bech32 separator".to_string())?;
+    let data: Vec<u8> = addr[sep + 1..]
+        .bytes()
+        .map(|c| BECH32_CHARSET.bytes().position(|x| x == c).map(|i| i as u8))
+        .collect::<Option<Vec<u8>>>()
+        .ok_or_else(|| "payout address has a non-bech32 char".to_string())?;
+    if data.len() < 7 {
+        return Err("payout address carries no witness program".to_string());
+    }
+    let witver = data[0];
+    let program = convert_bits_5_to_8(&data[1..data.len() - 6]);
+    let ok = witver == 1 && program.as_ref().is_some_and(|p| p.len() == 32);
+    if !ok {
+        let got = match &program {
+            Some(p) => format!("v{witver}, {} bytes", p.len()),
+            None => format!("v{witver}, not a whole number of bytes"),
+        };
+        return Err(crate::tr!(
+            "payout address is not a payable PRL destination (needs a witness-v1 32-byte Taproot program; got %GOT%). The rebate can only be paid to a prl1p… Taproot address — copy the receive address from your PRL wallet.",
+            "返还地址不是可支付的 PRL 目标(需要 witness-v1 32 字节 Taproot 程序;实际为 %GOT%)。返还只能打到 prl1p… Taproot 地址 —— 请从你的 PRL 钱包复制收款地址。"
+        )
+        .replace("%GOT%", &got));
+    }
+    Ok(())
+}
+
+/// **Full** validation of a payout address: [`validate_payout_shape`], THEN
+/// [`verify_payout_checksum`], THEN [`verify_payout_witness_program`]. This is what
+/// every write/sign path uses (AM-SEC-008); `validate_payout_shape` alone remains
+/// available for cheap pre-filtering.
+///
+/// The three steps together are **the same standard the server applies** at its
+/// enroll write boundary (shape regex + `is_payable_prl_address`). Keeping them
+/// equal is the whole point: a client that says "valid" about an address the server
+/// will refuse is a client that lies about where the money is going.
 pub fn validate_payout_address(addr: &str) -> Result<(), String> {
     validate_payout_shape(addr)?;
-    verify_payout_checksum(addr)
+    verify_payout_checksum(addr)?;
+    verify_payout_witness_program(addr)
 }
 
 /// Render an address in 8-char groups so a human can actually COMPARE it against
@@ -530,14 +608,22 @@ mod tests {
     use super::*;
 
     const ADDR: &str = "a2uJXaVk7Zx4fgk9aRLnhiD2RdpAP4usJxKXpN4vh4hDNoP1C";
-    /// A legal-shaped **and checksum-valid** bech32m payout address (AM-SEC-008: the
-    /// old fixture `prl1pexamplewallet…` was shape-legal but checksum-garbage, which
-    /// is exactly what the new gate must reject — so it can no longer be the "OK" one).
-    const PAYOUT_OK: &str = "prl1pqzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn57kr3mc";
+    /// A synthetic but **fully payable** address: checksum-valid bech32m AND a
+    /// witness-v1 32-byte program (program bytes `00 01 … 1f`), so it satisfies the
+    /// server's `is_payable_prl_address` ruler exactly like a real wallet address.
+    ///
+    /// It replaces two earlier fixtures that were quietly WRONG:
+    ///   * `prl1pexamplewallet…` — shape-legal, checksum-garbage (pre-AM-SEC-008);
+    ///   * `prl1pqzry9x8…7kr3mc` — checksum-valid but its data part is not a whole
+    ///     number of bytes, so the server would refuse it. Using it as the "OK"
+    ///     fixture meant the tests certified an address that can never be paid.
+    const PAYOUT_OK: &str = "prl1pqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0ss8729k";
     /// Shape-legal, checksum-INVALID (one char off): the human-typo case.
     const PAYOUT_BAD_CKSUM: &str = "prl1pexamplewalletexamplewalletexamplewallet";
-    /// The shortest checksum-valid address the shape gate still admits (rest == 20).
-    const PAYOUT_OK_MIN: &str = "prl1pqqqqqqqqqqqqqqvapaqa";
+    /// Checksum-VALID and shape-legal, but **not payable**: witness v1 with an
+    /// 8-byte program instead of 32. The server's enroll boundary refuses it, so the
+    /// client must too — this is the case the merge review caught.
+    const PAYOUT_VALID_CKSUM_UNPAYABLE: &str = "prl1pqqqqqqqqqqqqqqvapaqa";
 
     #[test]
     fn payout_shape_accepts_legal_prl1p() {
@@ -571,9 +657,13 @@ mod tests {
 
     #[test]
     fn payout_shape_rejects_too_long() {
-        // 111 body chars (> 110).
-        let long = format!("prl1p{}", "q".repeat(111));
+        // 104 body chars (> 103) — the bound now mirrors the server's PRL_ADDRESS_RE.
+        let long = format!("prl1p{}", "q".repeat(104));
         assert!(validate_payout_shape(&long).is_err());
+        // 103 is still admitted by the shape pre-filter (payability is decided by the
+        // checksum + witness rules, not by the length bound).
+        let at_bound = format!("prl1p{}", "q".repeat(103));
+        assert!(validate_payout_shape(&at_bound).is_ok());
     }
 
     #[test]
@@ -793,7 +883,73 @@ mod tests {
             );
         }
         assert!(validate_payout_address(PAYOUT_OK).is_ok());
-        assert!(validate_payout_address(PAYOUT_OK_MIN).is_ok());
+    }
+
+    /// AM-SEC-008, second half (merge review 2026-08-04): the client's verdict must
+    /// equal the SERVER's. A checksum-valid address with the wrong witness program is
+    /// refused by `assert_payable_prl_payout_address` server-side; if the client
+    /// called it valid it would store it, sign an enroll for it, and the miner would
+    /// only learn the rebate is undeliverable much later — the exact class of silent
+    /// lie this batch exists to remove.
+    #[test]
+    fn checksum_valid_but_unpayable_witness_program_is_refused() {
+        // Shape + checksum both pass on their own …
+        assert!(validate_payout_shape(PAYOUT_VALID_CKSUM_UNPAYABLE).is_ok());
+        assert!(verify_payout_checksum(PAYOUT_VALID_CKSUM_UNPAYABLE).is_ok());
+        // … and the full gate still refuses it, naming the real reason.
+        let err = validate_payout_address(PAYOUT_VALID_CKSUM_UNPAYABLE).unwrap_err();
+        assert!(
+            err.contains("Taproot") || err.contains("witness") || err.contains("字节"),
+            "the message must name the witness-program rule, not just 'invalid': {err}"
+        );
+        // NOT the typo message — this address is not mistyped, it is the wrong kind.
+        assert!(
+            !err.contains("mistyped") && !err.contains("打错"),
+            "an unpayable-but-well-typed address must not be blamed on a typo: {err}"
+        );
+    }
+
+    /// The witness rule must accept every real address and reject only the wrong
+    /// shape of program — including the "data part is not a whole number of bytes"
+    /// case, which a naive truncating decoder would wave through.
+    #[test]
+    fn witness_program_rule_matches_the_server_ruler() {
+        for payable in [
+            "prl1p2v2hrrhzls9ala8wpwjucvfa7znt8q67s35aw6gev7xeknspa0ysul5efx",
+            "prl1p32l5m3sw4g5p25qamk8fn7qae7ek6ujtj025g8h9r4mgk0pxf4sqhgwah3",
+            "prl1pukq3uu0txl6fc34f2frlxsxyfs9nj30lsa4dkw8vpmfkgv3ck74shvtxsa",
+            crate::lane::gpu_alpha::DEFAULT_ALPHA_PLACEHOLDER,
+            PAYOUT_OK,
+        ] {
+            assert!(
+                verify_payout_witness_program(payable).is_ok(),
+                "a real payable address must pass the witness rule: {payable}"
+            );
+        }
+        // 8-byte program (v1) — checksum-valid, unpayable.
+        assert!(verify_payout_witness_program(PAYOUT_VALID_CKSUM_UNPAYABLE).is_err());
+        // Checksum-valid, but the data part has a non-zero bit remainder: it is not a
+        // byte string at all. (This is the address that used to be our "OK" fixture.)
+        let ragged = "prl1pqzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn57kr3mc";
+        assert!(verify_payout_checksum(ragged).is_ok(), "fixture must be checksum-valid");
+        assert!(
+            verify_payout_witness_program(ragged).is_err(),
+            "a ragged (non-byte-aligned) data part must be refused, not truncated"
+        );
+    }
+
+    #[test]
+    fn convert_bits_rejects_ragged_remainders() {
+        // 8 five-bit groups = 40 bits = exactly 5 bytes.
+        assert_eq!(convert_bits_5_to_8(&[0; 8]).map(|v| v.len()), Some(5));
+        // 1 group = 5 bits: fewer than 8, remainder >= 5 → not a byte string.
+        assert!(convert_bits_5_to_8(&[0]).is_none());
+        // 2 groups = 10 bits: 1 byte + 2 leftover ZERO bits → accepted (1 byte).
+        assert_eq!(convert_bits_5_to_8(&[0, 0]).map(|v| v.len()), Some(1));
+        // 2 groups with a non-zero remainder → refused.
+        assert!(convert_bits_5_to_8(&[0, 1]).is_none());
+        // A value outside 0..=31 is not a 5-bit group at all.
+        assert!(convert_bits_5_to_8(&[32]).is_none());
     }
 
     #[test]

@@ -3998,7 +3998,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
 
         // A FULLY valid address is only PARKED — nothing is written until the human
         // confirms the unmasked address.
-        let good = "prl1pqzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn57kr3mc".to_string();
+        let good = "prl1pqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0ss8729k".to_string();
         app.form_prl_payout = good.clone();
         app.save_prl_payout();
         assert!(app.prl_payout_error.is_none(), "a valid address validates cleanly");

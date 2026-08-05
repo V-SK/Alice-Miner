@@ -1724,7 +1724,7 @@ mod tests {
             // the credit-only JSON assertion below exercises the skip.
             prl_payout: Some(crate::prl_payout::PrlPayoutDisplay::new(
                 true,
-                Some("prl1pqzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn57kr3mc"),
+                Some("prl1pqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0ss8729k"),
             )),
         };
         let json = serde_json::to_string(&snap).expect("serialize");

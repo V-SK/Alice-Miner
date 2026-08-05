@@ -917,7 +917,7 @@ fn pose_dashboard_m5_confirmed(app: &mut MinerApp) {
 fn demo_prl_snapshot() -> Snapshot {
     let disp = alice_miner_core::PrlPayoutDisplay::new(
         true,
-        Some("prl1pqzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn57kr3mc"),
+        Some("prl1pqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0ss8729k"),
     );
     Snapshot {
         state: EngineState::Running,

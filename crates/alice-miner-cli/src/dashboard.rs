@@ -1827,7 +1827,7 @@ mod tests {
     // ── Piece 3: the 15% PRL 返还 (credit-only) dashboard line ──────────────────
 
     /// A legal-shaped, CHECKSUM-VALID masked return wallet for the display block.
-    const PAYOUT_OK: &str = "prl1pqzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn57kr3mc";
+    const PAYOUT_OK: &str = "prl1pqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0ss8729k";
 
     /// A snapshot carrying a populated PRL display block (the engine attaches this
     /// for a PRL-earning lane). `prl_payout` is `#[serde(skip)]` on `Snapshot`, so it
