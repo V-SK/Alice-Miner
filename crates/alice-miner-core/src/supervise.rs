@@ -1773,10 +1773,17 @@ fn endpoint_reachable(host: &str, port: u16, timeout: Duration) -> bool {
 /// (which, on a pearlhash lane, can be a bare `POST https://…/m4/challenge: …`
 /// leaking an internal PoP endpoint) in the primary status; the raw error is kept
 /// only in the verbose debug log ([`log_verbose`]). Localized via [`crate::tr!`].
+///
+/// Scoped to THIS MACHINE on purpose. All the supervisor observed is that its own
+/// rebuild/relaunch against that region failed; it has no way to know whether the
+/// region itself is down. Saying "the region endpoint is unreachable" reads as a
+/// statement about our relay, and on 2026-07-25 that exact reading sent a whole
+/// investigation at a healthy HK relay when the real cause was a client-side zombie
+/// socket. Same rule as `errmsg`: report the observation, not a guessed cause.
 fn region_retry_message() -> String {
     crate::tr!(
-        "Region endpoint temporarily unreachable; retrying other regions",
-        "区域节点暂时不可达,正在重试其他区域"
+        "Could not reach this region endpoint from this machine; retrying other regions",
+        "本机暂时联系不上该区域节点,正在重试其他区域"
     )
     .to_string()
 }
@@ -1794,15 +1801,19 @@ fn region_resumed_status(to: &Endpoint, window: Duration) -> String {
     )
 }
 
-/// The status shown when EVERY region failed to (re)build/relaunch in one failover round
-/// — all relays are currently unreachable/unhealthy. Honest + bilingual. It no longer
-/// says "restart to retry": since BUG#4 the lane retries by itself, and the caller
-/// appends the countdown ([`retry_message`]), so telling the user to intervene would be
-/// a lie in the other direction.
+/// The status shown when EVERY region failed to (re)build/relaunch in one failover round.
+/// Honest + bilingual. It no longer says "restart to retry": since BUG#4 the lane retries
+/// by itself, and the caller appends the countdown ([`retry_message`]), so telling the
+/// user to intervene would be a lie in the other direction.
+///
+/// Also scoped to THIS MACHINE (see [`region_retry_message`]): "all relays are
+/// unavailable" asserts a fact about our infrastructure that the client cannot observe.
+/// One local cause — a captive portal, an HTTPS-inspecting firewall, a wedged socket —
+/// makes every region fail at once and looks identical from here.
 fn all_regions_unreachable_message() -> String {
     crate::tr!(
-        "all region relays are temporarily unavailable",
-        "所有区域节点暂时不可用"
+        "could not reach any region relay from this machine",
+        "本机联系不上任何区域中继"
     )
     .to_string()
 }
@@ -2037,13 +2048,15 @@ pub fn status_short(key: &str, args: &StatusArgs) -> String {
             format!("{region} recovered · resuming"),
             format!("{region} 已恢复 · 继续运行")
         ),
+        // Both of these are what THIS MACHINE observed, not a verdict on our relays —
+        // see `region_retry_message` for why the distinction is load-bearing.
         "region_retrying" => crate::tr!(
-            "Endpoint unreachable · retrying".to_string(),
-            "节点不可达 · 正在重试".to_string()
+            "No reply from endpoint · retrying".to_string(),
+            "节点无响应 · 正在重试".to_string()
         ),
         "all_regions_unavailable" => crate::tr!(
-            "All relays unavailable · stopped".to_string(),
-            "所有中继不可用 · 已停止".to_string()
+            "No relay reachable from here · stopped".to_string(),
+            "本机连不上任何中继 · 已停止".to_string()
         ),
         "budget_exhausted" => crate::tr!(
             "No progress · stopped to avoid a restart storm".to_string(),
@@ -2067,8 +2080,8 @@ pub fn status_short(key: &str, args: &StatusArgs) -> String {
         "all_regions_retrying" => {
             let when = human_delay(Duration::from_secs(args.retry_in_s.unwrap_or(0)));
             crate::tr!(
-                format!("All relays unavailable · retrying in {when}"),
-                format!("所有中继不可用 · {when}后重试")
+                format!("No relay reachable from here · retrying in {when}"),
+                format!("本机连不上任何中继 · {when}后重试")
             )
         }
         "relaunch_retrying" | "engine_still_alive_retrying" => {
@@ -4125,6 +4138,59 @@ mod tests {
         crate::i18n::set_lang(crate::i18n::Lang::En);
     }
 
+    /// HONESTY GATE (same rule as `errmsg`): a reachability status reports what THIS
+    /// MACHINE observed and must never assert a verdict about our relays. The client
+    /// cannot distinguish "the relay is down" from "a captive portal / HTTPS-inspecting
+    /// firewall / wedged socket on this box eats every region at once" — and on
+    /// 2026-07-25 the old "All relays unavailable" wording sent a real investigation at
+    /// a perfectly healthy HK relay.
+    #[test]
+    fn reachability_statuses_never_claim_our_relays_are_down() {
+        let _g = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let args = StatusArgs {
+            endpoint: Some("us.aliceprotocol.org:3340".into()),
+            region: Some("US".into()),
+            stalled_s: Some(600),
+            retry_in_s: Some(300),
+            ..Default::default()
+        };
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        for k in ["region_retrying", "all_regions_unavailable", "all_regions_retrying"] {
+            let en = status_short(k, &args).to_lowercase();
+            // The banned shapes: a bare claim that the relays / endpoint are down.
+            for banned in [
+                "all relays unavailable",
+                "relays are unavailable",
+                "endpoint unreachable",
+                "relay is down",
+            ] {
+                assert!(!en.contains(banned), "EN {k} asserts a relay verdict: {en:?}");
+            }
+            // …and it must instead scope the observation to this machine.
+            assert!(
+                en.contains("from here") || en.contains("no reply"),
+                "EN {k} must scope to this machine: {en:?}"
+            );
+            assert!(!has_cjk(&en), "EN {k} has no Chinese: {en:?}");
+        }
+        // The two free-form failover messages carry the same scoping.
+        for msg in [region_retry_message(), all_regions_unreachable_message()] {
+            let low = msg.to_lowercase();
+            assert!(
+                low.contains("from this machine"),
+                "must scope to this machine: {msg:?}"
+            );
+            assert!(!has_cjk(&msg), "EN has no Chinese: {msg:?}");
+        }
+        crate::i18n::set_lang(crate::i18n::Lang::Zh);
+        for msg in [region_retry_message(), all_regions_unreachable_message()] {
+            assert!(msg.contains("本机"), "ZH must scope to this machine: {msg:?}");
+        }
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+    }
+
     #[test]
     fn endpoint_reachable_rejects_dead_accepts_live_local() {
         // An unresolvable `.invalid` host is unreachable — bounded + fast (no hang).
@@ -4514,9 +4580,17 @@ mod tests {
             assert!(errored, "all-regions-unhealthy must land in a clear Error");
             let st = s.stats();
             let msg = st.message.clone().unwrap_or_default();
+            // The honest all-regions line, scoped to THIS MACHINE: the client only
+            // observed that it could not reach them, so it must not claim our relays
+            // are down (see `reachability_statuses_never_claim_our_relays_are_down`).
             assert!(
-                msg.contains("unavailable") || msg.contains("不可用"),
-                "the status must be the honest all-regions-unavailable line: {msg:?}"
+                msg.contains("could not reach any region relay from this machine")
+                    || msg.contains("本机联系不上任何区域中继"),
+                "the status must be the honest all-regions-unreachable line: {msg:?}"
+            );
+            assert!(
+                !msg.contains("relays are unavailable") && !msg.contains("所有中继不可用"),
+                "must not assert a verdict about our relays: {msg:?}"
             );
             // It must NOT tell the user to restart by hand — the lane retries itself.
             assert!(
