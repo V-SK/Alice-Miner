@@ -44,10 +44,39 @@ fn dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".alice"))
 }
 
-/// Read the recorded pid, if the file exists + parses.
+/// Read the recorded pid, if the file exists + parses. The pid is the FIRST line,
+/// so a file written by an older build (pid only) still reads correctly.
 pub fn read_pid() -> Option<u32> {
     let s = fs::read_to_string(pid_path()).ok()?;
-    s.trim().parse::<u32>().ok()
+    s.lines().next()?.trim().parse::<u32>().ok()
+}
+
+/// Who holds the rendezvous: the recorded pid plus (since v0.6.8) the data directory
+/// that instance is using. The directory is recorded so the refusal message can name
+/// it — "another miner is running" is not actionable; "pid 4242, data dir
+/// /Users/x/.alice" is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owner {
+    pub pid: u32,
+    pub data_dir: Option<PathBuf>,
+}
+
+/// Parse the pid-file body. Pure, so both the legacy (pid-only) and current
+/// (pid + data dir) shapes are pinned by tests.
+pub fn parse_owner(body: &str) -> Option<Owner> {
+    let mut lines = body.lines();
+    let pid = lines.next()?.trim().parse::<u32>().ok()?;
+    let data_dir = lines
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    Some(Owner { pid, data_dir })
+}
+
+/// Read the full owner record, if the file exists + parses.
+pub fn read_owner() -> Option<Owner> {
+    parse_owner(&fs::read_to_string(pid_path()).ok()?)
 }
 
 /// Remove the pid file (best-effort; a missing file is fine).
@@ -55,91 +84,175 @@ pub fn remove() {
     let _ = fs::remove_file(pid_path());
 }
 
-/// Write this process's pid into the pid file (best-effort). Creates the dir if
-/// needed. A failure (e.g. read-only home) is non-fatal: mining proceeds; only
-/// `stop` would be unable to find us (Ctrl-C still works).
-fn write_self() -> bool {
+/// The record this process writes: its pid, then the data directory it is using.
+fn self_record() -> String {
+    format!("{}\n{}\n", std::process::id(), dir().display())
+}
+
+/// Claim the rendezvous ATOMICALLY, or report who already holds it.
+///
+/// `create_new` maps to `O_EXCL` / `CREATE_NEW`, so between two `alice-miner start`
+/// processes racing at the same instant exactly ONE can win — the check-then-write
+/// the old `acquire` did had a window in which both could decide the file was free.
+///
+/// A file left by a process we can PROVE is gone is removed and the claim retried
+/// once (the stale-file takeover); a claim we cannot make for any other reason
+/// (read-only home) yields `Unavailable` rather than pretending to have the lock.
+fn claim_atomic() -> Claim {
+    use std::io::Write as _;
     let path = pid_path();
     if let Some(parent) = path.parent() {
         if fs::create_dir_all(parent).is_err() {
-            return false;
+            return Claim::Unavailable;
         }
     }
-    fs::write(&path, std::process::id().to_string()).is_ok()
+    for _ in 0..2 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                return match f.write_all(self_record().as_bytes()) {
+                    Ok(()) => Claim::Won,
+                    // We created the file but could not fill it — remove it rather
+                    // than leave an unparseable record that blocks the next start.
+                    Err(_) => {
+                        let _ = fs::remove_file(&path);
+                        Claim::Unavailable
+                    }
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner = read_owner();
+                let Some(owner) = owner else {
+                    // Present but unparseable (a truncated write, a stray file): it
+                    // names nobody, so it can be replaced.
+                    let _ = fs::remove_file(&path);
+                    continue;
+                };
+                match liveness_settled(owner.pid) {
+                    // Provably gone → stale-file takeover.
+                    Liveness::Dead => {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    Liveness::Alive => return Claim::Held(owner, Liveness::Alive),
+                    Liveness::Unknown => return Claim::Held(owner, Liveness::Unknown),
+                }
+            }
+            Err(_) => return Claim::Unavailable,
+        }
+    }
+    // Two takeover attempts both lost the race to someone else: whoever is there now
+    // is live enough to keep winning. Report it rather than loop.
+    match read_owner() {
+        Some(o) => {
+            let l = liveness_settled(o.pid);
+            Claim::Held(o, l)
+        }
+        None => Claim::Unavailable,
+    }
+}
+
+/// The outcome of one atomic claim attempt.
+#[derive(Debug)]
+enum Claim {
+    /// We hold the rendezvous.
+    Won,
+    /// Someone else holds it; with what we could establish about their liveness.
+    Held(Owner, Liveness),
+    /// We could not use the rendezvous at all (read-only home). Mining still works;
+    /// `stop` just cannot find us.
+    Unavailable,
+}
+
+/// Why a start was refused, with everything needed to act on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceConflict {
+    pub pid: u32,
+    pub data_dir: Option<PathBuf>,
 }
 
 /// An RAII guard that records this process's pid on construction and removes the
-/// pid file on drop — so a clean exit never leaves a stale pid. If another live
-/// `start` already holds the pid file, we DON'T clobber it (so the original owner
-/// keeps the rendezvous) — but we still run; `stop` would just target the first.
+/// pid file on drop — so a clean exit never leaves a stale pid.
 pub struct PidGuard {
     /// Whether THIS guard wrote the file (only then do we remove it on drop, so
     /// we never delete another live instance's pid).
     owns: bool,
-    /// The pid of an ALREADY-RUNNING `alice-miner start` we found holding the
-    /// rendezvous, if any. We still run (declining to mine would be worse), but the
-    /// caller must SAY so: two instances on one machine both drive the same engine
-    /// directory, both write telemetry, and `stop` can only reach the first — which
-    /// looks exactly like "stop did nothing" / "my poll rate doubled".
-    other: Option<u32>,
+    /// Set when we are running ALONGSIDE another instance: either the user passed
+    /// `--allow-multiple`, or we could not verify the recorded pid's liveness.
+    /// Rendered as a warning by the caller.
+    sharing: Option<SharingReason>,
+}
+
+/// Why this process is running without owning the rendezvous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharingReason {
+    /// The user explicitly opted in with `--allow-multiple` over a LIVE owner.
+    UserOverride { pid: u32, data_dir: Option<PathBuf> },
+    /// A pid is recorded and we could NOT determine whether it is alive. We do not
+    /// know, so we neither steal the rendezvous nor refuse to mine — and we say
+    /// exactly that instead of picking a story.
+    Unverifiable { pid: u32 },
+    /// The rendezvous file could not be used at all (read-only home).
+    RendezvousUnavailable,
 }
 
 impl PidGuard {
-    /// Acquire the rendezvous: record our pid unless a *live* one is already
-    /// recorded. Always returns a guard (mining proceeds regardless).
+    /// Acquire the rendezvous, or REFUSE to start.
     ///
-    /// **Stale-file takeover (bug fix).** The decision now turns on a POSITIVE
-    /// [`Liveness::Dead`], not on "not alive". The old code asked `is_alive`, which
-    /// on Windows was hard-coded to `true` — so after ANY crash / power loss / closed
-    /// window the leftover pid file looked like a live owner forever, we declined to
-    /// record our own pid, and every later `stop` aimed at the dead pid and reported
-    /// a clean stop while the real miner kept running. A pid we can PROVE is gone is
-    /// safe to take over; an `Unknown` (we could not probe) still yields to the
-    /// recorded owner, because stealing the rendezvous from a live miner would be the
-    /// worse failure.
-    pub fn acquire() -> Self {
-        let (take, other) = classify_owner(read_pid(), std::process::id(), liveness_settled);
-        let owns = if take { write_self() } else { false };
-        Self { owns, other }
+    /// **AM-REL-007.** Until v0.6.7 a second `alice-miner start` printed a warning
+    /// and mined anyway. That warning was not enough, because the failure it warns
+    /// about is silent and expensive: both instances drive the same engine directory,
+    /// each overwrites the other's telemetry snapshot, and `alice-miner stop` can only
+    /// reach the recorded one — so the survivor keeps the GPU busy while the UI, the
+    /// dashboard and the exit code all agree that mining stopped. A warning printed
+    /// once, minutes ago, above a live dashboard, is not a control.
+    ///
+    /// So a PROVABLY live owner is now a refusal. The two honest exceptions:
+    ///   * `allow_multiple` — the user's explicit override (pids DO get recycled, so
+    ///     "alive" can be a false positive and the user must be able to say so);
+    ///   * [`Liveness::Unknown`] — we could not probe. Refusing there would mean
+    ///     guessing that another miner exists and blocking a legitimate start on that
+    ///     guess; we run, and say we could not verify.
+    pub fn try_acquire(allow_multiple: bool) -> Result<Self, InstanceConflict> {
+        match claim_atomic() {
+            Claim::Won => Ok(Self {
+                owns: true,
+                sharing: None,
+            }),
+            Claim::Unavailable => Ok(Self {
+                owns: false,
+                sharing: Some(SharingReason::RendezvousUnavailable),
+            }),
+            Claim::Held(owner, Liveness::Unknown) => Ok(Self {
+                owns: false,
+                sharing: Some(SharingReason::Unverifiable { pid: owner.pid }),
+            }),
+            Claim::Held(owner, _) => {
+                if allow_multiple {
+                    Ok(Self {
+                        owns: false,
+                        sharing: Some(SharingReason::UserOverride {
+                            pid: owner.pid,
+                            data_dir: owner.data_dir,
+                        }),
+                    })
+                } else {
+                    Err(InstanceConflict {
+                        pid: owner.pid,
+                        data_dir: owner.data_dir,
+                    })
+                }
+            }
+        }
     }
 
-    /// The pid of another LIVE `alice-miner start` that already held the rendezvous
-    /// when we came up, if any. `None` on the normal single-instance path.
-    ///
-    /// Two instances are not blocked (we would rather mine than refuse), but they are
-    /// genuinely harmful and invisible: they share one engine/log directory, each
-    /// mirrors its own telemetry snapshot over the other's, and `alice-miner stop`
-    /// reaches only the recorded one — so the survivor keeps the GPU busy while the UI
-    /// says "stopped". Surfacing the pid turns that into a one-line diagnosis.
-    pub fn other_instance(&self) -> Option<u32> {
-        self.other
-    }
-}
-
-/// The rendezvous decision, pure so the whole table is testable without spawning a
-/// second miner: given the `recorded` pid (if any), our own pid, and a liveness probe,
-/// answer `(take_ownership, other_live_instance)`.
-///
-/// * no file, or a pid we can PROVE is gone ⇒ take it (the stale-file takeover);
-/// * a pid that is (or might be) alive ⇒ yield — stealing from a live miner is the
-///   worse failure;
-/// * a pid we can prove is alive and is NOT us ⇒ additionally report it, because that
-///   is a genuine second instance and the user needs to be told.
-///
-/// `Unknown` deliberately yields WITHOUT reporting: we do not accuse the user of
-/// running two miners on a probe we could not complete.
-fn classify_owner(
-    recorded: Option<u32>,
-    me: u32,
-    probe: impl Fn(u32) -> Liveness,
-) -> (bool, Option<u32>) {
-    match recorded {
-        Some(pid) => match probe(pid) {
-            Liveness::Dead => (true, None),
-            Liveness::Alive if pid != me => (false, Some(pid)),
-            _ => (false, None),
-        },
-        None => (true, None),
+    /// Why this process is running without the rendezvous, if it is. `None` on the
+    /// normal single-instance path.
+    pub fn sharing(&self) -> Option<&SharingReason> {
+        self.sharing.as_ref()
     }
 }
 
@@ -342,16 +455,10 @@ mod tests {
         assert!(!is_alive(DEAD_PID));
     }
 
-    /// REGRESSION (Bug 2): a STALE pid file left by a crash / power loss must be
-    /// taken over by the next `start`, so the running miner's pid is the one on
-    /// record and a later `stop` aims at a real process. On Windows this used to be
-    /// impossible (`is_alive` was always `true` → we never wrote our pid → `stop`
-    /// targeted a dead pid and falsely reported success). Runs on every OS.
-    #[test]
-    fn acquire_takes_over_a_stale_pid_file() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    /// A temp `$ALICE_IDENTITY_DIR` for a rendezvous test.
+    fn temp_dir(tag: &str) -> PathBuf {
         let tmp = std::env::temp_dir().join(format!(
-            "alice-pid-stale-{}-{}",
+            "alice-pid-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -360,84 +467,149 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
+        tmp
+    }
+
+    /// REGRESSION (Bug 2): a STALE pid file left by a crash / power loss must be
+    /// taken over by the next `start`, so the running miner's pid is the one on
+    /// record and a later `stop` aims at a real process. On Windows this used to be
+    /// impossible (`is_alive` was always `true` -> we never wrote our pid -> `stop`
+    /// targeted a dead pid and falsely reported success). Runs on every OS.
+    #[test]
+    fn acquire_takes_over_a_stale_pid_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = temp_dir("stale");
 
         // A crash left a pid file naming a process that no longer exists.
         std::fs::write(pid_path(), DEAD_PID.to_string()).unwrap();
         {
-            let _guard = PidGuard::acquire();
+            let _guard = PidGuard::try_acquire(false).expect("a stale file must not block a start");
             assert_eq!(
                 read_pid(),
                 Some(std::process::id()),
                 "a stale pid file must be taken over, not treated as a live owner"
             );
         }
-        // We owned it → dropped → cleaned up.
+        // We owned it -> dropped -> cleaned up.
         assert!(read_pid().is_none());
 
         std::env::remove_var("ALICE_IDENTITY_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The other side of the takeover rule: a pid file naming a LIVE process (here,
-    /// ourselves) is respected — we neither steal it nor delete it on drop.
+    /// A pid file that exists but names NOBODY (truncated / stray) must not wedge
+    /// every future start: it is replaced, not obeyed.
     #[test]
-    fn acquire_yields_to_a_live_owner() {
+    fn acquire_replaces_an_unparseable_pid_file() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!(
-            "alice-pid-live-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
-
-        // A live pid that is NOT us would be ideal, but our own pid proves the same
-        // branch (`liveness != Dead` → don't take ownership) without spawning.
-        std::fs::write(pid_path(), std::process::id().to_string()).unwrap();
+        let tmp = temp_dir("junk");
+        std::fs::write(pid_path(), b"").unwrap();
         {
-            let _guard = PidGuard::acquire();
+            let _guard = PidGuard::try_acquire(false).expect("an empty pid file must not block");
             assert_eq!(read_pid(), Some(std::process::id()));
         }
-        // NOTE: the file still names our pid, and `Drop` only removes it when the
-        // guard OWNED it. It didn't (a live owner was recorded), but the recorded pid
-        // happens to equal ours, so the drop check cannot distinguish the two here.
-        // The takeover behaviour is what this test pins; ownership-on-drop is covered
-        // by `pid_guard_writes_and_cleans_up`.
+        std::fs::write(pid_path(), b"not-a-pid\n").unwrap();
+        {
+            let _guard = PidGuard::try_acquire(false).expect("a junk pid file must not block");
+            assert_eq!(read_pid(), Some(std::process::id()));
+        }
         std::env::remove_var("ALICE_IDENTITY_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// DUAL-INSTANCE DIAGNOSIS: the rendezvous decision table, including the new
-    /// "another live miner is already here" report. Pure, so every branch is covered on
-    /// every OS without spawning a second miner.
+    /// AM-REL-007, the headline change: a pid file naming a PROVABLY LIVE process is
+    /// now a REFUSAL, not a warning. (Our own pid is a live process we can create
+    /// without spawning anything.) The refusal must carry the pid AND the data dir —
+    /// "another miner is running" alone is not actionable.
     #[test]
-    fn classify_owner_reports_a_second_live_instance() {
-        const ME: u32 = 4242;
-        const OTHER: u32 = 909;
+    fn try_acquire_refuses_when_a_live_instance_holds_the_rendezvous() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = temp_dir("live");
 
-        // No file → take it, nothing to report.
-        assert_eq!(classify_owner(None, ME, |_| Liveness::Dead), (true, None));
-        // A pid we can PROVE is gone → stale-file takeover (the Windows bug fix).
-        assert_eq!(classify_owner(Some(OTHER), ME, |_| Liveness::Dead), (true, None));
-        // A LIVE pid that is not us → yield AND report it: this is the second instance
-        // the user needs to hear about.
+        std::fs::write(
+            pid_path(),
+            format!("{}\n/some/other/alice\n", std::process::id()),
+        )
+        .unwrap();
+        let conflict = PidGuard::try_acquire(false)
+            .err()
+            .expect("a live owner must REFUSE the start, not merely warn");
+        assert_eq!(conflict.pid, std::process::id());
+        assert_eq!(conflict.data_dir, Some(PathBuf::from("/some/other/alice")));
+        // The refusal must not have clobbered the owner's record.
+        assert_eq!(read_pid(), Some(std::process::id()));
+
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The escape hatch: `--allow-multiple` runs anyway, does NOT take the
+    /// rendezvous (so `stop` still reaches the original), and reports WHY.
+    #[test]
+    fn allow_multiple_runs_without_taking_the_rendezvous() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = temp_dir("override");
+
+        let owner_record = format!("{}\n/some/other/alice\n", std::process::id());
+        std::fs::write(pid_path(), &owner_record).unwrap();
+        {
+            let guard = PidGuard::try_acquire(true).expect("--allow-multiple must start");
+            match guard.sharing() {
+                Some(SharingReason::UserOverride { pid, data_dir }) => {
+                    assert_eq!(*pid, std::process::id());
+                    assert_eq!(data_dir.as_deref(), Some(std::path::Path::new("/some/other/alice")));
+                }
+                other => panic!("expected a UserOverride sharing reason, got {other:?}"),
+            }
+            // The ORIGINAL owner's record is untouched: `stop` must still reach it.
+            assert_eq!(
+                std::fs::read_to_string(pid_path()).unwrap(),
+                owner_record,
+                "--allow-multiple must not steal the rendezvous"
+            );
+        }
+        // Dropping a non-owning guard must not delete someone else's record either.
+        assert_eq!(std::fs::read_to_string(pid_path()).unwrap(), owner_record);
+
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The pid-file body parser: the current two-line form AND the legacy pid-only
+    /// form written by <= v0.6.7 (an upgrade must not orphan the running miner's
+    /// record). Pure - runs on every OS.
+    #[test]
+    fn parse_owner_reads_both_the_legacy_and_current_records() {
+        // Legacy: pid only.
         assert_eq!(
-            classify_owner(Some(OTHER), ME, |_| Liveness::Alive),
-            (false, Some(OTHER)),
-            "a second live miner must be surfaced, not silently tolerated"
+            parse_owner("4242"),
+            Some(Owner { pid: 4242, data_dir: None })
         );
-        // The recorded pid is OURS (e.g. a re-acquire) → yield, but that is not a
-        // second instance.
-        assert_eq!(classify_owner(Some(ME), ME, |_| Liveness::Alive), (false, None));
-        // Un-probeable → yield to the recorded owner, but do NOT accuse the user of
-        // running two miners on an answer we never got.
         assert_eq!(
-            classify_owner(Some(OTHER), ME, |_| Liveness::Unknown),
-            (false, None),
-            "an Unknown probe must not be reported as a second instance"
+            parse_owner("4242\n"),
+            Some(Owner { pid: 4242, data_dir: None })
+        );
+        // Current: pid + data dir.
+        assert_eq!(
+            parse_owner("4242\n/Users/x/.alice\n"),
+            Some(Owner {
+                pid: 4242,
+                data_dir: Some(PathBuf::from("/Users/x/.alice")),
+            })
+        );
+        // A blank second line is "not recorded", not an empty path.
+        assert_eq!(
+            parse_owner("4242\n\n"),
+            Some(Owner { pid: 4242, data_dir: None })
+        );
+        // Junk names nobody.
+        assert_eq!(parse_owner(""), None);
+        assert_eq!(parse_owner("not-a-pid\n/x"), None);
+        // `read_pid` still sees the pid in the two-line form (the compatibility that
+        // keeps `stop` working across the upgrade).
+        assert_eq!(
+            parse_owner("4242\n/Users/x/.alice").map(|o| o.pid),
+            Some(4242)
         );
     }
 
@@ -445,22 +617,20 @@ mod tests {
     #[test]
     fn pid_guard_writes_and_cleans_up() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!(
-            "alice-pid-guard-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("ALICE_IDENTITY_DIR", &tmp);
+        let tmp = temp_dir("guard");
 
         {
-            let _g = PidGuard::acquire();
+            let _g = PidGuard::try_acquire(false).expect("free rendezvous");
             assert_eq!(read_pid(), Some(std::process::id()));
+            // The record also carries the data dir, so a later conflict can name it.
+            let body = std::fs::read_to_string(pid_path()).unwrap();
+            assert_eq!(
+                parse_owner(&body).and_then(|o| o.data_dir),
+                Some(tmp.clone()),
+                "the rendezvous must record which data dir this miner is using"
+            );
         }
-        // Dropped → file removed.
+        // Dropped -> file removed.
         assert!(read_pid().is_none());
 
         std::env::remove_var("ALICE_IDENTITY_DIR");

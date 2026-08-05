@@ -211,6 +211,103 @@ fn print_notes(manifest: &Manifest) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// First-launch health gate (AM-REL-009)
+//
+// `apply_pipeline` above arms `arm_pending_health_check` after every CLI
+// self-update — the marker that says "a freshly-installed build is on probation".
+// Resolving that marker (bump the attempt, roll back a build that never confirms,
+// commit one that does) is `register_launch` + `confirm_health_and_commit`, and
+// until now ONLY the GUI called them.
+//
+// So on a headless box the designed safety net did not exist: `alice-miner update`
+// installed a new binary, armed the marker, and nothing ever cleared it. A build
+// that crashed on launch was never rolled back — the whole point of last-known-good
+// — and the marker plus the `.lkg` copy stayed on disk indefinitely.
+//
+// The CLI now drives the same gate:
+//   * [`register_launch_at_startup`] runs as early as possible in `main`, BEFORE
+//     argument parsing, so a build that dies during startup is on record;
+//   * [`confirm_launch_health`] runs the moment the process has demonstrably come
+//     up — clap has parsed (or produced a usage error, which equally proves the
+//     binary loads and runs).
+//
+// Deliberately NOT gated on "the miner mined successfully": that would roll a good
+// build back over an unrelated network outage. The claim being verified is only
+// "this binary starts", which is exactly the failure last-known-good exists for.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What the health gate found at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchHealth {
+    /// No update probation in effect (or the gate could not be resolved — a missing
+    /// app path is not an error worth blocking a miner over).
+    Normal,
+    /// This is the first run of a freshly-installed build; it must confirm.
+    Fresh { version: String },
+    /// A previously-installed build reached startup twice without ever confirming
+    /// health, and has been rolled back to last-known-good.
+    RolledBack { failed_version: String },
+}
+
+/// Resolve the first-launch health gate. Call ONCE, as early in `main` as possible.
+/// Never panics; never blocks; a failure to resolve is [`LaunchHealth::Normal`].
+pub fn register_launch_at_startup() -> LaunchHealth {
+    let Ok(app_path) = release::current_app_path() else {
+        return LaunchHealth::Normal;
+    };
+    match release::register_launch(&app_path, release::current_version()) {
+        Ok(release::LaunchDecision::FreshFirstRun { version }) => LaunchHealth::Fresh { version },
+        Ok(release::LaunchDecision::RolledBack { failed_version }) => {
+            LaunchHealth::RolledBack { failed_version }
+        }
+        _ => LaunchHealth::Normal,
+    }
+}
+
+/// Commit (or report) the health gate once the process has proven it starts.
+/// Prints a single line to STDERR so `--json` stdout stays machine-clean.
+pub fn confirm_launch_health(health: &LaunchHealth) {
+    match health {
+        LaunchHealth::Normal => {}
+        LaunchHealth::Fresh { version } => {
+            let Ok(app_path) = release::current_app_path() else {
+                return;
+            };
+            // Clears the marker and drops last-known-good.
+            if matches!(release::confirm_health_and_commit(&app_path), Ok(true)) {
+                eprintln!(
+                    "{}",
+                    tr!(
+                        format!("Updated to v{version}."),
+                        format!("已更新到 v{version}。")
+                    )
+                );
+            }
+        }
+        LaunchHealth::RolledBack { failed_version } => {
+            // Be precise about what just happened: the rollback replaced the binary
+            // ON DISK, but THIS process is still the failed build. Telling the user
+            // "rolled back" without that would be a half-truth they act on wrongly.
+            eprintln!(
+                "{}",
+                tr!(
+                    format!(
+                        "warning: v{failed_version} was installed but never started \
+                         successfully, so it has been rolled back to the previous version.\n\
+                         This process is still running the failed build — restart alice-miner \
+                         to use the restored one."
+                    ),
+                    format!(
+                        "警告:v{failed_version} 安装后从未成功启动,已回滚到上一个版本。\n\
+                         本进程仍在运行那个失败的版本 —— 请重启 alice-miner 以使用已恢复的版本。"
+                    )
+                )
+            );
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Non-blocking startup version-check banner
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -424,6 +521,94 @@ mod tests {
         with_temp_dir(|| {
             startup_banner(true);
             assert!(!cache_path().exists(), "quiet must not write a cache");
+        });
+    }
+
+    // ── AM-REL-009: the CLI now drives the first-launch health gate ───────────
+
+    /// The gate's full state machine, driven against a REAL marker file on a stub
+    /// app path — the same `alice-release` primitives the CLI calls, so this pins
+    /// the wiring, not a mock of it.
+    ///
+    /// This is the regression that matters: `arm_pending_health_check` was called by
+    /// the CLI's `apply_pipeline` and resolved by nobody, so a headless self-update
+    /// left the marker armed forever and a crash-on-launch build was never rolled
+    /// back.
+    #[test]
+    fn health_gate_arms_confirms_and_rolls_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "alice-cli-health-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = dir.join(if cfg!(windows) { "alice-miner.exe" } else { "alice-miner" });
+        std::fs::write(&app, b"new-build").unwrap();
+
+        // Nothing armed → Normal, and confirming is a no-op.
+        assert_eq!(
+            release::register_launch(&app, "1.4.0").unwrap(),
+            release::LaunchDecision::Normal
+        );
+
+        // An update armed the gate (what `apply_pipeline` does).
+        release::arm_pending_health_check(&app, "1.4.0").unwrap();
+        assert!(release::has_pending_health_check(&app));
+
+        // First run of the new build: on probation.
+        assert_eq!(
+            release::register_launch(&app, "1.4.0").unwrap(),
+            release::LaunchDecision::FreshFirstRun {
+                version: "1.4.0".into()
+            }
+        );
+        assert!(
+            release::has_pending_health_check(&app),
+            "the marker stays armed until the build proves it starts"
+        );
+
+        // The process came up → commit. THIS is the step the CLI never took.
+        assert!(release::confirm_health_and_commit(&app).unwrap());
+        assert!(
+            !release::has_pending_health_check(&app),
+            "a confirmed launch must clear the marker (it used to linger forever)"
+        );
+
+        // Now the crash-on-launch path: armed, reaches startup, never confirms.
+        release::arm_pending_health_check(&app, "1.5.0").unwrap();
+        assert_eq!(
+            release::register_launch(&app, "1.5.0").unwrap(),
+            release::LaunchDecision::FreshFirstRun {
+                version: "1.5.0".into()
+            }
+        );
+        // (no confirm — the build died here)
+        assert_eq!(
+            release::register_launch(&app, "1.5.0").unwrap(),
+            release::LaunchDecision::RolledBack {
+                failed_version: "1.5.0".into()
+            },
+            "a build that reaches startup twice without confirming must roll back"
+        );
+        assert!(!release::has_pending_health_check(&app), "no marker is left behind");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `register_launch_at_startup` + `confirm_launch_health` must never panic and
+    /// must be safe to call on a plain, never-updated build (the overwhelmingly
+    /// common case — including inside the test harness, whose exe has no marker).
+    #[test]
+    fn health_gate_entry_points_are_safe_on_a_normal_build() {
+        let h = register_launch_at_startup();
+        assert_eq!(h, LaunchHealth::Normal, "no marker → nothing to report");
+        confirm_launch_health(&h);
+        // A RolledBack report is print-only and must not panic either.
+        confirm_launch_health(&LaunchHealth::RolledBack {
+            failed_version: "9.9.9".into(),
         });
     }
 }
