@@ -545,6 +545,20 @@ fn parse_pull(resp: PullResponse) -> Result<PullOutcome, String> {
 /// repaint the screen and forge a success line. (The broader "sanitize every remote
 /// string on its way to the UI" sweep is audit AM-SEC-007; this is the narrow
 /// version for the two fields this module itself renders.)
+///
+/// **Two sanitisers coexist on purpose** (noted at the v0.6.8 merge so the split is
+/// deliberate, not accidental drift):
+///   * this one — for values with a KNOWN contract (`reason_code`, `status`), which
+///     the server defines as lowercase snake_case codes. It DROPS anything outside
+///     that contract and lowercases, so codes compare and read uniformly.
+///   * [`alice_supervise::sanitize_remote_id`] — for values with NO contract
+///     (`model_id`, `task_id`, an opaque `lease_id`). It substitutes `?` instead of
+///     dropping and preserves case, because there the exact characters are what the
+///     reader needs (a hash must stay a hash).
+///
+/// Both are safe for a terminal; the difference is fidelity, and the choice follows
+/// whether the value has a contract. Do not "unify" them by making ids lowercase —
+/// that would quietly corrupt hashes.
 pub fn sanitize_reason_code(raw: &str) -> String {
     raw.chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
