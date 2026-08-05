@@ -218,6 +218,11 @@ struct NonceResponse {
 struct PullResponse {
     #[serde(default)]
     status: String,
+    /// The server's stable, machine-readable reason (e.g.
+    /// `shard_stage_no_assignment`). Surfaced verbatim-but-SANITIZED on an
+    /// unexpected status so a protocol error names itself instead of hiding.
+    #[serde(default)]
+    reason_code: Option<String>,
     #[serde(default)]
     model_id: Option<String>,
     #[serde(default)]
@@ -442,6 +447,17 @@ pub fn pull(center_url: &str, alice_address: &str) -> Result<PullOutcome, String
 /// Turn a parsed pull response into a [`PullOutcome`], validating that an
 /// "assigned" status actually carries the launch spec + model/device (a truncated
 /// "assigned" with no spec is a protocol error, not a silent no-op).
+///
+/// **AM-REL-011.** The old code accepted `"assigned"` and mapped *everything else*
+/// — including a status string this client has never heard of, and including a
+/// server-side error envelope — onto [`PullOutcome::NoAssignment`]. That is the
+/// most expensive kind of lie: the miner sat rendering "waiting for the center to
+/// place this stage" (a normal, patient-looking state) while the control plane was
+/// actually telling it something was wrong, and no operator had any reason to look.
+///
+/// Now exactly ONE string means not-placed: `no_assignment`. Anything else is
+/// returned as an error naming the (sanitized) status + reason_code, so the loop can
+/// distinguish "keep polling" from "the protocol broke" and say which.
 fn parse_pull(resp: PullResponse) -> Result<PullOutcome, String> {
     match resp.status.as_str() {
         "assigned" => {
@@ -460,10 +476,168 @@ fn parse_pull(resp: PullResponse) -> Result<PullOutcome, String> {
                 session_ready: resp.session_ready,
             })))
         }
-        // "no_assignment" (the honest not-placed answer) or anything unexpected →
-        // treat as not-placed so the loop keeps heartbeating (never fabricate a run).
-        _ => Ok(PullOutcome::NoAssignment),
+        // The ONE honest "not placed yet" answer. Keep polling.
+        "no_assignment" => Ok(PullOutcome::NoAssignment),
+        // Anything else — an unknown protocol value, a renamed status, a server
+        // error envelope — is a protocol error. It is NOT "waiting for a placement".
+        other => {
+            let status = sanitize_reason_code(other);
+            let reason = resp
+                .reason_code
+                .as_deref()
+                .map(sanitize_reason_code)
+                .filter(|r| !r.is_empty());
+            Err(match reason {
+                Some(r) => format!(
+                    "pull returned an unrecognized status {status:?} (reason_code {r:?}); this \
+                     client does not know what that means, so it is NOT being treated as \
+                     'waiting for a placement'"
+                ),
+                None => format!(
+                    "pull returned an unrecognized status {status:?} with no reason_code; this \
+                     client does not know what that means, so it is NOT being treated as \
+                     'waiting for a placement'"
+                ),
+            })
+        }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Control-plane fault classification (AM-REL-004 / AM-REL-011)
+//
+// `post_json` renders every failure as a string (`POST <url>: HTTP <code>: <body>`
+// or `POST <url>: <transport error>`). The loops need to make DECISIONS from that
+// — retry, re-register, or stop pretending to be online — so the string is parsed
+// ONCE, here, by a pure function with a full unit table, instead of by ad-hoc
+// `e.contains("…")` tests scattered through the CLI.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Reduce a remote string (a `reason_code`, a status value) to something safe to
+/// print: lowercase ASCII word characters, `.` `:` `-` only, length-capped.
+///
+/// Remote text must never reach a terminal unfiltered — an ANSI/OSC payload can
+/// repaint the screen and forge a success line. (The broader "sanitize every remote
+/// string on its way to the UI" sweep is audit AM-SEC-007; this is the narrow
+/// version for the two fields this module itself renders.)
+pub fn sanitize_reason_code(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+        .take(64)
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// What KIND of control-plane failure happened — the decision input for the loops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultKind {
+    /// The request never got an HTTP answer (DNS, TCP, TLS, timeout). Retryable;
+    /// says nothing about our registration.
+    Transport,
+    /// 401/403 — the PoP was refused. Re-registering is the repair.
+    Auth,
+    /// 404/409/410 — the server does not know this stage (seat pruned/expired).
+    /// Re-registering is the repair.
+    SeatGone,
+    /// 5xx / 429 — the server is unhappy but our state is probably fine. Retry.
+    ServerError,
+    /// A well-formed HTTP answer this client cannot interpret (unknown status /
+    /// unparseable body). NOT retryable-silently: it must be shown.
+    Protocol,
+}
+
+/// A parsed control-plane failure: the kind, the HTTP status when there was one,
+/// and the server's sanitized `reason_code` when it sent one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fault {
+    pub kind: FaultKind,
+    pub status: Option<u16>,
+    pub reason_code: Option<String>,
+}
+
+impl Fault {
+    /// Whether the repair is to REGISTER again (rather than just retry).
+    pub fn needs_reregister(&self) -> bool {
+        if matches!(self.kind, FaultKind::Auth | FaultKind::SeatGone) {
+            return true;
+        }
+        // A server that renames its codes must still be understood: any reason_code
+        // that SAYS the seat is gone counts, whatever the HTTP status was.
+        self.reason_code.as_deref().is_some_and(|r| {
+            r.contains("not_registered")
+                || r.contains("unregistered")
+                || r.contains("unknown_stage")
+                || r.contains("stage_not_found")
+                || r.contains("expired")
+                || r.contains("pruned")
+        })
+    }
+
+    /// Whether simply trying again later is a reasonable response.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self.kind,
+            FaultKind::Transport | FaultKind::ServerError | FaultKind::Auth | FaultKind::SeatGone
+        )
+    }
+
+    /// A short, sanitized, user-facing description (never the raw remote body).
+    pub fn describe(&self) -> String {
+        let kind = match self.kind {
+            FaultKind::Transport => "cannot reach the center",
+            FaultKind::Auth => "the center refused this identity",
+            FaultKind::SeatGone => "the center does not know this stage",
+            FaultKind::ServerError => "the center returned an error",
+            FaultKind::Protocol => "the center's answer could not be understood",
+        };
+        match (self.status, self.reason_code.as_deref()) {
+            (Some(s), Some(r)) => format!("{kind} (HTTP {s}, {r})"),
+            (Some(s), None) => format!("{kind} (HTTP {s})"),
+            (None, Some(r)) => format!("{kind} ({r})"),
+            (None, None) => kind.to_string(),
+        }
+    }
+}
+
+/// Classify a control-plane error string produced by this module. Pure; the whole
+/// decision table is unit-tested with no network.
+pub fn classify_fault(err: &str) -> Fault {
+    let status = parse_http_status(err);
+    let reason_code = extract_reason_code(err);
+    let kind = match status {
+        None => FaultKind::Transport,
+        Some(401) | Some(403) => FaultKind::Auth,
+        Some(404) | Some(409) | Some(410) => FaultKind::SeatGone,
+        Some(429) => FaultKind::ServerError,
+        Some(s) if (500..600).contains(&s) => FaultKind::ServerError,
+        Some(_) => FaultKind::Protocol,
+    };
+    Fault {
+        kind,
+        status,
+        reason_code,
+    }
+}
+
+/// Pull `<code>` out of a `… HTTP <code>: <body>` rendering. `None` when the
+/// failure never reached HTTP (a transport error).
+fn parse_http_status(err: &str) -> Option<u16> {
+    let idx = err.find("HTTP ")?;
+    let rest = &err[idx + 5..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Pull a `"reason_code":"…"` out of a JSON error body, without parsing the whole
+/// (possibly hostile) document. Returns the SANITIZED value.
+fn extract_reason_code(err: &str) -> Option<String> {
+    let key = "\"reason_code\"";
+    let start = err.find(key)? + key.len();
+    let rest = &err[start..];
+    let quote = rest.find('"')? + 1;
+    let value: String = rest[quote..].chars().take_while(|c| *c != '"').collect();
+    let cleaned = sanitize_reason_code(&value);
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 #[cfg(test)]
@@ -674,6 +848,120 @@ mod tests {
         let resp: PullResponse =
             serde_json::from_str(r#"{"status":"assigned","model_id":"m"}"#).unwrap();
         assert!(parse_pull(resp).is_err());
+    }
+
+    /// AM-REL-011: an UNKNOWN status must surface as a protocol error naming itself,
+    /// never as the calm "waiting for a placement" state. This is the regression that
+    /// let a real server-side error look like patience for as long as anyone cared to
+    /// watch.
+    #[test]
+    fn parse_pull_unknown_status_is_an_error_not_a_silent_wait() {
+        for raw in [
+            r#"{"status":"error","reason_code":"shard_swarm_unavailable"}"#,
+            r#"{"status":"draining"}"#,
+            r#"{"status":""}"#,
+            r#"{}"#,
+        ] {
+            let resp: PullResponse = serde_json::from_str(raw).unwrap();
+            let e = parse_pull(resp).unwrap_err();
+            assert!(
+                e.contains("unrecognized status"),
+                "{raw} must be a protocol error, got: {e}"
+            );
+            assert!(
+                e.contains("NOT being treated"),
+                "the error must say what it is NOT doing: {e}"
+            );
+        }
+        // …while the ONE honest not-placed answer still means keep polling.
+        let ok: PullResponse = serde_json::from_str(r#"{"status":"no_assignment"}"#).unwrap();
+        assert_eq!(parse_pull(ok).unwrap(), PullOutcome::NoAssignment);
+    }
+
+    /// A hostile status/reason_code cannot repaint the terminal through the error.
+    #[test]
+    fn parse_pull_sanitizes_remote_strings_in_its_error() {
+        let raw = "{\"status\":\"\\u001b[2Jassigned-ish\",\"reason_code\":\"\\u001b]0;pwned\\u0007\"}";
+        let resp: PullResponse = serde_json::from_str(raw).unwrap();
+        let e = parse_pull(resp).unwrap_err();
+        assert!(!e.contains('\u{1b}'), "no ESC may survive into the message: {e:?}");
+        assert!(!e.contains('\u{7}'), "no BEL may survive into the message: {e:?}");
+    }
+
+    // ── fault classification (AM-REL-004) ─────────────────────────────────────
+
+    #[test]
+    fn sanitize_reason_code_strips_control_and_caps_length() {
+        assert_eq!(sanitize_reason_code("shard_stage_no_assignment"), "shard_stage_no_assignment");
+        assert_eq!(sanitize_reason_code("\u{1b}[31mBAD\u{1b}[0m"), "31mbad0m");
+        assert_eq!(sanitize_reason_code("a\nb\tc"), "abc");
+        assert_eq!(sanitize_reason_code(&"x".repeat(200)).len(), 64);
+        assert_eq!(sanitize_reason_code(""), "");
+    }
+
+    #[test]
+    fn classify_fault_decision_table() {
+        // No HTTP answer at all → transport (retryable, no re-register implied).
+        let t = classify_fault("POST https://api/x: Dns Failed: resolve");
+        assert_eq!(t.kind, FaultKind::Transport);
+        assert_eq!(t.status, None);
+        assert!(t.is_retryable());
+        assert!(!t.needs_reregister());
+
+        // 401/403 → auth; the repair is to register again.
+        for code in [401, 403] {
+            let f = classify_fault(&format!("POST https://api/x: HTTP {code}: {{\"detail\":\"no\"}}"));
+            assert_eq!(f.kind, FaultKind::Auth, "HTTP {code}");
+            assert!(f.needs_reregister());
+        }
+
+        // 404/409/410 → the seat is gone.
+        for code in [404, 409, 410] {
+            let f = classify_fault(&format!("POST https://api/x: HTTP {code}: {{}}"));
+            assert_eq!(f.kind, FaultKind::SeatGone, "HTTP {code}");
+            assert!(f.needs_reregister());
+        }
+
+        // 5xx / 429 → the server's problem; retry, don't re-register.
+        for code in [429, 500, 503] {
+            let f = classify_fault(&format!("POST https://api/x: HTTP {code}: upstream"));
+            assert_eq!(f.kind, FaultKind::ServerError, "HTTP {code}");
+            assert!(f.is_retryable());
+            assert!(!f.needs_reregister());
+        }
+
+        // A 4xx we have no rule for is a PROTOCOL fault — shown, not silently retried.
+        let p = classify_fault("POST https://api/x: HTTP 418: teapot");
+        assert_eq!(p.kind, FaultKind::Protocol);
+        assert!(!p.is_retryable());
+    }
+
+    /// The reason_code overrides the status class: a server that renames its codes
+    /// still gets us to re-register when it says the seat is gone.
+    #[test]
+    fn reason_code_can_demand_a_reregister_on_any_status() {
+        let f = classify_fault(
+            "POST https://api/x: HTTP 400: {\"ok\":false,\"reason_code\":\"shard_stage_not_registered\"}",
+        );
+        assert_eq!(f.status, Some(400));
+        assert_eq!(f.reason_code.as_deref(), Some("shard_stage_not_registered"));
+        assert!(f.needs_reregister(), "an explicit not_registered must trigger re-registration");
+
+        // …and a plain server error does NOT.
+        let g = classify_fault("POST https://api/x: HTTP 500: {\"reason_code\":\"internal\"}");
+        assert!(!g.needs_reregister());
+        assert_eq!(g.reason_code.as_deref(), Some("internal"));
+    }
+
+    #[test]
+    fn fault_describe_never_leaks_raw_body_or_escapes() {
+        let f = classify_fault(
+            "POST https://api/x: HTTP 403: {\"reason_code\":\"\u{1b}[2Jshard_pop_failed\",\"detail\":\"secret-ish body\"}",
+        );
+        let d = f.describe();
+        assert!(!d.contains('\u{1b}'));
+        assert!(!d.contains("secret-ish"), "the raw body must not be echoed: {d}");
+        assert!(d.contains("403"));
     }
 
     // ── argv construction (matches StageLaunchSpec.engine_argv byte-for-byte) ──

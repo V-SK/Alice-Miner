@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
+use alice_miner_core::alice_supervise::{spawn_guarded, GUARD_GRACE};
 use alice_miner_core::train_config::{self, TrainConfig};
 use alice_miner_core::train_worker::{self, LeaseOutcome, LeasedTask, SubmitVerdict};
 use alice_miner_core::tr;
@@ -86,6 +87,16 @@ const GEN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// the subprocess stdout channel. Short so Ctrl-C tears down promptly.
 const GEN_POLL_TICK: Duration = Duration::from_millis(200);
 
+/// Seconds of the lease reserved for the submit round-trip itself (sign → POST →
+/// server-side re-execution enqueue). A candidate that finishes with less than this
+/// left would be racing the coordinator's expiry check for nothing.
+const SUBMIT_SLACK_SECS: i64 = 45;
+
+/// The least generation budget worth spending a GPU on. Below this the model cannot
+/// realistically produce a candidate before the lease dies, so the honest move is to
+/// drop the lease immediately and ask for a fresh one rather than burn the card.
+const MIN_GEN_BUDGET: Duration = Duration::from_secs(60);
+
 /// Hard cap on candidate-block bytes accumulated from the subprocess stdout. The real
 /// candidate is a few KiB; this bounds memory if a hostile/broken LOCAL model floods the
 /// block sentinels. Past the cap we stop accumulating (the candidate is truncated →
@@ -117,6 +128,11 @@ pub enum TrainState {
     Verified,
     /// The generation subprocess crashed / produced no candidate; backing off.
     Error,
+    /// The lease ran out (or arrived with too little time left to be worth a
+    /// generation). The task is dropped WITHOUT submitting — a submission into an
+    /// expired lease is rejected server-side, so pretending otherwise would just
+    /// hide wasted GPU time. AM-REL-001.
+    LeaseExpired,
 }
 
 impl TrainState {
@@ -129,8 +145,30 @@ impl TrainState {
             TrainState::Submitting => "submitting",
             TrainState::Verified => "verified",
             TrainState::Error => "error",
+            TrainState::LeaseExpired => "lease-expired",
         }
     }
+}
+
+/// How long a generation attempt may run, given what is left on the lease.
+///
+/// **AM-REL-001.** `expires_at` was parsed nowhere and checked nowhere: the worker
+/// leased a task, generated for up to [`GEN_TIMEOUT`] (twenty minutes), and submitted
+/// into whatever was left — frequently nothing. The GPU time was real, the verdict
+/// was `train_lease_expired`, and the miner had no way to see why its work kept
+/// evaporating. Now the lease budgets the generation:
+///
+///   * `None` ⇒ do not start at all (less than [`MIN_GEN_BUDGET`] of usable time);
+///   * `Some(d)` ⇒ generate for at most `d`, which is never past the lease minus the
+///     submit reserve.
+///
+/// Pure, so the whole boundary is unit-tested without a coordinator.
+pub fn generation_budget(remaining_secs: i64, slack_secs: i64, cap: Duration) -> Option<Duration> {
+    let usable = remaining_secs - slack_secs;
+    if usable < MIN_GEN_BUDGET.as_secs() as i64 {
+        return None;
+    }
+    Some(cap.min(Duration::from_secs(usable as u64)))
 }
 
 /// The resolved, validated `train` invocation (flags + config merged). Built by
@@ -563,16 +601,40 @@ fn run_loop(
             Ok(LeaseOutcome::Leased(task)) => {
                 let task = *task;
                 status.task = Some(TaskView::from(&task));
+
+                // CHECKPOINT 1 of 3 (AM-REL-001) — BEFORE the generation. A lease that
+                // is already dead, or too short to finish inside, must never start a
+                // GPU run: that work cannot be accepted, and spending it anyway is the
+                // exact failure the audit found.
+                let now = train_worker::now_unix();
+                let remaining = task.remaining_secs(now);
+                let Some(budget) = generation_budget(remaining, SUBMIT_SLACK_SECS, GEN_TIMEOUT)
+                else {
+                    status.state = TrainState::LeaseExpired;
+                    status.last_message = Some(lease_too_short_message(&task, remaining));
+                    status.task = None;
+                    print!("{}", render_status(&status));
+                    sleep_interruptible(IDLE_TICK, stop);
+                    continue;
+                };
+
                 status.state = TrainState::Solving;
-                status.last_message = Some(
-                    tr!("leased a task; generating a candidate", "已租借任务;正在生成候选解")
-                        .into(),
-                );
+                status.last_message = Some(tr!(
+                    format!(
+                        "leased a task; generating a candidate (lease has {remaining}s left; \
+                         generation budget {}s)",
+                        budget.as_secs()
+                    ),
+                    format!(
+                        "已租借任务;正在生成候选解(租约剩余 {remaining} 秒;生成预算 {} 秒)",
+                        budget.as_secs()
+                    )
+                ));
                 print!("{}", render_status(&status));
 
                 // Solve: generate a candidate with the local model (bounded retries on a
                 // gen failure — a hard-failing model can't spin forever).
-                let candidate = solve_task(settings, driver_path, &task, stop, &mut status);
+                let candidate = solve_task(settings, driver_path, &task, budget, stop, &mut status);
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
@@ -585,6 +647,38 @@ fn run_loop(
                     sleep_interruptible(IDLE_TICK, stop);
                     continue;
                 };
+
+                // CHECKPOINT 3 of 3 (AM-REL-001) — BEFORE the submit. Generation can
+                // legitimately overrun (a slow first load, a retry); submitting into a
+                // lease that died meanwhile only produces a confusing server-side
+                // rejection. Say plainly that the work was finished but arrived late.
+                let now = train_worker::now_unix();
+                if task.is_expired(now, SUBMIT_SLACK_SECS) {
+                    status.state = TrainState::LeaseExpired;
+                    status.last_message = Some(tr!(
+                        format!(
+                            "a candidate WAS produced, but lease {lease} expired at {expiry} \
+                             ({over}s ago) — not submitting it (the coordinator would reject an \
+                             expired lease). The next lease starts fresh; if this repeats, this \
+                             GPU is slower than the coordinator's lease window for this model.",
+                            lease = task.lease_id,
+                            expiry = task.expires_at,
+                            over = (now - task.expires_at_unix).max(0)
+                        ),
+                        format!(
+                            "候选解已生成,但租约 {lease} 已于 {expiry} 过期({over} 秒前)—— \
+                             不再提交(调度中心会拒绝过期租约)。下一次租约将重新开始;\
+                             若反复出现,说明本 GPU 慢于该模型的租约窗口。",
+                            lease = task.lease_id,
+                            expiry = task.expires_at,
+                            over = (now - task.expires_at_unix).max(0)
+                        )
+                    ));
+                    status.task = None;
+                    print!("{}", render_status(&status));
+                    sleep_interruptible(IDLE_TICK, stop);
+                    continue;
+                }
 
                 // Submit the candidate. The coordinator re-executes + verdicts + folds
                 // credit (credit-only). A lease/candidate reject surfaces as an Err.
@@ -698,15 +792,17 @@ fn solve_task(
     settings: &TrainSettings,
     driver_path: &std::path::Path,
     task: &LeasedTask,
+    budget: Duration,
     stop: &Arc<AtomicBool>,
     status: &mut TrainStatus,
 ) -> Option<String> {
     let mut failures: u32 = 0;
+    let mut budget = budget;
     loop {
         if stop.load(Ordering::SeqCst) {
             return None;
         }
-        match run_gen_once(settings, driver_path, task, stop) {
+        match run_gen_once(settings, driver_path, task, budget, stop) {
             Ok(Some(code)) => return Some(code),
             Ok(None) => {
                 failures += 1;
@@ -741,6 +837,30 @@ fn solve_task(
         }
         // Brief interruptible backoff before the next attempt.
         sleep_interruptible(Duration::from_secs(3), stop);
+
+        // CHECKPOINT 2 of 3 (AM-REL-001) — BEFORE each retry. Each failed attempt
+        // ate real lease time; re-budget from the clock rather than from what was
+        // true when the task was leased. A retry with no room left is not attempted.
+        let now = train_worker::now_unix();
+        let remaining = task.remaining_secs(now);
+        match generation_budget(remaining, SUBMIT_SLACK_SECS, GEN_TIMEOUT) {
+            Some(next) => budget = next,
+            None => {
+                status.last_message = Some(tr!(
+                    format!(
+                        "not retrying: lease {lease} has {remaining}s left, too little to \
+                         finish and submit a candidate. Dropping it and leasing a fresh task.",
+                        lease = task.lease_id
+                    ),
+                    format!(
+                        "不再重试:租约 {lease} 仅剩 {remaining} 秒,不足以完成生成并提交。\
+                         放弃该租约,改为租借新任务。",
+                        lease = task.lease_id
+                    )
+                ));
+                return None;
+            }
+        }
     }
 }
 
@@ -754,6 +874,7 @@ fn run_gen_once(
     settings: &TrainSettings,
     driver_path: &std::path::Path,
     task: &LeasedTask,
+    budget: Duration,
     stop: &Arc<AtomicBool>,
 ) -> Result<Option<String>, String> {
     use std::process::{Command, Stdio};
@@ -789,12 +910,15 @@ fn run_gen_once(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
+    // AM-REL-006: spawn through the shared guard, so the generator's OWN children
+    // (torch dataloader workers, an NCCL helper) are in our process group / Job
+    // Object and die with it. `Child::kill()` reaped only the python process and
+    // left the workers holding VRAM until the box was rebooted.
+    let mut child = spawn_guarded(&mut cmd)
         .map_err(|e| format!("failed to spawn the candidate generator ({}): {e}", settings.python))?;
 
     // Feed the task JSON, then close stdin so the driver's `sys.stdin.read()` returns.
-    if let Some(mut stdin) = child.stdin.take() {
+    if let Some(mut stdin) = child.take_stdin() {
         stdin
             .write_all(task_json.as_bytes())
             .map_err(|e| format!("failed to write task to the generator stdin: {e}"))?;
@@ -803,7 +927,7 @@ fn run_gen_once(
 
     // Mirror stderr to the log on its own thread (diagnostics only).
     let log = Arc::new(Mutex::new(log_file));
-    if let Some(err) = child.stderr.take() {
+    if let Some(err) = child.take_stderr() {
         let log = Arc::clone(&log);
         std::thread::spawn(move || {
             let reader = BufReader::new(err);
@@ -821,7 +945,7 @@ fn run_gen_once(
     // emits EOF). The reader thread stops relaying once the candidate block exceeds the
     // byte cap — a hostile/broken LOCAL model can't OOM us.
     let (tx, rx) = mpsc::channel::<String>();
-    if let Some(out) = child.stdout.take() {
+    if let Some(out) = child.take_stdout() {
         std::thread::spawn(move || {
             let reader = BufReader::new(out);
             for line in reader.lines().map_while(Result::ok) {
@@ -838,7 +962,9 @@ fn run_gen_once(
     let mut in_block = false;
     let mut buf = String::new();
     let mut capped = false;
-    let deadline = Instant::now() + GEN_TIMEOUT;
+    // The deadline is the LEASE budget, not a fixed twenty minutes: generating past
+    // the point where the result could still be submitted is pure waste.
+    let deadline = Instant::now() + budget;
     let mut killed_reason: Option<&str> = None;
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -846,7 +972,7 @@ fn run_gen_once(
             break;
         }
         if Instant::now() >= deadline {
-            killed_reason = Some("generation timed out");
+            killed_reason = Some("generation ran out of its lease budget");
             break;
         }
         match rx.recv_timeout(GEN_POLL_TICK) {
@@ -888,9 +1014,10 @@ fn run_gen_once(
     }
 
     if let Some(reason) = killed_reason {
-        let _ = child.kill();
+        // The whole tree, not just the python process (AM-REL-006).
+        child.kill_tree(GUARD_GRACE);
         if let Ok(mut f) = log.lock() {
-            let _ = writeln!(f, "[alice] killed generation subprocess: {reason}");
+            let _ = writeln!(f, "[alice] killed generation subprocess tree: {reason}");
         }
     }
     let exit = child
@@ -902,6 +1029,49 @@ fn run_gen_once(
     // carries the driver's stderr reason.
     let _ = exit;
     Ok(parse_candidate(candidate))
+}
+
+/// The message for a lease that arrived already dead (or too short to be worth a
+/// GPU run). Names the lease, its stated expiry, and what was actually left, so the
+/// operator can tell a slow clock from a slow coordinator from a slow GPU.
+fn lease_too_short_message(task: &LeasedTask, remaining: i64) -> String {
+    if remaining <= 0 {
+        tr!(
+            format!(
+                "lease {lease} was ALREADY expired on arrival (expires_at {expiry}); no \
+                 generation was started. If this repeats, check this machine's clock against \
+                 UTC — a skewed clock makes every lease look dead.",
+                lease = task.lease_id,
+                expiry = task.expires_at
+            ),
+            format!(
+                "租约 {lease} 到手即已过期(expires_at {expiry});未启动任何生成。\
+                 若反复出现,请核对本机时钟与 UTC —— 时钟偏差会让每个租约都显得已过期。",
+                lease = task.lease_id,
+                expiry = task.expires_at
+            )
+        )
+    } else {
+        tr!(
+            format!(
+                "lease {lease} had only {remaining}s left (expires_at {expiry}); that is under \
+                 the {min}s minimum plus the {slack}s submit reserve, so no generation was \
+                 started — the result could not have been submitted in time.",
+                lease = task.lease_id,
+                expiry = task.expires_at,
+                min = MIN_GEN_BUDGET.as_secs(),
+                slack = SUBMIT_SLACK_SECS
+            ),
+            format!(
+                "租约 {lease} 仅剩 {remaining} 秒(expires_at {expiry}),低于 {min} 秒最低生成\
+                 预算加 {slack} 秒提交预留,因此未启动生成 —— 结果也来不及提交。",
+                lease = task.lease_id,
+                expiry = task.expires_at,
+                min = MIN_GEN_BUDGET.as_secs(),
+                slack = SUBMIT_SLACK_SECS
+            )
+        )
+    }
 }
 
 /// Validate a captured candidate: `Some(code)` only when it is non-empty after
@@ -1007,11 +1177,99 @@ mod tests {
             TrainState::Submitting.label(),
             TrainState::Verified.label(),
             TrainState::Error.label(),
+            TrainState::LeaseExpired.label(),
         ];
         let mut sorted = labels.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), labels.len(), "every state has a distinct label");
+        // A dropped lease must be its OWN word: folding it into `error` would hide
+        // the one failure mode where the GPU worked perfectly and still earned zero.
+        assert_eq!(TrainState::LeaseExpired.label(), "lease-expired");
+    }
+
+    // ── AM-REL-001: the lease budgets the generation ──────────────────────────
+
+    /// The boundary table for [`generation_budget`]: enough time → generate (capped);
+    /// not enough → do not start at all.
+    #[test]
+    fn generation_budget_refuses_to_start_work_that_cannot_be_submitted() {
+        let cap = Duration::from_secs(20 * 60);
+        let slack = SUBMIT_SLACK_SECS;
+        let min = MIN_GEN_BUDGET.as_secs() as i64;
+
+        // Plenty of time → the full cap.
+        assert_eq!(generation_budget(3600, slack, cap), Some(cap));
+        // Less than the cap → exactly what is usable (lease minus the submit reserve).
+        assert_eq!(
+            generation_budget(600, slack, cap),
+            Some(Duration::from_secs(600 - slack as u64))
+        );
+        // Exactly at the minimum → allowed (and equals the minimum).
+        assert_eq!(
+            generation_budget(min + slack, slack, cap),
+            Some(MIN_GEN_BUDGET)
+        );
+        // One second under the minimum → refused. This is the whole point: a run that
+        // cannot finish in time is not started.
+        assert_eq!(generation_budget(min + slack - 1, slack, cap), None);
+        // Already expired, or expired past the epoch of this lease → refused.
+        assert_eq!(generation_budget(0, slack, cap), None);
+        assert_eq!(generation_budget(-500, slack, cap), None);
+        // The budget NEVER exceeds what is left on the lease.
+        for remaining in [100i64, 200, 400, 1200] {
+            if let Some(b) = generation_budget(remaining, slack, cap) {
+                assert!(
+                    b.as_secs() as i64 <= remaining - slack,
+                    "budget {b:?} must leave the submit reserve of {slack}s at {remaining}s"
+                );
+            }
+        }
+    }
+
+    fn leased(expires_at_unix: i64) -> LeasedTask {
+        LeasedTask {
+            task_id: "m0-001".into(),
+            entry_point: "run_length_encode".into(),
+            prompt: "solve it".into(),
+            held_out_commitment: "sha256:abc123def".into(),
+            lease_id: "L1".into(),
+            expires_at: "2026-07-02T20:00:00+00:00".into(),
+            expires_at_unix,
+        }
+    }
+
+    /// The three checkpoints all consult the same two primitives; pin their edges.
+    #[test]
+    fn lease_expiry_predicates_reserve_the_submit_window() {
+        let now = 1_000_000i64;
+        let t = leased(now + 300);
+        assert_eq!(t.remaining_secs(now), 300);
+        assert!(!t.is_expired(now, SUBMIT_SLACK_SECS));
+        // Inside the submit reserve counts as expired — submitting there is a race
+        // we would lose, and losing it silently is the bug.
+        assert!(t.is_expired(now + 300 - SUBMIT_SLACK_SECS, SUBMIT_SLACK_SECS));
+        assert!(t.is_expired(now + 301, SUBMIT_SLACK_SECS));
+        // Past the deadline, `remaining` floors at 0 rather than going negative.
+        assert_eq!(t.remaining_secs(now + 900), 0);
+    }
+
+    /// The refusal message must name the lease, its expiry, and the actual shortfall
+    /// — and tell an already-dead lease apart from a merely short one (a dead-on-
+    /// arrival lease usually means a skewed local clock, which is a different fix).
+    #[test]
+    fn lease_too_short_message_distinguishes_dead_on_arrival_from_short() {
+        alice_miner_core::i18n::set_lang(alice_miner_core::i18n::Lang::En);
+        let t = leased(0);
+        let dead = lease_too_short_message(&t, 0);
+        assert!(dead.contains("ALREADY expired"), "{dead}");
+        assert!(dead.contains("clock"), "a dead-on-arrival lease points at the clock: {dead}");
+        assert!(dead.contains("L1") && dead.contains("2026-07-02T20:00:00+00:00"));
+
+        let short = lease_too_short_message(&t, 30);
+        assert!(short.contains("only 30s left"), "{short}");
+        assert!(!short.contains("ALREADY expired"));
+        assert!(short.contains(&SUBMIT_SLACK_SECS.to_string()));
     }
 
     #[test]

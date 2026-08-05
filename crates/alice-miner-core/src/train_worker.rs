@@ -225,6 +225,24 @@ pub struct LeasedTask {
     pub held_out_commitment: String,
     pub lease_id: String,
     pub expires_at: String,
+    /// `expires_at` parsed to a Unix timestamp at LEASE time. Not on the wire —
+    /// [`parse_lease`] fills it, and refuses the lease if `expires_at` cannot be
+    /// parsed, so no later code has to cope with an unparseable deadline.
+    #[serde(skip)]
+    pub expires_at_unix: i64,
+}
+
+impl LeasedTask {
+    /// Seconds left on the lease at `now_unix` (0 once it has expired).
+    pub fn remaining_secs(&self, now_unix: i64) -> i64 {
+        (self.expires_at_unix - now_unix).max(0)
+    }
+
+    /// Whether the coordinator will still accept a submission for this lease.
+    /// `slack_secs` reserves time for the submit round-trip itself.
+    pub fn is_expired(&self, now_unix: i64, slack_secs: i64) -> bool {
+        self.expires_at_unix - now_unix <= slack_secs
+    }
 }
 
 /// The `lease` response envelope: `ok` gates whether a task was handed out (`ok:true`
@@ -396,6 +414,24 @@ pub fn lease(center_url: &str, alice_address: &str, secrets: &WalletSecrets) -> 
 /// is a protocol error, not a silent no-op). `ok:false` is the honest "no task"
 /// (`train_no_task_available`) OR an unregistered caller (`train_worker_not_registered`);
 /// the latter surfaces as an `Err` so the loop re-registers rather than spinning.
+/// AM-REL-012 + AM-REL-001: the three fields that used to default to `""` —
+/// `entry_point`, `held_out_commitment`, `expires_at` — are REQUIRED and format-
+/// checked here.
+///
+/// Why this is not pedantry. Each of the three silently defaulting to empty put the
+/// client into a state it could not win from:
+///   * no `entry_point` → the generator is told to write a function with no name;
+///     whatever it produces cannot match the hidden tests, so a full GPU generation
+///     is spent to earn a guaranteed `not_verified`.
+///   * no `held_out_commitment` → the anti-overfit seal is gone. The worker cannot
+///     show the tests were fixed before it solved, and the one number that makes
+///     the verdict trustworthy is silently absent from the UI.
+///   * no `expires_at` → the client has no idea when the lease dies, so it happily
+///     generates for minutes and submits into a lease the coordinator already
+///     dropped (audit AM-REL-001). The work is real; the reward is zero.
+///
+/// An incomplete lease is refused immediately, BEFORE the expensive generation, and
+/// the reason names the missing field.
 fn parse_lease(resp: LeaseResponse) -> Result<LeaseOutcome, String> {
     if resp.ok {
         let lease_id = resp
@@ -408,11 +444,57 @@ fn parse_lease(resp: LeaseResponse) -> Result<LeaseOutcome, String> {
             .ok_or("lease ok:true but carried no task_id")?;
         let prompt = resp
             .prompt
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
             .ok_or("lease ok:true but carried no prompt")?;
-        let entry_point = resp.entry_point.unwrap_or_default();
-        let held_out_commitment = resp.held_out_commitment.unwrap_or_default();
-        let expires_at = resp.expires_at.unwrap_or_default();
+
+        let entry_point = resp
+            .entry_point
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or(
+                "lease ok:true but carried no entry_point — refusing to generate a candidate for \
+                 an unnamed function (it could not pass the hidden tests)",
+            )?;
+        if !is_valid_entry_point(&entry_point) {
+            return Err(format!(
+                "lease carried a malformed entry_point (expected a python identifier, got \
+                 {:?}) — refusing the lease rather than generating against it",
+                sanitize_field(&entry_point)
+            ));
+        }
+
+        let held_out_commitment = resp
+            .held_out_commitment
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or(
+                "lease ok:true but carried no held_out_commitment — without the anti-overfit \
+                 seal this task is not verifiable, so it is refused rather than solved",
+            )?;
+        if !is_valid_commitment(&held_out_commitment) {
+            return Err(format!(
+                "lease carried a malformed held_out_commitment ({:?}) — refusing the lease",
+                sanitize_field(&held_out_commitment)
+            ));
+        }
+
+        let expires_at = resp
+            .expires_at
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or(
+                "lease ok:true but carried no expires_at — without a deadline this client cannot \
+                 tell whether a generated candidate would still be accepted, so the lease is \
+                 refused instead of gambling a full generation on it",
+            )?;
+        let expires_at_unix = parse_rfc3339_unix(&expires_at).ok_or_else(|| {
+            format!(
+                "lease carried an unparseable expires_at ({:?}); expected an RFC3339 timestamp \
+                 like 2026-07-02T20:00:00+00:00 — refusing the lease",
+                sanitize_field(&expires_at)
+            )
+        })?;
+
         return Ok(LeaseOutcome::Leased(Box::new(LeasedTask {
             task_id,
             entry_point,
@@ -420,6 +502,7 @@ fn parse_lease(resp: LeaseResponse) -> Result<LeaseOutcome, String> {
             held_out_commitment,
             lease_id,
             expires_at,
+            expires_at_unix,
         })));
     }
     // ok:false — distinguish "no task" (a normal, keep-polling state) from
@@ -430,6 +513,153 @@ fn parse_lease(resp: LeaseResponse) -> Result<LeaseOutcome, String> {
         }
         _ => Ok(LeaseOutcome::NoTask),
     }
+}
+
+// ── lease field validation + deadline parsing (AM-REL-012 / AM-REL-001) ───────
+
+/// A python identifier: ASCII letters / digits / `_`, not starting with a digit,
+/// bounded. This is the name the generated candidate must define, so anything the
+/// python driver could not use as a function name is a malformed lease.
+pub fn is_valid_entry_point(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && !s.starts_with(|c: char| c.is_ascii_digit())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The anti-overfit seal: a bounded, printable token like `sha256:<hex>` (a bare
+/// digest is accepted too). Deliberately permissive about the ALGORITHM prefix and
+/// strict about the shape, so a server that upgrades to blake3 still works while a
+/// blank / control-character / novel-length value is refused.
+pub fn is_valid_commitment(s: &str) -> bool {
+    let body = s.rsplit(':').next().unwrap_or(s);
+    (8..=256).contains(&s.len())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_'))
+        && body.len() >= 6
+        && body.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Reduce a remote field to something safe to put in an error message (no ANSI/OSC
+/// repaint, bounded length).
+fn sanitize_field(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect::<String>()
+}
+
+/// Parse the RFC3339 timestamp the coordinator sends (`2026-07-02T20:00:00+00:00`,
+/// `…Z`, and fractional seconds are all accepted) into a Unix timestamp.
+///
+/// Hand-rolled rather than pulling in `chrono`/`time`: this crate ships in the
+/// signed miner binary and the workspace deliberately keeps that tree small. The
+/// civil-days algorithm is Howard Hinnant's `days_from_civil`, valid for any
+/// Gregorian date; the whole function is pure and unit-tested against known values.
+///
+/// Returns `None` for anything it cannot parse — the caller REFUSES the lease
+/// rather than guessing a deadline.
+pub fn parse_rfc3339_unix(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let num = |a: usize, b: usize| -> Option<i64> { s.get(a..b)?.parse::<i64>().ok() };
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    // The date/time separator is 'T' (RFC3339) or a space (the "human" variant
+    // python's `isoformat(sep=' ')` emits).
+    if bytes[10] != b'T' && bytes[10] != b't' && bytes[10] != b' ' {
+        return None;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    if h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+
+    // Offset: 'Z' | '+HH:MM' | '-HH:MM' | '+HHMM' | (absent ⇒ UTC, which is what
+    // the coordinator sends; a naive timestamp is treated as UTC, matching the
+    // server's `datetime.now(timezone.utc).isoformat()`).
+    let rest = &s[19..];
+    let rest = rest.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let offset_secs = if rest.is_empty() || rest.eq_ignore_ascii_case("z") {
+        0
+    } else {
+        let sign = match rest.as_bytes()[0] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        // Strictly `HH`, `HHMM`, or `HH:MM` — NOT "whatever digits happen to be
+        // there". A sloppy filter turned the malformed `+2:0` into a silent +20h,
+        // which would have made a live lease look days away from expiry.
+        let tail = &rest[1..];
+        let (oh_s, om_s) = match tail.len() {
+            2 => (&tail[0..2], "0"),
+            4 => (&tail[0..2], &tail[2..4]),
+            5 if tail.as_bytes()[2] == b':' => (&tail[0..2], &tail[3..5]),
+            _ => return None,
+        };
+        if !oh_s.chars().all(|c| c.is_ascii_digit()) || !om_s.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let oh: i64 = oh_s.parse().ok()?;
+        let om: i64 = om_s.parse().ok()?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        sign * (oh * 3600 + om * 60)
+    };
+
+    let days = days_from_civil(y, mo as u32, d as u32)?;
+    Some(days * 86_400 + h * 3600 + mi * 60 + sec - offset_secs)
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian date (Hinnant). `None` for a
+/// day-of-month the month does not have (e.g. 2026-02-30).
+fn days_from_civil(y: i64, m: u32, d: u32) -> Option<i64> {
+    if d > days_in_month(y, m) {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = ((m + 9) % 12) as i64; // Mar=0 … Feb=11
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    Some(era * 146_097 + doe - 719_468)
+}
+
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Seconds since the Unix epoch (0 on the impossible pre-epoch clock).
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// POST `/v1/train/submit` — submit the candidate solution for a leased task (same PoP
@@ -775,6 +1005,165 @@ mod tests {
         let resp: LeaseResponse =
             serde_json::from_str(r#"{"ok":true,"task_id":"m0-001","prompt":"p"}"#).unwrap();
         assert!(parse_lease(resp).is_err(), "ok:true with no lease_id is a protocol error");
+    }
+
+    // ── AM-REL-012: the three formerly-defaulted fields are now REQUIRED ───────
+
+    /// Build an otherwise-valid lease body with one field overridden/removed.
+    fn lease_json(entry: &str, commitment: &str, expires: &str) -> String {
+        let mut fields = vec![
+            "\"ok\":true".to_string(),
+            "\"lease_id\":\"L1\"".to_string(),
+            "\"task_id\":\"m0-001\"".to_string(),
+            "\"prompt\":\"solve it\"".to_string(),
+        ];
+        if !entry.is_empty() {
+            fields.push(format!("\"entry_point\":{entry}"));
+        }
+        if !commitment.is_empty() {
+            fields.push(format!("\"held_out_commitment\":{commitment}"));
+        }
+        if !expires.is_empty() {
+            fields.push(format!("\"expires_at\":{expires}"));
+        }
+        format!("{{{}}}", fields.join(","))
+    }
+
+    const GOOD_ENTRY: &str = "\"run_length_encode\"";
+    const GOOD_COMMIT: &str = "\"sha256:abc123def456\"";
+    const GOOD_EXPIRY: &str = "\"2026-07-02T20:00:00+00:00\"";
+
+    #[test]
+    fn parse_lease_accepts_a_complete_lease_and_resolves_the_deadline() {
+        let raw = lease_json(GOOD_ENTRY, GOOD_COMMIT, GOOD_EXPIRY);
+        let resp: LeaseResponse = serde_json::from_str(&raw).unwrap();
+        match parse_lease(resp).unwrap() {
+            LeaseOutcome::Leased(t) => {
+                assert_eq!(t.entry_point, "run_length_encode");
+                assert_eq!(t.held_out_commitment, "sha256:abc123def456");
+                // 2026-07-02T20:00:00Z — cross-checked against `date -u -d`.
+                assert_eq!(t.expires_at_unix, 1_783_022_400);
+                assert!(!t.is_expired(t.expires_at_unix - 60, 30));
+                assert!(t.is_expired(t.expires_at_unix - 10, 30));
+                assert_eq!(t.remaining_secs(t.expires_at_unix + 5), 0);
+            }
+            other => panic!("expected leased, got {other:?}"),
+        }
+    }
+
+    /// Each missing field is refused BEFORE any generation, naming itself. These
+    /// used to default to `""` and let the worker burn a full GPU generation on a
+    /// task it could not be paid for.
+    #[test]
+    fn parse_lease_refuses_a_lease_missing_any_required_field() {
+        for (entry, commit, expires, needle) in [
+            ("", GOOD_COMMIT, GOOD_EXPIRY, "entry_point"),
+            (GOOD_ENTRY, "", GOOD_EXPIRY, "held_out_commitment"),
+            (GOOD_ENTRY, GOOD_COMMIT, "", "expires_at"),
+        ] {
+            let raw = lease_json(entry, commit, expires);
+            let resp: LeaseResponse = serde_json::from_str(&raw).unwrap();
+            let e = parse_lease(resp).unwrap_err();
+            assert!(e.contains(needle), "missing {needle} must be named: {e}");
+        }
+    }
+
+    /// Malformed (not merely absent) values are refused too.
+    #[test]
+    fn parse_lease_refuses_malformed_required_fields() {
+        let cases = [
+            ("\"9bad name\"", GOOD_COMMIT, GOOD_EXPIRY, "entry_point"),
+            (GOOD_ENTRY, "\"short\"", GOOD_EXPIRY, "held_out_commitment"),
+            (GOOD_ENTRY, GOOD_COMMIT, "\"soon\"", "expires_at"),
+            (GOOD_ENTRY, GOOD_COMMIT, "\"2026-02-30T00:00:00Z\"", "expires_at"),
+        ];
+        for (entry, commit, expires, needle) in cases {
+            let raw = lease_json(entry, commit, expires);
+            let resp: LeaseResponse = serde_json::from_str(&raw).unwrap();
+            let e = parse_lease(resp).unwrap_err();
+            assert!(e.contains(needle), "malformed {needle} must be refused: {e}");
+        }
+    }
+
+    /// A hostile field cannot repaint the terminal through the refusal message.
+    #[test]
+    fn parse_lease_error_sanitizes_the_offending_value() {
+        let raw = lease_json(GOOD_ENTRY, GOOD_COMMIT, "\"\\u001b[2Jnot-a-date\"");
+        let resp: LeaseResponse = serde_json::from_str(&raw).unwrap();
+        let e = parse_lease(resp).unwrap_err();
+        assert!(!e.contains('\u{1b}'), "no ESC in the message: {e:?}");
+    }
+
+    // ── AM-REL-001: the deadline parser ───────────────────────────────────────
+
+    #[test]
+    fn rfc3339_parses_the_shapes_the_coordinator_emits() {
+        // The canonical server form.
+        assert_eq!(
+            parse_rfc3339_unix("2026-07-02T20:00:00+00:00"),
+            Some(1_783_022_400)
+        );
+        // Z, lowercase z, fractional seconds, python's space separator, naive.
+        for s in [
+            "2026-07-02T20:00:00Z",
+            "2026-07-02t20:00:00z",
+            "2026-07-02T20:00:00.123456Z",
+            "2026-07-02 20:00:00+00:00",
+            "2026-07-02T20:00:00",
+        ] {
+            assert_eq!(parse_rfc3339_unix(s), Some(1_783_022_400), "{s}");
+        }
+        // A real non-UTC offset shifts correctly (+02:00 is two hours EARLIER in UTC).
+        assert_eq!(
+            parse_rfc3339_unix("2026-07-02T22:00:00+02:00"),
+            Some(1_783_022_400)
+        );
+        assert_eq!(
+            parse_rfc3339_unix("2026-07-02T15:00:00-05:00"),
+            Some(1_783_022_400)
+        );
+        // The epoch itself + a leap day (the civil-days algorithm's classic traps).
+        assert_eq!(parse_rfc3339_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339_unix("2024-02-29T00:00:00Z"), Some(1_709_164_800));
+        assert_eq!(parse_rfc3339_unix("2000-02-29T00:00:00Z"), Some(951_782_400));
+    }
+
+    #[test]
+    fn rfc3339_refuses_what_it_cannot_parse_rather_than_guessing() {
+        for bad in [
+            "",
+            "soon",
+            "2026-07-02",
+            "2026-13-02T00:00:00Z",   // month 13
+            "2026-02-30T00:00:00Z",   // no such day
+            "2026-07-02T25:00:00Z",   // hour 25
+            "2026-07-02T20:61:00Z",   // minute 61
+            "2026-07-02X20:00:00Z",   // wrong separator
+            "2026-07-02T20:00:00+2:0", // malformed offset
+            "2026-07-02T20:00:00 UTC",
+        ] {
+            assert_eq!(parse_rfc3339_unix(bad), None, "{bad:?} must not parse");
+        }
+        // 1999-12-31 is NOT a leap year day; 2100 is not a leap year.
+        assert_eq!(parse_rfc3339_unix("2100-02-29T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn entry_point_and_commitment_validators() {
+        assert!(is_valid_entry_point("run_length_encode"));
+        assert!(is_valid_entry_point("_f2"));
+        assert!(!is_valid_entry_point(""));
+        assert!(!is_valid_entry_point("2fast"));
+        assert!(!is_valid_entry_point("has space"));
+        assert!(!is_valid_entry_point("import os; os.system('x')"));
+
+        assert!(is_valid_commitment("sha256:abc123def456"));
+        assert!(is_valid_commitment(&"a".repeat(64)));
+        assert!(is_valid_commitment("blake3:0123456789abcdef"));
+        assert!(!is_valid_commitment(""));
+        assert!(!is_valid_commitment("sha256:"));
+        assert!(!is_valid_commitment("short"));
+        assert!(!is_valid_commitment("has spaces in it"));
     }
 
     #[test]

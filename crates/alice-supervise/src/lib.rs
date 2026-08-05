@@ -30,7 +30,8 @@ pub mod child;
 // Re-export the child-process API so consumers can use it directly off the
 // crate root (`alice_supervise::spawn_supervised`, `OwnedChild`, …).
 pub use child::{
-    read_pid_file, spawn_supervised, LogLine, LogStream, OwnedChild,
+    read_pid_file, spawn_guarded, spawn_supervised, GuardedChild, LogLine, LogStream, OwnedChild,
+    GUARD_GRACE,
 };
 
 use std::collections::VecDeque;

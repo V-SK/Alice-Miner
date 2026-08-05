@@ -90,6 +90,11 @@ const EXIT_UNVERIFIED: i32 = 3;
 ///
 /// For scripts: `0` and `4` both mean **stopped**; `3` means may-still-be-running.
 const EXIT_SCAN_GAP: i32 = 4;
+/// `start` only: **refused because another `alice-miner start` is already running**
+/// on this data directory (AM-REL-007). Its own code so a supervisor script can tell
+/// "already running, nothing to do" apart from a real failure — restarting on this
+/// code would be exactly the wrong move.
+const EXIT_ALREADY_RUNNING: i32 = 5;
 
 /// ONE crate-wide lock for every test that mutates the process-global
 /// `$ALICE_IDENTITY_DIR` (or other shared env). Rust runs a crate's tests in
@@ -537,6 +542,14 @@ struct StartArgs {
     /// (no secret; a core test asserts its wire form). Not for manual use. Hidden.
     #[arg(long, value_name = "PATH", hide = true)]
     telemetry_file: Option<std::path::PathBuf>,
+    /// Start even though another `alice-miner start` already holds this data
+    /// directory's rendezvous. NOT recommended: both instances drive the same engine
+    /// directory and overwrite each other's telemetry, and `alice-miner stop` can only
+    /// reach the recorded one. The legitimate use is a FALSE positive — pids are
+    /// recycled, so a recorded pid can be alive as an unrelated program. For genuinely
+    /// running two miners, give each one its own `ALICE_IDENTITY_DIR` instead.
+    #[arg(long)]
+    allow_multiple: bool,
 }
 
 #[derive(clap::Args)]
@@ -854,6 +867,139 @@ struct LangArgs {
     lang: Option<String>,
 }
 
+/// How often the background agent re-checks a held rendezvous.
+const SERVICE_RENDEZVOUS_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+/// How often it says so while waiting (a line every ~5 minutes, not every poll).
+const SERVICE_RENDEZVOUS_LOG_EVERY: u32 = 20;
+
+/// Claim the rendezvous, or — for the BACKGROUND AGENT only — wait for it.
+///
+/// A user-launched `start` gets an immediate, actionable refusal. The agent instead
+/// polls, because its supervisor respawns it on every exit: refusing would turn one
+/// foreground mining session into a restart storm (launchd) or a tripped start limit
+/// that leaves the agent dead afterwards (systemd). It reports the wait once, then
+/// roughly every five minutes, so the state is visible in the service log without
+/// flooding it.
+fn wait_or_acquire_rendezvous(args: &StartArgs) -> Result<pidfile::PidGuard, pidfile::InstanceConflict> {
+    let first = pidfile::PidGuard::try_acquire(args.allow_multiple);
+    if !args.from_service {
+        return first;
+    }
+    let Err(conflict) = first else {
+        return first;
+    };
+    eprintln!(
+        "{}",
+        tr!(
+            format!(
+                "background agent: pid {} is already mining on this data directory; waiting for \
+                 it to finish rather than starting a second miner.",
+                conflict.pid
+            ),
+            format!(
+                "后台代理:进程 {} 已在本数据目录上挖矿;等待其结束,而不是启动第二个矿工。",
+                conflict.pid
+            )
+        )
+    );
+    let mut ticks: u32 = SERVICE_RENDEZVOUS_LOG_EVERY;
+    loop {
+        std::thread::sleep(SERVICE_RENDEZVOUS_POLL);
+        match pidfile::PidGuard::try_acquire(args.allow_multiple) {
+            Ok(g) => {
+                eprintln!(
+                    "{}",
+                    tr!(
+                        "background agent: the rendezvous is free — starting.",
+                        "后台代理:会合已释放 —— 正在启动。"
+                    )
+                );
+                return Ok(g);
+            }
+            Err(c) => {
+                // A countdown rather than a modulo: `u32::is_multiple_of` is newer
+                // than this workspace's floor toolchain, and clippy rejects the
+                // hand-rolled `%` form.
+                ticks = if ticks == 0 {
+                    SERVICE_RENDEZVOUS_LOG_EVERY - 1
+                } else {
+                    ticks - 1
+                };
+                if ticks == 0 {
+                    eprintln!(
+                        "{}",
+                        tr!(
+                            format!("background agent: still waiting for pid {}.", c.pid),
+                            format!("后台代理:仍在等待进程 {}。", c.pid)
+                        )
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The warning for a start that is running WITHOUT owning the rendezvous. Each of
+/// the three reasons is genuinely different, and the advice differs with it — one
+/// generic "another instance may be running" line would be the vague guess the
+/// honesty rule forbids. Pure, so the wording is unit-tested.
+fn describe_sharing(reason: &pidfile::SharingReason) -> String {
+    match reason {
+        pidfile::SharingReason::UserOverride { pid, data_dir } => {
+            let dir = data_dir
+                .as_ref()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| tr!("(not recorded)", "(未记录)").to_string());
+            tr!(
+                format!(
+                    "warning: starting anyway (--allow-multiple) while pid {pid} holds this \
+                     rendezvous (data dir {dir}).\n\
+                     This instance did NOT take the rendezvous, so `alice-miner stop` will \
+                     target pid {pid}, not this one —\n\
+                     stop this window with Ctrl-C. If both are really miners they share one \
+                     engine directory and\n\
+                     overwrite each other's telemetry; give each its own ALICE_IDENTITY_DIR \
+                     instead."
+                ),
+                format!(
+                    "警告:已按 --allow-multiple 强行启动,而进程 {pid} 仍持有本会合文件\
+                     (数据目录 {dir})。\n\
+                     本实例未取得会合登记,因此 `alice-miner stop` 会停掉进程 {pid} 而不是\
+                     本实例 —— 请用 Ctrl-C 停止本窗口。\n\
+                     若两者都是矿工,它们会共用同一个引擎目录并互相覆盖遥测;\
+                     请改为各自使用独立的 ALICE_IDENTITY_DIR。"
+                )
+            )
+        }
+        pidfile::SharingReason::Unverifiable { pid } => tr!(
+            format!(
+                "warning: pid {pid} is recorded as the running miner, but this system could \
+                 NOT tell us whether it\n\
+                 is still alive (the process probe did not run). We do not know, so we are \
+                 neither refusing to start\n\
+                 nor claiming the rendezvous: `alice-miner stop` will target pid {pid}. If \
+                 that is stale, delete the\n\
+                 pid file and restart; if a miner really is running there, stop it first."
+            ),
+            format!(
+                "警告:记录中的运行矿工为进程 {pid},但本系统无法判断它是否仍在运行\
+                 (进程探测未能执行)。\n\
+                 既然无法确定,我们既不拒绝启动、也不接管会合登记:`alice-miner stop` \
+                 仍会指向进程 {pid}。\n\
+                 若该记录已过期,请删除 pid 文件后重启;若那里确有矿工在跑,请先停止它。"
+            )
+        ),
+        pidfile::SharingReason::RendezvousUnavailable => tr!(
+            "note: the pid file could not be written (read-only home?). Mining works \
+             normally, but `alice-miner stop` from another window will not find this \
+             process — stop it with Ctrl-C.",
+            "提示:无法写入 pid 文件(只读的主目录?)。挖矿不受影响,但从另一个窗口运行 \
+             `alice-miner stop` 将找不到本进程 —— 请用 Ctrl-C 停止。"
+        )
+        .to_string(),
+    }
+}
+
 fn main() {
     // FIRST, before ANY output (including clap's help/version/usage errors): on
     // Windows, force the console code pages to UTF-8 so our UTF-8 text — notably
@@ -862,7 +1008,26 @@ fn main() {
     // `alice_miner_core::console::init_utf8_console` for the full root-cause note.
     alice_miner_core::console::init_utf8_console();
 
-    let cli = Cli::parse();
+    // AM-REL-009, step 1: resolve the self-update health gate BEFORE anything that
+    // can fail, so a freshly-installed build that dies during startup is on record
+    // and gets rolled back on its next attempt. (The CLI never called this; only the
+    // GUI did, so headless self-updates had no rollback at all.)
+    let launch_health = update::register_launch_at_startup();
+
+    // Parse WITHOUT clap's built-in exit, so the health gate below runs even on
+    // `--help` / a usage error — both of which prove the binary loads and runs.
+    let parsed = Cli::try_parse();
+
+    // AM-REL-009, step 2: the process is demonstrably up. Commit a pending update
+    // (drop last-known-good) or report a rollback that already happened.
+    update::confirm_launch_health(&launch_health);
+
+    let cli = match parsed {
+        Ok(c) => c,
+        // `exit` prints to the right stream (stdout for --help/--version, stderr for
+        // an error) with clap's own exit code — identical to what `parse()` did.
+        Err(e) => e.exit(),
+    };
     let no_color = cli.no_color;
     // Resolve + set the process-global UI language ONCE, before any user-facing
     // output. Order: --lang flag → saved settings → interactive first-run prompt →
@@ -1180,6 +1345,7 @@ fn start_args_auto() -> StartArgs {
         region: None,
         from_service: false,
         telemetry_file: None,
+        allow_multiple: false,
     }
 }
 
@@ -2259,6 +2425,78 @@ fn cmd_start_with_unlock(
         doctor::print_preflight_summary(lane, &cap);
     }
 
+    // Claim the single-instance rendezvous ATOMICALLY, or refuse (AM-REL-007). The
+    // guard removes the pid file on the way out so a stale pid never lingers.
+    //
+    // The BACKGROUND AGENT waits instead of refusing. It is supervised by launchd
+    // (`KeepAlive` + a 30s throttle) / systemd (`Restart=always` with a start limit),
+    // both of which respawn on ANY exit — so an agent that exited here would either
+    // hammer the rendezvous every 30 seconds or, on systemd, trip its start limit and
+    // stay down even after the user's foreground miner stopped. Waiting keeps the
+    // single-miner guarantee AND leaves the agent ready to take over the moment the
+    // foreground run ends, with no supervisor churn either way.
+    let pid_guard = match wait_or_acquire_rendezvous(&args) {
+        Ok(g) => g,
+        Err(conflict) => {
+            let dir = conflict
+                .data_dir
+                .as_ref()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| {
+                    tr!("(not recorded by that instance)", "(该实例未记录)").to_string()
+                });
+            let pid = conflict.pid;
+            eprintln!(
+                "{}",
+                tr!(
+                    format!(
+                        "error: another `alice-miner start` is already running.\n  \
+                         process id : {pid}\n  \
+                         data dir   : {dir}\n\n\
+                         Refusing to start a second miner on the same data directory: both would \
+                         drive the same\n\
+                         engine directory and overwrite each other's telemetry, and \
+                         `alice-miner stop` can only\n\
+                         reach the recorded one — the survivor would keep the GPU busy while \
+                         everything reported\n\
+                         'stopped'.\n\n\
+                         What to do:\n  \
+                         • stop the running miner:      alice-miner stop\n  \
+                         • or run this one in its own data directory:\n      \
+                         ALICE_IDENTITY_DIR=/path/to/other-alice alice-miner start …\n  \
+                         • if pid {pid} is NOT a miner (pids get recycled), re-run with \
+                         --allow-multiple"
+                    ),
+                    format!(
+                        "错误:已有另一个 `alice-miner start` 在运行。\n  \
+                         进程号   : {pid}\n  \
+                         数据目录 : {dir}\n\n\
+                         拒绝在同一数据目录上启动第二个矿工:两者会驱动同一个引擎目录、互相覆盖\
+                         遥测数据,\n\
+                         而 `alice-miner stop` 只能停掉登记的那一个 —— 幸存的那个会继续占用 GPU,\
+                         但所有界面都会\n\
+                         显示“已停止”。\n\n\
+                         可行做法:\n  \
+                         • 停止正在运行的矿工:      alice-miner stop\n  \
+                         • 或用独立数据目录运行本实例:\n      \
+                         ALICE_IDENTITY_DIR=/path/to/other-alice alice-miner start …\n  \
+                         • 若进程 {pid} 并不是矿工(进程号会被系统回收),请加 --allow-multiple 重试"
+                    )
+                )
+            );
+            return EXIT_ALREADY_RUNNING;
+        }
+    };
+
+    // Running without the rendezvous is allowed in exactly three cases, and each one
+    // says WHICH it is rather than printing one vague warning for all of them.
+    if let Some(reason) = pid_guard.sharing() {
+        if !args.json {
+            eprintln!("{}", describe_sharing(reason));
+        }
+    }
+
+
     let engine = match EngineHandle::spawn() {
         Ok(e) => e,
         Err(e) => {
@@ -2276,37 +2514,6 @@ fn cmd_start_with_unlock(
         let _ = ctrlc::set_handler(move || {
             f.store(true, Ordering::SeqCst);
         });
-    }
-
-    // Record our pid so `alice-miner stop` (another process) can find us. Removed
-    // on the way out so a stale pid never lingers. Best-effort: a write failure
-    // (e.g. read-only home) does not block mining — only `stop` would be unable
-    // to find us, and Ctrl-C still works.
-    let pid_guard = pidfile::PidGuard::acquire();
-
-    // Two `alice-miner start` processes on one machine is a real, silent failure mode
-    // (shared engine/log directory, each overwriting the other's telemetry snapshot,
-    // and `stop` able to reach only the recorded one — so the survivor keeps the GPU
-    // busy while the UI reports "stopped"). We do not refuse to mine, but we say it
-    // out loud with the pid, so it is one line to diagnose instead of an afternoon.
-    if let Some(other) = pid_guard.other_instance() {
-        if !args.json {
-            eprintln!(
-                "{}",
-                tr!(
-                    format!(
-                        "warning: another alice-miner start is already running on this machine (pid {other}).\n\
-                         Two instances share one engine directory and both report telemetry, and `alice-miner stop`\n\
-                         can only reach the first — stop the other one, or close this window."
-                    ),
-                    format!(
-                        "警告:本机已有另一个 alice-miner start 在运行(进程号 {other})。\n\
-                         两个实例会共用同一个引擎目录并各自上报遥测,而 `alice-miner stop` 只能停掉先注册的那个 ——\n\
-                         请先停止另一个实例,或关闭本窗口。"
-                    )
-                )
-            );
-        }
     }
 
     // A pearlhash lane needs the wallet password to unlock the signing key for the OOB
@@ -4313,5 +4520,81 @@ mod tests {
             IdentitySpec::Create { password, .. } => assert_eq!(password, "hunter2"),
             _ => panic!("expected Create"),
         }
+    }
+
+    // ── AM-REL-007: the single-instance surface ───────────────────────────────
+
+    /// `--allow-multiple` is a real, parseable flag on `start` and defaults OFF.
+    #[test]
+    fn allow_multiple_flag_parses_and_defaults_off() {
+        let cli = Cli::try_parse_from(["alice-miner", "start", "--lane", "xmr"]).unwrap();
+        match cli.command {
+            Some(Command::Start(a)) => assert!(!a.allow_multiple, "must default to refusing"),
+            _ => panic!("expected start"),
+        }
+        let cli = Cli::try_parse_from(["alice-miner", "start", "--allow-multiple"]).unwrap();
+        match cli.command {
+            Some(Command::Start(a)) => assert!(a.allow_multiple),
+            _ => panic!("expected start"),
+        }
+    }
+
+    /// The refusal exit code is its OWN value, distinct from every other, so a
+    /// supervisor script can tell "already running" from a real failure (restarting
+    /// on this code would be exactly wrong).
+    #[test]
+    fn already_running_exit_code_is_distinct() {
+        let codes = [
+            EXIT_OK,
+            EXIT_RUNTIME,
+            EXIT_USAGE,
+            EXIT_UNVERIFIED,
+            EXIT_SCAN_GAP,
+            EXIT_ALREADY_RUNNING,
+        ];
+        let mut sorted = codes.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), codes.len(), "exit codes must be distinct");
+        assert_eq!(EXIT_ALREADY_RUNNING, 5);
+    }
+
+    /// Each reason for running WITHOUT the rendezvous gets its own wording and its
+    /// own advice. A single vague "another instance may be running" for all three
+    /// would be the guess the honesty rule forbids — "we could not check" and "you
+    /// told us to" are different facts and need different fixes.
+    #[test]
+    fn sharing_warnings_say_which_case_it_is() {
+        i18n::set_lang(Lang::En);
+
+        let override_msg = describe_sharing(&pidfile::SharingReason::UserOverride {
+            pid: 4242,
+            data_dir: Some(std::path::PathBuf::from("/Users/x/.alice")),
+        });
+        assert!(override_msg.contains("--allow-multiple"));
+        assert!(override_msg.contains("4242"));
+        assert!(override_msg.contains("/Users/x/.alice"), "names the shared data dir");
+        assert!(
+            override_msg.contains("did NOT take the rendezvous"),
+            "must say `stop` will not reach THIS process: {override_msg}"
+        );
+
+        let unknown_msg = describe_sharing(&pidfile::SharingReason::Unverifiable { pid: 909 });
+        assert!(
+            unknown_msg.contains("could NOT tell us") && unknown_msg.contains("do not know"),
+            "an unverifiable probe must admit it is unverifiable: {unknown_msg}"
+        );
+        assert!(
+            !unknown_msg.contains("--allow-multiple"),
+            "this case is not a user override; do not offer an irrelevant flag"
+        );
+
+        let unavailable = describe_sharing(&pidfile::SharingReason::RendezvousUnavailable);
+        assert!(unavailable.contains("pid file could not be written"));
+        assert!(unavailable.contains("Ctrl-C"), "gives the working way to stop");
+
+        // The three are genuinely different texts.
+        assert_ne!(override_msg, unknown_msg);
+        assert_ne!(unknown_msg, unavailable);
     }
 }

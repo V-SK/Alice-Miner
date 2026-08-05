@@ -416,6 +416,215 @@ where
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Synchronous guarded spawn — the SAME kill-the-whole-tree guarantee, for the
+// blocking (non-tokio) call sites.
+//
+// Audit AM-REL-006: the `ai` and `train` roles spawned their python engine with
+// a bare `std::process::Command` and stopped it with `child.kill()`. `kill()` is
+// `TerminateProcess` / `SIGKILL` on the DIRECT child only, so every descendant
+// the engine forked (torch dataloader workers, an NCCL helper, a `python -c`
+// shell-out) was orphaned and kept the GPU memory and the relay socket. The
+// mining lanes have not had that bug since the Job Object / process-group work
+// landed — but that machinery lived behind an ASYNC API (`spawn_supervised`
+// returns a tokio-driven `OwnedChild`), so the blocking roles could not reuse it
+// and grew their own weaker copy.
+//
+// [`spawn_guarded`] closes that gap WITHOUT duplicating any OS code: it applies
+// the same `setpgid(0,0)` pre-exec on unix and binds the same kill-on-close
+// [`job`] object on Windows, then hands back a blocking handle whose teardown
+// signals the whole GROUP / TREE.
+//
+// DELIBERATELY NOT DONE HERE: the caller's environment is passed through
+// untouched (unlike `spawn_supervised`, which `env_clear`s to an allowlist).
+// Scrubbing the AI/Train child's env is audit AM-SEC-003/004 — a real finding,
+// but one that needs a python-side compatibility pass (HF_HOME, VIRTUAL_ENV,
+// CUDA paths…) and is tracked as its own project. Silently `env_clear`ing here
+// would look like a reliability fix while changing what the engine can load.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// How long a guarded child gets to exit after the polite signal before the
+/// force path runs. Short: this is a teardown, not a shutdown negotiation.
+pub const GUARD_GRACE: Duration = Duration::from_millis(1500);
+
+/// A spawned `std::process::Child` whose ENTIRE descendant tree is owned:
+///
+///   * **unix** — the child leads its own process group (`setpgid(0, 0)` in
+///     `pre_exec`), so [`GuardedChild::kill_tree`] signals `-pid` and reaches
+///     every descendant, not just the direct child.
+///   * **Windows** — the child is bound to a `KILL_ON_JOB_CLOSE` Job Object (the
+///     same [`job`] module the mining lanes use), so the kernel terminates the
+///     whole job when the last handle closes — including when THIS process is
+///     `TerminateProcess`d and no destructor ever runs. `taskkill /T /F` is the
+///     belt to that suspender.
+///
+/// `Drop` tears the tree down, so an early return / panic on the supervising
+/// thread can never leave a GPU-holding orphan behind.
+pub struct GuardedChild {
+    child: std::process::Child,
+    pid: u32,
+    /// Set once the child has been reaped (so `Drop` doesn't signal a pid the OS
+    /// may already have recycled).
+    reaped: bool,
+    #[cfg(windows)]
+    job: Option<job::JobHandle>,
+}
+
+impl GuardedChild {
+    /// The direct child's pid (the process-group leader / job root).
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Windows: whether the kill-on-close Job Object binding succeeded (i.e.
+    /// whether "we die → the engine dies" is kernel-enforced for this child).
+    /// Exposed for tests + honest diagnostics.
+    #[cfg(windows)]
+    pub fn job_bound(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// Take the child's piped stdout (once).
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    /// Take the child's piped stderr (once).
+    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    /// Take the child's piped stdin (once).
+    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    /// Non-blocking exit poll. `Ok(Some(status))` once the child has exited (and
+    /// been reaped); `Ok(None)` while it is still running.
+    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        if self.reaped {
+            return Ok(None);
+        }
+        let r = self.child.try_wait();
+        if let Ok(Some(_)) = r {
+            self.reaped = true;
+        }
+        r
+    }
+
+    /// Block until the child exits.
+    pub fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        let r = self.child.wait();
+        if r.is_ok() {
+            self.reaped = true;
+        }
+        r
+    }
+
+    /// Terminate the child AND every descendant, then reap. Polite signal first
+    /// (SIGTERM to the group / `taskkill /T`), `grace` to comply, then the force
+    /// path (SIGKILL to the group / `taskkill /T /F` + `Child::kill`).
+    ///
+    /// Idempotent: a child that has already been reaped is a no-op.
+    pub fn kill_tree(&mut self, grace: Duration) {
+        if self.reaped {
+            return;
+        }
+        if let Ok(Some(_)) = self.child.try_wait() {
+            self.reaped = true;
+            return;
+        }
+
+        #[cfg(unix)]
+        unsafe {
+            // Negative pid = the whole process group the child leads.
+            libc_kill(-(self.pid as i32), 15);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/PID", &self.pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+
+        let deadline = std::time::Instant::now() + grace;
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                self.reaped = true;
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Force path: the whole tree, not just the recorded pid.
+        #[cfg(unix)]
+        unsafe {
+            libc_kill(-(self.pid as i32), 9);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &self.pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = self.child.kill();
+        // Reap so we never leave a zombie (and never signal a recycled pid).
+        let _ = self.child.wait();
+        self.reaped = true;
+    }
+}
+
+impl Drop for GuardedChild {
+    fn drop(&mut self) {
+        // An early return / `?` / panic on the supervising thread must not leave
+        // the engine running. (On Windows the Job Object is the backstop even for
+        // a `TerminateProcess`d parent, where this never runs.)
+        self.kill_tree(GUARD_GRACE);
+    }
+}
+
+/// Spawn `cmd` as a [`GuardedChild`]. The caller configures the command fully
+/// (program, args, cwd, stdio, env); this only adds the OS ownership bond.
+///
+/// On unix the child is made a process-group leader via `pre_exec`; on Windows it
+/// is bound to a kill-on-close Job Object right after spawn (we still hold the
+/// process handle, so the pid cannot have been recycled in between). A Job
+/// binding failure is FAIL-SOFT — the child still runs and `kill_tree` still walks
+/// the tree with `taskkill /T` — and is observable via
+/// [`GuardedChild::job_bound`], never silently reported as guarded.
+pub fn spawn_guarded(cmd: &mut std::process::Command) -> io::Result<GuardedChild> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        unsafe {
+            cmd.pre_exec(|| {
+                if set_pgid(0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let child = cmd.spawn()?;
+    let pid = child.id();
+
+    #[cfg(windows)]
+    let job = job::bind(pid);
+
+    Ok(GuardedChild {
+        child,
+        pid,
+        reaped: false,
+        #[cfg(windows)]
+        job,
+    })
+}
+
 /// Read a previously-written PID file, if present and parseable. Used on
 /// startup to detect a possibly-orphaned prior node (we do NOT auto-kill it;
 /// the supervisor decides — see plan §1.2 ownership rule).
@@ -650,6 +859,199 @@ mod tests {
             }
             assert!(gone, "pid {pid} still present after stop() — orphan left behind");
         });
+    }
+
+    // ── Synchronous guarded spawn (AM-REL-006) ────────────────────────────────
+    //
+    // These run on EVERY OS: the platform difference is a RUNTIME `cfg!(windows)`
+    // branch that picks the shell + probe, not a `#[cfg]` that would compile the
+    // test out of existence on the platform it matters most for. (2026-07-26
+    // lesson: a `#[cfg(unix)]` test suite is a coverage illusion on Windows.)
+
+    /// Is `pid` present? Same shape as the CLI's probe, local to the test.
+    fn probe_pid_alive(pid: u32) -> bool {
+        if cfg!(windows) {
+            std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .output()
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout).lines().any(|l| {
+                        l.split("\",\"")
+                            .nth(1)
+                            .map(|f| f.trim_matches('"').trim() == pid.to_string())
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        } else {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+    }
+
+    /// A command whose DIRECT child spawns a long-lived GRANDCHILD and prints the
+    /// grandchild's pid on stdout, then keeps running. This is the exact shape the
+    /// AI/Train roles have in the field (python → dataloader/NCCL helpers) and the
+    /// exact shape `child.kill()` used to orphan.
+    fn grandchild_spawner() -> std::process::Command {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("powershell");
+            c.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$p = Start-Process -PassThru -WindowStyle Hidden ping \
+                 -ArgumentList '-n','120','127.0.0.1'; \
+                 Write-Output $p.Id; Start-Sleep -Seconds 120",
+            ]);
+            c
+        } else {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.args(["-c", "sleep 120 & echo $!; wait"]);
+            c
+        };
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        cmd
+    }
+
+    /// Read the first line the child prints, within a bounded wall clock.
+    fn first_line(out: std::process::ChildStdout) -> Option<String> {
+        use std::io::{BufRead, BufReader};
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut r = BufReader::new(out);
+            let mut line = String::new();
+            if r.read_line(&mut line).is_ok() {
+                let _ = tx.send(line);
+            }
+        });
+        rx.recv_timeout(Duration::from_secs(20))
+            .ok()
+            .map(|l| l.trim().to_string())
+    }
+
+    /// THE regression this API exists for: `kill_tree` must take the DESCENDANTS
+    /// down too. A plain `Child::kill()` reaps only the direct child and leaves the
+    /// grandchild holding VRAM / a relay socket forever.
+    #[test]
+    fn guarded_kill_tree_takes_descendants_with_it() {
+        let mut cmd = grandchild_spawner();
+        let mut child = spawn_guarded(&mut cmd).expect("spawn guarded child");
+        let direct = child.pid();
+        assert!(direct > 0);
+
+        let out = child.take_stdout().expect("piped stdout");
+        let grand: u32 = first_line(out)
+            .and_then(|l| l.trim().parse().ok())
+            .expect("the child must report its grandchild's pid (test setup)");
+        assert_ne!(grand, direct, "the grandchild must be a distinct process");
+
+        // Both alive before the teardown.
+        assert!(child.try_wait().unwrap().is_none(), "direct child still running");
+        let mut saw_grand = false;
+        for _ in 0..40 {
+            if probe_pid_alive(grand) {
+                saw_grand = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(saw_grand, "grandchild pid {grand} should be observable before the kill");
+
+        child.kill_tree(Duration::from_secs(2));
+
+        // The direct child is gone…
+        let mut direct_gone = false;
+        for _ in 0..40 {
+            if !probe_pid_alive(direct) {
+                direct_gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(direct_gone, "direct pid {direct} survived kill_tree");
+
+        // …and so is the grandchild. THIS is the assertion `child.kill()` fails.
+        let mut grand_gone = false;
+        for _ in 0..60 {
+            if !probe_pid_alive(grand) {
+                grand_gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            grand_gone,
+            "grandchild pid {grand} outlived kill_tree — the engine's helpers would keep the GPU"
+        );
+    }
+
+    /// `Drop` must tear the tree down too: a supervising thread that returns early
+    /// (or panics) can never leave the engine mining in the background.
+    #[test]
+    fn guarded_drop_kills_the_child() {
+        let mut cmd = grandchild_spawner();
+        let pid = {
+            let child = spawn_guarded(&mut cmd).expect("spawn");
+            child.pid()
+            // dropped here
+        };
+        let mut gone = false;
+        for _ in 0..60 {
+            if !probe_pid_alive(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(gone, "pid {pid} survived the GuardedChild drop");
+    }
+
+    /// `kill_tree` is idempotent and never signals a reaped pid twice (a reaped pid
+    /// can be recycled by the OS onto an unrelated process).
+    #[test]
+    fn guarded_kill_tree_is_idempotent() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "exit 7"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.args(["-c", "exit 7"]);
+            c
+        };
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = spawn_guarded(&mut cmd).expect("spawn");
+        // Let it exit on its own, then reap through the normal path.
+        let status = child.wait().expect("wait");
+        assert_eq!(status.code(), Some(7));
+        // Already reaped → both calls are no-ops, and neither panics.
+        child.kill_tree(Duration::from_millis(100));
+        child.kill_tree(Duration::from_millis(100));
+    }
+
+    /// Windows-only: the guarded child must be inside a kill-on-close Job Object,
+    /// the only mechanism that survives our own `TerminateProcess`.
+    #[cfg(windows)]
+    #[test]
+    fn guarded_child_is_bound_to_a_kill_on_close_job() {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "ping -n 30 127.0.0.1 > nul"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_guarded(&mut cmd).expect("spawn");
+        assert!(
+            child.job_bound(),
+            "a guarded AI/Train engine child MUST be in a kill-on-close job"
+        );
+        child.kill_tree(Duration::from_secs(2));
     }
 
     #[cfg(unix)]
