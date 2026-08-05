@@ -538,7 +538,7 @@ fn generate_identity_address(cfg: &SetupConfig) -> Result<(String, Zeroizing<Str
 fn maybe_set_prl_payout(cfg: &SetupConfig, lane: Lane) -> Result<(), i32> {
     // An explicit value always wins (even off a GPU lane it's harmless to store).
     if let Some(addr) = cfg.prl_payout.as_deref() {
-        return save_prl(addr);
+        return save_prl(cfg, addr);
     }
     if !lane.is_prl_lane() {
         return Ok(()); // the return only applies to GPU pearlhash lanes
@@ -573,12 +573,68 @@ fn maybe_set_prl_payout(cfg: &SetupConfig, lane: Lane) -> Result<(), i32> {
     if ans.is_empty() {
         return Ok(());
     }
-    save_prl(&ans)
+    save_prl(cfg, &ans)
 }
 
-/// Persist a PRL return address (shape-validated by the core). A typo is surfaced
-/// as a usage error and NEVER written.
-fn save_prl(addr: &str) -> Result<(), i32> {
+/// Persist a PRL return address. AM-SEC-008: the core does a FULL bech32m verify (a
+/// one-character typo is surfaced as a typo and NEVER written), and the human must
+/// confirm the address **unmasked** before it is stored — because storing it is what
+/// later makes it get signed into the enroll binding. A non-interactive wizard run
+/// (`--no-input` / no TTY) must carry `--yes`; we never infer consent from silence.
+fn save_prl(cfg: &SetupConfig, addr: &str) -> Result<(), i32> {
+    use alice_miner_core::prl_payout::{self, PayoutConfirm};
+    let trimmed = addr.trim();
+    if let Err(e) = prl_payout::validate_payout_address(trimmed) {
+        eprintln!("error: {e}");
+        return Err(EXIT_USAGE);
+    }
+
+    let interactive = can_prompt(cfg);
+    let answer = if !cfg.yes && interactive {
+        println!(
+            "\n  {}",
+            tr!(
+                "Your 15% PRL return will be sent to THIS address:",
+                "你的 15% PRL 返还将发送到此地址:"
+            )
+        );
+        println!("    {}", prl_payout::format_for_confirm(trimmed));
+        println!(
+            "  {}",
+            tr!(
+                "Compare it against your PRL wallet, character by character.",
+                "请逐字与你的 PRL 钱包核对。"
+            )
+        );
+        prompt_line(tr!(
+            "  Is this exactly your address? [y/N] ",
+            "  这确实是你的地址吗? [y/N] "
+        ))
+    } else {
+        None
+    };
+
+    match prl_payout::decide_payout_confirm(interactive, cfg.yes, answer.as_deref()) {
+        PayoutConfirm::Proceed => {}
+        PayoutConfirm::Declined => {
+            println!(
+                "  {}",
+                tr!("skipped — no return address stored.", "已跳过 — 未存储返还地址。")
+            );
+            return Ok(()); // the 15% return is optional; declining is not a failure
+        }
+        PayoutConfirm::NeedsExplicitFlag => {
+            eprintln!(
+                "error: {}",
+                tr!(
+                    "refusing to store an unconfirmed PRL return address on a non-interactive run. Re-run with --yes once you have compared the full address against your PRL wallet.",
+                    "非交互运行时拒绝存储未经确认的 PRL 返还地址。请先逐字核对完整地址,再加 --yes 重新运行。"
+                )
+            );
+            return Err(EXIT_USAGE);
+        }
+    }
+
     match alice_miner_core::prl_payout::save_payout_address(addr) {
         Ok(_) => {
             let masked = alice_miner_core::prl_payout::mask_payout(addr.trim());

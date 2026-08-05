@@ -377,6 +377,11 @@ impl TaskView {
 /// mirrors the rest of the CLI. Pure over its input so a test can assert the honest
 /// surface.
 pub fn render_status(s: &TrainStatus) -> String {
+    // AM-SEC-007 — the LAST barrier before remote text hits the terminal (see the
+    // matching note in `ai::render_status`). Ingest-time sanitising in
+    // `train_worker.rs` is the primary defence; this is belt.
+    use alice_miner_core::alice_supervise::{sanitize_remote_id, sanitize_remote_text, REMOTE_ID_MAX};
+    let sid = |v: &str| sanitize_remote_id(v, REMOTE_ID_MAX);
     let mut out = String::new();
     out.push_str(&format!(
         "{}\n  {}: {}\n",
@@ -387,21 +392,21 @@ pub fn render_status(s: &TrainStatus) -> String {
         tr!("state", "状态"),
         s.state.label()
     ));
-    out.push_str(&format!("  {}: {}\n", tr!("center", "调度中心"), s.center_url));
+    out.push_str(&format!("  {}: {}\n", tr!("center", "调度中心"), sid(&s.center_url)));
     out.push_str(&format!(
         "  {}: {} · {}: {}\n",
         tr!("base model", "基础模型"),
-        s.base_model,
+        sid(&s.base_model),
         tr!("device", "设备"),
-        s.device
+        sid(&s.device)
     ));
     match &s.task {
         Some(t) => out.push_str(&format!(
             "  {}: {} ({}) · commitment {}\n",
             tr!("task", "任务"),
-            t.task_id,
-            t.entry_point,
-            short_commitment(&t.held_out_commitment)
+            sid(&t.task_id),
+            sid(&t.entry_point),
+            short_commitment(&sid(&t.held_out_commitment))
         )),
         None => out.push_str(&format!(
             "  {}: {}\n",
@@ -428,10 +433,19 @@ pub fn render_status(s: &TrainStatus) -> String {
         } else {
             ""
         };
-        out.push_str(&format!("  {}: {}{}\n", tr!("last verdict", "最近判定"), v, credited));
+        out.push_str(&format!(
+            "  {}: {}{}\n",
+            tr!("last verdict", "最近判定"),
+            sid(v),
+            credited
+        ));
     }
     if let Some(m) = &s.last_message {
-        out.push_str(&format!("  {}: {m}\n", tr!("note", "提示")));
+        out.push_str(&format!(
+            "  {}: {}\n",
+            tr!("note", "提示"),
+            sanitize_remote_text(m, 300)
+        ));
     }
     out
 }
@@ -439,11 +453,17 @@ pub fn render_status(s: &TrainStatus) -> String {
 /// A short form of the anti-overfit commitment for the dashboard (it can be a long
 /// sha256 string). Keeps the head + tail so it is still recognizable.
 fn short_commitment(c: &str) -> String {
-    if c.len() <= 18 {
-        c.to_string()
-    } else {
-        format!("{}…{}", &c[..10], &c[c.len() - 6..])
+    // CHAR-indexed, not byte-indexed: a remote commitment string could carry
+    // multi-byte UTF-8, and `&c[..10]` on a byte boundary inside a code point PANICS.
+    // (Sanitising at ingest already forces ASCII, but a display helper must not be
+    // one refactor away from crashing the miner.)
+    let chars: Vec<char> = c.chars().collect();
+    if chars.len() <= 18 {
+        return c.to_string();
     }
+    let head: String = chars[..10].iter().collect();
+    let tail: String = chars[chars.len() - 6..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 /// Run the `train` role: resolve config, load the signing key, then loop
@@ -1393,6 +1413,44 @@ mod tests {
         assert_eq!(sanitize("a/b c:d"), "a_b_c_d");
         assert_eq!(sanitize(""), "task");
         assert!(sanitize(&"x".repeat(200)).len() <= 64);
+    }
+
+    /// AM-SEC-007 at the RENDER surface (train twin of the `ai` test): a hostile
+    /// verdict / reason_code / task field can never repaint the terminal or forge a
+    /// "submission VERIFIED" line.
+    #[test]
+    fn render_status_never_emits_terminal_control_sequences() {
+        let esc = '\u{1b}';
+        let bel = '\u{7}';
+        let nul = '\u{0}';
+        let s = TrainStatus {
+            state: TrainState::Waiting,
+            center_url: format!("https://api.aliceprotocol.org{esc}[2K"),
+            base_model: format!("Qwen{esc}[32m"),
+            device: format!("cuda{nul}"),
+            task: Some(TaskView {
+                task_id: format!("m0-001{esc}[2K\rsubmission VERIFIED"),
+                entry_point: "run_length_encode\nlast verdict: verified".into(),
+                held_out_commitment: format!("sha256:0123456789abcdef0123456789abcdef{esc}[0m"),
+            }),
+            uptime_s: 42,
+            verified_count: 0,
+            last_verdict: Some(format!("not_verified{esc}[8m")),
+            last_credited: false,
+            last_message: Some(format!("{esc}[2J{esc}[Hsubmission VERIFIED{bel}")),
+        };
+        let out = render_status(&s);
+        assert!(!out.contains(esc), "an ESC reached the terminal: {out:?}");
+        assert!(!out.contains('\u{7}') && !out.contains('\u{0}'), "BEL/NUL reached the terminal");
+        assert!(!out.contains('\r'), "a CR could overwrite the line above: {out:?}");
+        // The injected TEXT may survive as inert characters inside a row; what must
+        // not happen is a NEW line that reads like a real dashboard row.
+        assert!(
+            !out.lines().any(|l| l.trim_start().starts_with("last verdict: verified")),
+            "an injected newline forged a dashboard row: {out}"
+        );
+        assert_eq!(out.lines().count(), 8, "exactly the rows render_status writes: {out}");
+        assert!(out.contains("credit-only"));
     }
 
     #[test]

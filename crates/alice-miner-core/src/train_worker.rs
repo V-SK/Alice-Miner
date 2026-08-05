@@ -91,6 +91,10 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// response.
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
 
+/// AM-SEC-007: how much of a server error body may reach a CLI line / log after
+/// sanitisation (mirrors `shard.rs`). A stable `reason_code` is short.
+const REMOTE_BODY_MAX: usize = 200;
+
 /// Reject any non-`https://` URL — fail closed so a PoP signature can never be sent
 /// in the clear.
 fn require_https(url: &str) -> Result<(), String> {
@@ -141,7 +145,12 @@ fn post_json<B: Serialize, R: serde::de::DeserializeOwned>(url: &str, body: &B) 
                 .into_reader()
                 .take(MAX_RESPONSE_BYTES)
                 .read_to_end(&mut buf);
-            let body = String::from_utf8_lossy(&buf);
+            // AM-SEC-007: remote text bound for CLI output/logs — strip ANSI/control
+            // chars and bound it (mirrors `shard.rs::post_json`).
+            let body = alice_supervise::sanitize_remote_text(
+                &String::from_utf8_lossy(&buf),
+                REMOTE_BODY_MAX,
+            );
             return Err(format!("POST {url}: HTTP {code}: {body}"));
         }
         Err(e) => return Err(format!("POST {url}: {e}")),
@@ -495,18 +504,34 @@ fn parse_lease(resp: LeaseResponse) -> Result<LeaseOutcome, String> {
             )
         })?;
 
+        // AM-SEC-007 — sanitise the remote IDENTIFIERS at ingest (they are printed by
+        // `train::render_status` every tick). `prompt` is deliberately NOT sanitised:
+        // it is program input for the generation driver, not display text — mangling
+        // its newlines would corrupt the task. It is never printed to the terminal.
+        //
+        // ORDER MATTERS (v0.6.8 merge): the AM-REL-012/001 strict validation above runs
+        // FIRST, on the raw value, and `expires_at_unix` is parsed from the raw string.
+        // Sanitising first could turn a hostile byte into `?` and make a malformed value
+        // *look* well-formed. For the three validated fields the sanitiser is provably a
+        // no-op (python identifiers, lowercase hex and RFC3339 are all inside the
+        // allowlist), so it costs nothing; `task_id` / `lease_id` have no format contract
+        // and are the ones it actually guards.
+        let sid = |s: String| alice_supervise::sanitize_remote_id(&s, alice_supervise::REMOTE_ID_MAX);
         return Ok(LeaseOutcome::Leased(Box::new(LeasedTask {
-            task_id,
-            entry_point,
+            task_id: sid(task_id),
+            entry_point: sid(entry_point),
             prompt,
-            held_out_commitment,
-            lease_id,
-            expires_at,
+            held_out_commitment: sid(held_out_commitment),
+            lease_id: sid(lease_id),
+            expires_at: sid(expires_at),
             expires_at_unix,
         })));
     }
     // ok:false — distinguish "no task" (a normal, keep-polling state) from
     // "not registered" (a state the loop must repair by re-registering).
+    // NOTE the reason_code is compared against a FIXED literal and, on the error path,
+    // the literal (not the remote string) is what we return — a hostile reason_code can
+    // never reach a display surface from here.
     match resp.reason_code.as_deref() {
         Some("train_worker_not_registered") => {
             Err("train_worker_not_registered".to_string())
@@ -721,11 +746,14 @@ fn parse_submit(resp: SubmitResponse) -> Result<SubmitVerdict, String> {
     let _ = resp.ok;
     let _ = resp.verified_reward;
     let _ = resp.max_verifiable_reward;
+    // AM-SEC-007 — every one of these lands verbatim in `render_status`'s "last
+    // verdict" / "note" lines. Sanitise at ingest so no render site can be tricked.
+    let sid = |s: String| alice_supervise::sanitize_remote_id(&s, alice_supervise::REMOTE_ID_MAX);
     Ok(SubmitVerdict {
-        task_id: resp.task_id.unwrap_or_default(),
-        verdict,
-        reason_code,
-        match_rate: resp.match_rate,
+        task_id: sid(resp.task_id.unwrap_or_default()),
+        verdict: sid(verdict),
+        reason_code: sid(reason_code),
+        match_rate: resp.match_rate.map(sid),
         quorum_k: resp.quorum_k,
         quorum_agree: resp.quorum_agree,
         credited: resp.credited,
@@ -975,6 +1003,88 @@ mod tests {
                 assert!(t.prompt.starts_with("Write a Python function"));
                 // The hidden tests are NEVER present — assert the wire never carried them.
                 assert!(!raw.contains("\"tests\""), "the lease wire must not carry hidden tests");
+            }
+            other => panic!("expected leased, got {other:?}"),
+        }
+    }
+
+    /// AM-SEC-007 ⊕ AM-REL-012, layer 1 (v0.6.8 merge): a hostile coordinator that
+    /// smuggles a terminal payload into a FORMAT-CONSTRAINED field does not get its
+    /// string sanitised and then used — the whole lease is REFUSED, because a control
+    /// sequence inside an entry point / commitment / timestamp also means the value is
+    /// not the thing it claims to be. The refusal message itself must be clean.
+    #[test]
+    fn parse_lease_refuses_hostile_format_constrained_fields() {
+        // Escapes are JSON \u sequences so this SOURCE file holds no invisible bytes.
+        for (field, raw) in [
+            (
+                "entry_point",
+                r#"{"ok":true,"lease_id":"a","task_id":"b","prompt":"p",
+                    "entry_point":"run_length_encode\u001b[32m",
+                    "held_out_commitment":"sha256:abc123",
+                    "expires_at":"2026-07-02T20:00:00+00:00"}"#,
+            ),
+            (
+                "held_out_commitment",
+                r#"{"ok":true,"lease_id":"a","task_id":"b","prompt":"p",
+                    "entry_point":"run_length_encode",
+                    "held_out_commitment":"sha256:abc123\u0000",
+                    "expires_at":"2026-07-02T20:00:00+00:00"}"#,
+            ),
+            (
+                "expires_at",
+                r#"{"ok":true,"lease_id":"a","task_id":"b","prompt":"p",
+                    "entry_point":"run_length_encode",
+                    "held_out_commitment":"sha256:abc123",
+                    "expires_at":"2026-07-02T20:00:00+00:00\u0007"}"#,
+            ),
+        ] {
+            let err = parse_lease(serde_json::from_str(raw).unwrap()).unwrap_err();
+            assert!(err.contains(field), "the refusal must name {field}: {err}");
+            assert!(
+                !err.chars().any(char::is_control),
+                "the refusal for {field} leaked a control char: {err:?}"
+            );
+            assert!(!err.contains('\u{1b}'), "ESC survived into the refusal for {field}");
+        }
+    }
+
+    /// AM-SEC-007 at INGEST, layer 2: `lease_id` / `task_id` carry NO format contract
+    /// (they are opaque coordinator ids), so a hostile value there cannot be refused on
+    /// shape — it must be neutralised before `train::render_status` prints it every
+    /// tick. `prompt` is intentionally NOT sanitised (it is program input for the
+    /// generation driver, never terminal output) — this test pins that distinction so a
+    /// later "tidy-up" cannot silently start mangling task prompts.
+    #[test]
+    fn parse_lease_sanitises_opaque_ids_but_not_the_prompt() {
+        // Escapes are JSON \u sequences so this SOURCE file holds no invisible bytes.
+        let raw = r#"{
+            "ok":true,
+            "lease_id":"lease\u001b[2K\rVERIFIED",
+            "expires_at":"2026-07-02T20:00:00+00:00",
+            "task_id":"m0-001\u001b[32m",
+            "entry_point":"run_length_encode",
+            "prompt":"line one\nline two\n\ttabbed",
+            "held_out_commitment":"sha256:abc123"
+        }"#;
+        let resp: LeaseResponse = serde_json::from_str(raw).unwrap();
+        match parse_lease(resp).unwrap() {
+            LeaseOutcome::Leased(t) => {
+                for s in [&t.lease_id, &t.expires_at, &t.task_id, &t.entry_point, &t.held_out_commitment] {
+                    assert!(
+                        !s.chars().any(char::is_control),
+                        "a control char reached a display surface: {s:?}"
+                    );
+                    assert!(!s.contains('\u{1b}'), "ESC survived: {s:?}");
+                }
+                // The prompt keeps its real newlines/tabs — it is fed to the model, not
+                // printed to the terminal.
+                assert_eq!(t.prompt, "line one\nline two\n\ttabbed");
+                // The strict fields are untouched by the sanitiser (it is provably a
+                // no-op on values that already passed the format gate).
+                assert_eq!(t.entry_point, "run_length_encode");
+                assert_eq!(t.expires_at, "2026-07-02T20:00:00+00:00");
+                assert_eq!(t.held_out_commitment, "sha256:abc123");
             }
             other => panic!("expected leased, got {other:?}"),
         }

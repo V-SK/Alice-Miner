@@ -1015,8 +1015,14 @@ fn upgrade_banner(ui: &mut egui::Ui, min_supported: &str, download_url: &str) {
         .fill(THEME.well)
         .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 90)))
         .corner_radius(9);
-    if ui.add(btn).on_hover_text(download_url).clicked() {
-        ui.ctx().open_url(egui::OpenUrl::new_tab(download_url.to_string()));
+    // AM-SEC-006 defense in depth: the URL originated with the read API, and this is
+    // the exact moment it becomes an OS-level "open this site" action. Re-run the
+    // host allowlist here rather than trusting that the producer already did — an
+    // unallowlisted value silently becomes the built-in official releases page.
+    let target = alice_miner_core::dashboard::download_url_allowed(download_url)
+        .unwrap_or_else(|| alice_miner_core::dashboard::RELEASES_PAGE_DEFAULT.to_string());
+    if ui.add(btn).on_hover_text(target.clone()).clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(target));
     }
 }
 
@@ -1618,6 +1624,59 @@ fn prl_payout_row(ui: &mut egui::Ui, app: &mut MinerApp) {
                 });
                 if do_save {
                     app.save_prl_payout();
+                }
+
+                // AM-SEC-008 — the pre-save confirmation. `save_prl_payout` only
+                // FULL-validates (shape + bech32m) and parks the value here; NOTHING
+                // is written until the human confirms the address shown UNMASKED.
+                if let Some(pending) = app.prl_payout_pending.clone() {
+                    ui.add_space(10.0);
+                    egui::Frame::NONE
+                        .fill(THEME.well)
+                        .corner_radius(11)
+                        .inner_margin(egui::Margin::symmetric(14, 12))
+                        .stroke(egui::Stroke::new(1.0_f32, THEME.line_strong))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                RichText::new(strings::prl_payout_confirm_title())
+                                    .size(12.5)
+                                    .strong()
+                                    .color(THEME.text),
+                            );
+                            ui.add_space(7.0);
+                            // The WHOLE address, grouped — never the masked form here.
+                            ui.label(widgets::mono(
+                                alice_miner_core::prl_payout::format_for_confirm(&pending),
+                                12.0,
+                                THEME.text,
+                            ));
+                            ui.add_space(7.0);
+                            ui.label(
+                                RichText::new(strings::prl_payout_confirm_body())
+                                    .size(11.0)
+                                    .color(THEME.text3),
+                            );
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                if widgets::primary_button(
+                                    ui,
+                                    strings::PRL_PAYOUT_CONFIRM_YES,
+                                    true,
+                                    false,
+                                )
+                                .clicked()
+                                {
+                                    app.confirm_prl_payout();
+                                }
+                                ui.add_space(8.0);
+                                if widgets::ghost_button(ui, strings::PRL_PAYOUT_CONFIRM_NO, false)
+                                    .clicked()
+                                {
+                                    app.cancel_prl_payout();
+                                }
+                            });
+                        });
                 }
 
                 // Inline validation/save error (red), if any.

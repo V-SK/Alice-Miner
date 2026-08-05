@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use super::gpu_rvn::GpuLaunchPlan;
 use super::xmr::{derive_worker_id, MINING_EXECUTION_ALLOWED};
 use super::{GpuSelection, Lane};
-use crate::endpoint::{Endpoint, EndpointPlan};
+use crate::endpoint::{Endpoint, EndpointPlan, Transport};
 
 /// SRBMiner's algorithm token for the Alice GPU-PRL lane. argv-only.
 const PEARLHASH_ALGO: &str = "pearlhash";
@@ -256,7 +256,7 @@ pub fn build_srbminer_pearl_launch_plan(
     let reward = reward_identity.trim();
     let worker = derive_worker_id(reward)?; // fail-closed Alice-address validation
     let wallet = format!("{reward}.{worker}");
-    let pool = format!("stratum+tcp://{region_endpoint}");
+    let pool = pool_url(region_endpoint)?;
     let mut args = vec![
         "--algorithm".into(),
         PEARLHASH_ALGO.into(),
@@ -278,11 +278,48 @@ pub fn build_srbminer_pearl_launch_plan(
     Ok(GpuLaunchPlan { program, args })
 }
 
-/// The `<host>:<port>` authority for an [`Endpoint`] (transport-agnostic — SRBMiner
-/// takes the scheme in `--pool stratum+tcp://`; TLS region endpoints are a future
-/// additive change).
-fn endpoint_authority(ep: &Endpoint) -> String {
-    format!("{}:{}", ep.host, ep.port)
+/// The `--pool` target for an [`Endpoint`], **transport-aware** — `stratum+tcp://`
+/// for [`Transport::Plaintext`], `stratum+ssl://` for [`Transport::Tls`], via the
+/// shared [`Transport::stratum_scheme`] the XMR + RVN lanes already use.
+///
+/// AM-SEC-001 (partial): before this, the GPU-PRL lane hardcoded `stratum+tcp://`
+/// and SILENTLY IGNORED an endpoint declared `transport: "tls"` — the client would
+/// have mined in the clear while its own config claimed TLS. That silent
+/// disagreement is the part fixed here. **The default is unchanged**: every shipped
+/// region endpoint is `Transport::Plaintext`, so today's argv is byte-identical to
+/// v0.6.7's. NOTE the rest of AM-SEC-001 is NOT fixed: none of our three relays
+/// terminate TLS yet, so declaring an endpoint `tls` today just makes the connection
+/// fail — this change only means the client will follow the declaration once a relay
+/// can honour it.
+pub fn endpoint_pool_target(ep: &Endpoint) -> String {
+    format!("{}://{}:{}", ep.transport.stratum_scheme(), ep.host, ep.port)
+}
+
+/// Resolve the `--pool` value from a caller-supplied endpoint string. Accepts either
+/// a bare `host:port` (legacy call shape ⇒ plaintext, the historical default) or a
+/// full `<scheme>://host:port` produced by [`endpoint_pool_target`].
+///
+/// Fails CLOSED on any scheme we do not emit ourselves: a `--pool` value is what
+/// decides whether shares cross the wire in the clear, so an unrecognised scheme is
+/// refused rather than passed through to SRBMiner to interpret.
+fn pool_url(region_endpoint: &str) -> Result<String, String> {
+    let Some((scheme, authority)) = region_endpoint.split_once("://") else {
+        return Ok(format!("{}://{region_endpoint}", Transport::Plaintext.stratum_scheme()));
+    };
+    let known = [Transport::Plaintext, Transport::Tls]
+        .iter()
+        .any(|t| t.stratum_scheme() == scheme);
+    if !known {
+        return Err(format!(
+            "refusing an unrecognised stratum scheme {scheme:?} for the gpu-prl pool              (expected {} or {})",
+            Transport::Plaintext.stratum_scheme(),
+            Transport::Tls.stratum_scheme()
+        ));
+    }
+    if authority.is_empty() {
+        return Err("gpu-prl pool endpoint has an empty host:port".to_string());
+    }
+    Ok(region_endpoint.to_string())
 }
 
 /// Build the SRBMiner plan for the ACTIVE endpoint of an [`EndpointPlan`] (rotated
@@ -304,7 +341,7 @@ pub fn build_srbminer_pearl_launch_plan_for(
     build_srbminer_pearl_launch_plan(
         program,
         reward_identity,
-        &endpoint_authority(active),
+        &endpoint_pool_target(active),
         pop_token,
         log_path,
         gpus,
@@ -859,6 +896,69 @@ mod tests {
         .unwrap();
         let pool = lplan.args.iter().position(|x| x == "--pool").unwrap();
         assert_eq!(lplan.args[pool + 1], "stratum+tcp://asia.aliceprotocol.org:3340");
+    }
+
+    // ── transport consumption (AM-SEC-001, client half) ───────────────────────
+
+    /// A `transport: tls` endpoint must actually produce `stratum+ssl://`. Before this
+    /// change the lane hardcoded `stratum+tcp://` and the declaration was silently
+    /// dropped — the client would mine in the clear while its own config said TLS.
+    /// (No network here: this asserts the ARGV, which is the whole client-side half.)
+    #[test]
+    fn tls_endpoint_produces_a_tls_stratum_scheme() {
+        let addr = valid_address();
+        let lp = log_path();
+        let plan = EndpointPlan::new(vec![Endpoint::tls("us.aliceprotocol.org", GPU_RELAY_PORT)]).unwrap();
+        let lplan = build_srbminer_pearl_launch_plan_for(
+            PathBuf::from("SRBMiner-MULTI"),
+            addr,
+            &plan,
+            "pop=a:b",
+            &lp,
+            &GpuSelection::All,
+        )
+        .unwrap();
+        let pool = lplan.args.iter().position(|x| x == "--pool").unwrap();
+        assert_eq!(lplan.args[pool + 1], "stratum+ssl://us.aliceprotocol.org:3340");
+    }
+
+    /// …and the DEFAULT is unchanged: a plaintext endpoint still yields exactly the
+    /// v0.6.7 argv. This is the "does not change live behaviour" guard — every shipped
+    /// region endpoint is plaintext today.
+    #[test]
+    fn plaintext_endpoint_argv_is_unchanged() {
+        let addr = valid_address();
+        let lp = log_path();
+        let plan = EndpointPlan::new(vec![Endpoint::plaintext("us.aliceprotocol.org", GPU_RELAY_PORT)]).unwrap();
+        let lplan = build_srbminer_pearl_launch_plan_for(
+            PathBuf::from("SRBMiner-MULTI"),
+            addr,
+            &plan,
+            "pop=a:b",
+            &lp,
+            &GpuSelection::All,
+        )
+        .unwrap();
+        let pool = lplan.args.iter().position(|x| x == "--pool").unwrap();
+        assert_eq!(lplan.args[pool + 1], "stratum+tcp://us.aliceprotocol.org:3340");
+        // And the legacy bare `host:port` call shape still means plaintext.
+        assert_eq!(
+            pool_url("us.aliceprotocol.org:3340").unwrap(),
+            "stratum+tcp://us.aliceprotocol.org:3340"
+        );
+    }
+
+    /// A scheme we do not emit ourselves is REFUSED, not forwarded to SRBMiner to
+    /// interpret — `--pool` is what decides whether shares cross the wire in the clear.
+    #[test]
+    fn unknown_pool_scheme_fails_closed() {
+        for bad in ["http://relay:3340", "stratum+ssl2://relay:3340", "tcp://relay:3340"] {
+            assert!(pool_url(bad).is_err(), "must refuse {bad}");
+        }
+        assert!(pool_url("stratum+tcp://").is_err(), "empty authority is refused");
+        // The two schemes we DO emit are accepted verbatim.
+        assert_eq!(pool_url("stratum+ssl://r:1").unwrap(), "stratum+ssl://r:1");
+        assert_eq!(pool_url("stratum+tcp://r:1").unwrap(), "stratum+tcp://r:1");
     }
 
     // Region-selection env override is process-global; serialize the tests that

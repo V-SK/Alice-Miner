@@ -22,9 +22,14 @@
 //! ── HONESTY / CREDIT-ONLY INVARIANTS ────────────────────────────────────────
 //!   * The user's `prl1p…` payout address is **theirs** and may be shown (masked)
 //!     in the UI — it is NOT the foundation collection address (which stays
-//!     server-side). Only **shape** is validated here; **payability is the
-//!     server's authority** (we deliberately do NOT checksum-verify so a future
-//!     HRP/length tweak server-side doesn't brick the client).
+//!     server-side). **Payability is still the server's authority** — but as of
+//!     2026-08-04 the server enrol route performs a FULL bech32m verify, so the
+//!     client now verifies the SAME checksum **before it signs** (AM-SEC-008).
+//!     Rationale for the reversal of the old "shape-only" stance: a mistyped
+//!     character used to be signed, POSTed, and only rejected server-side — the
+//!     user learned about the typo (if ever) hours later, from a missing rebate.
+//!     Catching it locally costs nothing and cannot brick a client, because the
+//!     `prl1p…` prefix pins witness-version 1, which BIP-350 defines as bech32m.
 //!   * `paid == 0.0` always. There is no minting / release / paid_acu path here.
 
 use std::path::PathBuf;
@@ -87,6 +92,120 @@ pub fn validate_payout_shape(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// bech32m checksum (BIP-350) — the SAME check the server's enroll route does
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The BIP-350 bech32m constant (bech32 v1 uses `1`; witness-v1+ uses this).
+const BECH32M_CONST: u32 = 0x2bc8_30a3;
+
+/// BIP-173/350 `bech32_polymod` over 5-bit values. Self-contained (no bech32 dep,
+/// matching the workspace's no-new-crate discipline — the same routine already
+/// guards `gpu_alpha`'s placeholder invariant).
+fn bech32_polymod(values: &[u8]) -> u32 {
+    const GEN: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
+    let mut chk: u32 = 1;
+    for &v in values {
+        let b = chk >> 25;
+        chk = ((chk & 0x1ff_ffff) << 5) ^ u32::from(v);
+        for (i, g) in GEN.iter().enumerate() {
+            if (b >> i) & 1 == 1 {
+                chk ^= *g;
+            }
+        }
+    }
+    chk
+}
+
+/// Verify the **bech32m checksum** of a `prl1…` address. Assumes the shape check
+/// already ran (lowercase, `prl1p`-prefixed, charset-clean); returns a user-facing
+/// "you probably mistyped a character" error when the checksum does not close.
+///
+/// A checksum failure is exactly the class of error a human makes — one wrong or
+/// transposed character — and bech32m is designed to catch it. This runs BEFORE we
+/// sign anything, so a typo can never reach an enroll signature.
+pub fn verify_payout_checksum(addr: &str) -> Result<(), String> {
+    let sep = addr
+        .rfind('1')
+        .ok_or_else(|| "payout address has no bech32 separator".to_string())?;
+    let (hrp, data) = (&addr[..sep], &addr[sep + 1..]);
+    // The checksum itself is the last 6 data chars; anything shorter cannot carry one.
+    if data.len() < 6 {
+        return Err("payout address is too short to carry a bech32m checksum".to_string());
+    }
+    let mut values: Vec<u8> = hrp.bytes().map(|b| b >> 5).collect();
+    values.push(0);
+    values.extend(hrp.bytes().map(|b| b & 31));
+    for c in data.bytes() {
+        match BECH32_CHARSET.bytes().position(|x| x == c) {
+            Some(i) => values.push(i as u8),
+            None => return Err(format!("payout address has non-bech32 char {:?}", c as char)),
+        }
+    }
+    if bech32_polymod(&values) != BECH32M_CONST {
+        return Err(crate::tr!(
+            "payout address checksum is wrong — you very likely mistyped one character. Copy/paste the whole address from your PRL wallet.",
+            "返还地址校验和不对 — 极可能打错了一个字符。请从你的 PRL 钱包完整复制粘贴整个地址。"
+        )
+        .to_string());
+    }
+    Ok(())
+}
+
+/// **Full** validation of a payout address: [`validate_payout_shape`] THEN
+/// [`verify_payout_checksum`]. This is what every write/sign path uses (AM-SEC-008);
+/// `validate_payout_shape` alone remains available for cheap pre-filtering.
+pub fn validate_payout_address(addr: &str) -> Result<(), String> {
+    validate_payout_shape(addr)?;
+    verify_payout_checksum(addr)
+}
+
+/// Render an address in 8-char groups so a human can actually COMPARE it against
+/// their wallet before confirming. Used by the pre-sign confirmation prompt — the
+/// masked form is for at-a-glance panels, this one is for verification.
+pub fn format_for_confirm(addr: &str) -> String {
+    let chars: Vec<char> = addr.chars().collect();
+    chars
+        .chunks(8)
+        .map(|c| c.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The outcome of the "is this really your address?" gate that runs before an
+/// address is stored (and therefore before it is ever signed into an enroll).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayoutConfirm {
+    /// Store it — the human said yes, or passed the explicit non-interactive flag.
+    Proceed,
+    /// Do not store it: the human declined.
+    Declined,
+    /// Do not store it: nobody could be asked and no explicit flag was given.
+    /// The caller must tell the user which flag to add — NEVER assume consent.
+    NeedsExplicitFlag,
+}
+
+/// Pure decision for the pre-store confirmation (mirrors the keystore-overwrite
+/// gate's shape so both are testable without a TTY).
+///
+///   * `explicit_yes` — the caller passed the "I verified the address" flag; that IS
+///     the confirmation, on a TTY or not.
+///   * `is_tty` + `answer` — an interactive run: only `y`/`yes` proceeds.
+///   * neither — [`PayoutConfirm::NeedsExplicitFlag`]. We never infer consent from
+///     silence for a value that decides where money goes.
+pub fn decide_payout_confirm(is_tty: bool, explicit_yes: bool, answer: Option<&str>) -> PayoutConfirm {
+    if explicit_yes {
+        return PayoutConfirm::Proceed;
+    }
+    if !is_tty {
+        return PayoutConfirm::NeedsExplicitFlag;
+    }
+    match answer.map(|a| a.trim().to_ascii_lowercase()) {
+        Some(a) if a == "y" || a == "yes" => PayoutConfirm::Proceed,
+        _ => PayoutConfirm::Declined,
+    }
+}
+
 /// The `~/.alice/prl_payout_address` path (or `None` if no home dir is resolvable).
 fn payout_file_path() -> Option<PathBuf> {
     home_dir().map(|h| h.join(PAYOUT_FILE_REL))
@@ -109,14 +228,14 @@ fn home_dir() -> Option<PathBuf> {
 pub fn load_payout_address() -> Result<Option<String>, String> {
     if let Some(v) = std::env::var(ENV_PAYOUT_ADDRESS).ok().filter(|s| !s.trim().is_empty()) {
         let addr = v.trim().to_string();
-        validate_payout_shape(&addr)?;
+        validate_payout_address(&addr)?;
         return Ok(Some(addr));
     }
     if let Some(path) = payout_file_path() {
         if let Ok(contents) = std::fs::read_to_string(&path) {
             if let Some(line) = contents.lines().map(str::trim).find(|l| !l.is_empty()) {
                 let addr = line.to_string();
-                validate_payout_shape(&addr)?;
+                validate_payout_address(&addr)?;
                 return Ok(Some(addr));
             }
         }
@@ -125,15 +244,18 @@ pub fn load_payout_address() -> Result<Option<String>, String> {
 }
 
 /// Persist the user's 15%-PRL payout address to `~/.alice/prl_payout_address` (the
-/// exact file [`load_payout_address`] reads). **Shape-validated first** — a typo is
-/// rejected and NEVER written. The address is PUBLIC (not a secret), written
+/// exact file [`load_payout_address`] reads). **Fully validated first** (shape +
+/// bech32m checksum, [`validate_payout_address`]) — a typo is rejected and NEVER
+/// written. NOTE: this function does NOT ask the human anything; the "is this
+/// really your address?" confirmation is the caller's (see [`decide_payout_confirm`]),
+/// because only the caller knows whether it has a terminal or an explicit flag. The address is PUBLIC (not a secret), written
 /// atomically (temp + rename). Returns the path written so the caller can confirm.
 ///
 /// NOTE: this is independent of the keystore — it touches only the small public
 /// pointer file, never `miner-keystore.json` / `wallet.json`.
 pub fn save_payout_address(addr: &str) -> Result<PathBuf, String> {
     let trimmed = addr.trim();
-    validate_payout_shape(trimmed)?;
+    validate_payout_address(trimmed)?;
     let path = payout_file_path().ok_or("no home directory to store the payout address")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -215,6 +337,13 @@ pub fn run_enroll_best_effort(
         Ok(None) => return EnrollOutcome::NoPayoutAddress,
         Err(e) => return EnrollOutcome::Failed(format!("payout address invalid: {e}")),
     };
+    // (1b) AM-SEC-008 defense-in-depth: re-verify the FULL address (shape + bech32m
+    // checksum) immediately before the signing step. `load_payout_address` already
+    // validated, but this is the last line before a signature is produced, and a
+    // signature over a mistyped address is exactly what we must never emit.
+    if let Err(e) = validate_payout_address(&payout) {
+        return EnrollOutcome::Failed(format!("payout address invalid: {e}"));
+    }
     // (2) watch-only → never sign.
     if secrets.to_keypair().is_err() {
         return EnrollOutcome::WatchOnly;
@@ -401,8 +530,14 @@ mod tests {
     use super::*;
 
     const ADDR: &str = "a2uJXaVk7Zx4fgk9aRLnhiD2RdpAP4usJxKXpN4vh4hDNoP1C";
-    // A legal-shaped payout address: prl1p + 58 bech32 chars (well within 20..=110).
-    const PAYOUT_OK: &str = "prl1pexamplewalletexamplewalletexamplewallet";
+    /// A legal-shaped **and checksum-valid** bech32m payout address (AM-SEC-008: the
+    /// old fixture `prl1pexamplewallet…` was shape-legal but checksum-garbage, which
+    /// is exactly what the new gate must reject — so it can no longer be the "OK" one).
+    const PAYOUT_OK: &str = "prl1pqzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn57kr3mc";
+    /// Shape-legal, checksum-INVALID (one char off): the human-typo case.
+    const PAYOUT_BAD_CKSUM: &str = "prl1pexamplewalletexamplewalletexamplewallet";
+    /// The shortest checksum-valid address the shape gate still admits (rest == 20).
+    const PAYOUT_OK_MIN: &str = "prl1pqqqqqqqqqqqqqqvapaqa";
 
     #[test]
     fn payout_shape_accepts_legal_prl1p() {
@@ -636,6 +771,150 @@ mod tests {
         if let Some(v) = prev_up {
             std::env::set_var("USERPROFILE", v);
         }
+    }
+
+    // ── AM-SEC-008: full bech32m checksum before we ever sign ──────────────────
+
+    /// The three REAL, published `prl1p…` addresses (transit / cold / legacy) must
+    /// all verify — if this fails, our checksum implementation is wrong, not the
+    /// addresses. This is the anchor that keeps the gate from bricking real users.
+    #[test]
+    fn checksum_accepts_the_real_published_addresses() {
+        for real in [
+            "prl1p2v2hrrhzls9ala8wpwjucvfa7znt8q67s35aw6gev7xeknspa0ysul5efx",
+            "prl1p32l5m3sw4g5p25qamk8fn7qae7ek6ujtj025g8h9r4mgk0pxf4sqhgwah3",
+            "prl1pukq3uu0txl6fc34f2frlxsxyfs9nj30lsa4dkw8vpmfkgv3ck74shvtxsa",
+            // The alpha lane's published placeholder (already bech32m-checked there).
+            crate::lane::gpu_alpha::DEFAULT_ALPHA_PLACEHOLDER,
+        ] {
+            assert!(
+                validate_payout_address(real).is_ok(),
+                "a REAL published address must pass: {real}"
+            );
+        }
+        assert!(validate_payout_address(PAYOUT_OK).is_ok());
+        assert!(validate_payout_address(PAYOUT_OK_MIN).is_ok());
+    }
+
+    #[test]
+    fn checksum_rejects_shape_legal_garbage_with_a_clear_message() {
+        // Shape-legal (right prefix, right charset, right length) but the checksum
+        // does not close — the pre-fix code would have SIGNED this.
+        assert!(validate_payout_shape(PAYOUT_BAD_CKSUM).is_ok(), "shape alone still passes");
+        let err = validate_payout_address(PAYOUT_BAD_CKSUM).unwrap_err();
+        assert!(
+            err.contains("mistyped") || err.contains("打错"),
+            "the message must tell the human it is a typo, not a bare 'invalid': {err}"
+        );
+    }
+
+    /// Every single-character substitution of a valid address must be caught. This is
+    /// the property the whole fix exists for (the miner who typos one char).
+    #[test]
+    fn checksum_catches_every_single_character_typo() {
+        let chars: Vec<char> = PAYOUT_OK.chars().collect();
+        let mut checked = 0usize;
+        // Only mutate the data part (skip the "prl1" HRP+separator).
+        for i in 4..chars.len() {
+            for sub in BECH32_CHARSET.chars() {
+                if sub == chars[i] {
+                    continue;
+                }
+                let mut m = chars.clone();
+                m[i] = sub;
+                let typo: String = m.into_iter().collect();
+                assert!(
+                    validate_payout_address(&typo).is_err(),
+                    "single-char typo slipped through at {i}: {typo}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 1000, "sanity: the sweep actually ran ({checked} mutations)");
+    }
+
+    #[test]
+    fn checksum_catches_adjacent_transposition() {
+        let chars: Vec<char> = PAYOUT_OK.chars().collect();
+        for i in 4..chars.len() - 1 {
+            if chars[i] == chars[i + 1] {
+                continue; // swapping equal chars is a no-op, not a typo
+            }
+            let mut m = chars.clone();
+            m.swap(i, i + 1);
+            let typo: String = m.into_iter().collect();
+            assert!(validate_payout_address(&typo).is_err(), "transposition at {i} slipped through");
+        }
+    }
+
+    #[test]
+    fn bad_checksum_is_never_written_and_never_loaded() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_addr = std::env::var(ENV_PAYOUT_ADDRESS).ok();
+        let prev_home = std::env::var("HOME").ok();
+        let prev_up = std::env::var("USERPROFILE").ok();
+        std::env::remove_var(ENV_PAYOUT_ADDRESS);
+        let home = std::env::temp_dir().join(format!(
+            "alice-prl-cksum-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("USERPROFILE");
+
+        // (a) save refuses it and writes nothing.
+        assert!(save_payout_address(PAYOUT_BAD_CKSUM).is_err());
+        assert_eq!(load_payout_address().unwrap(), None);
+        // (b) a file that somehow already holds a bad-checksum address surfaces as an
+        //     Err on load — it is NOT silently used to build an enroll signature.
+        let dir = home.join(".alice");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("prl_payout_address"), format!("{PAYOUT_BAD_CKSUM}\n")).unwrap();
+        assert!(load_payout_address().is_err());
+        // (c) and the enroll path reports it instead of signing.
+        let watch = WalletSecrets::display_only(ADDR);
+        match run_enroll_best_effort(ADDR, "worker-abc", "us", &watch) {
+            EnrollOutcome::Failed(e) => assert!(e.contains("payout address invalid")),
+            other => panic!("a bad-checksum address must not reach signing: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+        match prev_addr {
+            Some(v) => std::env::set_var(ENV_PAYOUT_ADDRESS, v),
+            None => std::env::remove_var(ENV_PAYOUT_ADDRESS),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        if let Some(v) = prev_up {
+            std::env::set_var("USERPROFILE", v);
+        }
+    }
+
+    #[test]
+    fn confirm_gate_never_infers_consent() {
+        // Non-interactive + no flag ⇒ we REFUSE and say which flag is needed.
+        assert_eq!(decide_payout_confirm(false, false, None), PayoutConfirm::NeedsExplicitFlag);
+        // Non-interactive + explicit flag ⇒ proceed.
+        assert_eq!(decide_payout_confirm(false, true, None), PayoutConfirm::Proceed);
+        // Interactive: only y/yes proceeds; anything else (incl. EOF) declines.
+        assert_eq!(decide_payout_confirm(true, false, Some("y\n")), PayoutConfirm::Proceed);
+        assert_eq!(decide_payout_confirm(true, false, Some("YES")), PayoutConfirm::Proceed);
+        assert_eq!(decide_payout_confirm(true, false, Some("n")), PayoutConfirm::Declined);
+        assert_eq!(decide_payout_confirm(true, false, Some("")), PayoutConfirm::Declined);
+        assert_eq!(decide_payout_confirm(true, false, None), PayoutConfirm::Declined);
+    }
+
+    #[test]
+    fn confirm_rendering_shows_the_whole_address_not_a_mask() {
+        let shown = format_for_confirm(PAYOUT_OK);
+        // Every character survives (only spaces are added) — the point of the prompt
+        // is that the human can compare the FULL string against their wallet.
+        assert_eq!(shown.replace(' ', ""), PAYOUT_OK);
+        assert!(shown.contains(' '), "grouped for readability");
+        assert!(!shown.contains('…'), "the confirm view must NOT be the masked view");
     }
 
     // Process env is global; serialize every test that reads/writes a payout/lookup
