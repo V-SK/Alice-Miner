@@ -1033,6 +1033,12 @@ fn pose_settings_update(app: &mut MinerApp) {
         released: "2026-06-03T00:00:00Z".to_string(),
         notes: "stability + speed.".to_string(),
         artifacts: vec![artifact.clone()],
+        // The posed screenshot shows the MANUAL update affordance; the automatic
+        // policy fields stay at their defaults so the capture is unchanged.
+        rollout_pct: None,
+        soak_hours: None,
+        revoked: Vec::new(),
+        security: None,
     };
     app.updater.ui = crate::update::UpdateUi::Available {
         current: release::current_version().to_string(),

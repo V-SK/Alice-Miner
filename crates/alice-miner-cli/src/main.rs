@@ -1032,6 +1032,13 @@ fn main() {
     // GUI did, so headless self-updates had no rollback at all.)
     let launch_health = update::register_launch_at_startup();
 
+    // The same question for an update NOBODY asked for. Separate gate, separate
+    // record, deliberately: the manual gate commits as soon as the binary starts,
+    // which is the right bar for a build a human chose and too low a bar for one
+    // that installed itself. A rollback here has already happened on disk by the
+    // time this returns — the line it hands back says so precisely.
+    let auto_rollback = alice_miner_core::autoupdate::register_launch();
+
     // Parse WITHOUT clap's built-in exit, so the health gate below runs even on
     // `--help` / a usage error — both of which prove the binary loads and runs.
     let parsed = Cli::try_parse();
@@ -1039,6 +1046,10 @@ fn main() {
     // AM-REL-009, step 2: the process is demonstrably up. Commit a pending update
     // (drop last-known-good) or report a rollback that already happened.
     update::confirm_launch_health(&launch_health);
+    alice_miner_core::autoupdate::confirm_start();
+    if let Some(msg) = auto_rollback {
+        eprintln!("{msg}");
+    }
 
     let cli = match parsed {
         Ok(c) => c,
@@ -1319,7 +1330,7 @@ fn run_menu_action(action: menu::MenuAction, no_color: bool) -> i32 {
             fix: true,
         }),
         // Check for updates (interactive apply flow — asks before applying).
-        menu::MenuAction::Update => update::run(update::UpdateArgs { check: false, yes: false }),
+        menu::MenuAction::Update => update::run(update::UpdateArgs { check: false, yes: false, auto: None }),
         // Training: run the RLVR training worker with default flags (the config the
         // user saved on a prior `train` run replays; a first run without a saved
         // trainer dir fails closed with the exact flag to pass — never a fake run).
@@ -2766,7 +2777,30 @@ fn cmd_start_with_unlock(
     // sees the CTA + non-zero exit and updates).
     let mut printed_upgrade_notice = false;
 
+    // The guarded automatic updater, for the life of this session. It checks in
+    // the background (never on this thread), installs only what clears every
+    // guardrail, and NEVER interrupts the running engine — an installed build
+    // takes effect on the next start and the message says exactly that. It also
+    // owns the mining half of the post-update health probation, because this loop
+    // is the only place that can see both the elapsed session and the accepted
+    // share count. `--json` / service runs keep the machinery and lose the prose.
+    let mut auto = update::AutoUpdater::start(args.json || args.from_service);
+    // Held until the in-place panel is torn down, so an update line is not painted
+    // over by the next frame and then lost. Kept SEPARATE from `deferred_error` —
+    // an update note must never overwrite an error the user needs to read.
+    let mut deferred_update: Option<String> = None;
+
     loop {
+        if let Some(msg) = auto.tick(last_snapshot.as_ref().map(|s| s.shares_accepted).unwrap_or(0))
+        {
+            if args.json {
+                println!("{}", serde_json::json!({ "update": msg }));
+            } else if tui.is_none() {
+                eprintln!("{msg}");
+            } else {
+                deferred_update = Some(msg);
+            }
+        }
         match engine.recv_timeout(Duration::from_millis(500)) {
             Ok(Event::Snapshot(snap)) => {
                 let credit = credit_cell
@@ -2896,6 +2930,9 @@ fn cmd_start_with_unlock(
         // `e` is already the polished multi-line message (built via errmsg::render_error
         // when the error was captured), so print it as-is.
         eprintln!("{e}");
+    }
+    if let Some(u) = deferred_update {
+        eprintln!("{u}");
     }
 
     // Best-effort: ensure the child is torn down on the way out (kill_on_drop is

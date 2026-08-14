@@ -24,6 +24,12 @@
 //!     SHA-256 before it is ever signed, unpacked, or run. A mismatch aborts.
 //!   * Last-known-good: the previous app is preserved; if the freshly-installed
 //!     version fails its first-launch health check, we roll back.
+//!
+//! Everything above describes an update the USER asked for. The policy for
+//! updates nobody asked for — staged rollout, a soak window the manifest cannot
+//! shorten, revocation, and a health probation that will not blame the client
+//! for an upstream outage — lives in [`auto`], deliberately in its own module so
+//! this kernel stays the byte-shared copy it is.
 
 /// Inlined copy of the subset of `alice-wallet/gui/src/config.rs` that
 /// `update.rs` depends on for the data-dir safety guard (`assert_not_in_data_dir`
@@ -60,6 +66,8 @@ mod config {
     #[cfg(test)]
     pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
+
+pub mod auto;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -311,6 +319,40 @@ pub struct Manifest {
     /// Human-readable release notes shown in the update prompt.
     pub notes: String,
     pub artifacts: Vec<Artifact>,
+
+    // ── Automatic-update policy fields (all OPTIONAL, all additive) ─────────
+    //
+    // These are read only by [`auto`]. They are `#[serde(default)]` and the
+    // `schema` stays 1 on purpose: a manifest carrying them still parses in
+    // every already-shipped client (0.6.5 … 0.6.7 ignore unknown fields), and a
+    // manifest WITHOUT them still parses here. Bumping `schema` instead would
+    // have made every older client reject the manifest outright and stop seeing
+    // updates at all — a self-inflicted version of the outage we are fixing.
+    //
+    // Read the guarantee direction carefully: each of these can only make an
+    // automatic update *narrower or later*. The client floors them; it never
+    // lets them widen anything. Under a stolen release key every field here is
+    // attacker-controlled, so a field that could loosen a guardrail would be
+    // worse than no field at all.
+    /// Ceiling on the share of machines that may auto-install this version,
+    /// 0..=100. Absent means 100 (no extra narrowing); values above 100 are
+    /// clamped. Set 0 to publish a version that only manual updates take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_pct: Option<u8>,
+    /// Ask clients to soak this version for LONGER than their own floor before
+    /// auto-installing it. A value below the client floor has no effect —
+    /// including 0, which is the field an attacker would reach for first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soak_hours: Option<u64>,
+    /// Versions withdrawn by the publisher. A revoked version is never
+    /// installed, and a client already RUNNING one rolls back to last-known-good
+    /// (or is told, loudly, to reinstall).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked: Vec<String>,
+    /// Marks this release as a security / emergency fix. The `security-only`
+    /// mode — the default — auto-installs these and only these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<bool>,
 }
 
 impl Manifest {
@@ -318,6 +360,19 @@ impl Manifest {
     pub fn artifact_for_current_platform(&self) -> Option<&Artifact> {
         let plat = current_platform();
         self.artifacts.iter().find(|a| a.platform == plat)
+    }
+
+    /// Whether the publisher has withdrawn `version`.
+    pub fn is_revoked(&self, version: &str) -> bool {
+        let v = version.trim().trim_start_matches('v');
+        self.revoked
+            .iter()
+            .any(|r| r.trim().trim_start_matches('v') == v)
+    }
+
+    /// Whether this release is flagged as a security / emergency fix.
+    pub fn is_security(&self) -> bool {
+        self.security.unwrap_or(false)
     }
 }
 
@@ -593,6 +648,23 @@ pub fn check_for_update(current: &str) -> Result<CheckOutcome> {
     Ok(evaluate(manifest, current))
 }
 
+/// Fetch + verify the manifest and hand it back WHOLE, without collapsing it
+/// into a [`CheckOutcome`].
+///
+/// [`check_for_update`] throws the manifest away on the `UpToDate` path, which
+/// is fine for "is there something newer" and wrong for the automatic path:
+/// `revoked` has to be read on exactly the run where nothing newer exists —
+/// that is the run where we are sitting on a withdrawn build.
+pub fn fetch_verified_manifest() -> Result<Manifest> {
+    let url = update_url();
+    let agent = agent();
+    let manifest_bytes = http_get_bytes(&agent, &url, 1024 * 1024)?; // 1 MiB cap
+    let sig_b64 = String::from_utf8(http_get_bytes(&agent, &sig_url(&url), 64 * 1024)?)
+        .map_err(|e| UpdateError::Signature(format!("sig not utf-8: {e}")))?;
+    verify_with_embedded_key(&manifest_bytes, &sig_b64)?;
+    parse_verified_manifest(&manifest_bytes)
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Integrity: SHA-256
 // ────────────────────────────────────────────────────────────────────────────
@@ -855,11 +927,59 @@ pub fn rollback(current_path: &Path) -> Result<()> {
             "no last-known-good backup to roll back to".into(),
         ));
     }
-    // Remove the broken current, restore lkg.
-    let _ = remove_path(current_path);
-    std::fs::rename(&lkg, current_path)
-        .map_err(|e| UpdateError::Io(format!("restore last-known-good: {e}")))?;
+    // Move the broken build ASIDE rather than deleting it, then restore
+    // last-known-good over the vacated path.
+    //
+    // The order matters and it is a Windows fact that decides it: a rollback is
+    // driven from the startup of the very build being rolled back, so the file we
+    // are replacing is the RUNNING image. Windows refuses to delete a running
+    // executable — `DeleteFile` fails with a sharing violation — but it does
+    // allow RENAMING one. The previous "delete, then rename the backup in" order
+    // therefore failed silently on Windows (the delete error was discarded, and
+    // the rename then hit an existing destination), which would have made the
+    // whole last-known-good mechanism a no-op on the platform where a headless
+    // rig is most likely to be sitting unattended.
+    //
+    // Rename-aside works everywhere, so this is not a `#[cfg]` branch: the same
+    // code path runs and is tested on all three platforms.
+    let mut aside_os = current_path.as_os_str().to_os_string();
+    aside_os.push(format!(".failed-{}", nanos()));
+    let aside = PathBuf::from(aside_os);
+    let mut moved_aside = false;
+    if current_path.exists() {
+        if std::fs::rename(current_path, &aside).is_ok() {
+            moved_aside = true;
+        } else {
+            // Renaming aside failed (e.g. a cross-device layout): fall back to a
+            // real removal, and fail LOUDLY if that does not work either — a
+            // rollback we cannot perform must never be reported as done.
+            remove_path(current_path).map_err(|e| {
+                UpdateError::Io(format!("could not clear the failed build for rollback: {e}"))
+            })?;
+        }
+    }
+    if let Err(e) = std::fs::rename(&lkg, current_path) {
+        // Put the failed build back so the user is left with a working install
+        // rather than nothing at all, and report the failure.
+        if moved_aside {
+            let _ = std::fs::rename(&aside, current_path);
+        }
+        return Err(UpdateError::Io(format!("restore last-known-good: {e}")));
+    }
+    // The failed build is no longer referenced. Best-effort cleanup: on Windows
+    // this may fail while the process still runs, which is harmless — it is a
+    // stray file next to the app, not a broken install.
+    if moved_aside {
+        let _ = remove_path(&aside);
+    }
     Ok(())
+}
+
+/// Whether a last-known-good copy is currently on disk — i.e. whether a
+/// rollback has somewhere to go. Callers use it to avoid promising a user a
+/// revert they cannot perform.
+pub fn has_last_known_good(current_path: &Path) -> bool {
+    lkg_path(current_path).exists()
 }
 
 /// Discard the last-known-good backup once the new version has proven healthy.
@@ -1654,7 +1774,52 @@ mod tests {
                     size: 789,
                 },
             ],
+            rollout_pct: None,
+            soak_hours: None,
+            revoked: Vec::new(),
+            security: None,
         }
+    }
+
+    /// A manifest published BEFORE the auto-update fields existed (and the
+    /// Wallet's, which will never carry them) must still parse here, and the
+    /// absent fields must default to "no extra narrowing" rather than to
+    /// something that silently blocks every update.
+    #[test]
+    fn manifest_without_auto_fields_still_parses() {
+        let json = br#"{
+            "schema": 1, "product": "alice-miner", "version": "1.4.0",
+            "min_supported": "1.0.0", "released": "2026-06-02T00:00:00Z",
+            "notes": "", "artifacts": []
+        }"#;
+        let m = parse_verified_manifest(json).expect("legacy manifest must parse");
+        assert_eq!(m.rollout_pct, None);
+        assert_eq!(m.soak_hours, None);
+        assert!(m.revoked.is_empty());
+        assert!(!m.is_security());
+        assert!(!m.is_revoked("1.4.0"));
+    }
+
+    /// And a manifest carrying UNKNOWN future fields must not be rejected —
+    /// this is the property that lets us add policy fields without bumping
+    /// `schema` and cutting every already-shipped client off from updates.
+    #[test]
+    fn manifest_with_unknown_fields_still_parses() {
+        let json = br#"{
+            "schema": 1, "product": "alice-miner", "version": "1.4.0",
+            "min_supported": "1.0.0", "released": "2026-06-02T00:00:00Z",
+            "notes": "", "artifacts": [], "some_field_from_2027": {"a": 1}
+        }"#;
+        assert!(parse_verified_manifest(json).is_ok());
+    }
+
+    #[test]
+    fn revocation_matching_tolerates_a_v_prefix() {
+        let mut m = sample_manifest();
+        m.revoked = vec!["v1.4.0".to_string()];
+        assert!(m.is_revoked("1.4.0"));
+        assert!(m.is_revoked("v1.4.0"));
+        assert!(!m.is_revoked("1.4.1"));
     }
 
     #[test]

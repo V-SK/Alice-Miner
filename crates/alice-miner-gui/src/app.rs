@@ -463,6 +463,14 @@ impl MinerApp {
         } else {
             None
         };
+        // The same resolution for an update NOBODY asked for. A rollback has
+        // already happened on disk by the time this returns; the note says so and
+        // says that THIS process is still the failed build.
+        let auto_update_note = if shot.is_none() {
+            crate::update::UpdateManager::auto_gate_at_startup()
+        } else {
+            None
+        };
         // No identity on disk → start in onboarding.
         let onboarding = if identity.is_none() {
             Some(Onboarding::Choose)
@@ -517,7 +525,11 @@ impl MinerApp {
             // runs never spawn a network thread).
             credit_poll: None,
             shot,
-            updater: crate::update::UpdateManager::default(),
+            updater: {
+                let mut m = crate::update::UpdateManager::default();
+                m.auto_note = auto_update_note;
+                m
+            },
             update_committed_note,
             launch_update_checked: false,
             bg_service: None,
@@ -2196,6 +2208,11 @@ impl eframe::App for MinerApp {
         if !self.launch_update_checked {
             self.launch_update_checked = true;
             self.updater.check();
+            // …and one GUARDED automatic cycle, which is a different thing: the
+            // check above only ever populates the UI, while this one may install
+            // (subject to the mode, the day-long hold, the rollout slice, the
+            // revocation list and the failure pins). It never interrupts mining.
+            self.updater.auto_check(true);
             // Also learn the background-service state once at launch so the Home
             // Start control can enforce single-owner (don't foreground-mine while
             // the background agent is active) without re-querying every frame.
@@ -2205,6 +2222,15 @@ impl eframe::App for MinerApp {
         // UI state. Cheap + non-blocking; the actual network/FS work runs on a
         // worker thread (see `crate::update`). Kept off the screenshot path.
         self.updater.poll();
+        // The periodic automatic cycle (no-op until it is due), and the mining
+        // half of the post-update health probation fed from the live snapshot.
+        self.updater.auto_check(false);
+        self.updater.note_mining(
+            self.snapshot
+                .as_ref()
+                .filter(|s| matches!(s.state, alice_miner_core::EngineState::Running))
+                .map(|s| s.shares_accepted),
+        );
         // Source B: refresh the server-confirmed credit state from the poller
         // (v1: a pure no-op yielding `NotExposed`; the fast-follow drives a real
         // poll here). Kept off the screenshot path so posed states survive.

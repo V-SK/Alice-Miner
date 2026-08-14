@@ -1333,6 +1333,65 @@ fn render_background_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
 /// the "Check for updates" affordance; on a verified newer manifest it offers
 /// "Update now". All work is user-initiated and runs on a background thread (see
 /// [`crate::update`]); this only reads/sets `app.updater`.
+/// The automatic-update mode selector: four buttons, the active one filled.
+///
+/// The description under it is deliberately blunt about the trade. Turning this
+/// up is a decision about who is allowed to run code on this machine, and a UI
+/// that presents it as a pure convenience setting would be lying by omission.
+fn render_auto_update_mode(ui: &mut egui::Ui) {
+    use alice_miner_core::alice_release::auto::Mode;
+    use alice_miner_core::autoupdate;
+
+    let active = autoupdate::mode();
+    let mut pick: Option<Mode> = None;
+    srow(
+        ui,
+        tr!("Install updates automatically", "自动安装更新"),
+        tr!(
+            "A new version is held for a day, rolled out in batches, and rolled back automatically if it fails to start or stops earning. Installing without being asked also means trusting our release key more — nothing is installed here that is not ed25519-signed and SHA-256-verified.",
+            "新版本会先观察一天、分批放量,若无法启动或不再有收益会自动回滚。让它自动安装也意味着更依赖我们发布密钥的安全 —— 这里安装的任何内容都经过 ed25519 签名与 SHA-256 校验。"
+        ),
+        |ui| {
+            for (m, label) in [
+                (Mode::Off, tr!("Off", "关闭")),
+                (Mode::Notify, tr!("Notify", "仅提示")),
+                (Mode::SecurityOnly, tr!("Security", "仅安全")),
+                (Mode::Full, tr!("All", "全部")),
+            ] {
+                let on = m == active;
+                let btn = egui::Button::new(
+                    RichText::new(label)
+                        .size(12.0)
+                        .strong()
+                        .color(if on { THEME.ink_on_brand } else { THEME.text3 }),
+                )
+                .fill(if on { THEME.brand } else { THEME.well })
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    if on { THEME.brand } else { THEME.line_strong },
+                ))
+                .corner_radius(9)
+                .min_size(egui::vec2(0.0, 28.0));
+                if ui.add(btn).clicked() && !on {
+                    pick = Some(m);
+                }
+            }
+        },
+    );
+    if let Some(m) = pick {
+        // A failure to persist is surfaced, never swallowed: a setting the user
+        // believes they changed and did not is worse than an error message.
+        if let Err(e) = autoupdate::set_mode(m) {
+            srow(
+                ui,
+                tr!("Could not save", "保存失败"),
+                &e,
+                |_ui| {},
+            );
+        }
+    }
+}
+
 fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
     // The release channel link (PUBLIC apex; never an internal/core host). Shown
     // as the fallback for platforms without an in-app artifact.
@@ -1352,6 +1411,41 @@ fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
             );
             app.update_committed_note = None;
         }
+
+        // What the AUTOMATIC updater last did, or last declined to do and why.
+        // This row is the answer to the question the August 2026 incident left
+        // us with: a miner should never have to wonder whether their client is
+        // current, or guess why it is not.
+        if let Some(note) = app.updater.auto_note.clone() {
+            srow(
+                ui,
+                tr!("Automatic updates", "自动更新"),
+                &note,
+                |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(tr!("Dismiss", "知道了"))
+                                    .size(12.0)
+                                    .color(THEME.text3),
+                            )
+                            .fill(THEME.well)
+                            .corner_radius(9)
+                            .min_size(egui::vec2(0.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        app.updater.auto_note = None;
+                    }
+                },
+            );
+        }
+
+        // The mode switch. Four explicit choices, no hidden default: whichever
+        // one is active is drawn as active even when the user has never chosen,
+        // because "what will this machine do on its own" is not something to make
+        // someone dig for.
+        render_auto_update_mode(ui);
 
         let current = env!("CARGO_PKG_VERSION");
         let busy = app.updater.ui.is_busy();

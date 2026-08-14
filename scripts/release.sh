@@ -36,6 +36,8 @@
 # Usage:
 #   scripts/release.sh [--version X.Y.Z] [--targets "macos-arm64 linux-x86_64 windows-x86_64"]
 #                      [--min-supported X.Y.Z] [--notes-file NOTES.md]
+#                      [--rollout-pct 0..100] [--soak-hours N] [--security]
+#                      [--revoke "X.Y.Z X.Y.Z"]
 #                      [--out dist] [--base-url URL] [--sign] [--publish] [--repo owner/name]
 #
 # Safe by default: with neither --sign nor --publish it only builds + packages +
@@ -50,6 +52,36 @@ GUI_CRATE_DIR="${ROOT_DIR}/crates/alice-miner-gui"
 GUI_BIN="alice-miner-gui"   # the workspace [[bin]] name
 VERSION=""
 MIN_SUPPORTED=""
+# ── Automatic-update policy (all OPTIONAL; omitted from the manifest when unset)
+#
+# These four are the publisher's side of the guarded auto-updater. Read the
+# direction of each one before using it: the CLIENT floors every one of them, so
+# they can only ever make an automatic update NARROWER or LATER, never wider or
+# sooner. That is deliberate — under a stolen release key every field here is
+# attacker-controlled, so a field that could loosen a guardrail would be worse
+# than no field at all.
+#
+#   --rollout-pct N   Ceiling on the share of machines that may auto-install this
+#                     version (0..100). Omitted = 100. Use 0 to publish a version
+#                     that ONLY manual `alice-miner update` takes. Start a real
+#                     rollout small (5, then 25, then 100) by re-publishing the
+#                     manifest — the artifacts do not change, only latest.json.
+#   --soak-hours N    Ask clients to wait LONGER than their own 24h floor. A value
+#                     below the floor does nothing at all, including 0: there is
+#                     no way to publish an instant-deploy release, by design.
+#   --revoke "A B"    Space-separated versions to WITHDRAW. Clients never install
+#                     a revoked version, and a client already running one rolls
+#                     back to its last-known-good copy. This is the kill switch;
+#                     it works on already-shipped clients without a new release.
+#   --security        Mark this release as a security/emergency fix. The DEFAULT
+#                     client mode (security-only) auto-installs these and only
+#                     these. Do not set it out of enthusiasm: it is the flag that
+#                     decides whether a release installs itself on other people's
+#                     machines.
+ROLLOUT_PCT=""
+SOAK_HOURS=""
+REVOKE=""
+SECURITY=0
 NOTES_FILE=""
 OUT_DIR="${ROOT_DIR}/dist"
 TARGETS=""          # platform keys; empty => just the host
@@ -153,6 +185,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --version)       VERSION="$2"; shift 2 ;;
     --min-supported) MIN_SUPPORTED="$2"; shift 2 ;;
+    --rollout-pct)   ROLLOUT_PCT="$2"; shift 2 ;;
+    --soak-hours)    SOAK_HOURS="$2"; shift 2 ;;
+    --revoke)        REVOKE="$2"; shift 2 ;;
+    --security)      SECURITY=1; shift ;;
     --notes-file)    NOTES_FILE="$2"; shift 2 ;;
     --targets)       TARGETS="$2"; shift 2 ;;
     --out)           OUT_DIR="$2"; shift 2 ;;
@@ -196,6 +232,7 @@ NOTES="$( [[ -n "${NOTES_FILE}" && -f "${NOTES_FILE}" ]] && cat "${NOTES_FILE}" 
 echo "── Alice Miner release ${VERSION} ──────────────────────────────────────"
 echo "targets       : ${TARGETS}"
 echo "min_supported : ${MIN_SUPPORTED}"
+echo "auto policy   : rollout_pct=${ROLLOUT_PCT:-<unset=100>} soak_hours=${SOAK_HOURS:-<unset=client floor>} security=${SECURITY} revoked=${REVOKE:-<none>}"
 echo "out           : ${OUT_DIR}"
 echo "base url      : ${BASE_URL:-<unset — set --base-url / ALICE_RELEASE_BASE_URL>}"
 echo "sign          : ${DO_SIGN}    publish: ${DO_PUBLISH}"
@@ -393,8 +430,33 @@ done
 # this serialization stable; the Miner re-serializes via serde for comparison
 # only in tests, never for verification (it verifies the bytes as fetched).
 NOTES_ESCAPED="$(printf '%s' "${NOTES}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+
+# The automatic-update policy fields. Emitted ONLY when the operator asked for
+# them, so a release cut without any of these flags produces byte-for-byte the
+# manifest this pipeline has always produced. `schema` deliberately stays 1: the
+# fields are additive and every already-shipped client (0.6.5 … 0.6.7) ignores
+# what it does not recognise, whereas bumping the schema would make those clients
+# reject the manifest outright and stop seeing updates entirely.
+POLICY=""
+if [[ -n "${ROLLOUT_PCT}" ]]; then
+  [[ "${ROLLOUT_PCT}" =~ ^[0-9]+$ && "${ROLLOUT_PCT}" -le 100 ]] || { echo "--rollout-pct must be 0..100" >&2; exit 2; }
+  POLICY="${POLICY},\"rollout_pct\":${ROLLOUT_PCT}"
+fi
+if [[ -n "${SOAK_HOURS}" ]]; then
+  [[ "${SOAK_HOURS}" =~ ^[0-9]+$ ]] || { echo "--soak-hours must be a non-negative integer" >&2; exit 2; }
+  POLICY="${POLICY},\"soak_hours\":${SOAK_HOURS}"
+fi
+if [[ -n "${REVOKE}" ]]; then
+  rev=""
+  for v in ${REVOKE}; do rev="${rev:+${rev},}\"${v}\""; done
+  POLICY="${POLICY},\"revoked\":[${rev}]"
+fi
+if [[ "${SECURITY}" -eq 1 ]]; then
+  POLICY="${POLICY},\"security\":true"
+fi
+
 cat > "${OUT_DIR}/latest.json" <<JSON
-{"schema":1,"product":"${PRODUCT}","version":"${VERSION}","min_supported":"${MIN_SUPPORTED}","released":"${RELEASED}","notes":${NOTES_ESCAPED},"artifacts":[${artifacts_json}]}
+{"schema":1,"product":"${PRODUCT}","version":"${VERSION}","min_supported":"${MIN_SUPPORTED}","released":"${RELEASED}","notes":${NOTES_ESCAPED},"artifacts":[${artifacts_json}]${POLICY}}
 JSON
 echo "  -> ${OUT_DIR}/latest.json"
 cat "${OUT_DIR}/latest.json"; echo
