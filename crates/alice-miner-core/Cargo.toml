@@ -62,5 +62,13 @@ keyring = { version = "3", default-features = false, features = [
 # code page (cp950/Big5 on 繁中 Windows). Only the console feature — no extra API
 # surface. The version matches the one already resolved in the workspace lockfile
 # (pulled transitively via crossterm/ctrlc), so this adds NO new crate download.
+[dev-dependencies]
+# Tests only: sign a throwaway engine-pin document so the whole
+# verify → validate → anti-replay → anti-swap → stage pipeline can be exercised
+# end-to-end without the production sub-key (which lives offline and is never in
+# this repo). Same crate + version the release verifier already links, so this
+# adds no new dependency to the shipped binary.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

@@ -29,52 +29,37 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
-
-/// The pinned-engine manifest, embedded at compile time so the SHA-256 pins
-/// travel inside the binary (no `release-assets/miners.json` needed at runtime).
-/// This is the SAME file the offline packaging step reads; baking it in is what
-/// turns the "SHA-pinned engine" promise from a packaging-time note into a
-/// runtime guarantee (audit B-1).
-const MINERS_MANIFEST: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../release-assets/miners.json"));
-
 /// The env var that, set to `1`/`true`, permits the `ALICE_MINER_<KIND>_BIN`
 /// override to run a binary whose SHA-256 is NOT pinned (or doesn't match). This
 /// is an explicit, loud opt-in for advanced users supplying their own engine
 /// (e.g. T-Rex); without it, an override to an unverified binary is refused.
 pub const ALLOW_UNVERIFIED_ENV: &str = "ALICE_MINER_ALLOW_UNVERIFIED_BIN";
 
-/// A single entry in `release-assets/miners.json`.
-#[derive(Debug, Clone, Deserialize)]
-struct MinerPin {
-    kind: String,
-    target: String,
-    filename: String,
-    sha256: String,
-    #[serde(default)]
-    #[serde(rename = "_placeholder")]
-    placeholder: bool,
-    /// Auto-download: a direct URL to the engine BINARY (e.g. a frozen xmrig).
-    /// The fetched bytes are verified against `sha256` before install.
-    #[serde(default)]
-    binary_url: Option<String>,
-    /// Auto-download (archive form): a URL to an archive (`.tar.gz` / `.zip`)
-    /// containing the engine at `binary_path_in_archive`. The archive bytes are
-    /// verified against `archive_sha256`, then the extracted binary against
-    /// `sha256`. Used for SRBMiner-MULTI (GPU-PRL).
-    #[serde(default)]
-    archive_url: Option<String>,
-    #[serde(default)]
-    archive_sha256: Option<String>,
-    #[serde(default)]
-    binary_path_in_archive: Option<String>,
+/// Machine-readable marker on every "we could not verify these engine bytes"
+/// error. A lane that sees it must stop rather than degrade: there is no
+/// "run the old engine anyway" path (that is exactly how you keep mining into a
+/// hard fork, or run bytes someone swapped).
+pub const ENGINE_UNVERIFIED: &str = "ENGINE_UNVERIFIED";
+
+/// True when `err` came from an integrity/verification refusal (as opposed to a
+/// merely-missing engine or a network hiccup).
+pub fn is_engine_unverified(err: &str) -> bool {
+    err.contains(ENGINE_UNVERIFIED)
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct MinersManifest {
-    engines: Vec<MinerPin>,
-}
+/// One engine pin. Defined in [`crate::engine_pins`] because the pin table now
+/// has two sources — the manifest compiled into this binary (the floor) and the
+/// separately-signed, independently-publishable `engines.json` — and the
+/// resolver must treat them as the same shape.
+pub use crate::engine_pins::PinEntry;
+
+/// The pin table compiled into this binary from `release-assets/miners.json` —
+/// the FLOOR the resolver falls back to whenever no verified `engines.json` is
+/// active. Baking it in is what makes "SHA-pinned engine" a runtime guarantee
+/// rather than a packaging-time note (audit B-1); it now also guarantees that a
+/// client with no network, no pin document, or a refused one still knows exactly
+/// which bytes it is allowed to run.
+pub use crate::engine_pins::EMBEDDED_MANIFEST as MINERS_MANIFEST;
 
 /// The bundled engine kinds. [`MinerKind::CpuXmr`] = xmrig (the proven CPU lane);
 /// [`MinerKind::GpuRvn`] = kawpowminer (the M3 GPU lane). The kawpowminer binary
@@ -111,8 +96,9 @@ impl MinerKind {
         }
     }
 
-    /// The `kind` string this engine carries in `release-assets/miners.json`.
-    fn manifest_kind(self) -> &'static str {
+    /// The `kind` string this engine carries in `release-assets/miners.json`
+    /// (and in the signed `engines.json`).
+    pub fn manifest_kind(self) -> &'static str {
         match self {
             MinerKind::CpuXmr => "cpu-xmr",
             MinerKind::GpuRvn => "gpu-rvn",
@@ -122,42 +108,22 @@ impl MinerKind {
     }
 }
 
-/// A non-placeholder SHA-256 pin for `kind` on the current target triple, parsed
-/// from the embedded [`MINERS_MANIFEST`]. `None` when no entry matches OR the
-/// entry is an all-zero placeholder (e.g. kawpowminer until M7) — i.e. "there is
-/// no real pin to verify against", which the resolver treats as not-installable
-/// for a bundled binary (it must not exec something it can't verify).
+/// The SHA-256 pin in force for `kind` on the current target triple.
+///
+/// The pin comes from [`crate::engine_pins::effective_pin_for`]: a verified,
+/// non-stale `engines.json` if one is active on this machine, otherwise the
+/// manifest compiled into this binary (the floor). `None` when no entry matches
+/// OR the entry is an all-zero placeholder (e.g. kawpowminer until M7) — i.e.
+/// "there is no real pin to verify against", which the resolver treats as
+/// not-installable for a bundled binary (it must not exec what it can't verify).
 fn pinned_sha256_for(kind: MinerKind) -> Option<String> {
-    let triple = current_target_triple();
-    let manifest: MinersManifest = serde_json::from_str(MINERS_MANIFEST).ok()?;
-    manifest.engines.into_iter().find_map(|e| {
-        let matches = e.kind == kind.manifest_kind()
-            && e.target == triple
-            && e.filename == kind.binary_name();
-        if !matches {
-            return None;
-        }
-        let sha = e.sha256.trim().to_ascii_lowercase();
-        // Reject the all-zero placeholder: it is NOT a usable pin.
-        if e.placeholder || sha.chars().all(|c| c == '0') || sha.len() != 64 {
-            None
-        } else {
-            Some(sha)
-        }
-    })
+    crate::engine_pins::effective_pin_for(kind).and_then(|p| p.entry.real_sha256())
 }
 
-/// The full embedded manifest entry for `kind` on the current target triple
-/// (filename-matched), or `None` if absent. Unlike [`pinned_sha256_for`], this
-/// returns the WHOLE entry so the auto-download path can read the fetch URLs.
-fn manifest_entry_for(kind: MinerKind) -> Option<MinerPin> {
-    let triple = current_target_triple();
-    let manifest: MinersManifest = serde_json::from_str(MINERS_MANIFEST).ok()?;
-    manifest.engines.into_iter().find(|e| {
-        e.kind == kind.manifest_kind()
-            && e.target == triple
-            && e.filename == kind.binary_name()
-    })
+/// The whole pin entry in force for `kind` on the current target triple.
+/// Unlike [`pinned_sha256_for`], this returns the download URLs too.
+fn manifest_entry_for(kind: MinerKind) -> Option<PinEntry> {
+    crate::engine_pins::effective_pin_for(kind).map(|p| p.entry)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -199,9 +165,11 @@ impl FetchPhase {
 /// must never share a directory tree with wallet secrets. Returns an error if no
 /// data-local dir can be resolved (the auto-download then simply doesn't run).
 pub fn engine_cache_dir() -> Result<PathBuf, String> {
-    let base = dirs::data_local_dir()
-        .ok_or_else(|| "no per-user data directory available for the engine cache".to_string())?;
-    Ok(base.join("AliceMiner").join("engines").join(current_target_triple()))
+    // The engines root (`…/AliceMiner/engines`) is shared with the pin store and
+    // honours the same single relocation hook, so a test — or an operator moving
+    // the cache off a small disk — never ends up with the pins in one place and
+    // the binaries they pin in another.
+    Ok(crate::engine_pins::engines_root()?.join(current_target_triple()))
 }
 
 /// How to obtain a missing engine, parsed from its manifest entry.
@@ -218,19 +186,115 @@ enum FetchSpec {
     },
 }
 
-/// Build a [`FetchSpec`] for `kind` from the embedded manifest, or `None` if the
-/// entry is a placeholder / has no real pin / has no download URL configured.
-/// A direct `binary_url` wins over an `archive_url` if both are present.
-fn fetch_spec_for(kind: MinerKind) -> Option<FetchSpec> {
-    let pin = pinned_sha256_for(kind)?; // refuses placeholders / non-64-hex
-    let e = manifest_entry_for(kind)?;
-    if let Some(url) = e.binary_url.filter(|u| u.starts_with("https://")) {
+/// Build a [`FetchSpec`] from a pin entry, or `None` if the entry is a
+/// placeholder / has no real pin / has no usable download URL. A direct
+/// `binary_url` wins over an `archive_url` if both are present.
+///
+/// Every URL must sit under one of [`crate::engine_pins::ALLOWED_URL_PREFIXES`]
+/// — the upstream projects' official release hosts, compiled into this client.
+/// The signed pin list is validated against the same list when it is accepted;
+/// enforcing it again HERE means the download path itself has the property,
+/// whichever source the entry came from.
+fn fetch_spec_from(e: &PinEntry) -> Option<FetchSpec> {
+    let pin = e.real_sha256()?; // refuses placeholders / non-64-hex
+    let allowed = |u: &String| crate::engine_pins::url_is_allowed(u);
+    if let Some(url) = e.binary_url.clone().filter(allowed) {
         return Some(FetchSpec::Direct { url, sha256: pin });
     }
-    let url = e.archive_url.filter(|u| u.starts_with("https://"))?;
-    let archive_sha256 = e.archive_sha256.filter(|s| s.len() == 64)?;
-    let member = e.binary_path_in_archive.filter(|m| !m.is_empty())?;
+    let url = e.archive_url.clone().filter(allowed)?;
+    let archive_sha256 = e.archive_sha256.clone().filter(|s| s.len() == 64)?;
+    let member = e.binary_path_in_archive.clone().filter(|m| !m.is_empty())?;
     Some(FetchSpec::Archive { url, archive_sha256, member, binary_sha256: pin })
+}
+
+/// Build a [`FetchSpec`] for the pin in force for `kind` on this platform.
+fn fetch_spec_for(kind: MinerKind) -> Option<FetchSpec> {
+    fetch_spec_from(&manifest_entry_for(kind)?)
+}
+
+/// Why an engine fetch did not produce verified bytes. The distinction is
+/// load-bearing for the pin updater: a NETWORK failure must leave the current
+/// engine (and the current pin) alone and be retried, while an INTEGRITY failure
+/// means the bytes upstream do not match what was signed — that is a refusal, not
+/// a retry, and it is never resolved by running something else.
+#[derive(Debug, Clone)]
+pub enum FetchFail {
+    Network(String),
+    Integrity(String),
+    NotFetchable(String),
+}
+
+impl FetchFail {
+    pub fn message(&self) -> &str {
+        match self {
+            FetchFail::Network(m) | FetchFail::Integrity(m) | FetchFail::NotFetchable(m) => m,
+        }
+    }
+}
+
+/// Download the engine bytes an entry names and verify them against that entry's
+/// own SHA-256 (and, for an archive, the archive hash first). Returns the
+/// verified bytes; NOTHING is written to disk here, so a failure cannot leave a
+/// runnable file behind.
+pub fn fetch_entry_bytes(e: &PinEntry) -> Result<Vec<u8>, FetchFail> {
+    fetch_entry_bytes_with_progress(e, &mut |_p, _d, _t| {})
+}
+
+/// [`fetch_entry_bytes`] with progress reporting.
+pub fn fetch_entry_bytes_with_progress(
+    e: &PinEntry,
+    cb: &mut dyn FnMut(FetchPhase, u64, Option<u64>),
+) -> Result<Vec<u8>, FetchFail> {
+    let spec = fetch_spec_from(e).ok_or_else(|| {
+        FetchFail::NotFetchable(format!(
+            "no verified download is configured for {}/{} ({})",
+            e.kind, e.target, e.filename
+        ))
+    })?;
+    match spec {
+        FetchSpec::Direct { url, sha256 } => {
+            cb(FetchPhase::Downloading, 0, None);
+            let bytes = alice_release::https_get_capped(&url, ENGINE_DOWNLOAD_CAP)
+                .map_err(FetchFail::Network)?;
+            cb(FetchPhase::Verifying, bytes.len() as u64, None);
+            verify_bytes_sha256(&bytes, &sha256, &e.filename).map_err(FetchFail::Integrity)?;
+            Ok(bytes)
+        }
+        FetchSpec::Archive { url, archive_sha256, member, binary_sha256 } => {
+            cb(FetchPhase::Downloading, 0, None);
+            let archive = alice_release::https_get_capped(&url, ENGINE_DOWNLOAD_CAP)
+                .map_err(FetchFail::Network)?;
+            cb(FetchPhase::Verifying, archive.len() as u64, None);
+            verify_bytes_sha256(&archive, &archive_sha256, "engine archive")
+                .map_err(FetchFail::Integrity)?;
+            cb(FetchPhase::Extracting, 0, None);
+            // A malformed/unexpected archive is an integrity problem, not a
+            // network one: retrying the same URL cannot fix it.
+            let bytes = extract_member(&url, &archive, &member).map_err(FetchFail::Integrity)?;
+            verify_bytes_sha256(&bytes, &binary_sha256, &e.filename)
+                .map_err(FetchFail::Integrity)?;
+            Ok(bytes)
+        }
+    }
+}
+
+/// Install ALREADY-VERIFIED engine bytes into the per-user engine cache under
+/// `filename`, atomically. Used by the pin updater to stage a newly pinned engine
+/// while the old one is still running.
+///
+/// The caller is responsible for having hashed `bytes` against the pin; this
+/// function is the write half only, and it is deliberately not reachable from
+/// anywhere that has not just done that check.
+pub fn install_verified_engine(filename: &str, bytes: &[u8]) -> Result<(), String> {
+    if filename.is_empty()
+        || Path::new(filename).file_name().map(|n| n != filename).unwrap_or(true)
+    {
+        return Err(format!("refusing to install an engine under an unsafe name {filename:?}"));
+    }
+    let dir = engine_cache_dir()?;
+    ensure_cache_dir(&dir)?;
+    sweep_stale_installs(&dir);
+    cache_install_atomic(&dir, &dir.join(filename), bytes)
 }
 
 /// Whether a missing `kind` COULD be auto-downloaded on this platform (a real
@@ -268,7 +332,7 @@ pub fn ensure_cached_engine_with_progress(
         return Ok(dest);
     }
 
-    let spec = fetch_spec_for(kind).ok_or_else(|| {
+    let entry = manifest_entry_for(kind).filter(|e| fetch_spec_from(e).is_some()).ok_or_else(|| {
         let name = kind.binary_name();
         match crate::i18n::lang() {
             crate::i18n::Lang::En => format!(
@@ -286,26 +350,13 @@ pub fn ensure_cached_engine_with_progress(
     // (esp. Windows, running-exe) install may have left behind.
     sweep_stale_installs(&dir);
 
-    // Fetch + verify ENTIRELY before touching the destination path.
-    let verified_bytes = match spec {
-        FetchSpec::Direct { url, sha256 } => {
-            cb(FetchPhase::Downloading, 0, None);
-            let bytes = alice_release::https_get_capped(&url, ENGINE_DOWNLOAD_CAP)?;
-            cb(FetchPhase::Verifying, bytes.len() as u64, None);
-            verify_bytes_sha256(&bytes, &sha256, kind.binary_name())?;
-            bytes
-        }
-        FetchSpec::Archive { url, archive_sha256, member, binary_sha256 } => {
-            cb(FetchPhase::Downloading, 0, None);
-            let archive = alice_release::https_get_capped(&url, ENGINE_DOWNLOAD_CAP)?;
-            cb(FetchPhase::Verifying, archive.len() as u64, None);
-            verify_bytes_sha256(&archive, &archive_sha256, "engine archive")?;
-            cb(FetchPhase::Extracting, 0, None);
-            let bytes = extract_member(&url, &archive, &member)?;
-            verify_bytes_sha256(&bytes, &binary_sha256, kind.binary_name())?;
-            bytes
-        }
-    };
+    // Fetch + verify ENTIRELY before touching the destination path. An integrity
+    // failure is tagged so a lane can tell "could not reach the CDN" (retry) from
+    // "these are not the bytes we pinned" (stop, say so, never substitute).
+    let verified_bytes = fetch_entry_bytes_with_progress(&entry, cb).map_err(|f| match f {
+        FetchFail::Integrity(m) => format!("{ENGINE_UNVERIFIED}: {m}"),
+        other => other.message().to_string(),
+    })?;
 
     cb(FetchPhase::Installing, verified_bytes.len() as u64, None);
     cache_install_atomic(&dir, &dest, &verified_bytes)?;
@@ -615,12 +666,12 @@ fn verify_pinned(kind: MinerKind, path: &Path) -> Result<(), String> {
         let at = path.display();
         return Err(match crate::i18n::lang() {
             crate::i18n::Lang::En => format!(
-                "refusing to run the {name} engine at {at}: no pinned SHA-256 is available for this \
+                "{ENGINE_UNVERIFIED}: refusing to run the {name} engine at {at}: no pinned SHA-256 is available for this \
                  platform yet (the bundled binary cannot be integrity-verified). The lane stays \
                  unavailable until a pinned build ships."
             ),
             crate::i18n::Lang::Zh => format!(
-                "拒绝运行位于 {at} 的 {name} 引擎:此平台尚无固定的 SHA-256 \
+                "{ENGINE_UNVERIFIED}: 拒绝运行位于 {at} 的 {name} 引擎:此平台尚无固定的 SHA-256 \
                  (无法对内置二进制做完整性校验)。在固定校验的构建发布前,该通道保持不可用。"
             ),
         });
@@ -632,12 +683,12 @@ fn verify_pinned(kind: MinerKind, path: &Path) -> Result<(), String> {
         let at = path.display();
         Err(match crate::i18n::lang() {
             crate::i18n::Lang::En => format!(
-                "refusing to run the {name} engine at {at}: SHA-256 integrity check FAILED \
+                "{ENGINE_UNVERIFIED}: refusing to run the {name} engine at {at}: SHA-256 integrity check FAILED \
                  (got {got}, pinned {pin}). The on-disk binary does not match the signed \
                  release; it may have been tampered with or replaced."
             ),
             crate::i18n::Lang::Zh => format!(
-                "拒绝运行位于 {at} 的 {name} 引擎:SHA-256 完整性校验失败 \
+                "{ENGINE_UNVERIFIED}: 拒绝运行位于 {at} 的 {name} 引擎:SHA-256 完整性校验失败 \
                  (实际 {got},固定 {pin})。磁盘上的二进制与签名发布不匹配;\
                  可能已被篡改或替换。"
             ),
@@ -692,6 +743,13 @@ pub fn current_target_triple() -> &'static str {
 /// path that may skip verification, and only behind the explicit
 /// `ALICE_MINER_ALLOW_UNVERIFIED_BIN=1` opt-in (with a loud warning).
 pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
+    // 0) One line, every front-end (CLI, GUI, service, fleet): make sure the
+    //    engine-pin refresher is running. It is idempotent, it runs OFF this
+    //    thread, and it never blocks mining — a pin published while we mine takes
+    //    effect the next time a lane starts an engine. Without this, an upstream
+    //    hard fork would again need a full client release to answer.
+    crate::engine_pins::start_background_refresh();
+
     // 1) explicit override. This is an advanced/test escape hatch (e.g. T-Rex),
     //    so we verify it against the pin IF one exists, and otherwise refuse —
     //    UNLESS the user has explicitly opted out of verification, in which case
@@ -1270,6 +1328,56 @@ mod tests {
         assert_eq!(resolved, tmp);
         clear_env(MinerKind::GpuRvn);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ── Fail-closed verification (engine-pin layer) ─────────────────────────
+
+    /// A binary on disk that does not hash to the pin is REFUSED, and the refusal
+    /// is machine-taggable so a lane can stop instead of "degrading" into mining
+    /// with whatever bytes happen to be there.
+    #[test]
+    fn a_binary_that_misses_the_pin_is_refused_and_tagged() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("verify");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(MinerKind::CpuXmr.binary_name());
+        std::fs::write(&path, b"not the pinned engine").unwrap();
+        let err = verify_pinned(MinerKind::CpuXmr, &path).expect_err("must refuse");
+        assert!(is_engine_unverified(&err), "tagged for the lane layer: {err}");
+        assert!(
+            err.contains("integrity check FAILED") || err.contains("no pinned SHA-256"),
+            "and readable by a human: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `install_verified_engine` is the write half used by the pin stager: it
+    /// refuses a name that is anything other than a bare filename, so a pin
+    /// document can never write outside the engine cache.
+    #[test]
+    fn install_verified_engine_refuses_a_path_as_a_name() {
+        for bad in ["../evil", "a/b", ""] {
+            let err = install_verified_engine(bad, b"x").expect_err("must refuse {bad}");
+            assert!(err.contains("unsafe name"), "got: {err}");
+        }
+    }
+
+    /// The download path enforces the upstream allow-list itself, whichever pin
+    /// source the entry came from — a pin naming a foreign host is simply not
+    /// fetchable, so nothing is ever downloaded from it.
+    #[test]
+    fn a_pin_pointing_off_the_allowlist_is_not_fetchable() {
+        let mut e = crate::engine_pins::embedded_entry(
+            "gpu-prl",
+            "x86_64-unknown-linux-gnu",
+            "SRBMiner-MULTI",
+        )
+        .expect("floor entry");
+        assert!(fetch_spec_from(&e).is_some(), "the real upstream URL is fetchable");
+        e.archive_url = Some("https://cdn.attacker.example/SRBMiner.tar.gz".into());
+        assert!(fetch_spec_from(&e).is_none(), "a foreign host must not be fetchable");
+        let err = fetch_entry_bytes(&e).expect_err("and fetching it fails");
+        assert!(matches!(err, FetchFail::NotFetchable(_)), "got: {err:?}");
     }
 
     // ── Auto-download (v0.3.2) ──────────────────────────────────────────────

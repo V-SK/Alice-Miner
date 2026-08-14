@@ -38,6 +38,7 @@ pub mod dashboard;
 pub mod detect;
 pub mod endpoint;
 pub mod engine;
+pub mod engine_pins;
 pub mod i18n;
 pub mod identity;
 pub mod keyring;
