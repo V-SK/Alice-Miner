@@ -35,6 +35,9 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use alice_supervise::child::{spawn_supervised, LogLine, LogStream, OwnedChild};
 use alice_supervise::{sanitize_log_line, ProcState, RestartPolicy, RetryLadder};
 
+use crate::acceptance::{
+    self, AcceptanceConfig, AcceptanceMonitor, Attribution, Collapse, LaneVerdict,
+};
 use crate::endpoint::{Endpoint, EndpointPlan};
 use crate::lane::Lane;
 use crate::stats::parse_kawpow;
@@ -102,7 +105,11 @@ pub type RebuildFn =
 /// stream (no key) deserializes cleanly to `None` (the GUI then falls back to
 /// parsing the raw `message`). See [`status_short`] / [`status_tooltip`] /
 /// [`status_from_legacy`].
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+// `Eq` was dropped when `accept_pct` (an `f64`) joined: a measured rate is a real
+// number and rounding it to keep a marker trait would be the tail wagging the dog.
+// Nothing compares `StatusArgs` for total equality — `Snapshot`, which embeds it, is
+// itself only `PartialEq` (it has carried `f64` hashrates since day one).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct StatusArgs {
     /// The full active endpoint (`host:port`) — for the tooltip / diagnostics, never
     /// the crowded first status line.
@@ -137,6 +144,17 @@ pub struct StatusArgs {
     /// and not just "it died once".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crashes: Option<u64>,
+    /// LAYER 3: the run's accepted / rejected share totals behind an acceptance-halt
+    /// status. Carried as the raw numbers (not a baked sentence) for the same reason
+    /// every other field here is — a front-end renders them in its own language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shares_accepted: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shares_rejected: Option<u64>,
+    /// The MEASURED acceptance rate in percent. `None` means "not measured" and must
+    /// render as "—"; it is never 0-as-a-placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_pct: Option<f64>,
 }
 
 /// A point-in-time, UI-safe snapshot of a lane's child. Cloneable + secret-free
@@ -203,6 +221,18 @@ pub struct LaneStats {
     /// Seconds until the pending automatic restart fires, when one is scheduled.
     /// `None` when the lane is not waiting to retry.
     pub retry_in_s: Option<u64>,
+    /// The acceptance verdict's machine key ([`LaneVerdict::key`]): `warmup`,
+    /// `unknown`, `gathering`, `healthy`, `degrading`, `collapsed`.
+    pub acceptance: &'static str,
+    /// The MEASURED share-acceptance rate in percent, or `None` when this machine has
+    /// not measured one — during warm-up, before a period completes, or on a lane
+    /// whose engine cannot report rejections at all. A front-end renders `None` as
+    /// "—". It is NEVER 0-as-a-placeholder: on this project, an unknown that renders
+    /// as a number is the bug.
+    pub accept_pct: Option<f64>,
+    /// The lane was stopped by the acceptance guard (not a crash, not a user stop).
+    /// Nothing will restart it automatically.
+    pub halted: bool,
 }
 
 impl LaneStats {
@@ -230,6 +260,9 @@ impl LaneStats {
             fan_pct: None,
             crashes: 0,
             retry_in_s: None,
+            acceptance: "warmup",
+            accept_pct: None,
+            halted: false,
         }
     }
 }
@@ -371,6 +404,20 @@ struct Inner {
     /// directly.
     generic_accepted_pending: Option<u64>,
     generic_rejected_pending: Option<u64>,
+
+    // ── Layer 3: acceptance-rate collapse self-protection ───────────────────────
+    /// Watches the dimension nothing else watched: whether the pool is ACCEPTING
+    /// what this lane submits. Fed the cumulative counters on every parsed line; see
+    /// [`crate::acceptance`] for why a rejected-share storm is invisible to every
+    /// other guard we have (TCP is up, jobs arrive, the hashrate is nominal, and a
+    /// rejected share still moves the counters that mark Layer-B "progress").
+    acceptance: AcceptanceMonitor,
+    /// Set once the lane has been HALTED for acceptance collapse. This is the one
+    /// self-protective stop that is deliberately terminal-until-the-user-acts: it
+    /// suppresses failover, the crash ladder and the stall ladder, because all three
+    /// would do exactly what the 2026-08-11 incident did — burn three days of power
+    /// re-connecting to a pool that rejects every share.
+    halted: bool,
 }
 
 /// Fold a new reading of a CUMULATIVE counter (accepted / rejected shares) coming
@@ -511,8 +558,33 @@ impl LaneSupervisor {
                 pending_good_region: None,
                 generic_accepted_pending: None,
                 generic_rejected_pending: None,
+                // Keyed on the PARSER, not the lane: only the parser knows whether the
+                // engine actually reports pool rejections (a custom miner breaks the
+                // lane→format mapping, and alpha-miner reports submissions, not accepts).
+                acceptance: AcceptanceMonitor::new(parser),
+                halted: false,
             })),
         }
+    }
+
+    /// Test hook: run the acceptance monitor on compressed thresholds so the halt
+    /// path can be exercised in milliseconds instead of the production 5 min warm-up
+    /// + 10 min window. Must be set before `start`. Production never calls this — the
+    /// real thresholds live in [`crate::acceptance`].
+    #[doc(hidden)]
+    pub fn set_acceptance_config(&self, cfg: AcceptanceConfig) {
+        let mut g = self.inner.lock().expect("mutex");
+        g.acceptance = AcceptanceMonitor::with_config(self.parser, cfg);
+    }
+
+    /// The lane's current acceptance verdict (what the pool is doing to our shares).
+    pub fn acceptance_verdict(&self) -> LaneVerdict {
+        self.inner.lock().expect("mutex").acceptance.verdict()
+    }
+
+    /// Whether the lane has been halted by the acceptance guard.
+    pub fn is_halted(&self) -> bool {
+        self.inner.lock().expect("mutex").halted
     }
 
     /// Test/operator hook: shorten the no-progress window + fix the per-failover
@@ -597,6 +669,12 @@ impl LaneSupervisor {
             retry_in_s: g
                 .retry_at
                 .map(|t| t.saturating_duration_since(Instant::now()).as_secs()),
+            acceptance: {
+                let v = g.acceptance.verdict();
+                v.key()
+            },
+            accept_pct: g.acceptance.verdict().accept_pct(),
+            halted: g.halted,
         }
     }
 
@@ -721,6 +799,17 @@ impl LaneSupervisor {
                 g.accepted = 0;
                 g.rejected = 0;
                 g.best_hashrate_hs = 0.0;
+                // A fresh start is the user's explicit act (possibly after updating),
+                // so it also clears an acceptance halt and every judgement behind it —
+                // the share counters just went to zero, so keeping the old verdict
+                // would be judging this run on the last one's evidence.
+                g.acceptance.on_run_start(Instant::now());
+                g.halted = false;
+            } else {
+                // A failover deliberately carries the evidence over — see
+                // `AcceptanceMonitor::on_failover` for why resetting here would
+                // reproduce the incident.
+                g.acceptance.on_failover(Instant::now());
             }
             // Either way, drop any half-formed generic re-baseline candidate: it
             // belonged to the previous child's output stream (see `fold_cumulative`).
@@ -873,7 +962,17 @@ impl LaneSupervisor {
                             .unwrap_or_default();
                         g.started_at = None;
                         if g.stop_requested {
-                            g.state = ProcState::Stopped;
+                            // A stop we asked for. `forced_error` distinguishes a USER
+                            // stop (→ Stopped, message cleared elsewhere) from one WE
+                            // forced — failover-budget exhaustion, or a Layer-3
+                            // acceptance halt. A forced stop must land in `Error` and
+                            // keep its explanation: a halt that renders as a plain
+                            // "Stopped" is exactly the silence this layer exists to end.
+                            g.state = if g.forced_error {
+                                ProcState::Error
+                            } else {
+                                ProcState::Stopped
+                            };
                         } else {
                             // ── BUG#4 ──────────────────────────────────────────────
                             // The engine died on its own. This used to be a TERMINAL
@@ -989,71 +1088,129 @@ impl LaneSupervisor {
                     }
                     continue;
                 }
-                let window = g.no_progress_window;
-                let stalled = g
-                    .last_progress_at
-                    .map(|t| t.elapsed() >= window)
-                    .unwrap_or(false);
-                if !stalled {
-                    continue;
-                }
-                // No progress for the window. Decide: can we (a) advance to another
-                // endpoint, and (b) is there restart budget?
-                let now = Instant::now();
-                if !g.restart_policy.may_restart(now) {
-                    // ── BUG#4 ──────────────────────────────────────────────────────
-                    // The FAST failover budget is spent. That used to end the lane for
-                    // good — `GiveUp`, a terminal `Error`, no further attempt ever. It
-                    // is the right answer to a restart STORM and the wrong answer to a
-                    // temporarily sick relay: the miner simply stopped earning, silently,
-                    // until someone re-ran it by hand. Now we back OFF instead of giving
-                    // up: tear the stalled child down and retry on the escalating ladder
-                    // (5s → … → 30min, capped), with a visible countdown the whole time.
-                    // Credit whatever healthy mining this run did before it stalled, so a
-                    // rig that worked for hours retries quickly.
-                    let healthy_for = g
-                        .last_progress_at
-                        .zip(g.started_at)
-                        .map(|(p, s)| p.saturating_duration_since(s))
-                        .unwrap_or_default();
-                    g.restart_policy.credit_healthy_run(healthy_for);
-                    g.retry_ladder.credit_healthy_run(healthy_for);
-                    g.forced_error = true;
+
+                // ── PRIORITY 1: acceptance collapse ────────────────────────────────
+                // Checked BEFORE the no-progress stall, and it wins outright. The two
+                // guards answer different questions and only one of them can be right
+                // at a time:
+                //
+                //   * Layer B asks "is this lane still moving?" and answers a stall by
+                //     rotating regions and restarting.
+                //   * This asks "is anything we submit being ACCEPTED?" — and when the
+                //     answer is no, rotating and restarting is the WORST thing we can
+                //     do. In the 2026-08-11 incident the lane was never stalled: shares
+                //     kept flowing, so the counters kept moving, so Layer B kept seeing
+                //     progress; the 69 failovers it did perform each burned a re-init
+                //     and changed nothing, because every region rejects the same share.
+                //
+                // So a collapse halts the lane outright: no failover, no crash ladder,
+                // no stall ladder. Ordering it first is what guarantees the two never
+                // fight — once `halted` is set, every other automatic path checks it
+                // and declines.
+                if let LaneVerdict::Collapsed(collapse) = g.acceptance.verdict() {
+                    g.halted = true;
+                    // Cancel any retry a crash armed moments ago, and make sure nothing
+                    // can arm a new one: `halted` is checked by `schedule_retry` and by
+                    // the countdown task before it relaunches.
+                    g.retry_token = g.retry_token.wrapping_add(1);
+                    g.retry_at = None;
                     g.stop_requested = true; // let supervise_until_exit reap the child
+                    g.forced_error = true; // land in Error, keep the explanation
                     g.state = ProcState::Stopping; // transitional; loop → Error
-                    // ARM the retry here, under the same lock that condemns the child:
-                    // the teardown below flips the lane to `Error`, and by then the
-                    // pending restart + its countdown are already published.
-                    let reason = RetryReason::Stalled(window.as_secs());
-                    let (token, delay, attempt) = arm_retry_locked(&mut g, &reason);
-                    WatchAction::GiveUp { reason, token, delay, attempt }
+                    // Publish an immediate, attribution-free status so the lane is
+                    // never a silent stop while we go ask the network whose fault it
+                    // is. The wording is upgraded once that answer lands (or doesn't).
+                    set_halt_status_locked(&mut g, &collapse, Attribution::Unknown);
+                    WatchAction::Halt { collapse }
                 } else {
-                    // A stall with budget remaining. Record the restart against the
-                    // budget, then hand the CHOICE to the post-lock stage: it
-                    // pre-flights the candidate region(s) OFF-lock (a TCP probe can't
-                    // run under the mutex) and commits the rotation to the first
-                    // REACHABLE one — or retries THIS region in place for a locked /
-                    // single-region plan (empty candidates). We do NOT advance the
-                    // cursor or set the failover message here — both depend on the
-                    // probe outcome.
-                    let policy_backoff = g.restart_policy.record(now);
-                    let backoff = g.failover_backoff_override.unwrap_or(policy_backoff);
-                    WatchAction::Failover {
-                        from: g.endpoint_plan.current().clone(),
-                        candidates: g.endpoint_plan.failover_candidates(),
-                        rebuild: g.rebuild.clone(),
-                        backoff,
-                        probe_timeout: g.failover_probe_timeout,
-                        window,
-                        // The region that last landed an accepted share THIS run — the
-                        // recovery order prefers it (so a restart-in-place resumes where
-                        // mining was actually working, per `settings.last_good_region`).
-                        last_good: g.persisted_good_region.clone(),
+                    let window = g.no_progress_window;
+                    let stalled = g
+                        .last_progress_at
+                        .map(|t| t.elapsed() >= window)
+                        .unwrap_or(false);
+                    if !stalled {
+                        continue;
+                    }
+                    // No progress for the window. Decide: can we (a) advance to another
+                    // endpoint, and (b) is there restart budget?
+                    let now = Instant::now();
+                    if !g.restart_policy.may_restart(now) {
+                        // ── BUG#4 ──────────────────────────────────────────────────────
+                        // The FAST failover budget is spent. That used to end the lane for
+                        // good — `GiveUp`, a terminal `Error`, no further attempt ever. It
+                        // is the right answer to a restart STORM and the wrong answer to a
+                        // temporarily sick relay: the miner simply stopped earning, silently,
+                        // until someone re-ran it by hand. Now we back OFF instead of giving
+                        // up: tear the stalled child down and retry on the escalating ladder
+                        // (5s → … → 30min, capped), with a visible countdown the whole time.
+                        // Credit whatever healthy mining this run did before it stalled, so a
+                        // rig that worked for hours retries quickly.
+                        let healthy_for = g
+                            .last_progress_at
+                            .zip(g.started_at)
+                            .map(|(p, s)| p.saturating_duration_since(s))
+                            .unwrap_or_default();
+                        g.restart_policy.credit_healthy_run(healthy_for);
+                        g.retry_ladder.credit_healthy_run(healthy_for);
+                        g.forced_error = true;
+                        g.stop_requested = true; // let supervise_until_exit reap the child
+                        g.state = ProcState::Stopping; // transitional; loop → Error
+                        // ARM the retry here, under the same lock that condemns the child:
+                        // the teardown below flips the lane to `Error`, and by then the
+                        // pending restart + its countdown are already published.
+                        let reason = RetryReason::Stalled(window.as_secs());
+                        let (token, delay, attempt) = arm_retry_locked(&mut g, &reason);
+                        WatchAction::GiveUp { reason, token, delay, attempt }
+                    } else {
+                        // A stall with budget remaining. Record the restart against the
+                        // budget, then hand the CHOICE to the post-lock stage: it
+                        // pre-flights the candidate region(s) OFF-lock (a TCP probe can't
+                        // run under the mutex) and commits the rotation to the first
+                        // REACHABLE one — or retries THIS region in place for a locked /
+                        // single-region plan (empty candidates). We do NOT advance the
+                        // cursor or set the failover message here — both depend on the
+                        // probe outcome.
+                        let policy_backoff = g.restart_policy.record(now);
+                        let backoff = g.failover_backoff_override.unwrap_or(policy_backoff);
+                        WatchAction::Failover {
+                            from: g.endpoint_plan.current().clone(),
+                            candidates: g.endpoint_plan.failover_candidates(),
+                            rebuild: g.rebuild.clone(),
+                            backoff,
+                            probe_timeout: g.failover_probe_timeout,
+                            window,
+                            // The region that last landed an accepted share THIS run — the
+                            // recovery order prefers it (so a restart-in-place resumes where
+                            // mining was actually working, per `settings.last_good_region`).
+                            last_good: g.persisted_good_region.clone(),
+                        }
                     }
                 }
             };
 
             match action {
+                WatchAction::Halt { collapse } => {
+                    // Stop the engine first — every second we spend deciding whose
+                    // fault it is costs the user electricity for shares nobody will
+                    // accept. The status was already published under the decision lock,
+                    // so the lane is explained before it is even torn down.
+                    self.teardown_current_child(gen).await;
+                    // Only NOW do we ask the network whose problem this is. It changes
+                    // the WORDING, never the halt: a slow, broken or hostile answer
+                    // (or none at all) leaves the honest "we can't tell you yet" text
+                    // in place. Bounded HTTP, so it runs on a blocking thread, off the
+                    // async runtime — and after the child is dead, so a 10 s timeout
+                    // can never delay the stop.
+                    let lane = self.lane;
+                    let attribution = tokio::task::spawn_blocking(move || fetch_attribution(lane))
+                        .await
+                        .unwrap_or(Attribution::Unknown);
+                    let mut g = self.inner.lock().expect("mutex");
+                    if g.generation == gen && g.halted {
+                        set_halt_status_locked(&mut g, &collapse, attribution);
+                    }
+                    return;
+                }
                 WatchAction::GiveUp { reason, token, delay, attempt } => {
                     // Reap the stalled child (bounded) — the retry was already armed
                     // under the decision lock — then hand the countdown to its task.
@@ -1348,6 +1505,14 @@ impl LaneSupervisor {
     fn schedule_retry(&self, gen: Option<u64>, reason: RetryReason) {
         let (gen, token, delay, attempt, old_pid) = {
             let mut g = self.inner.lock().expect("mutex");
+            // LAYER 3: a lane halted for acceptance collapse must not be restarted by
+            // ANY automatic path. The crash ladder is normally the right answer to a
+            // dead engine — but restarting into a pool that rejects every share is how
+            // a miner burns three days, so the halt outranks it. Only a user Start
+            // clears `halted`.
+            if g.halted {
+                return;
+            }
             let gen = match gen {
                 Some(want) if want != g.generation => return, // superseded
                 Some(want) => want,
@@ -1441,7 +1606,10 @@ impl LaneSupervisor {
         // by the relay. Fall back to the last plan for a `start_simple` lane.
         let plan = {
             let g = self.inner.lock().expect("mutex");
-            if g.generation != gen || g.retry_token != token {
+            // `halted` is checked alongside the generation/token at every gate on this
+            // path, not just once: the acceptance guard can fire while a countdown is
+            // running, and a rebuild is a real network handshake that can take seconds.
+            if g.generation != gen || g.retry_token != token || g.halted {
                 return;
             }
             match g.rebuild.clone() {
@@ -1470,7 +1638,7 @@ impl LaneSupervisor {
         // never stack a second engine on top of it.
         {
             let g = self.inner.lock().expect("mutex");
-            if g.generation != gen || g.retry_token != token || g.state.is_active() {
+            if g.generation != gen || g.retry_token != token || g.state.is_active() || g.halted {
                 return;
             }
         }
@@ -1526,6 +1694,7 @@ fn set_retry_status_locked(g: &mut Inner, reason: &RetryReason, remaining: Durat
         retry_in_s: Some(remaining.as_secs()),
         attempt: Some(attempt),
         crashes: (crashes > 0).then_some(crashes),
+        ..Default::default()
     };
     g.set_status(retry_message(reason, remaining, attempt), reason.key(), args);
 }
@@ -1555,6 +1724,64 @@ async fn await_child_gone(pid: u32) -> bool {
         tokio::time::sleep(CHILD_GONE_POLL).await;
     }
     crate::proc::liveness_settled(pid) != crate::proc::Liveness::Alive
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 3 helpers: the halt status, and the one network call behind its wording.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Publish the acceptance-halt status under an already-held lock.
+///
+/// Sets the short line, the machine key (so a GUI can re-render it in its own
+/// language) and the [`StatusArgs`] carrying the raw numbers — the localizable
+/// pieces, never a pre-baked foreign-language sentence. The full paragraph the user
+/// reads lives in [`status_tooltip`] / [`acceptance::halt_explanation`].
+fn set_halt_status_locked(g: &mut Inner, c: &Collapse, attribution: Attribution) {
+    let key = match attribution {
+        Attribution::NetworkWide => "acceptance_halt_network",
+        Attribution::LocalOnly => "acceptance_halt_local",
+        Attribution::Unknown => "acceptance_halt_unknown",
+    };
+    g.set_status(
+        acceptance::halt_status_line(c),
+        key,
+        StatusArgs {
+            endpoint: Some(g.endpoint_plan.current().host_port()),
+            region: Some(short_region_label(g.endpoint_plan.current())),
+            shares_accepted: Some(c.run_accepted),
+            shares_rejected: Some(c.run_rejected),
+            accept_pct: Some(c.period.accept_pct()),
+            ..Default::default()
+        },
+    );
+}
+
+/// Ask the public read-API what the WHOLE NETWORK's acceptance rate is for `lane`,
+/// and turn it into an [`Attribution`].
+///
+/// Blocking, bounded, unauthenticated, read-only, and called exactly once per halt —
+/// after the engine is already stopped. Anything that goes wrong (no network, a
+/// non-2xx, an unparseable body, a lane the server didn't mention, a figure drawn
+/// from a single miner) resolves to [`Attribution::Unknown`], and the user is told we
+/// don't know rather than being handed a guess. It CANNOT halt a healthy lane and
+/// CANNOT un-halt a collapsed one; the worst a compromised endpoint achieves is
+/// pointing a stopped miner at the wrong suspect.
+fn fetch_attribution(lane: Lane) -> Attribution {
+    let base = std::env::var(crate::dashboard::ENV_READ_API_URL)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::dashboard::READ_API_BASE_DEFAULT.to_string());
+    let url = acceptance::lane_health_url(&base);
+    match crate::dashboard::http_get_read_api(&url) {
+        Ok(body) => match acceptance::parse_lane_health(&body, lane) {
+            Some(h) => h.attribute(),
+            None => Attribution::Unknown,
+        },
+        Err(e) => {
+            log_verbose("lane-health lookup failed", &e);
+            Attribution::Unknown
+        }
+    }
 }
 
 /// Why an automatic restart is pending. Drives the status key + wording, and carries
@@ -1602,6 +1829,11 @@ impl RetryReason {
 /// What the watchdog decided to do this tick (computed under the lock, executed
 /// after releasing it).
 enum WatchAction {
+    /// LAYER 3: the pool is rejecting (nearly) everything this lane submits. Stop —
+    /// and stay stopped. Outranks every other action; see the watchdog's PRIORITY 1
+    /// comment for why failing over or restarting into a rejection storm is strictly
+    /// worse than doing nothing.
+    Halt { collapse: Collapse },
     /// The fast failover budget is spent. The child is torn down and the lane hands
     /// over to the escalating retry ladder — it does NOT stop for good (BUG#4). The
     /// retry is ARMED under the decision lock (so `Error` and "retrying in N" become
@@ -2058,6 +2290,27 @@ pub fn status_short(key: &str, args: &StatusArgs) -> String {
             "No relay reachable from here · stopped".to_string(),
             "本机连不上任何中继 · 已停止".to_string()
         ),
+        // ── LAYER 3: the acceptance halt ────────────────────────────────────────
+        // One line, and it must land the two facts that matter in the width of a
+        // status pill: we stopped, and your shares were not being accepted. The
+        // attribution and the full advice live in the tooltip.
+        "acceptance_halt_network" | "acceptance_halt_local" | "acceptance_halt_unknown" => {
+            let accepted = args.shares_accepted.unwrap_or(0);
+            let rejected = args.shares_rejected.unwrap_or(0);
+            let submitted = accepted.saturating_add(rejected);
+            if accepted == 0 && submitted > 0 {
+                crate::tr!(
+                    format!("Stopped · {submitted} shares submitted, 0 accepted"),
+                    format!("已停止 · 已提交 {submitted} 份额,0 个被接受")
+                )
+            } else {
+                let pct = args.accept_pct.unwrap_or(0.0);
+                crate::tr!(
+                    format!("Stopped · only {pct:.0}% of shares accepted"),
+                    format!("已停止 · 仅 {pct:.0}% 的份额被接受")
+                )
+            }
+        }
         "budget_exhausted" => crate::tr!(
             "No progress · stopped to avoid a restart storm".to_string(),
             "长时间无进展 · 已停止以避免频繁重启".to_string()
@@ -2127,6 +2380,29 @@ pub fn status_tooltip(key: &str, args: &StatusArgs) -> Option<String> {
             format!("No progress for {secs}s — switched to {to}."),
             format!("已 {secs}s 无进展 —— 已切换到 {to}。")
         )),
+        // ── LAYER 3: the paragraph the 2026-08-11 miner never got ───────────────
+        // Rebuilt from the raw numbers in `args`, so a GUI in a different language
+        // than the CLI that produced them still reads it in its own.
+        "acceptance_halt_network" | "acceptance_halt_local" | "acceptance_halt_unknown" => {
+            let accepted = args.shares_accepted.unwrap_or(0);
+            let rejected = args.shares_rejected.unwrap_or(0);
+            let attribution = match key {
+                "acceptance_halt_network" => Attribution::NetworkWide,
+                "acceptance_halt_local" => Attribution::LocalOnly,
+                _ => Attribution::Unknown,
+            };
+            let collapse = Collapse {
+                period: crate::acceptance::PeriodStat {
+                    accepted,
+                    rejected,
+                    elapsed: Duration::from_secs(secs),
+                },
+                run_accepted: accepted,
+                run_rejected: rejected,
+                shutout: accepted == 0,
+            };
+            Some(acceptance::halt_explanation(&collapse, attribution))
+        }
         // ── BUG#4: the full story behind a pending automatic restart ────────────
         "engine_crashed_retrying" => {
             let code = args.exit_code.unwrap_or(0);
@@ -2377,6 +2653,13 @@ fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
             }
         }
     }
+    // Layer 3: after the counters have been folded, let the acceptance guard look at
+    // them. This is the ONLY place the cumulative pair is known-consistent for every
+    // parser, so it is the only correct place to observe from. Cheap by construction
+    // (a few integer compares; at most one division per completed period) — it runs
+    // under the same lock as the stats hot path.
+    let (a, r) = (g.accepted, g.rejected);
+    g.acceptance.observe(Instant::now(), a, r);
     g.last_line = line;
 }
 
@@ -2808,6 +3091,56 @@ mod tests {
     /// single-endpoint relay plan). The args are fixed.
     fn fixed_rebuild(program: std::path::PathBuf, args: Vec<String>) -> RebuildFn {
         Arc::new(move |_eps: &[Endpoint]| Ok((program.clone(), args.clone())))
+    }
+
+    /// A child that stays alive for ~30 s doing nothing — a stand-in for a HEALTHY,
+    /// connected engine, on every OS. Same `cfg!`-not-`#[cfg]` discipline as
+    /// [`crashing_child`]: both arms compile everywhere so the Windows path cannot rot.
+    fn idle_child() -> (std::path::PathBuf, Vec<String>) {
+        if cfg!(windows) {
+            // `ping -n 31 127.0.0.1` waits ~30 s and needs no console (unlike `timeout`).
+            // Its stdout flows through the real log pump, which is the point: those lines
+            // must NOT move any counter (they carry no `accepted`/`rejected` token), so
+            // the Windows run also proves the parser ignores unrelated engine chatter.
+            (
+                std::path::PathBuf::from("cmd"),
+                vec!["/C".into(), "ping -n 31 127.0.0.1".into()],
+            )
+        } else {
+            (std::path::PathBuf::from("/bin/sh"), vec!["-c".into(), "sleep 30".into()])
+        }
+    }
+
+    /// Compressed acceptance thresholds: the same state machine, in milliseconds.
+    /// Production's 5 min warm-up + 10 min window are unchanged — only the test clock
+    /// shrinks, so the LOGIC under test is the shipped logic.
+    fn fast_acceptance() -> AcceptanceConfig {
+        AcceptanceConfig {
+            warmup: Duration::from_millis(30),
+            min_window: Duration::from_millis(120),
+            min_submissions: 20,
+            collapse_pct: 20.0,
+            strikes_to_halt: 2,
+        }
+    }
+
+    /// Push one already-sanitised engine line through the SAME entry point the live
+    /// log pump uses (`apply_log_line`, under the same lock), so these tests exercise
+    /// the real path rather than poking the monitor directly.
+    fn feed(s: &LaneSupervisor, line: &str) {
+        let mut g = s.inner.lock().unwrap();
+        apply_log_line(&mut g, ParserKind::Xmr, line);
+    }
+
+    /// Wait (bounded) for `pred` to hold of the lane's stats.
+    async fn wait_for(s: &LaneSupervisor, secs: u64, pred: impl Fn(&LaneStats) -> bool) -> bool {
+        for _ in 0..(secs * 10) {
+            if pred(&s.stats()) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
     }
 
     // ── GPU telemetry (parse + fold) ───────────────────────────────────────────
@@ -4108,6 +4441,9 @@ mod tests {
             retry_in_s: Some(300),
             attempt: Some(4),
             crashes: Some(3),
+            shares_accepted: Some(0),
+            shares_rejected: Some(72),
+            accept_pct: Some(0.0),
         };
         let keys = [
             "region_locked_no_failover",
@@ -4606,5 +4942,331 @@ mod tests {
             drop(a);
             drop(b);
         });
+    }
+
+    // ── LAYER 3: acceptance-rate collapse self-protection ──────────────────────
+    //
+    // These run on EVERY OS (`cfg!`, never `#[cfg]`): the failure they guard against
+    // hit a Windows rig, and a unix-only suite would be coverage theatre.
+
+    /// THE 2026-08-11 SCENARIO, end to end through the real supervisor.
+    ///
+    /// The shape that fooled every existing guard: the engine is up and stays up, the
+    /// connection is fine, jobs keep arriving, shares keep being submitted — and the
+    /// pool rejects every single one. Layer B sees a lane whose counters keep moving
+    /// and calls that progress. Nothing stops. The miner in the incident ran three
+    /// days like this, 0 accepted / 72 rejected, and was never told.
+    ///
+    /// Now it stops, and it says why.
+    #[test]
+    fn all_shares_rejected_halts_the_lane_and_explains_it() {
+        let _env = spawn_env_guard();
+        let _lock = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            let (program, args) = idle_child();
+            s.start_simple(program, args).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await, "child up");
+
+            // Past the warm-up, then a full window of nothing but rejections — the
+            // engine is healthy, the pool is not accepting anything.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            feed(&s, "net      rejected (0/0) diff 100 (10 ms)"); // warm baseline
+            for i in 1..=25u64 {
+                feed(&s, &format!("net      rejected (0/{i}) diff 100 (10 ms)"));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            // The watchdog stops the lane by itself.
+            assert!(
+                wait_for(&s, 12, |st| st.halted).await,
+                "a total rejection storm must halt the lane: {:?}",
+                s.stats()
+            );
+            let st = s.stats();
+            assert_eq!(st.acceptance, "collapsed");
+            assert_eq!(st.accept_pct, Some(0.0), "0% measured is a real measurement");
+            assert!(
+                wait_for(&s, 8, |st| !st.running).await,
+                "the engine must actually be stopped, not just flagged"
+            );
+            let st = s.stats();
+            assert_eq!(st.state, ProcState::Error, "a halt is visible, never a silent Stopped");
+
+            // It SAYS SO — the short line, the machine key, and the numbers.
+            let key = st.message_key.clone().expect("a halt must carry a machine key");
+            assert!(key.starts_with("acceptance_halt_"), "got {key}");
+            let line = st.message.clone().unwrap_or_default();
+            assert!(line.contains("0 accepted"), "the status must name the outcome: {line:?}");
+            let args = st.message_args.clone().expect("args");
+            assert_eq!(args.shares_accepted, Some(0));
+            assert!(args.shares_rejected.unwrap_or(0) >= 20, "{args:?}");
+
+            // And the full explanation says what it costs and where to go.
+            let tip = status_tooltip(&key, &args).expect("a halt must explain itself");
+            assert!(tip.contains("not one was accepted"), "{tip}");
+            assert!(
+                tip.contains("power bill"),
+                "the user must be told why stopping is in his interest: {tip}"
+            );
+            assert!(tip.contains("https://"), "the user must be pointed somewhere: {tip}");
+
+            // …and it STAYS stopped. No crash ladder, no failover, no silent resume.
+            let before = s.stats().crashes;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let st = s.stats();
+            assert!(st.halted, "the halt must not decay");
+            assert!(!st.running, "nothing may restart a halted lane");
+            assert_eq!(st.retry_in_s, None, "no automatic retry may be armed");
+            assert_eq!(st.crashes, before);
+            assert_eq!(s.failovers(), 0, "a halt must never rotate regions");
+
+            s.request_stop();
+        });
+    }
+
+    /// A LOW-HASHRATE rig — one share every few seconds, all rejected, but never
+    /// twenty inside a window — is NOT stopped. Stopping a small miner on three
+    /// samples would be a worse bug than the one this layer fixes.
+    #[test]
+    fn a_trickle_of_rejects_below_the_sample_floor_never_halts() {
+        let _env = spawn_env_guard();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(AcceptanceConfig {
+                warmup: Duration::from_millis(30),
+                min_window: Duration::from_millis(50),
+                min_submissions: 50, // far more than this rig will ever produce
+                ..fast_acceptance()
+            });
+            let (program, args) = idle_child();
+            s.start_simple(program, args).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            for i in 1..=12u64 {
+                feed(&s, &format!("net      rejected (0/{i}) diff 100 (10 ms)"));
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            let st = s.stats();
+            assert!(!st.halted, "a thin sample must never stop a rig: {st:?}");
+            assert_eq!(st.acceptance, "gathering");
+            assert_eq!(st.accept_pct, None, "an unmeasured rate must render as '—', not 0");
+            assert!(st.running);
+            s.request_stop();
+        });
+    }
+
+    /// COLD START: a burst of rejections in the first moments of a run — a
+    /// re-handshake, a vardiff settle, a stale job at start-up — is discarded, and a
+    /// run that is healthy thereafter is never touched.
+    #[test]
+    fn a_cold_start_reject_burst_never_halts_a_healthy_run() {
+        let _env = spawn_env_guard();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            let (program, args) = idle_child();
+            s.start_simple(program, args).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+
+            // 30 rejections while cold…
+            for i in 1..=30u64 {
+                feed(&s, &format!("net      rejected (0/{i}) diff 100 (10 ms)"));
+            }
+            // …then a normal lane: 3% rejects, sustained.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let mut rej = 30u64;
+            let mut ever_healthy = false;
+            for i in 1..=120u64 {
+                if i % 33 == 0 {
+                    rej += 1;
+                }
+                feed(&s, &format!("net      accepted ({i}/{rej}) diff 100 (10 ms)"));
+                let st = s.stats();
+                // A period in progress reads `gathering`; a completed one reads
+                // `healthy`. Neither a strike nor a halt may EVER appear here.
+                assert!(
+                    st.acceptance == "gathering" || st.acceptance == "healthy",
+                    "a warm-up burst must not count against the run: {st:?}"
+                );
+                if st.acceptance == "healthy" {
+                    ever_healthy = true;
+                    assert!(st.accept_pct.unwrap_or(0.0) > 90.0, "{st:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(ever_healthy, "the run should have completed a healthy period");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let st = s.stats();
+            assert!(!st.halted, "a warm-up burst must not stop a healthy rig: {st:?}");
+            assert!(st.running);
+            s.request_stop();
+        });
+    }
+
+    /// PRIORITY: the acceptance halt outranks the crash ladder. An engine that dies
+    /// AFTER a collapse must not be resurrected — restarting into a pool that rejects
+    /// everything is precisely the loop that burned three days.
+    #[test]
+    fn a_halted_lane_is_never_restarted_by_the_crash_ladder() {
+        let _env = spawn_env_guard();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            s.set_retry_timing(Duration::from_millis(50));
+            // A rebuild closure that would happily relaunch — if anything asked it to.
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls2 = calls.clone();
+            let (program, args) = idle_child();
+            let (p2, a2) = (program.clone(), args.clone());
+            let rebuild: RebuildFn = Arc::new(move |_eps: &[Endpoint]| {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                Ok((p2.clone(), a2.clone()))
+            });
+            s.start(program, args, rebuild).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            feed(&s, "net      rejected (0/0) diff 100 (10 ms)");
+            for i in 1..=25u64 {
+                feed(&s, &format!("net      rejected (0/{i}) diff 100 (10 ms)"));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(wait_for(&s, 12, |st| st.halted).await, "must halt: {:?}", s.stats());
+
+            // Give every automatic path (crash ladder, stall ladder, failover) ample
+            // time to misbehave.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let st = s.stats();
+            assert!(!st.running, "nothing may bring a halted lane back: {st:?}");
+            assert_eq!(st.retry_in_s, None);
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "no relaunch may be attempted");
+            s.request_stop();
+        });
+    }
+
+    /// A user Start CLEARS the halt — it is the one action that means "I've dealt with
+    /// it" (updated the client, fixed the address, stopped overclocking). The guard
+    /// protects the user; it does not lock him out of his own rig.
+    #[test]
+    fn a_user_start_clears_the_halt_and_the_verdict() {
+        let _env = spawn_env_guard();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            let (program, args) = idle_child();
+            s.start_simple(program.clone(), args.clone()).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            feed(&s, "net      rejected (0/0) diff 100 (10 ms)");
+            for i in 1..=25u64 {
+                feed(&s, &format!("net      rejected (0/{i}) diff 100 (10 ms)"));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(wait_for(&s, 12, |st| st.halted).await, "must halt");
+            assert!(wait_for(&s, 8, |st| !st.running).await, "must stop");
+
+            s.start_simple(program, args).expect("the user may always start again");
+            let st = s.stats();
+            assert!(!st.halted, "a user Start clears the halt");
+            assert_eq!(st.acceptance, "warmup", "and the evidence behind it");
+            assert_eq!(st.accepted, 0, "a fresh run zeroes the counters");
+            s.request_stop();
+        });
+    }
+
+    /// HONESTY: the GPU-Alpha lane's engine reports SUBMISSIONS, not accepts. It must
+    /// read `unknown` with no percentage — never a fabricated 100% (which would hide a
+    /// real collapse) and never a fabricated 0% (which would stop a working rig).
+    #[test]
+    fn an_engine_that_cannot_see_rejections_reports_unknown_not_a_number() {
+        let s = LaneSupervisor::with_backend(
+            Lane::GpuAlpha,
+            EndpointPlan::single(Endpoint::plaintext("us.aliceprotocol.org", 3340)),
+            ParserKind::Alpha,
+            None,
+        );
+        {
+            let mut g = s.inner.lock().unwrap();
+            for i in 1..=500u64 {
+                apply_log_line(
+                    &mut g,
+                    ParserKind::Alpha,
+                    &format!("level=info msg=miner-status hashrate_th_s=1.5 hits={i}"),
+                );
+            }
+        }
+        let st = s.stats();
+        assert_eq!(st.acceptance, "unknown", "alpha cannot see the pool's verdict");
+        assert_eq!(st.accept_pct, None, "and must not invent one");
+        assert!(!st.halted, "an unknown lane is never halted on local evidence");
+    }
+
+    /// The two verdict messages must actually differ, and neither may claim what we
+    /// did not measure. Sending a user on a two-day hardware hunt for OUR bug is the
+    /// failure mode that matters here — he had already spent three days reinstalling.
+    #[test]
+    fn network_wide_and_local_only_halts_read_differently() {
+        let _lock = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let args = StatusArgs {
+            shares_accepted: Some(0),
+            shares_rejected: Some(72),
+            accept_pct: Some(0.0),
+            ..Default::default()
+        };
+        let net = status_tooltip("acceptance_halt_network", &args).unwrap();
+        let loc = status_tooltip("acceptance_halt_local", &args).unwrap();
+        let unk = status_tooltip("acceptance_halt_unknown", &args).unwrap();
+        assert_ne!(net, loc);
+        assert_ne!(net, unk);
+        assert_ne!(loc, unk);
+        // Everyone is down → hands off the rig.
+        assert!(net.contains("not your machine"), "{net}");
+        // Only you are down → look at the local end.
+        assert!(loc.contains("this machine"), "{loc}");
+        assert!(!loc.contains("not your machine"), "{loc}");
+        // We couldn't check → say so, blame nobody.
+        assert!(unk.contains("cannot yet tell"), "{unk}");
+        // All three share the one-line status shape and stay short.
+        for key in ["acceptance_halt_network", "acceptance_halt_local", "acceptance_halt_unknown"] {
+            let short = status_short(key, &args);
+            assert!(short.contains("0 accepted"), "{key}: {short}");
+            assert!(short.chars().count() < 60, "a status pill must stay short: {short}");
+            assert!(!status_is_retrying(key), "a halt must never render as 'retrying'");
+        }
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+    }
+
+    /// The halt status re-localizes from its machine key + args, so a `zh` GUI paired
+    /// with an `en` CLI reads it in Chinese (the i18n boundary rule).
+    #[test]
+    fn the_halt_relocalizes_from_the_key_not_the_baked_string() {
+        let _lock = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let args = StatusArgs {
+            shares_accepted: Some(0),
+            shares_rejected: Some(72),
+            accept_pct: Some(0.0),
+            ..Default::default()
+        };
+        crate::i18n::set_lang(crate::i18n::Lang::Zh);
+        let zh = status_short("acceptance_halt_network", &args);
+        let zh_tip = status_tooltip("acceptance_halt_network", &args).unwrap();
+        assert!(has_cjk(&zh), "{zh}");
+        assert!(zh_tip.contains("不是你的机器"), "{zh_tip}");
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let en = status_short("acceptance_halt_network", &args);
+        assert!(!has_cjk(&en), "{en}");
     }
 }

@@ -30,6 +30,7 @@ pub use alice_crypto;
 pub use alice_release;
 pub use alice_supervise;
 
+pub mod acceptance;
 pub mod ai_config;
 pub mod backend;
 pub mod binaries;
