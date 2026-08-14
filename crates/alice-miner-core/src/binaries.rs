@@ -1053,6 +1053,52 @@ mod tests {
         assert!(targets.contains("x86_64-pc-windows-msvc"));
     }
 
+    /// A gpu-prl entry's `version` must AGREE with the URL it fetches and the member
+    /// it extracts.
+    ///
+    /// WHY THIS EXISTS (2026-08-11). Pearl hard-forked at height 99000 to the V3
+    /// salted-seed certificate; the engine we pinned, SRBMiner-MULTI 3.4.1, predated
+    /// that spec by seven weeks and so emitted invalid shares from the fork on — 78
+    /// hours at zero accepted PRL shares. The fix is a pin bump, and a pin bump is
+    /// FOUR fields that must move together: `version`, `archive_url`, the
+    /// `binary_path_in_archive` prefix, and the two hashes. The structural test above
+    /// would happily pass a half-done bump that declares 3.5.4 while still downloading
+    /// the 3.4.1 archive — the hashes would still be "real 64-hex", and the failure
+    /// would only surface as a mismatch on a miner's machine, or worse, as a silently
+    /// stale engine. SRBMiner spells its version with dashes in paths (`3.5.4` ->
+    /// `3-5-4`), so both spellings are checked.
+    ///
+    /// This asserts CONSISTENCY, never a specific version: bumping the pin correctly
+    /// keeps it green, bumping it halfway does not.
+    #[test]
+    fn gpu_prl_pin_version_agrees_with_its_url_and_archive_member() {
+        let v: serde_json::Value = serde_json::from_str(MINERS_MANIFEST).unwrap();
+        for e in v["engines"].as_array().expect("engines array") {
+            if e["kind"].as_str() != Some("gpu-prl") {
+                continue;
+            }
+            let target = e["target"].as_str().expect("gpu-prl target");
+            let version = e["version"].as_str().unwrap_or_else(|| {
+                panic!("gpu-prl {target}: a fetched engine must declare its version")
+            });
+            let dashed = version.replace('.', "-");
+            let url = e["archive_url"].as_str().unwrap_or("");
+            let member = e["binary_path_in_archive"].as_str().unwrap_or("");
+            assert!(
+                url.contains(&format!("/download/{version}/")),
+                "gpu-prl {target}: archive_url must fetch the DECLARED version {version}, got {url:?}"
+            );
+            assert!(
+                url.contains(&dashed),
+                "gpu-prl {target}: archive filename must carry {dashed}, got {url:?}"
+            );
+            assert!(
+                member.starts_with(&format!("SRBMiner-Multi-{dashed}/")),
+                "gpu-prl {target}: archive member must live under SRBMiner-Multi-{dashed}/, got {member:?}"
+            );
+        }
+    }
+
     /// The GPU-Alpha (alpha-miner) entries: 2 (linux+windows), NO macOS (NVIDIA-CUDA
     /// only), each a real 64-hex pin + an https binary_url (bare binary, not archive).
     #[test]
