@@ -75,10 +75,18 @@ pub fn parse_srbminer(raw: &str) -> Option<KawpowSample> {
 /// fail-soft: absent / unparseable → `None`, never disturbing the hashrate/share path.
 /// The `lower` arg is the already-lower-cased line.
 fn telemetry(lower: &str) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
-    let temp_c = labelled_number(lower, "temperature").or_else(|| labelled_number(lower, "temp"));
+    // SRBMiner 3.5.x moved temperature and board power into the abbreviated status
+    // bracket (`[T:71C FAN:63% P:169.9W …]`), where the old `temperature`/`power`
+    // labels no longer appear. Read those keys from the bracket, and only there —
+    // a bare `t:`/`p:` anywhere else on a line is far too weak a signal to trust.
+    let kv = kv_bracket(lower);
+    let temp_c = labelled_number(lower, "temperature")
+        .or_else(|| labelled_number(lower, "temp"))
+        .or_else(|| kv.and_then(|s| kv_num(s, "t")));
     // `power:` label only — the `442.94 gh/w` efficiency token is per-hash power and is
-    // never a board-power reading (the `/w` unit distinguishes it).
-    let power_w = labelled_number(lower, "power");
+    // never a board-power reading (the `/w` unit distinguishes it). `P:` inside the
+    // 3.5.x bracket IS board power; `EFF:` beside it is the efficiency figure.
+    let power_w = labelled_number(lower, "power").or_else(|| kv.and_then(|s| kv_num(s, "p")));
     let util_pct =
         labelled_number(lower, "utilization").or_else(|| labelled_number(lower, "gpu load"));
     let fan_pct = labelled_number(lower, "fan");
@@ -118,6 +126,20 @@ fn share_counts(line: &str, lower: &str) -> (Option<u64>, Option<u64>) {
     //    we fall through), so this only matches the integer `[acc|rej|...]` bracket.
     if let Some((a, r)) = bracket_counts(line) {
         return (Some(a), Some(r));
+    }
+    // 1b. SRBMiner 3.5.x replaced that bracket with `key:value` fields (see
+    //     `kv_bracket`). Read the counts ONLY from the aggregate `Total:` line —
+    //     the per-GPU `GPU<n> <model>: ...` line carries that CARD's share of the
+    //     count, so on a multi-GPU rig taking whichever line came last would make
+    //     the total flap downwards. `Total:` is emitted at the same cadence.
+    if lower.contains("total:") {
+        if let Some(seg) = kv_bracket(line) {
+            let a = kv_int(seg, "a");
+            let r = kv_int(seg, "r");
+            if a.is_some() || r.is_some() {
+                return (a, r);
+            }
+        }
     }
     // 2. The summary abbreviations `acc.` / `rej.` (each on its own line).
     let acc = if lower.contains("acc.") {
@@ -163,6 +185,63 @@ fn bracket_counts(line: &str) -> Option<(u64, u64)> {
     None
 }
 
+/// The `key:value` status bracket SRBMiner 3.5.x prints instead of the 3.4.x
+/// `[acc|rej|stale|eff]` one, e.g.
+/// `[T:71C FAN:63% P:169.9W EFF:0.265 CC:1672 MC:7301 A:0 R:0 HW:0]`. Identified by
+/// the `hw:` key, which only this bracket carries — so a `[pearlhash]` tag, a
+/// `[  375ms]` latency or the `[timestamp]` can never be mistaken for it. Returns
+/// the bracket's INNER text (original case), or `None`.
+fn kv_bracket(line: &str) -> Option<&str> {
+    let mut rest = line;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let end = after.find(']')?;
+        let inner = &after[..end];
+        if inner.to_ascii_lowercase().contains("hw:") {
+            return Some(inner);
+        }
+        rest = &after[end + 1..];
+    }
+    None
+}
+
+/// The integer value of `key` inside a [`kv_bracket`] segment. The key must be a
+/// WHOLE field — at the segment start or after whitespace, and followed by `:` —
+/// so looking up `a` reads `A:8` and never the `a` inside `MC:7301`, and looking up
+/// `r` never reads the `R` of a hypothetical `RX:1`. (The same word-boundary
+/// discipline the `cuda:0`/`power:120` misread cost us in v0.6.6.)
+fn kv_int(seg: &str, key: &str) -> Option<u64> {
+    kv_num(seg, key).and_then(|v| {
+        // A share count is a whole number; a fractional read means we matched
+        // something that is not a counter, and inventing a rounded count is worse
+        // than reporting none.
+        (v.fract() == 0.0 && v >= 0.0).then_some(v as u64)
+    })
+}
+
+/// [`kv_int`] for a possibly-fractional field (`P:169.9W`, `EFF:0.265`). Same
+/// whole-field key discipline; a trailing unit letter (`C`/`W`/`%`) is ignored.
+fn kv_num(seg: &str, key: &str) -> Option<f64> {
+    let lower = seg.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(key) {
+        let at = from + rel;
+        let before_ok = at == 0 || bytes[at - 1].is_ascii_whitespace();
+        let after = at + key.len();
+        if before_ok && bytes.get(after) == Some(&b':') {
+            let mut i = after + 1;
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            return lower[start..i].parse().ok();
+        }
+        from = at + key.len();
+    }
+    None
+}
+
 /// The first run of digits appearing AFTER `keyword` in `lower` (already
 /// lower-cased). Used ONLY for the `acc.` / `rej.` summary keys.
 fn integer_after(lower: &str, keyword: &str) -> Option<u64> {
@@ -180,6 +259,20 @@ fn integer_after(lower: &str, keyword: &str) -> Option<u64> {
         return None;
     }
     std::str::from_utf8(&rest[start..i]).ok()?.parse().ok()
+}
+
+/// The FIRST `<number> <unit>` hashrate on an already-lower-cased line, in H/s.
+fn first_rate(lower: &str) -> Option<f64> {
+    let toks: Vec<&str> = lower.split_whitespace().collect();
+    for i in 0..toks.len() {
+        let Ok(num) = toks[i].trim_end_matches([',', ';']).parse::<f64>() else {
+            continue;
+        };
+        if let Some(unit) = toks.get(i + 1).and_then(|u| unit_multiplier(u)) {
+            return Some(num * unit);
+        }
+    }
+    None
 }
 
 /// The hashrate multiplier for a unit token, or `None` if not a hashrate unit.
@@ -206,6 +299,19 @@ fn unit_multiplier(tok: &str) -> Option<f64> {
 fn parse_hashrate_hs(lower: &str) -> Option<f64> {
     if lower.contains("avg") && lower.contains("hr") {
         return None;
+    }
+    // SRBMiner 3.5.x prints every averaging window on ONE line, shortest first:
+    //   `Average hashrate: 1m 44.99 TH/s | 1h 0.00 H/s | 6h 0.00 H/s | 12h 0.00 H/s`
+    // The generic "last pair wins" rule below would read the 12h window — `0.00 H/s`
+    // until the rig has run twelve hours — and so ZERO the live rate on every one of
+    // these lines. That is what made a healthy 44.8 TH/s GPU show `0 H/s`, and what
+    // false-tripped the no-progress watchdog into restarting the engine every 10
+    // minutes (real-hardware run 2026-08-14). Take the FIRST (shortest, warmest)
+    // window instead, and treat an all-cold line as "nothing to say" rather than as
+    // zero — a genuinely idle GPU still reports 0.00 on its live `GPU<n>:`/`Total:`
+    // line, which is where a real zero belongs.
+    if lower.contains("average hashrate") {
+        return first_rate(lower).filter(|hs| *hs > 0.0);
     }
     let toks: Vec<&str> = lower.split_whitespace().collect();
     let prefer_total = lower.contains("total");
@@ -235,6 +341,95 @@ fn parse_hashrate_hs(lower: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Real lines from SRBMiner-MULTI 3.5.4, RTX 3060, pearlhash, captured on a
+    //    rented GPU 2026-08-14 22:51–23:11Z while the shares were being accepted
+    //    upstream (8 accepted, 0 rejected). 3.5.x reshaped every line this parser
+    //    depends on, so these are kept verbatim. ────────────────────────────────
+
+    /// The averaging line that made a healthy GPU read `0 H/s`. Every window after
+    /// the first is cold on a fresh rig, and the old "last pair wins" rule read the
+    /// 12h one. The live rate must survive it.
+    #[test]
+    fn v354_average_line_reports_the_warm_window_not_the_cold_one() {
+        let s = parse_srbminer(
+            "[2026-08-14 22:52:15] Average hashrate: 1m 44.99 TH/s | 1h 0.00 H/s | 6h 0.00 H/s | 12h 0.00 H/s",
+        )
+        .expect("the 1m window is a real reading");
+        assert_eq!(s.hashrate_hs, Some(44.99e12));
+
+        // Within the first minute nothing is warm yet. That is "no reading", NOT a
+        // rate of zero — returning zero here is what zeroed the panel and tripped
+        // the watchdog.
+        assert!(parse_srbminer(
+            "[2026-08-14 22:51:30] Average hashrate: 1m 0.00 H/s | 1h 0.00 H/s | 6h 0.00 H/s | 12h 0.00 H/s"
+        )
+        .is_none());
+    }
+
+    /// The per-GPU line: TH/s still readable, and temperature/fan/power now come
+    /// out of the `key:value` bracket that replaced the `[acc|rej|…]` one.
+    #[test]
+    fn v354_per_gpu_line_hashrate_and_telemetry() {
+        let s = parse_srbminer(
+            "[2026-08-14 22:52:15] GPU0 RTX 3060: 44.99 TH/s [T:71C FAN:63% P:169.9W EFF:0.265 CC:1672 MC:7301 A:0 R:0 HW:0]",
+        )
+        .unwrap();
+        assert_eq!(s.hashrate_hs, Some(44.99e12));
+        assert_eq!(s.temp_c, Some(71.0));
+        assert_eq!(s.fan_pct, Some(63.0));
+        assert_eq!(s.power_w, Some(169.9));
+        // Counts are deliberately NOT taken from a per-GPU line: on a multi-GPU rig
+        // that is this card's share, and letting it win would flap the total down.
+        assert_eq!(s.accepted, None);
+        assert_eq!(s.rejected, None);
+    }
+
+    /// The aggregate line is where the counts come from.
+    #[test]
+    fn v354_total_line_carries_the_share_counts() {
+        let s =
+            parse_srbminer("[2026-08-14 23:02:02] Total: 44.94 TH/s [P:169.8W EFF:0.265 A:2 R:0 HW:0]")
+                .unwrap();
+        assert_eq!(s.hashrate_hs, Some(44.94e12));
+        assert_eq!(s.accepted, Some(2));
+        assert_eq!(s.rejected, Some(0));
+    }
+
+    /// `MC:7301` contains an `a`-less digit run, `CC:1672` likewise, and a future
+    /// `RX:`/`HWA:` key must not answer a lookup for `r`/`a`. Only whole `A:`/`R:`
+    /// fields count — the same word-boundary rule the `cuda:0` misread taught us.
+    #[test]
+    fn v354_kv_keys_are_whole_fields_only() {
+        let seg = "T:71C FAN:63% P:169.9W EFF:0.265 CC:1672 MC:7301 A:8 R:1 HW:0";
+        assert_eq!(kv_int(seg, "a"), Some(8));
+        assert_eq!(kv_int(seg, "r"), Some(1));
+        assert_eq!(kv_int(seg, "hw"), Some(0));
+        // No such field → None, never a digit borrowed from a neighbour.
+        assert_eq!(kv_int(seg, "x"), None);
+        // A fractional field is not a counter.
+        assert_eq!(kv_int(seg, "eff"), None);
+        // The bracket is identified by `hw:` alone, so tags can never masquerade.
+        assert_eq!(kv_bracket("[2026-08-14 22:55:15] GPU0[t0] share accepted [  375ms] [pearlhash][0]"), None);
+    }
+
+    /// A per-share event line still carries a latency, not a count — unchanged in
+    /// 3.5.x, and still the trap that once read `375` accepted shares.
+    #[test]
+    fn v354_share_event_line_is_still_ignored() {
+        assert!(parse_srbminer(
+            "[2026-08-14 22:55:15] GPU0[t0] share accepted [  375ms] [pearlhash][0]"
+        )
+        .is_none());
+    }
+
+    /// A genuinely idle card must still be able to report zero — the fix suppresses
+    /// cold AVERAGES, not real zeroes on the live line.
+    #[test]
+    fn v354_a_real_zero_on_the_live_line_still_reports_zero() {
+        let s = parse_srbminer("[ts] Total: 0.00 H/s [P:12.0W EFF:0.000 A:2 R:0 HW:0]").unwrap();
+        assert_eq!(s.hashrate_hs, Some(0.0));
+    }
 
     // ── Real lines from matrix_4070-narissa-2026-06-26.log ──────────────────────
 
