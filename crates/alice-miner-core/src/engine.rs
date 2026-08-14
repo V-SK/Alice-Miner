@@ -304,6 +304,21 @@ pub struct LaneSnapshot {
     pub util_pct: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_pct: Option<f64>,
+    /// LAYER 3 — the share-acceptance verdict's machine key (`warmup`, `unknown`,
+    /// `gathering`, `healthy`, `degrading`, `collapsed`). `#[serde(default)]` so an
+    /// older stream deserializes to the empty string.
+    #[serde(default, skip_serializing_if = "str::is_empty")]
+    pub acceptance: String,
+    /// The MEASURED share-acceptance rate in percent, or `None` when this machine has
+    /// not measured one (warm-up, an incomplete period, or an engine that does not
+    /// report pool rejections at all — the GPU-Alpha lane). A front-end renders `None`
+    /// as "—". Never 0-as-a-placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_pct: Option<f64>,
+    /// This lane was STOPPED by the acceptance guard because the pool was rejecting
+    /// (nearly) everything it submitted. Nothing will restart it automatically.
+    #[serde(default)]
+    pub halted: bool,
 }
 
 impl Snapshot {
@@ -1486,6 +1501,9 @@ fn build_snapshot(
             power_w: st.power_w,
             util_pct: st.util_pct,
             fan_pct: st.fan_pct,
+            acceptance: st.acceptance.to_string(),
+            accept_pct: st.accept_pct,
+            halted: st.halted,
         });
     }
 
@@ -1687,6 +1705,9 @@ mod tests {
                     power_w: None,
                     util_pct: None,
                     fan_pct: None,
+                    acceptance: "healthy".into(),
+                    accept_pct: Some(99.0),
+                    halted: false,
                 },
                 LaneSnapshot {
                     lane: Lane::GpuRvn,
@@ -1704,6 +1725,9 @@ mod tests {
                     power_w: None,
                     util_pct: None,
                     fan_pct: None,
+                    acceptance: "healthy".into(),
+                    accept_pct: Some(99.0),
+                    halted: false,
                 },
             ],
             last_line: Some("net accepted (7/1)".into()),

@@ -651,10 +651,26 @@ pub fn render_snapshot_ctx(snap: &Snapshot, ctx: &RenderCtx) -> String {
             out.push_str(&format!("    ! {msg}\n"));
         }
     }
+    // LAYER 3: an acceptance HALT gets its full paragraph here, not just the one-line
+    // status. The GUI can put the detail in a tooltip; a terminal has nowhere else to
+    // put it, and this is the text the 2026-08-11 miner needed on his screen on day
+    // one — what we measured, why we stopped, and whose problem it is.
+    if let Some(text) = halt_explanation(snap) {
+        for line in wrap_note(&text, 76) {
+            out.push_str(&format!("    {line}\n"));
+        }
+    }
     // Reject-rate health note when elevated (rejected shares are wasted power that earns
     // nothing). Quiet under a noise floor; GPU-Alpha doesn't track rejects so it never trips.
-    if let Some(note) = reject_health_note(snap.shares_accepted, snap.shares_rejected) {
-        out.push_str(&format!("    ! {note}\n"));
+    //
+    // SUPPRESSED once the lane is halted: this note's advice ("check GPU stability /
+    // overclock / pool") is the LOCAL-cause guess, and printing it under a
+    // network-wide halt would send a user to tear down a healthy rig chasing our bug.
+    // The halt's own explanation knows which of the two it is; this one does not.
+    if !lane_halted(snap) {
+        if let Some(note) = reject_health_note(snap.shares_accepted, snap.shares_rejected) {
+            out.push_str(&format!("    ! {note}\n"));
+        }
     }
 
     // Crediting health for a pearlhash lane: it earns ONLY while the out-of-band PoP is
@@ -960,6 +976,52 @@ pub fn fmt_hashrate_human(h: f64) -> String {
 /// shares are wasted power that earns nothing, so an elevated rate is a real earn-
 /// correctness signal a miner should see. GPU-Alpha never tracks rejects (always 0), so
 /// it never trips.
+/// Whether ANY lane in this snapshot was stopped by the acceptance guard.
+fn lane_halted(snap: &alice_miner_core::engine::Snapshot) -> bool {
+    snap.lanes.iter().any(|l| l.halted)
+}
+
+/// The FULL acceptance-halt explanation for a terminal, or `None` when the snapshot
+/// carries no halt. Rebuilt from the status key + args (never a baked string), so a
+/// `zh` CLI reading an `en` engine's snapshot still prints Chinese.
+fn halt_explanation(snap: &alice_miner_core::engine::Snapshot) -> Option<String> {
+    let key = snap.message_key.as_deref()?;
+    if !key.starts_with("acceptance_halt_") {
+        return None;
+    }
+    let args = snap.message_args.clone().unwrap_or_default();
+    alice_miner_core::supervise::status_tooltip(key, &args)
+}
+
+/// Greedily wrap `text` to `width` columns, preserving its explicit newlines. CJK is
+/// counted by `char`, which under-counts double-width glyphs — deliberately: a
+/// slightly short Chinese line reads fine, a wrapped-mid-character one does not.
+fn wrap_note(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+                out.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        // A CJK paragraph has no spaces to break on — hard-wrap it by character.
+        while line.chars().count() > width {
+            let head: String = line.chars().take(width).collect();
+            line = line.chars().skip(width).collect();
+            out.push(head);
+        }
+        if !line.is_empty() {
+            out.push(line);
+        }
+    }
+    out
+}
+
 fn reject_health_note(accepted: u64, rejected: u64) -> Option<String> {
     let total = accepted + rejected;
     if total < 20 {
@@ -1063,6 +1125,9 @@ mod tests {
                 power_w: None,
                 util_pct: None,
                 fan_pct: None,
+                acceptance: "healthy".into(),
+                accept_pct: Some(99.0),
+                halted: false,
             }],
             last_line: Some("net accepted (142/1) diff 100".into()),
             message: None,
@@ -1107,6 +1172,9 @@ mod tests {
                     power_w: None,
                     util_pct: None,
                     fan_pct: None,
+                    acceptance: "healthy".into(),
+                    accept_pct: Some(99.0),
+                    halted: false,
                 },
                 LaneSnapshot {
                     lane: Lane::GpuRvn,
@@ -1123,6 +1191,9 @@ mod tests {
                     power_w: None,
                     util_pct: None,
                     fan_pct: None,
+                    acceptance: "healthy".into(),
+                    accept_pct: Some(99.0),
+                    halted: false,
                 },
             ],
             last_line: Some("Speed 25.00 Mh/s gpu0".into()),
@@ -1413,6 +1484,9 @@ mod tests {
             power_w: Some(145.0),
             util_pct: Some(98.0),
             fan_pct: Some(55.0),
+            acceptance: "healthy".into(),
+            accept_pct: Some(99.0),
+            halted: false,
         }];
         let t = render_lane_table(&s, false);
         assert!(t.contains("62°C"), "telemetry sub-row present: {t}");
@@ -1444,6 +1518,9 @@ mod tests {
             power_w: Some(300.0),
             util_pct: Some(99.0),
             fan_pct: Some(100.0),
+            acceptance: "healthy".into(),
+            accept_pct: Some(99.0),
+            halted: false,
         }];
         let plain = render_lane_table(&s, false);
         assert!(!plain.contains('\x1b'), "no ANSI when color off");
@@ -1472,6 +1549,9 @@ mod tests {
             power_w: None,
             util_pct: None,
             fan_pct: None,
+            acceptance: "healthy".into(),
+            accept_pct: Some(99.0),
+            halted: false,
         }];
         let t = render_lane_table(&s, false);
         assert!(t.contains("42 sub"), "submitted label: {t}");
@@ -1533,11 +1613,100 @@ mod tests {
             power_w: None,
             util_pct: None,
             fan_pct: None,
+            acceptance: "healthy".into(),
+            accept_pct: Some(99.0),
+            halted: false,
         }];
         let out = render_snapshot(&s);
         assert!(out.contains("42 submitted"), "submitted label + count: {out}");
         assert!(!out.contains("42A/0R"), "no accepted/rejected framing: {out}");
         assert!(!out.contains("(100%)"), "no fabricated 100% accept rate: {out}");
+    }
+
+    // ── LAYER 3: the acceptance halt on a terminal ──────────────────────────────
+
+    /// A halted lane prints the WHOLE explanation, not just a status chip. A terminal
+    /// has no tooltip; if the paragraph doesn't land here, the miner in the 2026-08-11
+    /// incident still doesn't learn why he earned nothing for three days.
+    #[test]
+    fn a_halted_lane_prints_the_full_explanation() {
+        let mut s = running_snapshot();
+        s.state = EngineState::Error;
+        s.shares_accepted = 0;
+        s.shares_rejected = 72;
+        s.message_key = Some("acceptance_halt_network".into());
+        s.message = Some("Stopped · 72 shares submitted, 0 accepted".into());
+        s.message_args = Some(alice_miner_core::supervise::StatusArgs {
+            shares_accepted: Some(0),
+            shares_rejected: Some(72),
+            accept_pct: Some(0.0),
+            ..Default::default()
+        });
+        for l in s.lanes.iter_mut() {
+            l.halted = true;
+            l.acceptance = "collapsed".into();
+            l.accept_pct = Some(0.0);
+        }
+        let out = render_snapshot(&s);
+        assert!(out.contains("72"), "the real count must appear: {out}");
+        assert!(out.contains("not one was accepted"), "{out}");
+        assert!(out.contains("power bill"), "why stopping helps him: {out}");
+        assert!(out.contains("https://"), "where to go: {out}");
+        // A network-wide halt must NOT be paired with "check your GPU / overclock".
+        assert!(
+            !out.contains("check GPU stability"),
+            "the local-cause guess must be suppressed under a halt: {out}"
+        );
+        assert!(out.contains("not your machine"), "{out}");
+    }
+
+    /// The SAME collapse attributed to this machine gives the opposite advice — and
+    /// still never claims the network is broken.
+    #[test]
+    fn a_local_only_halt_points_at_this_machine() {
+        let mut s = running_snapshot();
+        s.state = EngineState::Error;
+        s.message_key = Some("acceptance_halt_local".into());
+        s.message_args = Some(alice_miner_core::supervise::StatusArgs {
+            shares_accepted: Some(0),
+            shares_rejected: Some(72),
+            accept_pct: Some(0.0),
+            ..Default::default()
+        });
+        for l in s.lanes.iter_mut() {
+            l.halted = true;
+        }
+        let out = render_snapshot(&s);
+        assert!(out.contains("this machine"), "{out}");
+        assert!(!out.contains("not your machine"), "{out}");
+        assert!(out.contains("overclock"), "the likely local causes, in order: {out}");
+    }
+
+    /// A HEALTHY snapshot is untouched — no halt text, and the existing reject-rate
+    /// note still works.
+    #[test]
+    fn a_healthy_snapshot_prints_no_halt_text() {
+        let s = running_snapshot();
+        let out = render_snapshot(&s);
+        assert!(!out.contains("power bill"), "{out}");
+        assert!(!out.contains("not your machine"), "{out}");
+    }
+
+    /// The wrapper keeps paragraphs readable and never drops or splits characters.
+    #[test]
+    fn wrap_note_preserves_every_character() {
+        let en = "one two three four five six seven eight nine ten eleven twelve";
+        let w = wrap_note(en, 20);
+        assert!(w.len() > 1, "must actually wrap");
+        assert_eq!(w.join(" "), en, "no word may be lost or reordered");
+        assert!(w.iter().all(|l| l.chars().count() <= 20 || !l.contains(' ')));
+        // CJK has no spaces to break on → hard-wrapped by character, nothing lost.
+        let zh = "你提交的份额全部被拒绝".repeat(4);
+        let w = wrap_note(&zh, 10);
+        assert_eq!(w.concat(), zh);
+        assert!(w.iter().all(|l| l.chars().count() <= 10));
+        // Explicit newlines are honoured as paragraph breaks.
+        assert_eq!(wrap_note("a\nb", 40), vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]
@@ -1866,6 +2035,9 @@ mod tests {
                 power_w: None,
                 util_pct: None,
                 fan_pct: None,
+                acceptance: "healthy".into(),
+                accept_pct: Some(99.0),
+                halted: false,
             }],
             last_line: None,
             message: None,

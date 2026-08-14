@@ -999,7 +999,7 @@ impl PoolStatsClient {
             // Shouldn't happen (begin_poll gated on polls_network), but fail-closed.
             return self.fail();
         };
-        match http_get_credit(&url) {
+        match http_get_read_api(&url) {
             Ok(body) => self.complete(&body),
             Err(_) => self.fail(),
         }
@@ -1040,13 +1040,13 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// Read-only HTTPS GET of the public read-API `miner-lookup` URL, returning the
+/// Read-only HTTPS GET of a public read-API URL, returning the
 /// (capped) response body. Mirrors `pop.rs`'s ureq discipline: an https-only guard,
 /// a ~10 s connect+read timeout, and a small read cap on the body. NO auth header,
 /// NO secret, NO body — a plain public read. Any non-https URL, transport error, or
 /// non-2xx status is an `Err` (the caller surfaces `Error(Unreachable)`); we never
 /// panic and never block the mining hot path (the caller runs this off-thread).
-fn http_get_credit(url: &str) -> Result<String, String> {
+pub(crate) fn http_get_read_api(url: &str) -> Result<String, String> {
     // Fail closed on a non-https url (a credit lookup must never cross the wire in
     // the clear). A misconfigured ALICE_READ_API_URL can otherwise sneak http in.
     if !url.starts_with("https://") {
@@ -1078,7 +1078,7 @@ fn http_get_credit(url: &str) -> Result<String, String> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Balance view — the THREE honest reward buckets for the `balance` CLI command.
 //
-// Reuses the SAME read-API `miner-lookup` path + transport (`http_get_credit`) the
+// Reuses the SAME read-API `miner-lookup` path + transport (`http_get_read_api`) the
 // Source-B credit poller uses, then surfaces three honest, non-overlapping buckets:
 //
 //   * CREDIT (积分) — the credit-only cumulative accepted-share COUNT (AI + credit
@@ -1211,7 +1211,7 @@ pub fn fetch_balance_lookup(address: &str) -> Result<BalanceLookup, String> {
     let url = client
         .lookup_url(address)
         .ok_or_else(|| "read API is not configured for lookups".to_string())?;
-    let body = http_get_credit(&url)?;
+    let body = http_get_read_api(&url)?;
     Ok(parse_balance_lookup(&body))
 }
 
@@ -1410,6 +1410,9 @@ mod tests {
                 power_w: None,
                 util_pct: None,
                 fan_pct: None,
+                acceptance: "healthy".into(),
+                accept_pct: Some(99.3),
+                halted: false,
             }],
             last_line: Some("accepted (142/1)".into()),
             message: None,

@@ -2764,6 +2764,9 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
                 power_w: None,
                 util_pct: None,
                 fan_pct: None,
+                acceptance: "healthy".into(),
+                accept_pct: Some(99.0),
+                halted: false,
             },
             LaneSnapshot {
                 lane: Lane::GpuPrl,
@@ -2780,6 +2783,9 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
                 power_w: None,
                 util_pct: None,
                 fan_pct: None,
+                acceptance: "healthy".into(),
+                accept_pct: Some(99.0),
+                halted: false,
             },
         ];
         app.snapshot = Some(s);

@@ -402,6 +402,15 @@ fn reject_health_sub(
     sum_a: u64,
     sum_r: u64,
 ) -> (String, RejectTone) {
+    // LAYER 3 first: once a lane has been HALTED for acceptance collapse, "rolling ·
+    // healthy" or even "high" would both be wrong — the lane is not rolling at all. Say
+    // it stopped, and let the status pill's own text carry the why.
+    if snap.map(|s| s.lanes.iter().any(|l| l.halted)).unwrap_or(false) {
+        return (
+            tr!("stopped · shares rejected", "已停止 · 份额被拒绝").to_string(),
+            RejectTone::High,
+        );
+    }
     let dual = snap.map(|s| s.dual).unwrap_or(false);
     if dual {
         // The PRL-earning GPU lanes that are actually producing (have shares). Pick the
@@ -1831,6 +1840,9 @@ mod tests {
             power_w: None,
             util_pct: None,
             fan_pct: None,
+            acceptance: "healthy".into(),
+            accept_pct: Some(99.0),
+            halted: false,
         }
     }
 
@@ -1944,5 +1956,21 @@ mod tests {
         assert_eq!(reject_health_sub(Some(&s), Lane::GpuAlpha, 40, 0).0, "rejects n/a");
         // No shares yet.
         assert_eq!(reject_health_sub(Some(&s), Lane::Xmr, 0, 0).0, "no shares yet");
+    }
+
+    /// LAYER 3: a HALTED lane must never read "rolling · healthy". The chip has to
+    /// agree with the status pill — a card saying the lane is fine next to a pill
+    /// saying it stopped is how a user decides the client is lying to him.
+    #[test]
+    fn a_halted_lane_reads_stopped_not_rolling() {
+        let mut s = snap(false, vec![lane(Lane::Xmr, 0, 72)]);
+        s.lanes[0].halted = true;
+        s.lanes[0].acceptance = "collapsed".into();
+        let (label, tone) = reject_health_sub(Some(&s), Lane::Xmr, 0, 72);
+        assert!(label.contains("stopped"), "{label}");
+        assert_eq!(tone, RejectTone::High);
+        // And a healthy lane is untouched by the new branch.
+        let s = snap(false, vec![lane(Lane::Xmr, 95, 5)]);
+        assert_eq!(reject_health_sub(Some(&s), Lane::Xmr, 95, 5).1, RejectTone::Healthy);
     }
 }
