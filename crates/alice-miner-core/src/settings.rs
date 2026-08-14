@@ -56,6 +56,17 @@ pub struct Settings {
     /// See [`crate::backend::CustomMiner`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_miner: Option<CustomMinerConfig>,
+    /// How much the self-updater may do WITHOUT being asked:
+    /// `"off"` / `"notify"` / `"security-only"` / `"full"`. `None` (the default)
+    /// means the build's own default — see `alice_release::auto::DEFAULT_MODE`,
+    /// which carries the reasoning for the value it picks.
+    ///
+    /// An unrecognised string is treated as "no saved choice" and falls back to
+    /// that default; it is NEVER coerced into a more permissive mode, because a
+    /// typo in this field must not silently grant a stranger the ability to
+    /// install software on the miner's machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update: Option<String>,
     /// Any settings keys this build does not know about, preserved verbatim so a
     /// round-trip through an older binary never drops a newer field.
     #[serde(flatten)]
@@ -101,6 +112,14 @@ impl Settings {
 /// `$ALICE_IDENTITY_DIR` (tests) exactly like the identity pointer + ai config.
 pub fn settings_path() -> PathBuf {
     identity_dir().join("settings.json")
+}
+
+/// The Alice home directory (`~/.alice`, or `$ALICE_IDENTITY_DIR`). The
+/// self-updater keeps its local, non-secret policy state here (rollout label,
+/// seen-version ledger, pins, history) and needs the path without going through
+/// `settings_path().parent()` at every call site.
+pub fn alice_home() -> PathBuf {
+    identity_dir()
 }
 
 fn identity_dir() -> PathBuf {
@@ -151,6 +170,15 @@ pub fn save(settings: &Settings) -> Result<PathBuf, String> {
 pub fn save_lang(lang: Lang) -> Result<PathBuf, String> {
     let mut settings = load();
     settings.lang = Some(lang.code().to_string());
+    save(&settings)
+}
+
+/// Persist ONLY the auto-update mode, merging over whatever else is on disk.
+/// The caller has already validated the string (`alice_release::auto::Mode::parse`);
+/// we store the canonical spelling so a later read is unambiguous.
+pub fn save_auto_update(mode: &str) -> Result<PathBuf, String> {
+    let mut settings = load();
+    settings.auto_update = Some(mode.to_string());
     save(&settings)
 }
 

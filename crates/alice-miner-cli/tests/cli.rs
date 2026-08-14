@@ -691,3 +691,265 @@ fn doctor_prl_json_includes_companion_check() {
     let names: Vec<&str> = checks.iter().map(|c| c["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"companion (PoP)"), "doctor lists the companion check: {names:?}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Guarded automatic updates — driven through the REAL binary.
+//
+// The unit tests in `alice-release::auto` prove the state machine. These prove
+// the thing the unit tests structurally cannot: that the headless CLI actually
+// CALLS it at startup. That gap is precisely audit finding AM-REL-009 — the
+// health gate existed, the CLI armed it after every self-update, and only the
+// GUI ever resolved it, so on a headless rig the rollback machinery was armed
+// and nothing on earth would ever disarm it. A unit test would have passed
+// throughout. Only running the binary catches it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The client version under test — the probation record must name the running
+/// build or it is (correctly) discarded as stale.
+const THIS_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Copy the built CLI to `dir/alice-miner[.exe]`, put a recognisable sentinel at
+/// its `.lkg` sibling, and return (app path, lkg path). The sentinel is not an
+/// executable and never needs to be: the assertion is "did the bytes at the app
+/// path get replaced by the backup", which is exactly what a rollback is.
+fn staged_app(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    // `cfg!` (runtime), not `#[cfg]`: the same code compiles and is reasoned
+    // about on every platform, so a Windows-only path cannot rot unnoticed.
+    let name = if cfg!(windows) { "alice-miner.exe" } else { "alice-miner" };
+    let app = dir.join(name);
+    let real = assert_cmd::cargo::cargo_bin("alice-miner-cli");
+    std::fs::copy(&real, &app).expect("copy the built CLI into the sandbox");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let lkg = dir.join(format!("{name}.lkg"));
+    std::fs::write(&lkg, b"LKG-SENTINEL").unwrap();
+    (app, lkg)
+}
+
+/// Write an auto-update probation record next to the staged app.
+fn arm_probation(app: &std::path::Path, launches: u32, started_ok: bool) {
+    let marker = app.with_file_name(format!(
+        "{}.auto-probation",
+        app.file_name().unwrap().to_string_lossy()
+    ));
+    let body = serde_json::json!({
+        "version": THIS_VERSION,
+        "previous": "0.0.1",
+        "armed_at_unix": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        "launches": launches,
+        "started_ok": started_ok,
+        "previous_productive": true,
+        "failed_sessions": 0,
+    });
+    std::fs::write(&marker, serde_json::to_vec(&body).unwrap()).unwrap();
+}
+
+fn sandbox(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "alice-autoupd-it-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(d.join("dot-alice")).unwrap();
+    d
+}
+
+/// Run the staged copy with an isolated `~/.alice` and no network.
+fn run_staged(app: &std::path::Path, dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(app);
+    cmd.args(args)
+        .env("ALICE_IDENTITY_DIR", dir.join("dot-alice"))
+        .env("ALICE_WALLET_DATA_ROOT", dir.join("wallet"))
+        .env(ENV_NO_UPDATE_CHECK, "1")
+        .env("ALICE_MINER_AUTO_UPDATE", "off");
+    cmd.output().expect("run the staged binary")
+}
+
+/// THE test for AM-REL-009 on the headless path: a build that reached startup
+/// once without ever confirming health is rolled back on its next start — by the
+/// CLI, with no GUI anywhere.
+#[test]
+fn headless_startup_rolls_back_a_build_that_never_got_past_launch() {
+    let dir = sandbox("rollback");
+    let (app, _lkg) = staged_app(&dir);
+    // launches=1, started_ok=false ⇒ "we have been here before and it died".
+    arm_probation(&app, 1, false);
+
+    let out = run_staged(&app, &dir, &["--version"]);
+
+    let bytes = std::fs::read(&app).unwrap();
+    assert_eq!(
+        bytes, b"LKG-SENTINEL",
+        "the CLI must restore last-known-good over the failed build at startup"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("rolled back") || stderr.contains("回滚"),
+        "the rollback must be reported, not silent: {stderr}"
+    );
+    assert!(
+        stderr.contains("restart") || stderr.contains("重启"),
+        "and it must say THIS process is still the failed build: {stderr}"
+    );
+    // The failed version is pinned so the updater will not reinstall it.
+    let pins: Vec<String> = serde_json::from_slice(
+        &std::fs::read(dir.join("dot-alice").join("update-pins.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pins, vec![THIS_VERSION.to_string()]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The complement, and the more important half of "does the gate work": a build
+/// on its FIRST start is not rolled back, and — because a `--version` run has no
+/// earning baseline to be judged against — the probation is committed rather
+/// than left armed forever holding a spare copy of the app hostage.
+#[test]
+fn headless_startup_does_not_roll_back_a_healthy_first_run() {
+    let dir = sandbox("healthy");
+    let (app, lkg) = staged_app(&dir);
+    // A probation with NO earning baseline: starting is the whole bar.
+    let marker = app.with_file_name(format!(
+        "{}.auto-probation",
+        app.file_name().unwrap().to_string_lossy()
+    ));
+    let body = serde_json::json!({
+        "version": THIS_VERSION,
+        "previous": "0.0.1",
+        "armed_at_unix": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        "launches": 0,
+        "started_ok": false,
+        "previous_productive": false,
+        "failed_sessions": 0,
+    });
+    std::fs::write(&marker, serde_json::to_vec(&body).unwrap()).unwrap();
+
+    let out = run_staged(&app, &dir, &["--version"]);
+    assert!(out.status.success());
+    assert_ne!(
+        std::fs::read(&app).unwrap(),
+        b"LKG-SENTINEL",
+        "a first run must NEVER be rolled back"
+    );
+    assert!(!marker.exists(), "a committed probation clears its marker");
+    assert!(!lkg.exists(), "and drops the last-known-good copy");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A probation for a DIFFERENT version is stale (a rollback already happened, or
+/// the user installed something by hand). It must be discarded quietly — never
+/// acted on, because acting on it would revert a build nobody complained about.
+#[test]
+fn headless_startup_discards_a_probation_for_another_version() {
+    let dir = sandbox("stale");
+    let (app, lkg) = staged_app(&dir);
+    let marker = app.with_file_name(format!(
+        "{}.auto-probation",
+        app.file_name().unwrap().to_string_lossy()
+    ));
+    let body = serde_json::json!({
+        "version": "99.99.99",
+        "previous": "0.0.1",
+        "armed_at_unix": 1_700_000_000u64,
+        "launches": 5,
+        "started_ok": false,
+        "previous_productive": true,
+        "failed_sessions": 0,
+    });
+    std::fs::write(&marker, serde_json::to_vec(&body).unwrap()).unwrap();
+
+    let out = run_staged(&app, &dir, &["--version"]);
+    assert!(out.status.success());
+    assert_ne!(std::fs::read(&app).unwrap(), b"LKG-SENTINEL");
+    assert!(!marker.exists(), "stale marker is cleared");
+    assert!(lkg.exists(), "an untouched last-known-good is left alone");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A corrupt probation file must not brick the miner. Fail-open on the POLICY
+/// (do nothing) rather than fail-open on the SAFETY (never install something).
+#[test]
+fn a_corrupt_probation_file_is_ignored_not_fatal() {
+    let dir = sandbox("corrupt");
+    let (app, _lkg) = staged_app(&dir);
+    let marker = app.with_file_name(format!(
+        "{}.auto-probation",
+        app.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::write(&marker, b"{ not json at all").unwrap();
+    let out = run_staged(&app, &dir, &["--version"]);
+    assert!(out.status.success(), "a corrupt marker must not stop the miner");
+    assert_ne!(std::fs::read(&app).unwrap(), b"LKG-SENTINEL");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The opt-out is real and it is discoverable: `--auto` shows the mode, `--auto
+/// <mode>` sets it and it survives into the next process.
+#[test]
+fn auto_update_mode_can_be_shown_set_and_is_persisted() {
+    let dir = sandbox("mode");
+    let ident = dir.join("dot-alice");
+    let run = |args: &[&str]| {
+        Command::cargo_bin("alice-miner-cli")
+            .unwrap()
+            .args(args)
+            .env("ALICE_IDENTITY_DIR", &ident)
+            .env("ALICE_WALLET_DATA_ROOT", dir.join("wallet"))
+            .env(ENV_NO_UPDATE_CHECK, "1")
+            .env_remove("ALICE_MINER_AUTO_UPDATE")
+            .output()
+            .unwrap()
+    };
+
+    // Shows the built-in default and says it has not been chosen.
+    let out = run(&["update", "--auto"]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "show must exit 0: {s}");
+    assert!(s.contains("security-only"), "the default is security-only: {s}");
+    assert!(s.contains("default"), "and says so: {s}");
+
+    // Set it off, and it persists.
+    let out = run(&["update", "--auto", "off"]);
+    assert!(out.status.success());
+    let shown = run(&["update", "--auto"]);
+    let s = String::from_utf8_lossy(&shown.stdout);
+    assert!(s.contains("off"), "the choice persisted: {s}");
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ident.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(settings["auto_update"], "off");
+
+    // A typo changes NOTHING and exits non-zero — never a silent escalation.
+    let out = run(&["update", "--auto", "yes-please"]);
+    assert!(!out.status.success());
+    let shown = run(&["update", "--auto"]);
+    let s = String::from_utf8_lossy(&shown.stdout);
+    assert!(s.contains("off"), "a rejected value must leave the setting alone: {s}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `update --auto <mode>` never touches the network — it is a settings command,
+/// so it must work on a box with no route to the release channel.
+#[test]
+fn auto_update_mode_works_offline() {
+    let dir = sandbox("offline");
+    let out = Command::cargo_bin("alice-miner-cli")
+        .unwrap()
+        .args(["update", "--auto", "notify"])
+        // A URL that cannot resolve: if this command reached the network it
+        // would hang or fail here.
+        .env("ALICE_MINER_UPDATE_URL", "https://127.0.0.1:1/latest.json")
+        .env("ALICE_IDENTITY_DIR", dir.join("dot-alice"))
+        .env("ALICE_WALLET_DATA_ROOT", dir.join("wallet"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+}

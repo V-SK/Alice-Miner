@@ -96,13 +96,25 @@ enum Msg {
     CheckFailed(String),
     Applied(String),
     ApplyFailed(String),
+    /// A line from the GUARDED automatic updater (installed / held / refused).
+    Auto(String),
 }
 
 /// Owns the updater state + the channel to its background worker. One per app.
 pub struct UpdateManager {
     pub ui: UpdateUi,
+    /// The most recent line from the guarded automatic updater — what it did, or
+    /// what it declined to do and why. Rendered in Settings → Software update and
+    /// kept until it is replaced, so a miner can always answer "is my client
+    /// current, and if not, why not" without opening a terminal.
+    pub auto_note: Option<String>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
+    auto_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    last_auto_check: Option<std::time::Instant>,
+    last_productive_mark: Option<std::time::Instant>,
+    session_start: Option<std::time::Instant>,
+    judged_this_session: bool,
 }
 
 impl Default for UpdateManager {
@@ -110,8 +122,14 @@ impl Default for UpdateManager {
         let (tx, rx) = std::sync::mpsc::channel();
         Self {
             ui: UpdateUi::Idle,
+            auto_note: None,
             tx,
             rx,
+            auto_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_auto_check: None,
+            last_productive_mark: None,
+            session_start: None,
+            judged_this_session: false,
         }
     }
 }
@@ -139,6 +157,95 @@ impl UpdateManager {
         }
     }
 
+    /// Resolve the GUARDED-automatic-update probation at startup, alongside the
+    /// manual gate above. Returns a line to show the user when a build was
+    /// automatically rolled back (they need to restart to leave it), otherwise
+    /// `None`.
+    ///
+    /// Two gates rather than one with a flag, on purpose: the manual gate treats
+    /// "the process started" as proof of health, which is right for a build the
+    /// user chose and too weak for one that installed itself while they slept.
+    pub fn auto_gate_at_startup() -> Option<String> {
+        let note = alice_miner_core::autoupdate::register_launch();
+        // The GUI has constructed and is about to paint: that is this process
+        // demonstrably up and doing its job.
+        alice_miner_core::autoupdate::confirm_start();
+        note
+    }
+
+    /// Kick one guarded automatic-update cycle in the background, unless one is
+    /// already running or it is not yet due. `force` runs it regardless of the
+    /// timer (used once at launch).
+    ///
+    /// This never blocks the UI thread and never interrupts mining: an install
+    /// swaps the app on disk and takes effect on the next launch.
+    pub fn auto_check(&mut self, force: bool) {
+        use std::sync::atomic::Ordering;
+        const RECHECK: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+        if !force {
+            match self.last_auto_check {
+                Some(t) if t.elapsed() < RECHECK => return,
+                None => return,
+                _ => {}
+            }
+        }
+        if self.auto_in_flight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.last_auto_check = Some(std::time::Instant::now());
+        let tx = self.tx.clone();
+        let flag = self.auto_in_flight.clone();
+        let quiet_holds = !force;
+        thread::spawn(move || {
+            let outcome = alice_miner_core::autoupdate::tick(quiet_holds);
+            if let Some(m) = outcome.message() {
+                let _ = tx.send(Msg::Auto(m.to_string()));
+            }
+            flag.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Feed the mining half of the post-update health probation. Call once per
+    /// frame with the live accepted-share count (`None` when not mining).
+    ///
+    /// Identical logic to the CLI's session driver, calling the identical kernel:
+    /// an accepted share commits the probation and refreshes the "this machine
+    /// earns" baseline; a long stretch with none counts against the build once
+    /// per session, and only when the build it replaced HAD been earning here.
+    pub fn note_mining(&mut self, accepted: Option<u64>) {
+        let Some(accepted) = accepted else {
+            self.session_start = None;
+            self.judged_this_session = false;
+            return;
+        };
+        let start = *self.session_start.get_or_insert_with(std::time::Instant::now);
+
+        if accepted > 0 {
+            let due = self
+                .last_productive_mark
+                .map(|t| t.elapsed() >= std::time::Duration::from_secs(10 * 60))
+                .unwrap_or(true);
+            if due {
+                self.last_productive_mark = Some(std::time::Instant::now());
+                alice_miner_core::autoupdate::mark_productive();
+            }
+        }
+
+        let ran = start.elapsed();
+        let judge = accepted > 0
+            || (!self.judged_this_session
+                && ran >= alice_miner_core::alice_release::auto::MIN_JUDGED_SESSION);
+        if !judge {
+            return;
+        }
+        if accepted == 0 {
+            self.judged_this_session = true;
+        }
+        if let Some(msg) = alice_miner_core::autoupdate::note_session(ran, accepted) {
+            self.auto_note = Some(msg);
+        }
+    }
+
     /// Drain any completed background results into [`Self::ui`]. Call once per
     /// frame from the app's update loop (cheap; non-blocking).
     pub fn poll(&mut self) {
@@ -148,6 +255,10 @@ impl UpdateManager {
                 Msg::CheckFailed(m) => self.ui = UpdateUi::Failed { message: m },
                 Msg::Applied(version) => self.ui = UpdateUi::Applied { version },
                 Msg::ApplyFailed(m) => self.ui = UpdateUi::Failed { message: m },
+                // The automatic updater speaks in whole sentences and does NOT
+                // overwrite the manual updater's state — the two are independent
+                // and a user mid-manual-check should not see it hijacked.
+                Msg::Auto(m) => self.auto_note = Some(m),
             }
         }
     }
@@ -267,6 +378,10 @@ mod tests {
             released: "2026-06-03T00:00:00Z".to_string(),
             notes: "Test notes.".to_string(),
             artifacts,
+            rollout_pct: None,
+            soak_hours: None,
+            revoked: Vec::new(),
+            security: None,
         }
     }
 
@@ -391,6 +506,46 @@ mod tests {
         };
         mgr.check();
         assert_eq!(mgr.ui, UpdateUi::Applying, "must not clobber an in-flight job");
+    }
+
+    /// The automatic updater and the manual one share a channel but MUST NOT
+    /// share state: a background auto result arriving while the user is running
+    /// a manual check must not hijack the panel they are looking at.
+    #[test]
+    fn an_auto_note_never_clobbers_the_manual_updater_state() {
+        let mut mgr = UpdateManager {
+            ui: UpdateUi::Checking,
+            ..Default::default()
+        };
+        mgr.tx.send(Msg::Auto("held: soaking".into())).unwrap();
+        mgr.poll();
+        assert_eq!(mgr.ui, UpdateUi::Checking, "manual state is untouched");
+        assert_eq!(mgr.auto_note.as_deref(), Some("held: soaking"));
+    }
+
+    /// The periodic automatic check is a no-op until it is due; the launch-time
+    /// call is the only one that forces it. Without this a busy UI loop would
+    /// hammer the release channel once per frame.
+    #[test]
+    fn periodic_auto_check_does_not_fire_before_it_is_due() {
+        let mut mgr = UpdateManager::default();
+        // Never checked yet: the un-forced path must NOT decide "overdue" and fire.
+        mgr.auto_check(false);
+        assert!(mgr.last_auto_check.is_none(), "unforced first call must not check");
+    }
+
+    /// Leaving the mining state resets the session accounting, so a fresh session
+    /// starts its own 20-minute clock rather than inheriting a stale one.
+    #[test]
+    fn leaving_the_mining_state_resets_the_session_clock() {
+        let mut mgr = UpdateManager {
+            session_start: Some(std::time::Instant::now()),
+            judged_this_session: true,
+            ..Default::default()
+        };
+        mgr.note_mining(None);
+        assert!(mgr.session_start.is_none());
+        assert!(!mgr.judged_this_session);
     }
 
     /// The busy flag drives the disabled-button state.

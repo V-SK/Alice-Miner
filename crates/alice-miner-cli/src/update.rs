@@ -27,7 +27,7 @@ use alice_miner_core::alice_release as release;
 use alice_miner_core::tr;
 use release::{Artifact, CheckOutcome, Manifest};
 
-use crate::{EXIT_OK, EXIT_RUNTIME};
+use crate::{EXIT_OK, EXIT_RUNTIME, EXIT_USAGE};
 
 /// `alice-miner update` arguments.
 #[derive(clap::Args)]
@@ -39,10 +39,21 @@ pub struct UpdateArgs {
     /// ed25519 signature + SHA-256 — before anything is written).
     #[arg(long)]
     pub yes: bool,
+    /// Set how much this machine may update WITHOUT being asked:
+    /// `off` (never), `notify` (tell me, install nothing),
+    /// `security-only` (auto-install security releases only — the default),
+    /// or `full` (auto-install any release that clears the guardrails).
+    /// With no value, prints the current setting and what it means.
+    #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "")]
+    pub auto: Option<String>,
 }
 
 /// Run the `update` command.
 pub fn run(args: UpdateArgs) -> i32 {
+    // `--auto` is a settings command, not an update: handle it and return.
+    if let Some(v) = args.auto.as_deref() {
+        return run_auto_setting(v);
+    }
     let current = release::current_version();
     println!(
         "{} v{current} · {}",
@@ -50,8 +61,14 @@ pub fn run(args: UpdateArgs) -> i32 {
         tr!("checking for updates…", "正在检查更新…")
     );
 
-    let outcome = match release::check_for_update(current) {
-        Ok(o) => o,
+    // Fetch the manifest WHOLE rather than via `check_for_update`, which collapses
+    // it into a `CheckOutcome` and throws the manifest away on the up-to-date path.
+    // That path is exactly where `revoked` matters: it is the run where the newest
+    // published version IS the one we are on, and telling someone "you are on the
+    // latest version" about a build the publisher has withdrawn would be the most
+    // reassuring possible way to be wrong.
+    let manifest = match release::fetch_verified_manifest() {
+        Ok(m) => m,
         Err(e) => {
             eprintln!(
                 "error: {} ({e})",
@@ -60,6 +77,16 @@ pub fn run(args: UpdateArgs) -> i32 {
             return EXIT_RUNTIME;
         }
     };
+    if manifest.is_revoked(current) {
+        eprintln!(
+            "{}",
+            tr!(
+                format!("⚠ v{current} has been WITHDRAWN by the publisher — do not keep running it."),
+                format!("⚠ v{current} 已被发布方撤回 —— 请不要继续运行它。")
+            )
+        );
+    }
+    let outcome = release::evaluate(manifest, current);
 
     match outcome {
         CheckOutcome::UpToDate { current } => {
@@ -122,6 +149,53 @@ pub fn run(args: UpdateArgs) -> i32 {
 /// interactive confirm (and if stdin is NOT a TTY, refuses to apply — never silent).
 fn apply_flow(manifest: &Manifest, artifact: Option<&Artifact>, yes: bool, current: &str) -> i32 {
     let _ = current;
+
+    // A version the publisher has WITHDRAWN is never installed — not automatically,
+    // and not by hand either. `--yes` does not override this: revocation is the one
+    // switch we have for "we know this build is harmful", and a flag that means "do
+    // not ask me" must not also mean "ignore what we know".
+    if manifest.is_revoked(&manifest.version) {
+        eprintln!(
+            "error: {}",
+            tr!(
+                format!(
+                    "v{} has been WITHDRAWN by the publisher and will not be installed.",
+                    manifest.version
+                ),
+                format!("v{} 已被发布方撤回,不会被安装。", manifest.version)
+            )
+        );
+        return EXIT_RUNTIME;
+    }
+
+    // A version that already failed its health probation ON THIS MACHINE is not
+    // installed silently again. The user may still choose it — their machine, their
+    // call — but they get told first, and `--yes` alone is not that consent.
+    let pinned = alice_miner_core::alice_release::auto::pins(
+        &alice_miner_core::autoupdate::state_dir(),
+    )
+    .iter()
+    .any(|p| p == &manifest.version);
+    if pinned {
+        println!(
+            "  {}",
+            tr!(
+                format!(
+                    "note: this machine installed v{} before and rolled it back automatically.",
+                    manifest.version
+                ),
+                format!(
+                    "提示:本机曾安装过 v{} 并自动回滚。",
+                    manifest.version
+                )
+            )
+        );
+        if !confirm_apply_pinned(&manifest.version) {
+            println!("{}", tr!("Update cancelled.", "已取消更新。"));
+            return EXIT_OK;
+        }
+    }
+
     let Some(artifact) = artifact else {
         println!(
             "  {} {}",
@@ -197,6 +271,122 @@ fn apply_pipeline(manifest: &Manifest, artifact: &Artifact) -> Result<String, St
     release::arm_pending_health_check(&applied.app_path, &manifest.version)
         .map_err(|e| e.to_string())?;
     Ok(manifest.version.clone())
+}
+
+/// A second, explicit confirmation for re-installing a version this machine
+/// already rolled back. Never auto-answers "yes": off a TTY it refuses.
+fn confirm_apply_pinned(version: &str) -> bool {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "  {}",
+            tr!(
+                "not a terminal — re-installing a version this machine rolled back needs an interactive confirmation.",
+                "非终端 —— 重新安装本机曾回滚过的版本需要交互式确认。"
+            )
+        );
+        return false;
+    }
+    print!(
+        "{} v{version}? [y/N] ",
+        tr!(
+            "Install it anyway",
+            "仍然安装"
+        )
+    );
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `alice-miner update --auto <mode>` — the opt-out / opt-in switch
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Show or set the automatic-update mode. An empty value shows; a value sets.
+fn run_auto_setting(value: &str) -> i32 {
+    use alice_miner_core::alice_release::auto::Mode;
+    use alice_miner_core::autoupdate;
+
+    if value.trim().is_empty() {
+        let m = autoupdate::mode();
+        println!(
+            "{}: {}",
+            tr!("Automatic updates", "自动更新"),
+            m.as_str()
+        );
+        println!("  {}", explain_mode(m));
+        if !autoupdate::mode_is_explicit() {
+            println!(
+                "  {}",
+                tr!(
+                    "(this machine has not chosen — it is on the built-in default)",
+                    "(本机尚未做过选择 —— 当前为内置默认值)"
+                )
+            );
+        }
+        println!(
+            "  {}  alice-miner update --auto <off|notify|security-only|full>",
+            tr!("change it with:", "修改:")
+        );
+        return EXIT_OK;
+    }
+
+    let Some(m) = Mode::parse(value) else {
+        eprintln!(
+            "error: {}",
+            tr!(
+                format!("unknown auto-update mode '{value}' — expected off, notify, security-only, or full. Nothing was changed."),
+                format!("未知的自动更新模式 '{value}' —— 可选值为 off、notify、security-only、full。未做任何修改。")
+            )
+        );
+        return EXIT_USAGE;
+    };
+    match autoupdate::set_mode(m) {
+        Ok(stored) => {
+            println!(
+                "{}: {stored}",
+                tr!("Automatic updates", "自动更新")
+            );
+            println!("  {}", explain_mode(m));
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            EXIT_RUNTIME
+        }
+    }
+}
+
+/// One sentence per mode — including, for the installing modes, the fact that
+/// this is a trust decision and not just a convenience one.
+fn explain_mode(m: alice_miner_core::alice_release::auto::Mode) -> String {
+    use alice_miner_core::alice_release::auto::Mode;
+    match m {
+        Mode::Off => tr!(
+            "Never check, never notify, never install. You are on your own for updates.",
+            "从不检查、不提示、不安装。更新完全由你自己负责。"
+        )
+        .to_string(),
+        Mode::Notify => tr!(
+            "Check and tell you; install nothing. Nothing reaches this machine without you typing a command.",
+            "只检查并提示,不安装任何东西。没有你亲自输入命令,任何东西都不会装到本机。"
+        )
+        .to_string(),
+        Mode::SecurityOnly => tr!(
+            "Auto-install security releases only; notify for everything else. Held for a day first, rolled out in batches, and rolled back automatically if the new build fails to start or stops earning.",
+            "仅自动安装安全更新,其它版本只提示。新版本会先观察一天、分批放量,若新版本无法启动或不再有收益会自动回滚。"
+        )
+        .to_string(),
+        Mode::Full => tr!(
+            "Auto-install any release that clears the guardrails (day-long hold, batched rollout, automatic rollback). This is the most convenient setting and the one that trusts the release key the most.",
+            "自动安装任何通过护栏的版本(一天观察期、分批放量、自动回滚)。这是最省事、也是最依赖发布密钥安全性的设置。"
+        )
+        .to_string(),
+    }
 }
 
 /// Print the release notes block (indented), if the manifest carries any.
@@ -304,6 +494,141 @@ pub fn confirm_launch_health(health: &LaunchHealth) {
                 )
             );
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The in-session automatic updater
+//
+// Everything here is subordinate to one rule: MINING COMES FIRST. The check runs
+// on a background thread, an install never touches the running engine (the new
+// build takes effect on the next start, and we say so), and every failure path
+// is silent rather than fatal. A miner must never lose a share because the
+// updater had an opinion.
+//
+// It also owns the mining half of the health probation, because this is the only
+// place that can see both halves of the question "is the new build earning":
+// the elapsed session time and the accepted-share counter.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use std::sync::mpsc::{Receiver, Sender};
+use std::time::Instant;
+
+/// How often a long-running session re-checks. Matches `alice-release`'s own
+/// `CHECK_INTERVAL`; a rig that runs for weeks still sees a security release
+/// within a day of it clearing the soak window.
+const AUTO_RECHECK: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// How often an accepted-share run refreshes the "this machine was earning"
+/// mark. Cheap, but not once per share.
+const PRODUCTIVE_MARK_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// Drives automatic updates for the lifetime of one `start` session.
+pub struct AutoUpdater {
+    tx: Sender<String>,
+    rx: Receiver<String>,
+    /// A check is in flight (never two at once).
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    last_check: Instant,
+    session_start: Instant,
+    last_productive_mark: Option<Instant>,
+    /// Whether we have already recorded a long, zero-accepted stretch against
+    /// the probation for THIS session (once per session, not once per tick).
+    judged_this_session: bool,
+    /// Suppress all output (the `--json` / service paths).
+    quiet: bool,
+}
+
+impl AutoUpdater {
+    /// Start the session's updater and kick the first check immediately.
+    /// `quiet` (machine output / background service) suppresses every line but
+    /// keeps the machinery — a headless rig is exactly the one that most needs
+    /// an automatic security update and an automatic rollback.
+    pub fn start(quiet: bool) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut me = Self {
+            tx,
+            rx,
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_check: Instant::now(),
+            session_start: Instant::now(),
+            last_productive_mark: None,
+            judged_this_session: false,
+            quiet,
+        };
+        me.kick(false);
+        me
+    }
+
+    /// Spawn one background check cycle, unless one is already running.
+    fn kick(&mut self, quiet_holds: bool) {
+        use std::sync::atomic::Ordering;
+        if std::env::var_os(ENV_NO_UPDATE_CHECK).is_some() {
+            return;
+        }
+        if self.in_flight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.last_check = Instant::now();
+        let tx = self.tx.clone();
+        let flag = self.in_flight.clone();
+        std::thread::spawn(move || {
+            let outcome = alice_miner_core::autoupdate::tick(quiet_holds);
+            if let Some(msg) = outcome.message() {
+                let _ = tx.send(msg.to_string());
+            }
+            flag.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Call once per engine snapshot. Handles the periodic re-check, the
+    /// "this machine is earning" mark, and the mining half of the health
+    /// probation. Returns any line the caller should print.
+    pub fn tick(&mut self, accepted: u64) -> Option<String> {
+        // 1. An accepted share is two things at once: proof that THIS build works
+        //    (which commits a probation), and the baseline a FUTURE update will be
+        //    judged against.
+        if accepted > 0 {
+            let due = self
+                .last_productive_mark
+                .map(|t| t.elapsed() >= PRODUCTIVE_MARK_EVERY)
+                .unwrap_or(true);
+            if due {
+                self.last_productive_mark = Some(Instant::now());
+                alice_miner_core::autoupdate::mark_productive();
+            }
+        }
+
+        // 2. Feed the probation. An accepted share commits immediately; a long
+        //    stretch with none counts against the build ONCE per session, and only
+        //    when the build we replaced had been earning here (that check lives in
+        //    the kernel, which is where the outage-versus-client distinction is
+        //    made).
+        let ran = self.session_start.elapsed();
+        let judge = accepted > 0
+            || (!self.judged_this_session
+                && ran >= alice_miner_core::alice_release::auto::MIN_JUDGED_SESSION);
+        if judge {
+            if accepted == 0 {
+                self.judged_this_session = true;
+            }
+            if let Some(msg) = alice_miner_core::autoupdate::note_session(ran, accepted) {
+                return Some(msg);
+            }
+        }
+
+        // 3. Periodic re-check for a long-lived session.
+        if self.last_check.elapsed() >= AUTO_RECHECK {
+            self.kick(true);
+        }
+
+        // 4. Drain anything the background thread produced.
+        while let Ok(msg) = self.rx.try_recv() {
+            if !self.quiet {
+                return Some(msg);
+            }
+        }
+        None
     }
 }
 
@@ -513,6 +838,47 @@ mod tests {
             // No cache file should have been written (we never checked).
             assert!(!cache_path().exists(), "opt-out must not write a cache");
         });
+    }
+
+    /// A manifest that WITHDRAWS its own newest version must be refused by the
+    /// manual path too — including under `--yes`.
+    ///
+    /// Revocation is the only switch we have for "we know this build is
+    /// harmful". A flag whose meaning is "stop asking me" must not quietly also
+    /// mean "ignore what we know", so this asserts the refusal happens BEFORE
+    /// the confirmation prompt and before any byte is downloaded.
+    #[test]
+    fn manual_apply_refuses_a_revoked_version_even_with_yes() {
+        set_lang(Lang::En);
+        let mut m = Manifest {
+            schema: 1,
+            product: release::PRODUCT.to_string(),
+            version: "9.9.9".to_string(),
+            min_supported: "0.1.0".to_string(),
+            released: "2026-08-14T00:00:00Z".to_string(),
+            notes: String::new(),
+            artifacts: vec![Artifact {
+                platform: release::current_platform().to_string(),
+                url: "https://example.invalid/pkg.tar.gz".to_string(),
+                sha256: "00".repeat(32),
+                size: 1,
+            }],
+            rollout_pct: None,
+            soak_hours: None,
+            revoked: vec!["9.9.9".to_string()],
+            security: None,
+        };
+        let artifact = m.artifacts[0].clone();
+        assert_eq!(
+            apply_flow(&m, Some(&artifact), true, "0.6.7"),
+            EXIT_RUNTIME,
+            "a withdrawn version must not be installed by hand either"
+        );
+        // …and the same manifest without the revocation is NOT refused here (it
+        // proceeds to the download, which this offline test does not follow):
+        // the point is that the refusal is the revocation and nothing else.
+        m.revoked.clear();
+        assert!(!m.is_revoked(&m.version));
     }
 
     /// `quiet=true` (the `--json` / machine paths) is also a no-op.
