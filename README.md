@@ -59,9 +59,27 @@ shasum -a 256 AliceMiner-macos-arm64.zip
 Get-FileHash AliceMiner-windows-x86_64.zip -Algorithm SHA256
 ```
 
-On macOS the app is ad-hoc signed (no paid Apple certificate), so the first launch needs
-**right-click → Open** to get past Gatekeeper. On Windows the CPU engine is fetched on first
-run and may trip Defender's PUA heuristic (see the release notes for the exclusion step).
+On macOS the build is **Apple Silicon only** (`aarch64-apple-darwin`; there is no Intel build,
+and Rosetta translates the other direction, so it cannot help). Prefer
+`AliceMiner-macos-arm64.dmg` over the `.zip`: open it and **drag `AliceMiner.app` into
+`/Applications`**. Running it from `~/Downloads` instead gets the app App-Translocated onto a
+randomised read-only mount, which is what "it opens and does nothing" and "my settings reset
+every launch" actually are.
+
+The app is **ad-hoc signed — we have no paid Apple Developer ID, so it is not notarized.**
+Gatekeeper therefore refuses the first launch outright, and no amount of repackaging on our
+side changes that. Dismiss the dialog, then **System Settings → Privacy & Security →
+Open Anyway** (macOS 15 Sequoia removed the old `right-click → Open` shortcut). Or, once the
+app is in `/Applications`:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/AliceMiner.app
+```
+
+See [`docs/mining-guide.md`](docs/mining-guide.md) for the full macOS section, including what
+Finder's `-47` and `open`'s `-10827 kLSNoExecutableErr` mean when you hit them. On Windows the
+CPU engine is fetched on first run and may trip Defender's PUA heuristic (see the release notes
+for the exclusion step).
 
 > **Note:** the release assets above are the **desktop app**. A standalone signed
 > `alice-miner` CLI binary is not yet a separate release artifact — to run the headless CLI

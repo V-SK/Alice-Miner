@@ -346,11 +346,85 @@ alice-miner doctor --json          # machine-readable report
 
 ### macOS
 
-- **Gatekeeper.** The app is ad-hoc signed (no paid Apple Developer certificate), so
-  the first launch needs **right-click → Open**.
+- **Apple Silicon only.** The macOS artifact is `aarch64-apple-darwin` and nothing
+  else. There is no Intel (x86_64) macOS build, and Rosetta does not help — it
+  translates Intel binaries *for* Apple Silicon, not the reverse. On an Intel Mac
+  the app cannot open at all; mine from a Linux or Windows box instead. Minimum
+  macOS 11 Big Sur.
+- **Use the `.dmg`, and drag the app into `/Applications`.** Open
+  `AliceMiner-macos-arm64.dmg` and drag `AliceMiner.app` onto the `/Applications`
+  shortcut. (The `.zip` is still published for scripted installs and for the
+  in-app updater.) Launched from `~/Downloads`, a quarantined app is
+  **App-Translocated**: macOS runs it from a randomised read-only mount, which is
+  the usual cause of "it opens and does nothing", of settings not persisting
+  between launches, and of self-update failing. Moving the bundle clears it.
+- **Gatekeeper will refuse the first launch, and we cannot fix that for you.**
+  The app is **ad-hoc signed and not notarized** — Alice has no paid Apple
+  Developer ID. `spctl --assess` rejects the bundle by design, so macOS says it
+  "cannot verify the developer" no matter how the download is packaged. Dismiss
+  the dialog, then **System Settings → Privacy & Security → Open Anyway**
+  (confirm with *Open*). It launches normally from then on. Equivalent one-liner,
+  **after** the app is in `/Applications`:
+
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/AliceMiner.app
+  ```
+
+  > **`right-click → Open` no longer works.** macOS 15 (Sequoia) removed that
+  > Gatekeeper override for apps without a developer certificate. Any guide still
+  > teaching it — including earlier revisions of this one — is out of date; use
+  > Privacy & Security → Open Anyway.
+
+- **Decoding the two errors people actually report.** Neither names its real
+  cause, so:
+
+  | What you see | What it actually means | What to do |
+  | --- | --- | --- |
+  | Finder: *"AliceMiner cannot be opened"*, **error -47** | The generic LaunchServices refusal. On a fresh download it is Gatekeeper blocking the unnotarized bundle; it can also mean a **previous AliceMiner is still running** (`-47` is literally "file busy"). | Quit any running AliceMiner (`pkill -f AliceMiner.app`), move the app to `/Applications`, then Privacy & Security → Open Anyway. |
+  | `open`: **`-10827 kLSNoExecutableErr` "The executable is missing"** | LaunchServices could not find `Contents/MacOS/AliceMiner` **at the path it resolved** — which is often *not* the copy you are looking at. Typical causes: you cleared quarantine on one copy but opened another; an older AliceMiner is registered at a path you since deleted; or you opened a stale `/private/var/folders/…/AppTranslocation/…` path left over from a previous run. | Verify the bundle first (below). If it verifies, the app is fine and the LaunchServices record is stale — see the reset command below. |
+
+  Check the bundle itself before assuming it is damaged:
+
+  ```bash
+  ls -l@ /Applications/AliceMiner.app/Contents/MacOS/AliceMiner   # want -rwxr-xr-x
+  codesign --verify --deep --strict --verbose=2 /Applications/AliceMiner.app
+  /Applications/AliceMiner.app/Contents/MacOS/alice-miner-cli --version
+  ```
+
+  If the mode is `-rwxr-xr-x`, `codesign` says *valid on disk*, and the CLI prints
+  a version, **the download is intact** — the problem is local LaunchServices
+  state, not the artifact. Reset it:
+
+  ```bash
+  pkill -f 'AliceMiner.app/Contents/MacOS/AliceMiner' 2>/dev/null
+  # drop stale registrations, including ones pointing at deleted copies
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -kill -r -domain local -domain system -domain user
+  # re-register the copy you actually want
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -f /Applications/AliceMiner.app
+  open /Applications/AliceMiner.app
+  ```
+
+  `com.apple.provenance` surviving `xattr -dr com.apple.quarantine` is **normal and
+  harmless** — macOS stamps it on downloaded files and it does not block launching.
+  `spctl --assess` reporting *"internal error in Code Signing subsystem"* likewise
+  tells you nothing about the app; re-run it against the copy in `/Applications`.
+
+  Last resort, which always works because it bypasses LaunchServices entirely:
+
+  ```bash
+  /Applications/AliceMiner.app/Contents/MacOS/AliceMiner
+  ```
+
 - **App Nap → ~0 H/s.** A hidden window can throttle mining to near zero. The
   packaged app defeats this automatically; a raw CLI binary can be wrapped with
   `caffeinate -dimsu alice-miner start …`.
+- **The CLI lives inside the bundle.** There is no separate macOS CLI download:
+
+  ```bash
+  /Applications/AliceMiner.app/Contents/MacOS/alice-miner-cli start --lane xmr
+  ```
 - **PRL / Alpha on Apple Silicon.** There is no macOS SRBMiner pearlhash build, so the
   pearlhash lanes are unavailable on Apple Silicon — the CPU-XMR lane is the fit
   there (which is why `guide` recommends XMR on a Mac).
@@ -564,10 +638,77 @@ alice-miner doctor --lane prl                                  # 含 "companion 
 - **Windows 远程桌面白屏:** 通过 RDP / AnyDesk / TeamViewer / 向日葵 驱动机器时桌面
   应用若开成纯白,见 [`remote-desktop.md`](remote-desktop.md) —— 设
   `ALICE_GUI_RENDERER=wgpu`。无界面 CLI 不受此影响,也是无头矿机的推荐路径。
-- **macOS Gatekeeper:** 应用是 ad-hoc 签名(无付费 Apple 证书),首次启动需**右键 →
-  打开**。
+- **macOS 仅支持 Apple 芯片:** macOS 产物只有 `aarch64-apple-darwin`,没有 Intel
+  (x86_64)构建;Rosetta 也帮不上忙(它是把 Intel 程序翻译到 Apple 芯片上跑,反过来
+  不行)。Intel Mac 上这个 App 根本打不开 —— 请改用 Linux 或 Windows 的机器挖矿。最低
+  系统 macOS 11 Big Sur。
+- **请用 `.dmg`,并把 App 拖进 `/Applications`:** 打开
+  `AliceMiner-macos-arm64.dmg`,把 `AliceMiner.app` 拖到里面的 `/Applications`
+  快捷方式上。(`.zip` 仍会发布,供脚本安装和 App 内自动更新使用。)若直接从 `~/下载`
+  打开,带隔离标记的 App 会被 **App Translocation**(应用位置随机化)从一个随机只读挂载点
+  运行 —— 这正是「点了没反应」「设置每次都丢」以及自动更新失败的常见根因。移动 App 包
+  即可解除。
+- **Gatekeeper 一定会拦第一次启动,这一点我们改不了:** 应用是 **ad-hoc 签名、未经
+  公证(notarize)**—— Alice 没有付费的 Apple Developer ID。`spctl --assess` 按设计就会
+  拒绝这个包,所以无论怎么改打包方式,macOS 都会说「无法验证开发者」。关掉该提示,然后
+  打开**系统设置 → 隐私与安全性 → 仍要打开**(再确认一次「打开」),之后即可正常启动。
+  等效的一条命令(**须在 App 已移入 `/Applications` 之后**执行):
+
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/AliceMiner.app
+  ```
+
+  > **「右键 → 打开」已经失效。** macOS 15(Sequoia)取消了对无开发者证书 App 的这条
+  > Gatekeeper 捷径。任何仍这样教的文档 —— 包括本文的早期版本 —— 都已过时,请用
+  > 「隐私与安全性 → 仍要打开」。
+
+- **两个最常被反馈的报错,其字面意思都不是真因:**
+
+  | 你看到的 | 真正含义 | 怎么办 |
+  | --- | --- | --- |
+  | 访达:「无法打开应用程序」,**错误 -47** | LaunchServices 的通用拒绝。新下载时通常就是 Gatekeeper 在拦未公证的包;也可能是**已有一个 AliceMiner 仍在运行**(`-47` 字面意思就是「文件忙」)。 | 先结束残留进程(`pkill -f AliceMiner.app`),把 App 移到 `/Applications`,再走「隐私与安全性 → 仍要打开」。 |
+  | `open`:**`-10827 kLSNoExecutableErr`「可执行文件缺失」** | LaunchServices 在**它解析到的那个路径**下找不到 `Contents/MacOS/AliceMiner` —— 而那往往不是你正在看的这一份。常见原因:你对 A 份清了隔离标记却打开了 B 份;某个已被你删掉的旧版仍注册在系统里;或你打开的是上次运行残留的 `/private/var/folders/…/AppTranslocation/…` 旧路径。 | 先按下面验一遍包。若验得过,说明 App 是好的、坏的是本机 LaunchServices 记录,用下面的命令重置。 |
+
+  先别急着判定安装包坏了,验一下:
+
+  ```bash
+  ls -l@ /Applications/AliceMiner.app/Contents/MacOS/AliceMiner   # 应为 -rwxr-xr-x
+  codesign --verify --deep --strict --verbose=2 /Applications/AliceMiner.app
+  /Applications/AliceMiner.app/Contents/MacOS/alice-miner-cli --version
+  ```
+
+  如果权限是 `-rwxr-xr-x`、`codesign` 显示 *valid on disk*、CLI 能打印版本号,**那么下载
+  是完好的** —— 问题出在本机 LaunchServices 状态,不在产物。重置它:
+
+  ```bash
+  pkill -f 'AliceMiner.app/Contents/MacOS/AliceMiner' 2>/dev/null
+  # 清掉陈旧注册(含指向已删除副本的那些)
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -kill -r -domain local -domain system -domain user
+  # 重新注册你真正想用的那一份
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -f /Applications/AliceMiner.app
+  open /Applications/AliceMiner.app
+  ```
+
+  执行 `xattr -dr com.apple.quarantine` 后 `com.apple.provenance` 仍然存在是**正常且无害
+  的** —— macOS 会给下载来的文件都打上它,它不会阻止启动。`spctl --assess` 报
+  *"internal error in Code Signing subsystem"* 同样说明不了 App 有问题,请改对
+  `/Applications` 里的那一份再跑一次。
+
+  实在不行,下面这条永远有效,因为它完全绕开 LaunchServices:
+
+  ```bash
+  /Applications/AliceMiner.app/Contents/MacOS/AliceMiner
+  ```
+
 - **macOS App Nap → 约 0 H/s:** 隐藏窗口会把算力压到近零;打包版自动规避,裸 CLI 可用
   `caffeinate -dimsu alice-miner start …` 包一层。
+- **macOS 的 CLI 就在 App 包里:** 没有单独的 macOS CLI 下载:
+
+  ```bash
+  /Applications/AliceMiner.app/Contents/MacOS/alice-miner-cli start --lane xmr
+  ```
 - **macOS 上的 PRL / Alpha:** 没有 macOS SRBMiner pearlhash 构建,所以 Apple Silicon
   上 pearlhash 通道不可用 —— 这也是 `guide` 在 Mac 上推荐 XMR 的原因。
 - **Linux 无头无 keyring:** 后台跑 **GPU** 通道需要 OS keyring 持有钱包解锁;无 Secret

@@ -344,12 +344,59 @@ jobs:
           [ "$gate_fail" = 0 ] || { echo "post-sign engine integrity check failed"; exit 1; }
           echo "Post-sign engine integrity OK."
           ditto -c -k --keepParent "$APP" ${{ matrix.artifact }}
+          # Also ship a drag-to-/Applications disk image. The zip is fine as an
+          # archive; what it cannot do is stop people double-clicking the app
+          # inside ~/Downloads, where a quarantined bundle gets App-Translocated
+          # onto a randomised read-only mount ("it opens and does nothing",
+          # settings that never persist, self-update failing on a read-only path).
+          # A DMG makes the drag to /Applications the obvious gesture, and that
+          # drag is exactly what ends translocation.
+          chmod +x scripts/make_macos_dmg.sh
+          scripts/make_macos_dmg.sh "$APP" "AliceMiner-macos-arm64.dmg" "$VER"
+
+      # ----------------------------------------------------------------------
+      # UNPACK WHAT WE JUST BUILT AND ASSERT IT IS LAUNCHABLE.
+      #
+      # Until this step existed, nothing ever re-opened the macOS artifact. The
+      # exec bit on Contents/MacOS/<CFBundleExecutable>, that file existing under
+      # the name Info.plist promises, the signature surviving the archive round
+      # trip, each nested Mach-O carrying its own signature — all assumed, never
+      # checked. Any of them breaking ships silently and reaches the user as
+      # "-10827 kLSNoExecutableErr", Finder "-47", or "Launchd job spawn failed",
+      # none of which name the real cause.
+      #
+      # This does NOT and CANNOT make the app pass Gatekeeper — the bundle is
+      # ad-hoc signed with no Developer ID and no notarization ticket, so
+      # `spctl --assess` rejects it and every browser download still needs a
+      # manual quarantine clear. The gate prints that status loudly; it only
+      # ENFORCES it under --require-notarized, so once a Developer ID exists,
+      # sliding back to ad-hoc becomes a build failure instead of a silent
+      # regression.
+      # ----------------------------------------------------------------------
+      - name: Verify macOS artifact is launchable (fail-closed)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          chmod +x scripts/verify_macos_bundle.sh
+          VER=$(grep -m1 '^version' crates/alice-miner-gui/Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')
+          scripts/verify_macos_bundle.sh "${{ matrix.artifact }}" \
+            --expect-version "$VER" --expect-arch arm64 \
+            --source-app dist/AliceMiner.app
+          scripts/verify_macos_bundle.sh "AliceMiner-macos-arm64.dmg" \
+            --expect-version "$VER" --expect-arch arm64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
+
+      - name: Upload macOS dmg
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: AliceMiner-macos-arm64.dmg
+          path: AliceMiner-macos-arm64.dmg
 
   # NOTE: There is intentionally NO "release" / "Create Release" job.
   # The release manifest (latest.json) and SHA256SUMS are signed OFFLINE with the
