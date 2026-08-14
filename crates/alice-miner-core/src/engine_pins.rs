@@ -1259,6 +1259,17 @@ mod tests {
         );
     }
 
+    /// The bundled Linux GPU-PRL engine version, read from the embedded floor. Tests
+    /// that need "a version the floor already knows" ask for it here instead of
+    /// hard-coding one, so bumping the bundled engine can never fail them spuriously.
+    fn floor_prl_version() -> String {
+        embedded_entries()
+            .iter()
+            .find(|e| e.kind == "gpu-prl" && e.target == "x86_64-unknown-linux-gnu")
+            .and_then(|e| e.version.clone())
+            .expect("the floor pins a linux gpu-prl engine with a version")
+    }
+
     /// Anti-rollback: a signed but older document is refused against the floor.
     #[test]
     fn a_rolled_back_epoch_is_refused() {
@@ -1272,11 +1283,15 @@ mod tests {
     }
 
     /// Anti-swap: the embedded floor's (kind,target,version) → sha is remembered,
-    /// so a document re-issuing 3.4.1 with different bytes is refused whole.
+    /// so a document re-issuing a version the floor already knows, with different
+    /// bytes, is refused whole. The version is taken FROM the floor rather than
+    /// written here: pinning a literal made this test fail the moment the bundled
+    /// engine was bumped, which is drift in the test, not in the ratchet.
     #[test]
     fn reissuing_a_known_version_with_new_bytes_is_refused() {
         let mut st = PinState::default();
-        let bytes = doc_json(2, SHA_B, "3.4.1").into_bytes(); // 3.4.1 is in the floor
+        let known = floor_prl_version();
+        let bytes = doc_json(2, SHA_B, &known).into_bytes();
         let err = apply_verified_document(&bytes, "sig", &mut st).unwrap_err();
         assert!(err.contains("changes the bytes of"), "got: {err}");
         assert!(
@@ -1295,7 +1310,12 @@ mod tests {
             .find(|e| e.kind == "gpu-prl" && e.target == "x86_64-unknown-linux-gnu")
             .expect("linux gpu-prl pin exists");
         assert!(prl.real_sha256().is_some(), "a real pin, not a placeholder");
-        assert_eq!(prl.version.as_deref(), Some("3.4.1"));
+        // Which version is bundled is a release decision, not a property this test
+        // gets to assert — it only has to BE a version.
+        assert!(
+            prl.version.as_deref().is_some_and(|v| !v.is_empty()),
+            "the pin names its upstream version"
+        );
         let kawpow = entries.iter().find(|e| e.kind == "gpu-rvn").unwrap();
         assert!(
             kawpow.real_sha256().is_none(),
@@ -1310,7 +1330,7 @@ mod tests {
         let got = effective_pin("gpu-prl", "x86_64-unknown-linux-gnu", "SRBMiner-MULTI")
             .expect("floor pin");
         assert_eq!(got.source, PinSource::Embedded);
-        assert_eq!(got.entry.version.as_deref(), Some("3.4.1"));
+        assert_eq!(got.entry.version.as_deref(), Some(floor_prl_version().as_str()));
     }
 
     #[test]
