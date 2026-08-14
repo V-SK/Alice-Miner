@@ -1,0 +1,92 @@
+{
+  "_comment": "ENDORSEMENT INPUT for the signed engine-pin document (engines.json). This file is the human decision — which upstream engine build we are willing to run — and it is deliberately NOT what the client trusts: `scripts/build_engines_manifest.py` downloads every artifact listed here, reproduces its SHA-256 itself, and fails if a declared `expected_*` hash does not match. Only then does it emit engines.json for V to sign OFFLINE with the engine-pin sub-key. Every change here must land in ENGINE-TRUST-LOG.md with the same evidence. Seeded 2026-08-14 with the EXACT pins currently compiled into the client (release-assets/miners.json), so a first run reproduces today's state byte-for-byte and proves the pipeline before it is ever used to change an engine. macOS xmrig and the kawpowminer placeholders are intentionally absent: they have no fetch URL, so the client keeps using its built-in pin for them.",
+  "notes": "Baseline: the engines compiled into client v0.6.7.",
+  "engines": [
+    {
+      "kind": "gpu-prl",
+      "engine": "srbminer-multi",
+      "version": "3.4.1",
+      "target": "x86_64-unknown-linux-gnu",
+      "filename": "SRBMiner-MULTI",
+      "archive_url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.4.1/SRBMiner-Multi-3-4-1-Linux.tar.gz",
+      "binary_path_in_archive": "SRBMiner-Multi-3-4-1/SRBMiner-MULTI",
+      "expected_archive_sha256": "c2de6da87afad6d536573084a46cfb08e2bd5b38cdbf9245199d093a6ea6970f",
+      "expected_binary_sha256": "9335b57a97396b9f8a83b9953f69384704443469279694e34eb76cce2b7296f7",
+      "source_url": "https://github.com/doktor83/SRBMiner-Multi/releases/tag/3.4.1",
+      "endorsed_by": "V",
+      "endorsed_at": "2026-06-25T00:00:00Z",
+      "notes": "Vendor archive md5 834f26b94aa17064d17f4649d9ea98e7 matched locally; archive + extracted-binary sha256 reproduced 2026-06-25."
+    },
+    {
+      "kind": "gpu-prl",
+      "engine": "srbminer-multi",
+      "version": "3.4.1",
+      "target": "x86_64-pc-windows-msvc",
+      "filename": "SRBMiner-MULTI.exe",
+      "archive_url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.4.1/SRBMiner-Multi-3-4-1-win64.zip",
+      "binary_path_in_archive": "SRBMiner-Multi-3-4-1/SRBMiner-MULTI.exe",
+      "expected_archive_sha256": "73451074129cda947c9c63c0b7a08230dc71d589606bbc0664a09a58bfcf0a81",
+      "expected_binary_sha256": "e2fa2dd25f6afc5aed66af29e2616fd9c4223d577f23ce92d5b9f75feb1bb39a",
+      "source_url": "https://github.com/doktor83/SRBMiner-Multi/releases/tag/3.4.1",
+      "endorsed_by": "V",
+      "endorsed_at": "2026-06-25T00:00:00Z",
+      "notes": "Vendor archive md5 5962b5e4a67789c4bdd6cdcfdf3a70a0 matched locally."
+    },
+    {
+      "kind": "cpu-xmr",
+      "engine": "xmrig",
+      "version": "6.26.0",
+      "target": "x86_64-unknown-linux-gnu",
+      "filename": "xmrig",
+      "archive_url": "https://github.com/xmrig/xmrig/releases/download/v6.26.0/xmrig-6.26.0-linux-static-x64.tar.gz",
+      "binary_path_in_archive": "xmrig-6.26.0/xmrig",
+      "expected_archive_sha256": "fc6f8ae5f64e4f17481f7e3be29a1c56949f216a998414188003eae1db20c9e5",
+      "expected_binary_sha256": "b20f39fc00d242e706b6c30367ad811c676e0575050a4ec2f30104b696944b49",
+      "source_url": "https://github.com/xmrig/xmrig/releases/tag/v6.26.0",
+      "endorsed_by": "V",
+      "endorsed_at": "2026-06-26T00:00:00Z",
+      "notes": "Cross-checked against xmrig's official SHA256SUMS (shasum -c OK) 2026-06-26."
+    },
+    {
+      "kind": "cpu-xmr",
+      "engine": "xmrig",
+      "version": "6.26.0",
+      "target": "x86_64-pc-windows-msvc",
+      "filename": "xmrig.exe",
+      "archive_url": "https://github.com/xmrig/xmrig/releases/download/v6.26.0/xmrig-6.26.0-windows-x64.zip",
+      "binary_path_in_archive": "xmrig-6.26.0/xmrig.exe",
+      "expected_archive_sha256": "bba8097cb37d9b458a1cb1137876b27cde6740d17fe4ccbc086ba07d87d9e147",
+      "expected_binary_sha256": "6fa80698d7268f6e88aa88c06fb27ee99e1bcee747c2e76911e6206a5b1aeeb3",
+      "source_url": "https://github.com/xmrig/xmrig/releases/tag/v6.26.0",
+      "endorsed_by": "V",
+      "endorsed_at": "2026-06-26T00:00:00Z",
+      "notes": "Cross-checked against xmrig's official SHA256SUMS 2026-06-26."
+    },
+    {
+      "kind": "gpu-alpha",
+      "engine": "alpha-miner",
+      "version": "1.8.3",
+      "target": "x86_64-unknown-linux-gnu",
+      "filename": "alpha-miner",
+      "binary_url": "https://github.com/AlphaMine-Tech/alpha-miner/releases/download/v1.8.3/alpha-miner",
+      "expected_binary_sha256": "927f50f63343bb63b9e6eeed77d2959200e2c1df2022c84f47a117af50475fdb",
+      "source_url": "https://github.com/AlphaMine-Tech/alpha-miner/releases/tag/v1.8.3",
+      "endorsed_by": "V",
+      "endorsed_at": "2026-06-26T00:00:00Z",
+      "notes": "Matches the vendor's published SHA256SUMS and a local shasum of the 32032568-byte binary; live-validated on a real V100."
+    },
+    {
+      "kind": "gpu-alpha",
+      "engine": "alpha-miner",
+      "version": "1.8.3",
+      "target": "x86_64-pc-windows-msvc",
+      "filename": "alpha-miner.exe",
+      "binary_url": "https://github.com/AlphaMine-Tech/alpha-miner/releases/download/v1.8.3/alpha-miner-windows-1.8.3.exe",
+      "expected_binary_sha256": "9e3b52d63e12f1f1a00d5c6753d4f8e3b5df035caa00c453ff1598d630797081",
+      "source_url": "https://github.com/AlphaMine-Tech/alpha-miner/releases/tag/v1.8.3",
+      "endorsed_by": "V",
+      "endorsed_at": "2026-06-26T00:00:00Z",
+      "notes": "Matches the vendor's published SHA256SUMS; NOT yet live-validated on Windows-NVIDIA."
+    }
+  ]
+}

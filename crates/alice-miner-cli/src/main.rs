@@ -46,6 +46,7 @@ use alice_miner_core::{EngineHandle, EngineState, GpuSelection, Lane, Snapshot};
 
 mod ai;
 mod balance;
+mod engines;
 mod color;
 mod companion;
 mod dashboard;
@@ -382,6 +383,24 @@ enum Command {
         The global `--lang <en|zh>` flag does the same for a single run (and also\n\
         persists when passed explicitly).")]
     Lang(LangArgs),
+
+    /// Show which mining engine is pinned, where it came from, and check for a
+    /// newer signed pin.
+    #[command(long_about = "Show the mining ENGINE this client is allowed to run: the pinned\n\
+        SHA-256, the upstream version + release URL, when we endorsed it, whether the\n\
+        pin comes from this client's built-in table or from a separately-signed engine\n\
+        pin list, and whether the bytes are present + verified on this machine.\n\
+        \n\
+        The engine is a third-party binary, so it is only ever run when its SHA-256\n\
+        matches the pin. If it does not match, the lane stops and says so — it never\n\
+        silently falls back to an older engine.\n\
+        \n\
+        --check   check for a newer signed engine pin list right now (an upstream\n\
+                  emergency fork can be answered this way with no client update).\n\
+                  The new engine is downloaded and verified BEFORE it takes effect;\n\
+                  if anything fails, the current engine stays exactly as it is.\n\
+        --json    machine-readable output")]
+    Engines(engines::EnginesArgs),
 
     /// Show your THREE reward buckets: credit (积分), PRL rebate, and ALICE token.
     #[command(long_about = "Show the three honest reward buckets for your Alice address (or\n\
@@ -1070,6 +1089,7 @@ fn main() {
         Some(Command::Ai(args)) => cmd_ai(args),
         Some(Command::Train(args)) => cmd_train(args),
         Some(Command::Lang(args)) => cmd_lang(args),
+        Some(Command::Engines(args)) => engines::run(args),
         Some(Command::Balance(args)) => balance::run(args),
         Some(Command::Update(args)) => update::run(args),
         // No subcommand: on an interactive TTY, launch the interactive menu; else
@@ -1156,6 +1176,7 @@ fn command_allows_prompt(command: Option<&Command>) -> bool {
         Some(Command::Start(a)) => !a.json && !a.from_service,
         Some(Command::Doctor(a)) => !a.json,
         Some(Command::Balance(a)) => !a.json,
+        Some(Command::Engines(a)) => !a.json,
         // `guide` is interactive-friendly, but its `--json` form is a machine consumer.
         Some(Command::Guide(a)) => !a.json,
         // `companion` prompts for the keystore unlock; allow the pre-prompt.

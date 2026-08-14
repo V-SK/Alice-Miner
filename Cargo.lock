@@ -123,6 +123,7 @@ dependencies = [
  "blake2",
  "bs58",
  "dirs",
+ "ed25519-dalek",
  "flate2",
  "hex",
  "keyring",

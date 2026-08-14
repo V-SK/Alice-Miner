@@ -75,6 +75,85 @@ use std::time::Duration;
 /// key B, which is the intended fail-closed behaviour.
 pub const RELEASE_PUBKEY_B64: &str = "8P+XmZZFEsUHLmqeB62Xqr5GnwW5K9vf2sQHvRzfi5k=";
 
+/// Embedded ed25519 **engine-pin sub-key** (raw 32 bytes, base64) — a DIFFERENT
+/// key from [`RELEASE_PUBKEY_B64`], with strictly less power:
+///
+/// * the release key signs `latest.json`, i.e. **which client bytes you run**;
+/// * this sub-key signs `engines.json`, i.e. **which third-party engine bytes
+///   the client is allowed to fetch**, and nothing else. It cannot sign a client
+///   update, cannot raise `min_supported`, cannot change any URL outside the
+///   upstream allow-list compiled into the client.
+///
+/// Why a second key at all: an upstream hard fork (Pearl, 2026-08-11) makes a
+/// pinned engine 100%-rejected overnight, and shipping a whole client release to
+/// change one SHA-256 costs days. Splitting the key means the thing we now touch
+/// often is NOT the thing whose compromise is remote-code-execution on every
+/// miner's machine.
+///
+/// **EMPTY = fail-closed.** Until V generates the sub-key offline (same custody
+/// as the release key: `~/AliceRelease.sparseimage`, signed by hand, agent never
+/// reads it) this constant stays empty and the client uses ONLY the pins baked
+/// into its own binary. An empty key never "verifies" anything — see
+/// [`engine_pin_key_status`].
+pub const ENGINE_PIN_PUBKEY_B64: &str = "";
+
+/// Default location of the signed engine-pin document (`engines.json`, detached
+/// signature at `engines.json.sig`). Served as a **release asset that can be
+/// re-uploaded onto the existing tag** — publishing a new pin therefore needs no
+/// new client version, which is the entire point of this file. Overridable with
+/// [`ENGINES_URL_ENV`] for staging/tests.
+pub const DEFAULT_ENGINES_URL: &str =
+    "https://github.com/V-SK/alice-miner/releases/latest/download/engines.json";
+
+/// Env override for the engine-pin document URL (staging / tests).
+pub const ENGINES_URL_ENV: &str = "ALICE_MINER_ENGINES_URL";
+
+/// Whether this build can verify a remote engine-pin document at all, and why
+/// not when it can't. Surfaced verbatim to the user so "we are running the pins
+/// baked into this build" is never silent.
+pub fn engine_pin_key_status() -> std::result::Result<(), String> {
+    if ENGINE_PIN_PUBKEY_B64.trim().is_empty() {
+        return Err(
+            "this build embeds no engine-pin public key, so remote engine pins are disabled; \
+             only the engine SHA-256 pins compiled into this binary are used"
+                .to_string(),
+        );
+    }
+    verifying_key_from_b64(ENGINE_PIN_PUBKEY_B64)
+        .map(|_| ())
+        .map_err(|e| format!("the embedded engine-pin public key is unusable: {e}"))
+}
+
+/// Verify a detached base64 ed25519 signature over `doc_bytes` with the embedded
+/// **engine-pin sub-key**. Fails closed when the sub-key is absent/unusable — an
+/// unprovisioned build can never be talked into accepting a remote pin document.
+pub fn verify_engine_pin_sig(doc_bytes: &[u8], sig_b64: &str) -> std::result::Result<(), String> {
+    engine_pin_key_status()?;
+    verify_engine_pin_sig_with(doc_bytes, sig_b64, ENGINE_PIN_PUBKEY_B64)
+}
+
+/// As [`verify_engine_pin_sig`] but against an explicitly supplied public key.
+/// Used by tests (which own a throwaway key) and by the publishing tooling to
+/// prove a freshly-signed document verifies BEFORE it is uploaded. Production
+/// code paths must call [`verify_engine_pin_sig`].
+pub fn verify_engine_pin_sig_with(
+    doc_bytes: &[u8],
+    sig_b64: &str,
+    pubkey_b64: &str,
+) -> std::result::Result<(), String> {
+    let vk = verifying_key_from_b64(pubkey_b64).map_err(|e| e.to_string())?;
+    verify_manifest_sig(doc_bytes, sig_b64, &vk).map_err(|e| e.to_string())
+}
+
+/// The engine-pin document URL in effect (env override, else the default).
+pub fn engines_url() -> String {
+    std::env::var(ENGINES_URL_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_ENGINES_URL.to_string())
+}
+
 /// Default location of the signed release manifest. Overridable at runtime with
 /// `ALICE_MINER_UPDATE_URL` (must point at the directory/`latest.json`; the
 /// `.sig` is fetched from the same URL with `.sig` appended).

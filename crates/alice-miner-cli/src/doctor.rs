@@ -536,14 +536,37 @@ fn check_engine(lane: Lane) -> Check {
         Ok(path) => Check::pass(
             NAME,
             format!(
-                "{} {} {}",
+                "{} {} {}{}",
                 kind.binary_name(),
                 tr!("resolved at", "已解析于"),
-                path.display()
+                path.display(),
+                // Which engine build this is, and on whose word — the pin either
+                // came with this client or from a signed engine-pin list. Shown
+                // here because "the engine resolved" is only half the answer.
+                match alice_miner_core::engine_pins::effective_pin_for(kind) {
+                    Some(pin) => format!(" [{} · {}]", pin.entry.label(), pin.source.short()),
+                    None => String::new(),
+                }
             ),
         ),
         Err(e) => {
-            if binaries::is_fetchable(kind) {
+            if binaries::is_engine_unverified(&e) {
+                // Integrity, not availability: these bytes are not the pinned
+                // bytes. Never dress this up as "it will download later" — the
+                // lane cannot run, and re-downloading is exactly what the
+                // resolver already tried.
+                Check::fail(
+                    NAME,
+                    format!("{} {}", kind.binary_name(), tr!("failed verification", "校验失败")),
+                    format!(
+                        "{e}\n{}",
+                        tr!(
+                            "the lane stays stopped rather than run an engine we cannot verify; run `alice-miner engines` to see the pin in force",
+                            "该通道保持停止,不会运行无法校验的引擎;运行 `alice-miner engines` 查看当前生效的 pin"
+                        )
+                    ),
+                )
+            } else if binaries::is_fetchable(kind) {
                 // A real pin + URL exist, but the resolve failed (e.g. offline). The
                 // download will run at start; surface the transient reason as a WARN.
                 // `doctor --fix` can fetch it now (SHA-verified) — a fully-safe action.
