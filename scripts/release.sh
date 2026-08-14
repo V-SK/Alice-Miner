@@ -273,6 +273,16 @@ for plat in ${TARGETS}; do
       mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Resources"
       cp "${ROOT_DIR}/target/${triple}/release/${GUI_BIN}" "${app}/Contents/MacOS/AliceMiner"
       chmod +x "${app}/Contents/MacOS/AliceMiner"
+      # Headless CLI inside the bundle. CI has shipped this since the .app existed
+      # and the macOS docs point people at
+      # /Applications/AliceMiner.app/Contents/MacOS/alice-miner-cli — but this
+      # local build path never copied it, so a release cut here would silently
+      # lack the binary the docs promise.
+      ( cd "${ROOT_DIR}" && cargo build --release --target "${triple}" -p alice-miner-cli )
+      if [[ -f "${ROOT_DIR}/target/${triple}/release/alice-miner-cli" ]]; then
+        cp "${ROOT_DIR}/target/${triple}/release/alice-miner-cli" "${app}/Contents/MacOS/alice-miner-cli"
+        chmod +x "${app}/Contents/MacOS/alice-miner-cli"
+      fi
       # Bundled engines beside the binary in MacOS/ (binaries.rs resolves them as
       # siblings of the exe). xmrig = CPU-XMR (proven); kawpowminer = GPU-RVN
       # (when a pinned build is supplied). Each is SHA-pin-verified before copy.
@@ -337,6 +347,26 @@ PLIST
       done
       # Zip the bundle preserving metadata (matches the in-app updater's ditto).
       ( cd "${stage}" && ditto -c -k --keepParent "AliceMiner.app" "${OUT_DIR}/${artifact}" )
+      # Drag-to-/Applications disk image alongside the zip. See
+      # scripts/make_macos_dmg.sh for why: it is about WHERE the app ends up
+      # (App Translocation out of ~/Downloads), not about archive fidelity.
+      dmg="${OUT_DIR}/${artifact%.zip}.dmg"
+      "${ROOT_DIR}/scripts/make_macos_dmg.sh" "${app}" "${dmg}" "${VERSION}"
+      # Fail-closed: reopen both artifacts and assert a Mac could actually launch
+      # what we just built — the executable exists under the name Info.plist
+      # promises, it kept its exec bit, the signature survived the round trip and
+      # every nested Mach-O is signed. Without this, a broken bundle ships and is
+      # diagnosed by a miner reading LaunchServices error codes at us.
+      # It cannot make the bundle pass Gatekeeper (ad-hoc, unnotarized) and does
+      # not pretend to — it reports that separately and loudly.
+      case "${plat}" in
+        macos-arm64)  expect_arch="arm64" ;;
+        *)            expect_arch="x86_64" ;;
+      esac
+      "${ROOT_DIR}/scripts/verify_macos_bundle.sh" "${OUT_DIR}/${artifact}" \
+        --expect-version "${VERSION}" --expect-arch "${expect_arch}" --source-app "${app}"
+      "${ROOT_DIR}/scripts/verify_macos_bundle.sh" "${dmg}" \
+        --expect-version "${VERSION}" --expect-arch "${expect_arch}"
       ;;
     linux-x86_64)
       d="${stage}/AliceMiner"; mkdir -p "${d}"
@@ -396,14 +426,19 @@ EOF
 done
 
 # ── 3. SHA256SUMS ───────────────────────────────────────────────────────────
+# Covers the .dmg too: it is a published download, so a user must be able to
+# check it against a signed list like every other artifact. (It is deliberately
+# NOT added to latest.json's artifacts[] below — that array drives the in-app
+# self-updater, which downloads and unpacks a .zip. A dmg entry there would be a
+# second artifact claiming the same `macos-arm64` platform.)
 echo "Writing SHA256SUMS…"
 (
   cd "${OUT_DIR}"
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum ./*.zip ./*.tar.gz 2>/dev/null > SHA256SUMS || true
+    sha256sum ./*.zip ./*.tar.gz ./*.dmg 2>/dev/null > SHA256SUMS || true
   else
     : > SHA256SUMS
-    for f in ./*.zip ./*.tar.gz; do
+    for f in ./*.zip ./*.tar.gz ./*.dmg; do
       [[ -e "$f" ]] || continue
       printf '%s  %s\n' "$(shasum -a 256 "$f" | awk '{print $1}')" "${f#./}" >> SHA256SUMS
     done
