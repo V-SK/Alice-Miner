@@ -96,6 +96,47 @@ pub fn run(args: EnginesArgs) -> i32 {
             let by = p.endorsed_by.clone().unwrap_or_default();
             println!("    {} {at} {by}", tr!("endorsed:     ", "背书时间:  "));
         }
+        // How the pin says to CALL these bytes. Printed only when the pin actually
+        // overrides something, so the common case stays as short as it was.
+        if let Some(algo) = &p.algorithm {
+            println!(
+                "    {} {algo}",
+                tr!("algorithm:    ", "算法参数:  ")
+            );
+        }
+        if !p.extra_args.is_empty() {
+            println!(
+                "    {} {}",
+                tr!("extra argv:   ", "附加参数:  "),
+                p.extra_args.join(" ")
+            );
+        }
+        if let Some(parser) = &p.parser {
+            println!(
+                "    {} {parser}",
+                tr!("log parser:   ", "日志解析器:")
+            );
+        }
+        // A signed rollback to an older engine is the exact shape of the August
+        // outage. It is allowed — sometimes it is the right call — but never quiet.
+        if let Some(reason) = &p.downgrade_reason {
+            println!(
+                "    {} {reason}",
+                tr!(
+                    "!! DOWNGRADE: this pin deliberately moves BACK to an older engine —",
+                    "!! 降级:该 pin 有意退回到更旧的引擎版本 ——"
+                )
+            );
+        }
+        if let Some(from) = &p.version_regression_from {
+            println!(
+                "    {} {from}",
+                tr!(
+                    "!! this engine is NOT newer than the highest this machine has run:",
+                    "!! 该引擎版本并不比本机曾运行过的最高版本更新:"
+                )
+            );
+        }
         println!(
             "    {} {}",
             tr!("on this machine:", "本机状态:"),

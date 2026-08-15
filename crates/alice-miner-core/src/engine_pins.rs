@@ -50,6 +50,41 @@
 //!   we have ever accepted (including the embedded floor) is remembered. A
 //!   document that re-issues a known version with different bytes is rejected —
 //!   the sub-key cannot quietly swap an engine under a version we trust.
+//! * **Versions only go forward.** Per (kind, target) the highest version ever
+//!   accepted is remembered, and a document naming an older one — or one this
+//!   client cannot order against it — is rejected UNLESS the entry explicitly
+//!   marks itself [`PinEntry::downgrade`] with a reason. Without this the sub-key
+//!   could point the fleet back at SRBMiner 3.4.1 (an exact one-key replay of the
+//!   August outage) or at any older build with a known hole, using bytes that are
+//!   still genuinely hosted on an allow-listed upstream release page. See
+//!   [`compare_versions`] for the deliberately conservative ordering rule.
+//!
+//! ## The pin carries the CALL, not just the bytes (2026-08-14)
+//!
+//! A pin used to say only *which bytes*; **how to invoke them** and **how to read
+//! their output** were compiled in. SRBMiner-MULTI 3.5.4 proved that is not
+//! enough: it reshaped both log lines the client's parser depends on, and a
+//! healthy GPU landing accepted shares at 44.8 TH/s displayed
+//! `0 H/s · 0A/0R · STALL` for a whole twenty-minute run while the no-progress
+//! watchdog restarted the engine on that false reading. Publishing a new
+//! `engines.json` could not have fixed that — a client release could. That is the
+//! exact opposite of this feature's claim.
+//!
+//! So a signed entry may now also carry [`PinEntry::algorithm`],
+//! [`PinEntry::extra_args`] and [`PinEntry::parser`]
+//! ([`EngineInvocation`]). All three are **optional**: absent ⇒ byte-for-byte
+//! today's compiled-in behaviour. All three are **fail-closed**: an unknown parser
+//! id, an implausible algorithm token, or an extra argument that touches anything
+//! the client owns (the pool, the login, the password, the log file) rejects the
+//! whole document. And all three are re-validated at argv-build time, so the
+//! property belongs to the launch path and not only to the acceptance path.
+//!
+//! **What this does NOT remove**, stated plainly (also in
+//! `docs/engine-pin-publishing.md`): a fork whose output needs a parser this
+//! client does not compile in, an engine that needs a *different argv shape*
+//! (flag renames on the pool/login/password/log-file flags this client owns), a
+//! new upstream host, or a new engine kind — each of those still needs a client
+//! release.
 //!
 //! ## What this module deliberately does NOT do
 //!
@@ -106,6 +141,40 @@ pub const ALLOWED_URL_PREFIXES: &[&str] = &[
     "https://github.com/RavenCommunity/kawpowminer/releases/download/",
 ];
 
+/// Hard ceiling on [`PinEntry::extra_args`]. A fork needs a flag or two; a list
+/// this long is a mistake or an attempt to bury something in the middle of it.
+pub const MAX_EXTRA_ARGS: usize = 16;
+/// Hard ceiling on one extra-argv token.
+const MAX_EXTRA_ARG_LEN: usize = 128;
+/// Hard ceiling on [`PinEntry::algorithm`].
+const MAX_ALGORITHM_LEN: usize = 64;
+
+/// argv flags the CLIENT owns and a signed pin may never restate. These decide
+/// **where shares go, who is credited, what authorises the login, and where the
+/// engine writes** — i.e. every property the honesty gate and the reward path
+/// depend on. Compared case-insensitively and with any `=value` tail stripped, so
+/// `-P`, `--pool=…` and `--POOL` are all caught by one entry.
+///
+/// This list is the reason the invocation fields are safe to sign with a key we
+/// touch often: the sub-key can tell the client *how to ask an upstream engine for
+/// the new algorithm*, and it cannot tell the client to mine somewhere else, for
+/// someone else, or to write a file of its choosing.
+const CLIENT_OWNED_FLAGS: &[&str] = &[
+    // algorithm — carried by `algorithm`, never by a raw flag
+    "-a", "--algo", "--algorithm", "--coin",
+    // pool / transport
+    "-o", "-p", "--pool", "--url", "--server", "--port", "--host", "--tls", "--proxy",
+    // login / credit attribution
+    "-u", "--user", "--wallet", "--address", "--worker", "--rig-id", "--pass", "--password",
+    // where the engine writes, and what it exposes
+    "--log-file", "--logfile", "--config", "-c", "--api-bind", "--api-port", "--http-port",
+    "--http-host", "--http-enabled", "--api-enabled",
+    // device selection is the user's setting, not the publisher's
+    "--gpu-id", "--devices", "--cuda-devices", "--opencl-devices",
+    // never let a pin quietly raise the vendor's donation cut
+    "--donate-level", "--donate-over-proxy",
+];
+
 // ────────────────────────────────────────────────────────────────────────────
 // Trust + fetch seams
 //
@@ -117,16 +186,17 @@ pub const ALLOWED_URL_PREFIXES: &[&str] = &[
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-fn test_trust_key() -> &'static Mutex<Option<String>> {
+pub(crate) fn test_trust_key() -> &'static Mutex<Option<String>> {
     static K: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     K.get_or_init(|| Mutex::new(None))
 }
 
 #[cfg(test)]
-type TestFetch = Box<dyn Fn(&PinEntry) -> Result<Vec<u8>, binaries::FetchFail> + Send + Sync>;
+pub(crate) type TestFetch =
+    Box<dyn Fn(&PinEntry) -> Result<Vec<u8>, binaries::FetchFail> + Send + Sync>;
 
 #[cfg(test)]
-fn test_fetch_hook() -> &'static Mutex<Option<TestFetch>> {
+pub(crate) fn test_fetch_hook() -> &'static Mutex<Option<TestFetch>> {
     static H: OnceLock<Mutex<Option<TestFetch>>> = OnceLock::new();
     H.get_or_init(|| Mutex::new(None))
 }
@@ -231,6 +301,40 @@ pub struct PinEntry {
     pub source: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
+
+    // ── How to CALL these bytes (all optional; absent ⇒ compiled-in behaviour) ──
+    /// The algorithm token this engine build wants (`pearlhash`). Substituted for
+    /// the client's compiled-in token wherever a lane's argv carries one. Exists so
+    /// an upstream that RENAMES its algorithm on a fork does not cost a client
+    /// release; it can never widen anything, because it is one bounded token in one
+    /// argv slot the client itself places.
+    #[serde(default)]
+    pub algorithm: Option<String>,
+    /// Extra argv appended AFTER every flag the client controls. For a fork that
+    /// needs a new switch (`--pearl-fork-tweak`). Held to
+    /// [`CLIENT_OWNED_FLAGS`] and to the same credit-only / anti-leak scan a
+    /// bring-your-own miner's argv gets ([`crate::backend::forbidden_in_arg`]).
+    #[serde(default)]
+    pub extra_args: Option<Vec<String>>,
+    /// Which compiled-in log parser reads this engine's output
+    /// ([`crate::stats::ParserKind::id`]). An id this build does not have refuses
+    /// the whole document — never a guess, because guessing is precisely what read
+    /// `0 H/s · 0A/0R` off a healthy 44.8 TH/s card on 2026-08-14.
+    #[serde(default)]
+    pub parser: Option<String>,
+
+    // ── Version ratchet ────────────────────────────────────────────────────────
+    /// Set when this entry's version is **not provably newer** than one already in
+    /// force on a machine — a deliberate rollback, or a version string this client
+    /// cannot order ([`compare_versions`]). Without it such an entry is refused.
+    /// Deliberate downgrades are legitimate (a bad upstream build happens); silent
+    /// ones are the August outage with a signature on it.
+    #[serde(default)]
+    pub downgrade: bool,
+    /// Why the downgrade — REQUIRED when [`Self::downgrade`] is set, and shown
+    /// verbatim by `alice-miner engines` and `doctor`.
+    #[serde(default)]
+    pub downgrade_reason: Option<String>,
 }
 
 impl PinEntry {
@@ -248,11 +352,52 @@ impl PinEntry {
 
     /// `kind/target/version` — the identity used by the anti-swap history.
     fn history_key(&self) -> Option<String> {
+        Some(format!(
+            "{}/{}/{}",
+            self.kind,
+            self.target,
+            self.trimmed_version()?
+        ))
+    }
+
+    /// `kind/target` — the identity the VERSION ratchet is keyed on (one engine
+    /// slot on one platform; two targets of the same engine move independently).
+    fn version_slot(&self) -> String {
+        format!("{}/{}", self.kind, self.target)
+    }
+
+    /// The declared upstream version, trimmed; `None` when absent or blank.
+    fn trimmed_version(&self) -> Option<String> {
         let v = self.version.as_deref()?.trim();
-        if v.is_empty() {
-            return None;
-        }
-        Some(format!("{}/{}/{}", self.kind, self.target, v))
+        (!v.is_empty()).then(|| v.to_string())
+    }
+
+    /// How to CALL this engine, re-validated from scratch.
+    ///
+    /// Deliberately NOT a plain getter: the launch path calls this every time it
+    /// builds argv, so the invocation rules hold at the moment the argv is built
+    /// and not only at the moment the document was accepted — the same
+    /// belt-and-braces the URL allow-list gets (checked in [`validate_entry`] AND
+    /// again in [`crate::binaries`]). An `Err` fails the lane start closed; it
+    /// never degrades to "launch it anyway with the compiled-in call".
+    pub fn invocation(&self) -> Result<EngineInvocation, String> {
+        let algorithm = match self.algorithm.as_deref() {
+            Some(a) => Some(check_algorithm(a)?),
+            None => None,
+        };
+        let extra_args = match self.extra_args.as_deref() {
+            Some(list) => check_extra_args(list)?,
+            None => Vec::new(),
+        };
+        let parser = match self.parser.as_deref() {
+            Some(p) => Some(check_parser_id(p)?),
+            None => None,
+        };
+        Ok(EngineInvocation {
+            algorithm,
+            extra_args,
+            parser,
+        })
     }
 
     /// Human one-liner for status output: `srbminer-multi 3.5.3`.
@@ -262,6 +407,37 @@ impl PinEntry {
             Some(v) if !v.is_empty() => format!("{engine} {v}"),
             _ => engine,
         }
+    }
+}
+
+/// How to CALL a pinned engine — the half of the pin that used to be compiled in.
+///
+/// Every field is an override: `None`/empty means "use what this client was built
+/// with", which is why a document that carries none of them produces byte-identical
+/// argv and byte-identical parsing to v0.6.7.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineInvocation {
+    /// Replaces the lane's compiled-in algorithm token, where the lane's argv has
+    /// one. (Only the GPU-PRL lane's bundled argv carries an algorithm flag today:
+    /// alpha-miner has none by design, xmrig is driven by `--coin monero`, and
+    /// kawpowminer takes none.)
+    pub algorithm: Option<String>,
+    /// Appended after every client-controlled flag, in order.
+    pub extra_args: Vec<String>,
+    /// Which compiled-in parser reads this engine's output.
+    pub parser: Option<crate::stats::ParserKind>,
+}
+
+impl EngineInvocation {
+    /// Is this the "nothing overridden" invocation? Used by status output so the
+    /// common case says nothing rather than printing three empty fields.
+    pub fn is_default(&self) -> bool {
+        self.algorithm.is_none() && self.extra_args.is_empty() && self.parser.is_none()
+    }
+
+    /// Append this invocation's extra argv to a launch plan's args.
+    pub fn apply_extra_args(&self, args: &mut Vec<String>) {
+        args.extend(self.extra_args.iter().cloned());
     }
 }
 
@@ -372,6 +548,12 @@ pub struct PinState {
     /// `kind/target/version` → sha256 of every engine build ever accepted.
     #[serde(default)]
     pub seen: std::collections::BTreeMap<String, String>,
+    /// `kind/target` → the HIGHEST engine version ever in force on this machine.
+    /// Only ever raised, never lowered — including by a deliberate downgrade, so
+    /// that re-publishing the older build keeps re-stating its marker rather than
+    /// quietly becoming the new normal.
+    #[serde(default)]
+    pub version_floor: std::collections::BTreeMap<String, String>,
 }
 
 fn now_unix() -> u64 {
@@ -539,6 +721,23 @@ fn validate_entry(e: &PinEntry) -> Result<(), String> {
     {
         return Err(format!("engine pin entry has an unsafe filename '{f}'"));
     }
+    // How to CALL the bytes — validated for EVERY entry, placeholder or not: an
+    // entry that carries an unknown parser id or a forbidden argument is refused
+    // even when it pins nothing, because the client would otherwise be quietly
+    // ignoring a field the publisher believed was in force.
+    e.invocation()?;
+    // The downgrade marker must be a decision, not a bare flag: the reason is what
+    // `alice-miner engines` and `doctor` show the miner, so an empty one is refused.
+    if e.downgrade {
+        let reason = e.downgrade_reason.as_deref().unwrap_or("").trim();
+        if reason.len() < 8 {
+            return Err(format!(
+                "engine pin entry {}/{} is marked as a deliberate downgrade but gives no reason; \
+                 a downgrade is shown to every miner and must say why",
+                e.kind, e.target
+            ));
+        }
+    }
     if e.placeholder {
         // A placeholder carries no usable bytes; it is allowed to exist (the
         // kawpowminer slot) but must not pretend to have a pin.
@@ -600,6 +799,194 @@ fn validate_entry(e: &PinEntry) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The algorithm token, validated. A miner algorithm name is a short ASCII token
+/// (`pearlhash`, `rx/0`, `kawpow`, `ethash`); anything else is refused rather than
+/// handed to a process as argv. In particular it may not start with `-` (that
+/// would be a FLAG smuggled into the algorithm slot) and may carry no whitespace,
+/// quotes, shell metacharacters or control bytes.
+fn check_algorithm(a: &str) -> Result<String, String> {
+    let t = a.trim();
+    if t.is_empty() || t.len() > MAX_ALGORITHM_LEN {
+        return Err(format!(
+            "engine pin entry declares an implausible algorithm token '{a}' \
+             (1..={MAX_ALGORITHM_LEN} characters)"
+        ));
+    }
+    if t.starts_with('-') {
+        return Err(format!(
+            "engine pin entry's algorithm '{a}' starts with '-': that is a FLAG, not an \
+             algorithm name — refusing"
+        ));
+    }
+    let ok = t
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | '+'));
+    if !ok {
+        return Err(format!(
+            "engine pin entry's algorithm '{a}' contains characters an algorithm name never has \
+             (allowed: letters, digits, and / - _ . +)"
+        ));
+    }
+    Ok(t.to_string())
+}
+
+/// The extra argv, validated. See [`CLIENT_OWNED_FLAGS`] for the core rule: a
+/// signed pin may add switches to an engine, and may never restate one of the
+/// flags that decide where shares go, who is credited, or where the engine writes.
+fn check_extra_args(list: &[String]) -> Result<Vec<String>, String> {
+    if list.len() > MAX_EXTRA_ARGS {
+        return Err(format!(
+            "engine pin entry carries {} extra arguments; at most {MAX_EXTRA_ARGS} are accepted",
+            list.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(list.len());
+    for raw in list {
+        let t = raw.trim();
+        if t.is_empty() || t.len() > MAX_EXTRA_ARG_LEN {
+            return Err(format!(
+                "engine pin entry has an implausible extra argument {raw:?} \
+                 (1..={MAX_EXTRA_ARG_LEN} characters)"
+            ));
+        }
+        // One token per token: whitespace/control would let one entry become two
+        // argv words on any shell-ish re-parse, and is never legitimate here.
+        if t.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) {
+            return Err(format!(
+                "engine pin entry's extra argument {raw:?} contains whitespace or control \
+                 characters; give each argv token its own list entry"
+            ));
+        }
+        // The flags the client owns. Compare on the flag half only, case-folded, so
+        // `--pool=x`, `--POOL` and `-P` all collide with one list entry.
+        let flag = t.split('=').next().unwrap_or(t).to_ascii_lowercase();
+        if let Some(owned) = CLIENT_OWNED_FLAGS
+            .iter()
+            .find(|f| f.eq_ignore_ascii_case(&flag))
+        {
+            return Err(format!(
+                "engine pin entry's extra argument {raw:?} restates `{owned}`, which this client \
+                 controls (pool, login, password, log file, devices). A pin may add switches to an \
+                 engine; it may not redirect where shares go or who is credited — refusing the \
+                 whole list"
+            ));
+        }
+        // No URLs and no filesystem paths: an engine-pin document has no business
+        // naming a host or a file, and both are how a "harmless extra flag" turns
+        // into a redirect or an arbitrary write under some flag we did not enumerate.
+        if t.contains("://") {
+            return Err(format!(
+                "engine pin entry's extra argument {raw:?} carries a URL; the relay endpoints are \
+                 the client's to choose — refusing"
+            ));
+        }
+        if t.starts_with('/') || t.starts_with('~') || t.contains('\\') || t.contains("..") {
+            return Err(format!(
+                "engine pin entry's extra argument {raw:?} looks like a filesystem path; a pin may \
+                 not choose where the engine reads or writes — refusing"
+            ));
+        }
+        // The same credit-only / anti-leak scan a bring-your-own miner's argv gets.
+        if let Some(bad) = crate::backend::forbidden_in_arg(t) {
+            return Err(format!(
+                "engine pin entry's extra argument {raw:?} is refused by the argv honesty gate \
+                 ({bad:?}) — refusing the whole list"
+            ));
+        }
+        out.push(t.to_string());
+    }
+    Ok(out)
+}
+
+/// The parser id, resolved against the parsers compiled into THIS build. An id we
+/// do not have is refused — never approximated. Reading a fork's output with the
+/// nearest parser is what displayed `0 H/s · 0A/0R · STALL` on a healthy card.
+fn check_parser_id(p: &str) -> Result<crate::stats::ParserKind, String> {
+    crate::stats::ParserKind::from_id(p).ok_or_else(|| {
+        format!(
+            "engine pin list names log parser '{p}', which this client does not have (it knows: \
+             {}). Refusing to guess which parser to use — update the client to a build that has \
+             it; until then the pins compiled into this one stay in force.",
+            crate::stats::ParserKind::KNOWN_IDS.join(", ")
+        )
+    })
+}
+
+/// How two upstream version strings order — **conservatively**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionOrder {
+    Older,
+    Same,
+    Newer,
+    /// The two cannot be ordered by any rule this client is willing to apply.
+    /// Callers must treat this exactly like `Older`: refuse, and require an
+    /// explicit human marker.
+    Unordered,
+}
+
+/// Split a version into numeric components, or `None` if it is not a plain
+/// dotted-numeric version. A single optional leading `v` is tolerated (`v6.26.0`),
+/// because upstream tags carry one and it is not ambiguous.
+///
+/// Everything else is refused rather than interpreted: `3.5.4-rc1`, `3.5.4b`,
+/// `2026.08.14-nightly`, `3.5.4+build7`. `alice_release::parse_version` — which
+/// orders OUR OWN releases — happily truncates `1.4.0-rc1` to `(1,4,0)`, and that
+/// is right for versions we mint and wrong for a third party's, where the suffix
+/// may be the whole difference between two builds.
+fn numeric_version_parts(v: &str) -> Option<Vec<u64>> {
+    let t = v.trim();
+    let t = t.strip_prefix('v').or_else(|| t.strip_prefix('V')).unwrap_or(t);
+    if t.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for seg in t.split('.') {
+        // >9 digits cannot be a component of a real version and would risk an
+        // overflow surprise; refuse instead of saturating.
+        if seg.is_empty() || seg.len() > 9 || !seg.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        parts.push(seg.parse::<u64>().ok()?);
+    }
+    (!parts.is_empty() && parts.len() <= 8).then_some(parts)
+}
+
+/// Order two upstream version strings, refusing to guess.
+///
+/// * identical strings ⇒ [`VersionOrder::Same`] (whatever the shape);
+/// * both plain dotted-numeric ⇒ compared component-wise, missing trailing
+///   components read as `0` (`3.5` == `3.5.0`);
+/// * anything else ⇒ [`VersionOrder::Unordered`], which callers treat as "not
+///   provably newer" and refuse without an explicit marker.
+///
+/// Upstream version strings are not ours and are not always cleanly ordered, so
+/// the only two answers this function is willing to give with confidence are the
+/// ones it can prove.
+pub fn compare_versions(a: &str, b: &str) -> VersionOrder {
+    let (a, b) = (a.trim(), b.trim());
+    if a == b {
+        return VersionOrder::Same;
+    }
+    let (Some(pa), Some(pb)) = (numeric_version_parts(a), numeric_version_parts(b)) else {
+        return VersionOrder::Unordered;
+    };
+    for i in 0..pa.len().max(pb.len()) {
+        let (x, y) = (
+            pa.get(i).copied().unwrap_or(0),
+            pb.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return if x > y {
+                VersionOrder::Newer
+            } else {
+                VersionOrder::Older
+            };
+        }
+    }
+    // Numerically equal, textually different (`3.5.4` vs `v3.5.4` vs `3.5.4.0`).
+    VersionOrder::Same
 }
 
 /// A URL is acceptable only if it starts with one of the compiled-in upstream
@@ -759,6 +1146,26 @@ pub fn effective_pin_for(kind: MinerKind) -> Option<EffectivePin> {
     )
 }
 
+/// How to CALL the engine in force for `kind` — the argv/parser overrides the pin
+/// carries, re-validated here.
+///
+/// No pin at all ⇒ the default (empty) invocation: an engine we have no pin for is
+/// refused by the resolver long before argv is built, so there is nothing to
+/// override. A pin whose invocation does NOT validate ⇒ `Err`, which fails the
+/// lane start closed rather than launching with a call we could not check.
+pub fn effective_invocation(kind: MinerKind) -> Result<EngineInvocation, String> {
+    match effective_pin_for(kind) {
+        Some(p) => p.entry.invocation().map_err(|e| {
+            format!(
+                "the engine pin in force for {} ({}) is unusable: {e}",
+                p.entry.label(),
+                p.source.short()
+            )
+        }),
+        None => Ok(EngineInvocation::default()),
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Refresh
 // ────────────────────────────────────────────────────────────────────────────
@@ -785,6 +1192,29 @@ impl RefreshOutcome {
             self,
             RefreshOutcome::Deferred(_) | RefreshOutcome::Rejected(_)
         )
+    }
+}
+
+/// Raise `floors[kind/target]` to `e`'s version when that is provably newer (or
+/// when the slot has no floor yet). Never lowers, and never records a version it
+/// cannot order — an unorderable string leaves the existing floor alone, so the
+/// ratchet keeps comparing against the last version it actually understood.
+fn raise_version_floor(
+    floors: &mut std::collections::BTreeMap<String, String>,
+    e: &PinEntry,
+) {
+    let Some(v) = e.trimmed_version() else {
+        return;
+    };
+    match floors.get(&e.version_slot()) {
+        None => {
+            floors.insert(e.version_slot(), v);
+        }
+        Some(cur) => {
+            if compare_versions(&v, cur) == VersionOrder::Newer {
+                floors.insert(e.version_slot(), v);
+            }
+        }
     }
 }
 
@@ -924,6 +1354,51 @@ fn apply_verified_document(
         }
     }
 
+    // 3b. Version ratchet, per (kind,target): engines go FORWARD. Without this the
+    //     sub-key could sign a list pointing back at SRBMiner 3.4.1 — bytes that are
+    //     really on an allow-listed upstream page, that hash exactly to what this
+    //     machine already trusts for that version, and that cannot mine post-fork
+    //     Pearl at all. Every other guard in this file would wave that through: it
+    //     is a one-key replay of the 78-hour August outage.
+    //
+    //     The floor is seeded from the pins compiled into this build for the same
+    //     reason the anti-swap history is: a fresh install must not be downgradeable
+    //     just because it has no state file yet.
+    let mut floors = st.version_floor.clone();
+    for e in embedded_entries() {
+        raise_version_floor(&mut floors, &e);
+    }
+    for e in &doc.engines {
+        let Some(v) = e.trimmed_version() else {
+            continue;
+        };
+        let Some(floor) = floors.get(&e.version_slot()) else {
+            continue; // nothing to ratchet against yet
+        };
+        let order = compare_versions(&v, floor);
+        if matches!(order, VersionOrder::Newer | VersionOrder::Same) {
+            continue;
+        }
+        if e.downgrade {
+            continue; // explicitly marked; surfaced loudly by `engines` and `doctor`
+        }
+        let why = match order {
+            VersionOrder::Older => format!(
+                "{v} is OLDER than the {floor} this machine already runs"
+            ),
+            _ => format!(
+                "{v} cannot be ordered against the {floor} this machine already runs, so it is \
+                 not provably newer"
+            ),
+        };
+        return Err(format!(
+            "engine pin list moves {} backwards: {why}. A deliberate downgrade is allowed, but it \
+             must say so — set \"downgrade\": true with a \"downgrade_reason\" on that entry, so \
+             every miner is told. Refusing the whole list.",
+            e.version_slot()
+        ));
+    }
+
     // 4. Verified-before-effective: fetch + hash every engine this machine would
     //    actually run under the new list, BEFORE the list becomes effective.
     let mut staged: Vec<(PinEntry, Vec<u8>)> = Vec::new();
@@ -986,10 +1461,19 @@ fn apply_verified_document(
 
     st.schema = 1;
     st.epoch_floor = st.epoch_floor.max(doc.epoch).max(doc.min_engine_epoch);
+    // Persist the ratchet with the SAME seeding the check above used, or a machine
+    // whose state file predates this field would record the accepted (possibly
+    // downgraded) version as its floor and forget the higher one its own build
+    // ships. Raise, never lower — a deliberate downgrade does NOT re-base the
+    // ratchet, so republishing the older build re-states its marker every time.
+    for e in embedded_entries() {
+        raise_version_floor(&mut st.version_floor, &e);
+    }
     for e in &doc.engines {
         if let (Some(k), Some(sha)) = (e.history_key(), e.real_sha256()) {
             st.seen.insert(k, sha);
         }
+        raise_version_floor(&mut st.version_floor, e);
     }
     save_state(st)?;
     invalidate_cache();
@@ -1081,10 +1565,26 @@ pub struct PinStatus {
     pub endorsed_by: Option<String>,
     /// Whether the pinned bytes are present and verified in the engine cache.
     pub installed: bool,
+    /// The algorithm token the pin overrides the compiled-in one with, if any.
+    pub algorithm: Option<String>,
+    /// Extra argv the pin adds to this engine's launch, if any.
+    pub extra_args: Vec<String>,
+    /// The log parser the pin names, if any (else the lane's compiled-in one).
+    pub parser: Option<String>,
+    /// Set when the pin ITSELF declares it is a deliberate downgrade; carries the
+    /// published reason. Loud on purpose: a signed rollback to an older engine is
+    /// exactly the shape of the August outage, and the miner is entitled to see
+    /// that one was chosen on their behalf and why.
+    pub downgrade_reason: Option<String>,
+    /// Set when the version now in force is NOT newer than the highest this
+    /// machine has recorded for that engine — the machine-local half of the same
+    /// question, which fires even if the document forgot to say so.
+    pub version_regression_from: Option<String>,
 }
 
 /// The engine pins in force on THIS machine, one per lane that has one.
 pub fn status_for_current_platform() -> Vec<PinStatus> {
+    let floors = load_state().version_floor;
     let mut out = Vec::new();
     for kind in [
         MinerKind::CpuXmr,
@@ -1108,6 +1608,24 @@ pub fn status_for_current_platform() -> Vec<PinStatus> {
                     .unwrap_or(false)
             })
             .unwrap_or(false);
+        // Machine-local regression check: is the version in force behind the
+        // highest this machine has ever recorded for that slot? This is the half a
+        // document cannot talk its way out of — it fires whether or not the entry
+        // remembered to declare itself a downgrade.
+        let version_regression_from = pin
+            .entry
+            .trimmed_version()
+            .zip(floors.get(&pin.entry.version_slot()))
+            .filter(|(v, floor)| {
+                matches!(
+                    compare_versions(v, floor),
+                    VersionOrder::Older | VersionOrder::Unordered
+                )
+            })
+            .map(|(_, floor)| floor.clone());
+        // A malformed invocation is reported as "none" here rather than crashing
+        // the status command; the LAUNCH path is where it fails closed.
+        let inv = pin.entry.invocation().unwrap_or_default();
         out.push(PinStatus {
             kind: pin.entry.kind.clone(),
             engine: pin
@@ -1122,6 +1640,19 @@ pub fn status_for_current_platform() -> Vec<PinStatus> {
             endorsed_at: pin.entry.endorsed_at.clone(),
             endorsed_by: pin.entry.endorsed_by.clone(),
             installed,
+            algorithm: inv.algorithm.clone(),
+            extra_args: inv.extra_args.clone(),
+            parser: inv.parser.map(|p| p.id().to_string()),
+            downgrade_reason: pin
+                .entry
+                .downgrade
+                .then(|| {
+                    pin.entry
+                        .downgrade_reason
+                        .clone()
+                        .unwrap_or_else(|| "(no reason published)".to_string())
+                }),
+            version_regression_from,
         });
     }
     out
@@ -1162,6 +1693,356 @@ mod tests {
 
     const SHA_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const SHA_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    /// A one-entry document for the **linux gpu-prl** slot — the slot the embedded
+    /// floor pins on every host — with `extra_fields` (raw JSON, each ending in a
+    /// comma) spliced into the entry.
+    ///
+    /// Deliberately not `doc_for_this_platform`: these tests exercise validation and
+    /// the version ratchet, both of which must behave identically on macOS, Linux
+    /// and Windows, and the ratchet is seeded from the floor — which has no gpu-prl
+    /// entry for `aarch64-apple-darwin`. Using a fixed linux target also keeps the
+    /// staging step out of the way (a non-matching triple is skipped).
+    fn linux_prl_doc(epoch: u64, version: &str, sha: &str, extra_fields: &str) -> String {
+        format!(
+            r#"{{"schema":1,"product":"alice-miner-engines","epoch":{epoch},
+              "min_engine_epoch":1,"issued":"2026-08-15T00:00:00Z","engines":[
+              {{"kind":"gpu-prl","engine":"srbminer-multi","version":"{version}",
+                "target":"x86_64-unknown-linux-gnu","filename":"SRBMiner-MULTI",
+                "sha256":"{sha}",
+                {extra_fields}
+                "archive_url":"https://github.com/doktor83/SRBMiner-Multi/releases/download/{version}/SRBMiner-Multi-Linux.tar.gz",
+                "archive_sha256":"{sha}",
+                "binary_path_in_archive":"SRBMiner-Multi/SRBMiner-MULTI",
+                "source_url":"https://github.com/doktor83/SRBMiner-Multi/releases/tag/{version}",
+                "endorsed_at":"2026-08-15T00:00:00Z","endorsed_by":"V"}}]}}"#
+        )
+    }
+
+    // ── F6: the pin carries the CALL, not just the bytes ───────────────────────
+
+    /// The happy path: a signed entry names the algorithm token, the extra argv and
+    /// the parser, and all three come back out validated. This is the whole point —
+    /// SRBMiner 3.5.4 reshaped its output on 2026-08-14 and a published pin could
+    /// not have said so.
+    #[test]
+    fn a_pin_can_carry_the_algorithm_extra_argv_and_the_parser_it_needs() {
+        let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
+            2,
+            "3.6.0",
+            SHA_A,
+            r#""algorithm":"pearlhash2","extra_args":["--pearl-fork-salt","3"],"parser":"srbminer","#,
+        ))
+        .unwrap();
+        validate_doc(&doc).expect("a document that says how to call the engine is valid");
+        let inv = doc.engines[0].invocation().expect("invocation");
+        assert_eq!(inv.algorithm.as_deref(), Some("pearlhash2"));
+        assert_eq!(
+            inv.extra_args,
+            vec!["--pearl-fork-salt".to_string(), "3".to_string()]
+        );
+        assert_eq!(inv.parser, Some(crate::stats::ParserKind::Srbminer));
+        assert!(!inv.is_default());
+    }
+
+    /// A DOCUMENTED limitation, pinned by a test so it cannot rot into a surprise:
+    /// the argv honesty gate refuses any token containing `seed` or `priv`, and it
+    /// is applied to publisher-supplied extra argv too. A fork whose new flag is
+    /// spelled `--salted-seed` — not far-fetched, given the fork that started all
+    /// this is `SaltedSeedForkHeight` — therefore still needs a client release. We
+    /// keep the strict rule: a gate that refuses a legitimate flag costs a release,
+    /// a gate with a hole costs a leak.
+    #[test]
+    fn an_extra_argument_naming_seed_or_priv_is_refused_even_though_it_may_be_legitimate() {
+        for bad in ["--salted-seed", "--seed-mode", "--privkey-cache"] {
+            let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
+                2,
+                "3.6.0",
+                SHA_A,
+                &format!(r#""extra_args":["{bad}"],"#),
+            ))
+            .unwrap();
+            let err = match validate_doc(&doc) {
+                Err(e) => e,
+                Ok(()) => panic!("extra arg {bad:?} must be refused"),
+            };
+            assert!(err.contains("honesty gate"), "got: {err}");
+        }
+    }
+
+    /// An entry that says nothing about the call is byte-for-byte the compiled-in
+    /// behaviour — the compatibility promise that lets this ship without churning
+    /// a single existing pin.
+    #[test]
+    fn a_pin_that_says_nothing_about_the_call_changes_nothing() {
+        let doc: EnginesDoc = serde_json::from_str(&doc_json(2, SHA_A, "3.5.5")).unwrap();
+        let inv = doc.engines[0].invocation().unwrap();
+        assert_eq!(inv, EngineInvocation::default());
+        assert!(inv.is_default());
+        let mut args = vec!["--pool".to_string(), "x".to_string()];
+        inv.apply_extra_args(&mut args);
+        assert_eq!(args, vec!["--pool".to_string(), "x".to_string()]);
+        // And the embedded floor — every entry of it — is a default invocation, so
+        // today's clients build exactly the argv they built before this existed.
+        for e in embedded_entries() {
+            assert_eq!(
+                e.invocation().expect("floor entry validates"),
+                EngineInvocation::default(),
+                "floor entry {}/{} must not override the call",
+                e.kind,
+                e.target
+            );
+        }
+    }
+
+    /// A parser id this build does not have refuses the WHOLE document. Never a
+    /// guess and never a partial apply: reading a fork's output with the nearest
+    /// parser is exactly what showed `0 H/s · 0A/0R · STALL` on a healthy card.
+    #[test]
+    fn a_parser_id_this_client_does_not_have_refuses_the_whole_document() {
+        for bad in ["srbminer-4", "srbminer2", "pearl", ""] {
+            let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
+                2,
+                "3.6.0",
+                SHA_A,
+                &format!(r#""parser":"{bad}","#),
+            ))
+            .unwrap();
+            let err = validate_doc(&doc).unwrap_err();
+            assert!(
+                err.contains("does not have") && err.contains("Refusing to guess"),
+                "parser {bad:?} got: {err}"
+            );
+        }
+    }
+
+    /// The core restriction on publisher-supplied argv: it may add switches to an
+    /// engine and may NEVER restate a flag that decides where shares go, who is
+    /// credited, what authorises the login, or where the engine writes. Case and an
+    /// `=value` tail must not get round it.
+    #[test]
+    fn extra_argv_may_not_restate_a_flag_the_client_owns() {
+        for bad in [
+            "--pool",
+            "--POOL=stratum+tcp://x:1",
+            "-o",
+            "-p",
+            "-P",
+            "--wallet",
+            "--user",
+            "--password",
+            "--log-file",
+            "--config",
+            "--gpu-id",
+            "--donate-level=5",
+            "--algorithm",
+            "--api-bind",
+        ] {
+            let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
+                2,
+                "3.6.0",
+                SHA_A,
+                &format!(r#""extra_args":["{bad}"],"#),
+            ))
+            .unwrap();
+            let err = match validate_doc(&doc) {
+                Err(e) => e,
+                Ok(()) => panic!("extra arg {bad:?} must be refused"),
+            };
+            assert!(
+                err.contains("this client controls"),
+                "extra arg {bad:?} got: {err}"
+            );
+        }
+    }
+
+    /// Extra argv may not carry a URL, a filesystem path, whitespace, or anything
+    /// the credit-only / anti-leak gate refuses in a bring-your-own miner's argv.
+    #[test]
+    fn extra_argv_may_not_carry_a_url_a_path_or_a_leak() {
+        let cases: &[(&str, &str)] = &[
+            ("--upstream=https://evil.example/x", "carries a URL"),
+            ("/etc/cron.d/x", "filesystem path"),
+            ("--out=../../../home/v/.ssh/authorized_keys", "filesystem path"),
+            ("--x ; rm -rf /", "whitespace or control"),
+            ("--payout=prl1p32l5mxxxxxxxxxxxx", "honesty gate"),
+            ("--fallback=prl.kryptex.network", "honesty gate"),
+        ];
+        for (bad, needle) in cases {
+            let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
+                2,
+                "3.6.0",
+                SHA_A,
+                &format!(r#""extra_args":[{}],"#, serde_json::to_string(bad).unwrap()),
+            ))
+            .unwrap();
+            let err = match validate_doc(&doc) {
+                Err(e) => e,
+                Ok(()) => panic!("extra arg {bad:?} must be refused"),
+            };
+            assert!(err.contains(needle), "extra arg {bad:?} got: {err}");
+        }
+        // …and there is a hard ceiling on how many there can be.
+        let many: Vec<String> = (0..MAX_EXTRA_ARGS + 1).map(|i| format!("--x{i}")).collect();
+        let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
+            2,
+            "3.6.0",
+            SHA_A,
+            &format!(
+                r#""extra_args":{},"#,
+                serde_json::to_string(&many).unwrap()
+            ),
+        ))
+        .unwrap();
+        assert!(validate_doc(&doc).is_err(), "too many extra args must refuse");
+    }
+
+    /// The algorithm slot takes an algorithm NAME. A flag smuggled into it would be
+    /// argv this client placed itself, immediately after `--algorithm`.
+    #[test]
+    fn an_algorithm_token_that_is_really_a_flag_is_refused() {
+        for bad in ["--config", "-a", "pearl hash", "pearl;hash", ""] {
+            let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
+                2,
+                "3.6.0",
+                SHA_A,
+                &format!(r#""algorithm":"{bad}","#),
+            ))
+            .unwrap();
+            assert!(
+                validate_doc(&doc).is_err(),
+                "algorithm {bad:?} must be refused"
+            );
+        }
+    }
+
+    // ── F8: engine versions only go forward ────────────────────────────────────
+
+    /// The comparator answers only what it can prove. Everything it cannot order is
+    /// `Unordered`, which callers treat exactly like a downgrade.
+    #[test]
+    fn compare_versions_orders_only_what_it_can_prove() {
+        use VersionOrder::*;
+        assert_eq!(compare_versions("3.5.4", "3.4.1"), Newer);
+        assert_eq!(compare_versions("3.4.1", "3.5.4"), Older);
+        assert_eq!(compare_versions("3.10.0", "3.9.9"), Newer); // not lexicographic
+        assert_eq!(compare_versions("3.5.4", "3.5.4"), Same);
+        assert_eq!(compare_versions("v6.26.0", "6.26.0"), Same);
+        assert_eq!(compare_versions("3.5", "3.5.0"), Same);
+        assert_eq!(compare_versions("3.6", "3.5.9"), Newer);
+        // Anything with a suffix, a date shape mixed with a semver, or a non-numeric
+        // component is refused rather than guessed at. `alice_release::parse_version`
+        // would silently truncate the first two of these to (3,5,4).
+        for (a, b) in [
+            ("3.5.4-rc1", "3.5.4"),
+            ("3.5.4b", "3.5.4"),
+            ("2026.08.14-nightly", "3.5.4"),
+            ("3.5.4+build7", "3.5.4"),
+            ("", "3.5.4"),
+            ("latest", "3.5.4"),
+        ] {
+            assert_eq!(compare_versions(a, b), Unordered, "{a} vs {b}");
+        }
+    }
+
+    /// THE F8 CASE: a signed list pointing back at SRBMiner 3.4.1 after the fork.
+    /// Every other guard in this file waves it through — the bytes are real, they
+    /// are on an allow-listed upstream page, the hash matches what we already trust
+    /// for that version, and the epoch went up. It is a one-key replay of the
+    /// 78-hour August outage, and it must be refused.
+    #[test]
+    fn an_unmarked_engine_downgrade_is_refused() {
+        let mut st = PinState::default();
+        let bytes = linux_prl_doc(2, "3.4.1", SHA_A, "").into_bytes();
+        let err = apply_verified_document(&bytes, "sig", &mut st).unwrap_err();
+        assert!(err.contains("moves gpu-prl/x86_64-unknown-linux-gnu backwards"), "got: {err}");
+        assert!(err.contains("OLDER than the 3.5.4"), "names both versions: {err}");
+        assert!(err.contains("\"downgrade\": true"), "says how to do it on purpose: {err}");
+        assert!(err.contains("Refusing the whole list"), "whole-list refusal: {err}");
+    }
+
+    /// A version this client cannot order against the one in force is treated
+    /// exactly like an older one: refused, not guessed at.
+    #[test]
+    fn a_version_that_cannot_be_ordered_is_refused_like_a_downgrade() {
+        let mut st = PinState::default();
+        let bytes = linux_prl_doc(2, "3.5.4-hotfix", SHA_A, "").into_bytes();
+        let err = apply_verified_document(&bytes, "sig", &mut st).unwrap_err();
+        assert!(err.contains("cannot be ordered against the 3.5.4"), "got: {err}");
+    }
+
+    /// A downgrade IS allowed — sometimes it is the right call — but only as a
+    /// declared decision with a reason, because that reason is what every miner is
+    /// shown.
+    #[test]
+    fn a_deliberate_downgrade_is_accepted_marked_and_does_not_lower_the_ratchet() {
+        let env = TestEnv::new();
+        let mut st = load_state();
+        let bytes = linux_prl_doc(
+            2,
+            "3.4.1",
+            SHA_A,
+            r#""downgrade":true,"downgrade_reason":"3.5.4 crashes on RDNA3; reverting while upstream fixes it","#,
+        )
+        .into_bytes();
+        let out = apply_verified_document(&bytes, "sig", &mut st).expect("marked downgrade");
+        assert!(matches!(out, RefreshOutcome::Updated { epoch: 2, .. }), "got {out:?}");
+
+        // The ratchet is RAISED-only: accepting a declared downgrade does not re-base
+        // it, so republishing the older build has to keep re-stating the marker
+        // rather than quietly becoming the new normal.
+        let floors = load_state().version_floor;
+        assert_eq!(
+            floors
+                .get("gpu-prl/x86_64-unknown-linux-gnu")
+                .map(String::as_str),
+            Some("3.5.4"),
+            "a declared downgrade must not lower the ratchet"
+        );
+        // Proof that it stays armed: the SAME downgrade without the marker, at a
+        // higher epoch, is still refused.
+        let mut st = load_state();
+        let unmarked = linux_prl_doc(3, "3.4.1", SHA_A, "").into_bytes();
+        assert!(apply_verified_document(&unmarked, "sig", &mut st).is_err());
+        drop(env);
+    }
+
+    /// The marker is a decision, not a checkbox: without a reason it is refused,
+    /// because the reason is the whole of what a miner gets to judge.
+    #[test]
+    fn a_downgrade_marker_without_a_reason_is_refused() {
+        for fields in [
+            r#""downgrade":true,"#,
+            r#""downgrade":true,"downgrade_reason":"","#,
+            r#""downgrade":true,"downgrade_reason":"   ","#,
+            r#""downgrade":true,"downgrade_reason":"oops","#,
+        ] {
+            let doc: EnginesDoc =
+                serde_json::from_str(&linux_prl_doc(2, "3.4.1", SHA_A, fields)).unwrap();
+            let err = validate_doc(&doc).unwrap_err();
+            assert!(err.contains("gives no reason"), "got: {err}");
+        }
+    }
+
+    /// Moving FORWARD is untouched — the ratchet must never be a reason a real
+    /// emergency upgrade cannot be published.
+    #[test]
+    fn moving_the_engine_forward_is_unaffected_by_the_ratchet() {
+        let env = TestEnv::new();
+        let mut st = load_state();
+        let bytes = linux_prl_doc(2, "3.6.0", SHA_A, "").into_bytes();
+        let out = apply_verified_document(&bytes, "sig", &mut st).expect("an upgrade is accepted");
+        assert!(matches!(out, RefreshOutcome::Updated { epoch: 2, .. }), "got {out:?}");
+        assert_eq!(
+            load_state()
+                .version_floor
+                .get("gpu-prl/x86_64-unknown-linux-gnu")
+                .map(String::as_str),
+            Some("3.6.0"),
+            "the ratchet follows the upgrade"
+        );
+        drop(env);
+    }
 
     #[test]
     fn a_valid_document_passes_validation() {
@@ -1413,6 +2294,59 @@ mod tests {
         assert_eq!(doc.engines[0].sha256, floor.sha256);
     }
 
+    /// The SAME contract for the fields the script gained with the invocation and
+    /// the downgrade marker: captured verbatim from a run of
+    /// `scripts/build_engines_manifest.py` (field order, key names, JSON types), so
+    /// a change on either side breaks this test rather than a miner's engine.
+    #[test]
+    fn the_publishing_scripts_invocation_and_downgrade_output_validates() {
+        let produced = r#"{
+  "schema": 1,
+  "product": "alice-miner-engines",
+  "epoch": 3,
+  "min_engine_epoch": 1,
+  "issued": "2026-08-15T00:09:26Z",
+  "notes": "smoke",
+  "engines": [
+    {
+      "kind": "gpu-prl",
+      "engine": "srbminer-multi",
+      "version": "9.9.9",
+      "target": "x86_64-unknown-linux-gnu",
+      "filename": "SRBMiner-MULTI",
+      "source_url": "https://github.com/doktor83/SRBMiner-Multi/releases/tag/9.9.9",
+      "endorsed_by": "V",
+      "endorsed_at": "2026-08-15T00:00:00Z",
+      "algorithm": "pearlhash2",
+      "extra_args": [
+        "--pearl-fork-salt",
+        "3"
+      ],
+      "parser": "srbminer",
+      "downgrade": true,
+      "downgrade_reason": "smoke test of the marker path",
+      "sha256": "43224fd816f8416299aeff9d6e4cf5633c34113c9029a8347f95f66256c1a278",
+      "archive_url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/9.9.9/x.tar.gz",
+      "archive_sha256": "412df2665bd292191586a3194e0212a38aba323ffb85cc983540785bda067fa8",
+      "binary_path_in_archive": "SRBMiner-Multi-9-9-9/SRBMiner-MULTI"
+    }
+  ]
+}
+"#;
+        let doc: EnginesDoc = serde_json::from_str(produced).expect("parses");
+        validate_doc(&doc).expect("and is acceptable");
+        let e = &doc.engines[0];
+        let inv = e.invocation().expect("invocation");
+        assert_eq!(inv.algorithm.as_deref(), Some("pearlhash2"));
+        assert_eq!(inv.parser, Some(crate::stats::ParserKind::Srbminer));
+        assert_eq!(inv.extra_args.len(), 2);
+        assert!(e.downgrade);
+        assert_eq!(
+            e.downgrade_reason.as_deref(),
+            Some("smoke test of the marker path")
+        );
+    }
+
     // ── The full pipeline, offline ─────────────────────────────────────────
     //
     // These drive `refresh` end-to-end with a throwaway signing key and a
@@ -1473,6 +2407,16 @@ mod tests {
     /// A document pinning the GPU-PRL engine for THIS machine's triple, so the
     /// staging path runs identically on macOS, Linux and Windows.
     fn doc_for_this_platform(epoch: u64, version: &str, sha: &str) -> String {
+        doc_for_this_platform_with(epoch, version, sha, "")
+    }
+
+    /// [`doc_for_this_platform`] with raw extra entry fields (each ending in a comma).
+    fn doc_for_this_platform_with(
+        epoch: u64,
+        version: &str,
+        sha: &str,
+        extra_fields: &str,
+    ) -> String {
         let filename = MinerKind::GpuPrl.binary_name();
         let member = if cfg!(windows) {
             "SRBMiner-Multi-3-5-3/SRBMiner-MULTI.exe"
@@ -1490,6 +2434,7 @@ mod tests {
   "notes":"Pearl emergency hard fork",
   "engines":[{{"kind":"gpu-prl","engine":"srbminer-multi","version":"{version}",
     "target":"{target}","filename":"{filename}","sha256":"{sha}",
+    {extra_fields}
     "archive_url":"https://github.com/doktor83/SRBMiner-Multi/releases/download/3.5.3/{archive}",
     "archive_sha256":"{sha}","binary_path_in_archive":"{member}",
     "source_url":"https://github.com/doktor83/SRBMiner-Multi/releases/tag/3.5.3",
@@ -1574,6 +2519,83 @@ mod tests {
             prl.source.contains("epoch 2"),
             "provenance shown: {}",
             prl.source
+        );
+    }
+
+    /// F6 END TO END: a signed list that says HOW to call the engine, not just
+    /// which bytes it is, and the launch path's own resolver
+    /// ([`effective_invocation`] — what `engine.rs` calls on every rebuild) hands
+    /// back exactly that. Without this the pin could carry the fields and the
+    /// client could still launch the compiled-in call.
+    #[test]
+    fn a_signed_pin_changes_how_the_engine_is_called_not_only_which_bytes_run() {
+        let env = TestEnv::new();
+        env.trust_test_key();
+        // Before: no document, so the compiled-in call is in force.
+        assert_eq!(
+            effective_invocation(MinerKind::GpuPrl).unwrap(),
+            EngineInvocation::default(),
+            "the floor overrides nothing"
+        );
+
+        let engine_bytes = b"SRBMiner-MULTI 3.6.0 (next fork) payload".to_vec();
+        let sha = sha_of(&engine_bytes);
+        let json = doc_for_this_platform_with(
+            2,
+            "3.6.0",
+            &sha,
+            r#""algorithm":"pearlhash2","extra_args":["--pearl-fork-salt","3"],"parser":"generic","#,
+        );
+        let (bytes, sig, _pk) = sign(&json);
+        let staged = engine_bytes.clone();
+        env.on_fetch(move |_e| Ok(staged.clone()));
+        let mut st = load_state();
+        apply_document(&bytes, &sig, &mut st).expect("accepted");
+
+        let inv = effective_invocation(MinerKind::GpuPrl).expect("invocation in force");
+        assert_eq!(inv.algorithm.as_deref(), Some("pearlhash2"));
+        assert_eq!(
+            inv.extra_args,
+            vec!["--pearl-fork-salt".to_string(), "3".to_string()]
+        );
+        assert_eq!(inv.parser, Some(crate::stats::ParserKind::Generic));
+
+        // And it is visible to the miner, not just to the launch path.
+        let status = status_for_current_platform();
+        let prl = status.iter().find(|s| s.kind == "gpu-prl").expect("status");
+        assert_eq!(prl.algorithm.as_deref(), Some("pearlhash2"));
+        assert_eq!(prl.parser.as_deref(), Some("generic"));
+        assert_eq!(prl.extra_args, vec!["--pearl-fork-salt".to_string(), "3".to_string()]);
+        assert!(prl.downgrade_reason.is_none());
+    }
+
+    /// A DELIBERATE downgrade is surfaced by the same status the CLI and `doctor`
+    /// render — with the published reason, verbatim. A signed rollback to an older
+    /// engine is the shape of the August outage; it may happen, and it may not be
+    /// quiet.
+    #[test]
+    fn a_deliberate_downgrade_is_loud_in_the_status_a_miner_sees() {
+        let env = TestEnv::new();
+        env.trust_test_key();
+        let engine_bytes = b"SRBMiner-MULTI 3.5.0 payload".to_vec();
+        let sha = sha_of(&engine_bytes);
+        let json = doc_for_this_platform_with(
+            2,
+            "3.5.0",
+            &sha,
+            r#""downgrade":true,"downgrade_reason":"3.5.4 crashes on RDNA3; reverting while upstream fixes it","#,
+        );
+        let (bytes, sig, _pk) = sign(&json);
+        let staged = engine_bytes.clone();
+        env.on_fetch(move |_e| Ok(staged.clone()));
+        let mut st = load_state();
+        apply_document(&bytes, &sig, &mut st).expect("a marked downgrade is accepted");
+
+        let status = status_for_current_platform();
+        let prl = status.iter().find(|s| s.kind == "gpu-prl").expect("status");
+        assert_eq!(
+            prl.downgrade_reason.as_deref(),
+            Some("3.5.4 crashes on RDNA3; reverting while upstream fixes it")
         );
     }
 

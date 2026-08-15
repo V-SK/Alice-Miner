@@ -808,9 +808,15 @@ fn headless_startup_rolls_back_a_build_that_never_got_past_launch() {
 }
 
 /// The complement, and the more important half of "does the gate work": a build
-/// on its FIRST start is not rolled back, and — because a `--version` run has no
-/// earning baseline to be judged against — the probation is committed rather
-/// than left armed forever holding a spare copy of the app hostage.
+/// on its FIRST start is not rolled back.
+///
+/// It also pins the F11 fix. `alice-miner --version` prints and exits: it proves
+/// the binary LOADS and proves nothing about mining, so it must be recorded as a
+/// successful launch (or a second `--version` would look like crash-on-launch)
+/// and must NOT commit the update or delete the last-known-good copy. A build
+/// that starts fine and dies the moment it mines therefore still has something to
+/// roll back to. The commit happens when a command the user actually asked for
+/// runs — here, `guide --json`, which is read-only and writes nothing.
 #[test]
 fn headless_startup_does_not_roll_back_a_healthy_first_run() {
     let dir = sandbox("healthy");
@@ -839,6 +845,32 @@ fn headless_startup_does_not_roll_back_a_healthy_first_run() {
         b"LKG-SENTINEL",
         "a first run must NEVER be rolled back"
     );
+    // F11: printing a version is not a successful START.
+    assert!(
+        marker.exists(),
+        "a --version run must not end the probation — it never mined"
+    );
+    assert!(
+        lkg.exists(),
+        "and must not throw away the only copy of the build it replaced"
+    );
+    let rec: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(
+        rec["started_ok"],
+        serde_json::json!(true),
+        "it IS recorded as a successful launch, or the next --version would look \
+         like crash-on-launch and trigger a rollback"
+    );
+
+    // A second `--version` must therefore still be harmless.
+    assert!(run_staged(&app, &dir, &["--version"]).status.success());
+    assert_ne!(std::fs::read(&app).unwrap(), b"LKG-SENTINEL");
+    assert!(lkg.exists());
+
+    // A real command commits, exactly as before — there is no earning baseline
+    // here, so starting is the whole bar and the probation ends.
+    assert!(run_staged(&app, &dir, &["guide", "--json"]).status.success());
     assert!(!marker.exists(), "a committed probation clears its marker");
     assert!(!lkg.exists(), "and drops the last-known-good copy");
     let _ = std::fs::remove_dir_all(&dir);

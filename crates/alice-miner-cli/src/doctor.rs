@@ -192,6 +192,7 @@ pub fn run_checks(lane: Lane, cap: &CapabilityProfile) -> Vec<Check> {
         check_lane_support(lane, cap),
         check_gpu_compute_capability(lane, cap),
         check_engine(lane),
+        check_engine_version_direction(lane),
         check_keyring(lane),
         check_companion(lane),
         check_relay(lane),
@@ -594,6 +595,97 @@ fn check_engine(lane: Lane) -> Check {
                 )
             }
         }
+    }
+}
+
+/// Engine version DIRECTION: is the engine this lane will run older than one this
+/// machine has already run, and was that a decision or a slip?
+///
+/// A signed engine-pin document can point the fleet at any build its allow-listed
+/// upstream still hosts — including an older one. That is a legitimate move (a bad
+/// upstream release happens) and it is also the exact shape of the 78-hour August
+/// 2026 outage, where the pinned engine could not mine the forked chain at all. So
+/// the pin layer refuses an unmarked backwards step outright, and this check makes
+/// the marked ones — and any machine-local regression the document did not
+/// declare — impossible to miss.
+///
+/// WARN, never FAIL: a downgrade the publisher chose and explained is not a broken
+/// machine, and `doctor` must not tell a miner their rig is faulty when the answer
+/// is "we did that on purpose, here is why".
+fn check_engine_version_direction(lane: Lane) -> Check {
+    const NAME: &str = "engine version direction";
+    let kind = kind_for_lane(lane);
+    let manifest_kind = kind.manifest_kind();
+    let Some(pin) = alice_miner_core::engine_pins::status_for_current_platform()
+        .into_iter()
+        .find(|p| p.kind == manifest_kind)
+    else {
+        return Check::skip(
+            NAME,
+            tr!(
+                "no engine pin for this lane on this platform",
+                "此平台的该通道没有引擎 pin"
+            ),
+        );
+    };
+    // No declared version ⇒ no direction to report. (The bundled macOS-arm64 xmrig
+    // is in this state: which upstream build those committed bytes are has never
+    // been established, and guessing one here would be inventing provenance.)
+    let Some(version) = pin.version.clone().filter(|v| !v.trim().is_empty()) else {
+        return Check::skip(
+            NAME,
+            format!(
+                "{} {}",
+                pin.engine,
+                tr!(
+                    "declares no upstream version, so there is no direction to check",
+                    "未声明上游版本,因此无从判断版本方向"
+                )
+            ),
+        );
+    };
+    match (&pin.downgrade_reason, &pin.version_regression_from) {
+        (Some(reason), _) => Check::warn(
+            NAME,
+            format!(
+                "{} {} {version} — {reason}",
+                pin.engine,
+                tr!(
+                    "is pinned as a DELIBERATE DOWNGRADE to",
+                    "被固定为有意降级至"
+                ),
+            ),
+            tr!(
+                "this was published on purpose and signed; if the reason does not make sense to you, run `alice-miner engines` for the full provenance and hold off updating",
+                "这是有意发布并签名的降级;若你不认可其理由,请运行 `alice-miner engines` 查看完整来源信息,并暂缓更新"
+            ),
+        ),
+        (None, Some(from)) => Check::warn(
+            NAME,
+            format!(
+                "{} {version} {} {from}",
+                pin.engine,
+                tr!(
+                    "is not newer than the highest version this machine has run:",
+                    "并不比本机曾运行过的最高版本更新:"
+                ),
+            ),
+            tr!(
+                "an engine that goes backwards without being declared a downgrade is what a 100%-rejection outage looks like; run `alice-miner engines --check` and report it if it persists",
+                "引擎在未声明降级的情况下回退,正是 100% 拒绝型事故的表现;请运行 `alice-miner engines --check`,若仍存在请上报"
+            ),
+        ),
+        (None, None) => Check::pass(
+            NAME,
+            format!(
+                "{} {version} — {}",
+                pin.engine,
+                tr!(
+                    "not a downgrade from anything this machine has run",
+                    "相对本机运行过的版本没有回退"
+                )
+            ),
+        ),
     }
 }
 
@@ -1679,6 +1771,7 @@ mod tests {
         assert!(names.contains(&"lane support"));
         assert!(names.contains(&"gpu compute capability"));
         assert!(names.contains(&"engine"));
+        assert!(names.contains(&"engine version direction"));
         assert!(names.contains(&"keyring (background GPU)"));
         assert!(names.contains(&"relay reachability"));
         assert!(names.contains(&"TLS trust (engine download)"));
@@ -1689,6 +1782,37 @@ mod tests {
                 assert!(!c.fix.is_empty(), "{} ({:?}) must carry a fix", c.name, c.status);
             }
         }
+    }
+
+    /// The engine-version-direction check is present for every lane and — with the
+    /// pins this client ships (a plain upgrade path, no downgrade marker anywhere)
+    /// — must be a PASS. It is never a FAIL: a downgrade the publisher chose and
+    /// explained is not a broken machine, and `doctor` must not tell a miner their
+    /// rig is faulty when the answer is "we did that on purpose".
+    #[test]
+    fn engine_version_direction_is_reported_for_every_lane_and_is_never_a_fail() {
+        for lane in [Lane::Xmr, Lane::GpuPrl, Lane::GpuAlpha, Lane::GpuRvn] {
+            let c = check_engine_version_direction(lane);
+            assert_eq!(c.name, "engine version direction");
+            assert!(!c.detail.is_empty(), "{lane:?} must say something");
+            assert!(
+                !matches!(c.status, Status::Fail),
+                "{lane:?}: a version-direction finding is advisory, never a blocking failure"
+            );
+            if matches!(c.status, Status::Warn) {
+                assert!(!c.fix.is_empty(), "{lane:?}: a WARN must carry a next step");
+            }
+        }
+        // The pins compiled into this build declare no downgrade, so the lanes that
+        // have a real pin pass outright. (GPU-RVN is the all-zero kawpowminer
+        // placeholder — no pin, so it is skipped rather than judged.)
+        let prl = check_engine_version_direction(Lane::GpuPrl);
+        assert!(
+            matches!(prl.status, Status::Pass | Status::Skip),
+            "shipped pins move forward: {:?} — {}",
+            prl.status,
+            prl.detail
+        );
     }
 
     /// GPU-PRL region diagnostics: the three lines appear ONLY for the PRL lane, name

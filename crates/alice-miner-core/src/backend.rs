@@ -464,6 +464,47 @@ const UPSTREAM_POOL_MARKERS: &[&str] = &[
     "nicehash",
 ];
 
+/// Which credit-only / anti-leak invariant a single argv token breaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForbiddenArg {
+    /// A `prl1p…` foundation collection/payout address.
+    PayoutAddress,
+    /// An upstream pool host ([`UPSTREAM_POOL_MARKERS`]); carries which marker hit.
+    UpstreamPool(&'static str),
+    /// The documentation core IP.
+    CoreIp,
+    /// Looks like seed / private-key material.
+    KeyMaterial,
+}
+
+/// The forbidden-content scan of [`assert_no_forbidden`], for ONE already-scrubbed
+/// argv token.
+///
+/// Extracted so there is exactly one implementation of "what an Alice miner argv
+/// may never contain", shared by two callers that arrive from opposite directions:
+/// the custom-miner gate (a user's own binary, argv rendered from a template) and
+/// the engine-pin validator ([`crate::engine_pins`], argv tokens carried by a
+/// SIGNED document). Both are argv this client did not write, so both are held to
+/// the same bar.
+pub fn forbidden_in_arg(scrubbed: &str) -> Option<ForbiddenArg> {
+    let lower = scrubbed.to_ascii_lowercase();
+    if lower.contains("prl1p") {
+        return Some(ForbiddenArg::PayoutAddress);
+    }
+    for marker in UPSTREAM_POOL_MARKERS {
+        if lower.contains(marker) {
+            return Some(ForbiddenArg::UpstreamPool(marker));
+        }
+    }
+    if lower.contains("203.0.113") {
+        return Some(ForbiddenArg::CoreIp);
+    }
+    if scrubbed.contains("seed") || scrubbed.contains("priv") || contains_hex_key(scrubbed) {
+        return Some(ForbiddenArg::KeyMaterial);
+    }
+    None
+}
+
 /// THE HONESTY GATE for the custom argv (design §2.6 / §7), enforced at RUNTIME (a
 /// custom binary isn't SHA-pinned, so this is where the credit-only / anti-leak
 /// invariants are held). Rejects, anywhere in the argv:
@@ -505,32 +546,29 @@ pub fn assert_no_forbidden(args: &[String], lane: Lane, ctx: &ArgContext) -> Res
         } else {
             arg.replace(&ctx.password, "")
         };
-        let lower = scrubbed.to_ascii_lowercase();
-        if lower.contains("prl1p") {
-            return Err(format!(
-                "custom miner argv leaks a prl1p collection/payout address ({arg}); the relay \
-                 assigns collection server-side — remove it"
-            ));
-        }
-        for marker in UPSTREAM_POOL_MARKERS {
-            if lower.contains(marker) {
+        match forbidden_in_arg(&scrubbed) {
+            None => {}
+            Some(ForbiddenArg::PayoutAddress) => {
+                return Err(format!(
+                    "custom miner argv leaks a prl1p collection/payout address ({arg}); the relay \
+                     assigns collection server-side — remove it"
+                ))
+            }
+            Some(ForbiddenArg::UpstreamPool(marker)) => {
                 return Err(format!(
                     "custom miner argv names an upstream pool host `{marker}` ({arg}); point at \
                      the Alice relay only — it forwards upstream server-side"
-                ));
+                ))
             }
-        }
-        if lower.contains("203.0.113") {
-            return Err(format!("custom miner argv leaks a core IP ({arg})"));
-        }
-        if scrubbed.contains("seed")
-            || scrubbed.contains("priv")
-            || contains_hex_key(&scrubbed)
-        {
-            return Err(format!(
-                "custom miner argv looks like it carries seed/private-key material ({arg}); a \
-                 miner only needs your PUBLIC address — never a key"
-            ));
+            Some(ForbiddenArg::CoreIp) => {
+                return Err(format!("custom miner argv leaks a core IP ({arg})"))
+            }
+            Some(ForbiddenArg::KeyMaterial) => {
+                return Err(format!(
+                    "custom miner argv looks like it carries seed/private-key material ({arg}); a \
+                     miner only needs your PUBLIC address — never a key"
+                ))
+            }
         }
     }
     // Pearlhash (PoP) lanes: every stratum authority must be an Alice relay.

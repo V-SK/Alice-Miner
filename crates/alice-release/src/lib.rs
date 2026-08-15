@@ -630,7 +630,7 @@ pub fn parse_verified_manifest(bytes: &[u8]) -> Result<Manifest> {
 /// Parse a dotted numeric version ("1.4.0", "v1.4", "1.4.0-rc1") into a numeric
 /// triple for ordering. Any pre-release suffix after '-' is ignored for the
 /// ordering of the release line; build metadata is not used in our scheme.
-fn parse_version(v: &str) -> (u64, u64, u64) {
+pub(crate) fn parse_version(v: &str) -> (u64, u64, u64) {
     let core = v.trim().trim_start_matches('v');
     let core = core.split(['-', '+']).next().unwrap_or(core);
     let mut it = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
@@ -1907,6 +1907,132 @@ mod tests {
         let vk = embedded_verifying_key().expect("embedded pubkey must parse");
         assert_eq!(vk.to_bytes().len(), 32);
         assert_eq!(B64.decode(RELEASE_PUBKEY_B64).unwrap().len(), 32);
+    }
+
+    // ── The engine-pin SUB-KEY ────────────────────────────────────────────────
+    //
+    // The sub-key is an empty placeholder in this commit and will be pasted in by
+    // hand, from an offline image, when V generates it. A single mistyped
+    // character would leave engine pinning disabled — fail-closed, and therefore
+    // safe, and therefore completely silent. The root key has had
+    // `embedded_pubkey_is_valid_32_byte_ed25519` guarding exactly that since v0.5;
+    // these are its equivalents for the second key.
+
+    /// The sub-key must be one of exactly two things: genuinely ABSENT (the
+    /// honest current state — no key has been generated yet) or a real 32-byte
+    /// ed25519 public key. Anything between the two — a truncated paste, a stray
+    /// space inside the base64, a PEM header, the DER-wrapped form — is a typo
+    /// that would silently switch remote engine pins off on every shipped binary.
+    #[test]
+    fn embedded_engine_pin_subkey_is_absent_or_valid_32_byte_ed25519() {
+        if ENGINE_PIN_PUBKEY_B64.trim().is_empty() {
+            // Absent, and absent means absent: not "  " with a stray character.
+            assert!(
+                ENGINE_PIN_PUBKEY_B64.is_empty(),
+                "an unset engine-pin key must be the empty string, not whitespace"
+            );
+            assert!(
+                engine_pin_key_status().is_err(),
+                "with no sub-key, this build must report engine pins as disabled"
+            );
+            return;
+        }
+        // Present ⇒ it must be a key, and it must be usable by the verifier that
+        // will be handed real documents.
+        let raw = B64
+            .decode(ENGINE_PIN_PUBKEY_B64.trim())
+            .expect("engine-pin sub-key must be valid base64 of the RAW 32 bytes");
+        assert_eq!(
+            raw.len(),
+            32,
+            "engine-pin sub-key must be 32 raw bytes (not DER/PEM-wrapped)"
+        );
+        assert_eq!(
+            ENGINE_PIN_PUBKEY_B64,
+            ENGINE_PIN_PUBKEY_B64.trim(),
+            "no leading/trailing whitespace in the pasted key"
+        );
+        let vk = verifying_key_from_b64(ENGINE_PIN_PUBKEY_B64)
+            .expect("engine-pin sub-key must parse as ed25519");
+        assert_eq!(vk.to_bytes().len(), 32);
+        engine_pin_key_status().expect("a present, valid sub-key must enable engine pins");
+        // And it must be a DIFFERENT key from the release root. Pasting the root
+        // key here would hand `engines.json` the authority we split it away from —
+        // and it would "work", which is what makes it dangerous.
+        assert_ne!(
+            ENGINE_PIN_PUBKEY_B64.trim(),
+            RELEASE_PUBKEY_B64,
+            "the engine-pin sub-key must NOT be the release root key"
+        );
+    }
+
+    /// What actually runs while the sub-key is absent: every production
+    /// verification refuses, including one over a document with a perfectly good
+    /// signature. Fail-closed is only worth anything if it is the code path that
+    /// executes.
+    #[test]
+    fn engine_pin_verification_is_fail_closed_while_the_subkey_is_absent() {
+        if !ENGINE_PIN_PUBKEY_B64.trim().is_empty() {
+            // A provisioned build: the fail-closed branch does not apply. Assert the
+            // positive instead, so this test is never vacuous in either state.
+            let doc = br#"{"schema":1}"#;
+            assert!(
+                verify_engine_pin_sig(doc, "not-a-signature").is_err(),
+                "garbage must still fail against a real key"
+            );
+            return;
+        }
+        let doc = br#"{"schema":1,"product":"alice-miner-engines","epoch":1}"#;
+        let good_sig = sign_b64(doc); // a genuinely valid signature, wrong key
+        let err = verify_engine_pin_sig(doc, &good_sig).unwrap_err();
+        assert!(
+            err.contains("no engine-pin public key"),
+            "the refusal must say WHY, verbatim, for the status line: {err}"
+        );
+        assert!(engine_pin_key_status().unwrap_err().contains("disabled"));
+        // The explicit-key form still works — it is what the test suite and the
+        // publishing tooling use to prove a freshly-signed document verifies BEFORE
+        // it is uploaded. It must not have been disabled along with the embedded key.
+        verify_engine_pin_sig_with(doc, &good_sig, &test_pubkey_b64())
+            .expect("explicit-key verification is unaffected by the absent embedded key");
+    }
+
+    /// The sub-key verifies the SAME scheme the offline signer produces
+    /// (`openssl pkeyutl -sign -rawin` over the exact document bytes), and one
+    /// flipped byte anywhere in the document breaks it.
+    #[test]
+    fn engine_pin_signature_scheme_matches_the_offline_signer() {
+        let doc = br#"{"schema":1,"product":"alice-miner-engines","epoch":2}"#;
+        let sig = sign_b64(doc);
+        verify_engine_pin_sig_with(doc, &sig, &test_pubkey_b64()).expect("clean doc verifies");
+
+        let mut tampered = doc.to_vec();
+        let pos = tampered.iter().position(|b| *b == b'2').unwrap();
+        tampered[pos] = b'3';
+        verify_engine_pin_sig_with(&tampered, &sig, &test_pubkey_b64())
+            .expect_err("a one-byte edit must NOT verify");
+
+        // A key that is not a key is refused rather than treated as "no key".
+        for bad in ["not base64!!", "c2hvcnQ=", ""] {
+            assert!(verify_engine_pin_sig_with(doc, &sig, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The engine-pin document URL is the miner's own release channel and is
+    /// overridable only through the documented env var (staging / tests).
+    #[test]
+    fn engines_url_defaults_to_the_miner_release_asset() {
+        let _g = DATA_ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(ENGINES_URL_ENV);
+        assert_eq!(engines_url(), DEFAULT_ENGINES_URL);
+        assert!(DEFAULT_ENGINES_URL.starts_with("https://"));
+        assert!(DEFAULT_ENGINES_URL.ends_with("/engines.json"));
+        std::env::set_var(ENGINES_URL_ENV, "https://staging.example/engines.json");
+        assert_eq!(engines_url(), "https://staging.example/engines.json");
+        // A blank override is not an override (it must not blank the URL).
+        std::env::set_var(ENGINES_URL_ENV, "   ");
+        assert_eq!(engines_url(), DEFAULT_ENGINES_URL);
+        std::env::remove_var(ENGINES_URL_ENV);
     }
 
     #[test]
