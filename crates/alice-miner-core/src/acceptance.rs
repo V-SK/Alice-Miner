@@ -264,6 +264,95 @@ impl LaneVerdict {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Is this lane MINING, or is the guard using it to take a measurement?
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What Layer 3 is doing with a lane right now — and therefore whether that lane's
+/// share counters are evidence about the **installed client build** at all.
+///
+/// # Why this is not a boolean
+///
+/// It used to be one (`halted`), and the boolean was asked two different questions
+/// by two different layers. Layer 3 read it as "is the engine stopped by the
+/// guard?", which is what it means. The auto-updater's health probation (Layer 2)
+/// read it as "is this session's zero-accepted stretch the guard's doing?", which
+/// is *not* the same question — and the two answers diverge for the whole of a
+/// re-probe window.
+///
+/// A re-probe MUST clear `halted`, or the three gates that suppress every automatic
+/// restart would also refuse to start the probe child. So during a re-probe the lane
+/// reported `halted: false, accepted: 0` — indistinguishable, to Layer 2, from an
+/// ordinary miner that has simply stopped earning. On the exact release whose whole
+/// purpose is to survive an upstream fork, that reads as "the build I installed does
+/// not earn" and rolls it back and pins it permanently.
+///
+/// So the state is named for the question Layer 2 actually asks, it has a variant
+/// for the case the boolean could not express, and [`Self::is_ordinary_mining`]
+/// matches exhaustively with no wildcard: a fourth variant cannot be added without
+/// somebody deciding, at this one place, which side of the line it falls on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuardCustody {
+    /// Ordinary mining. The share counters mean what they say, so this lane's
+    /// session IS evidence about the build.
+    #[default]
+    Mining,
+    /// A deliberate acceptance RE-PROBE: the guard still owns this lane (it has a
+    /// halt on the ladder) and is spending one window MEASURING rather than earning.
+    /// The child is running and `halted` is false — that is the whole point — but a
+    /// zero here is the guard's doing, not the build's.
+    Probing,
+    /// Stopped by the guard, or parked by a persisted halt with no child at all.
+    Halted,
+}
+
+impl GuardCustody {
+    /// Every variant, so a test can enumerate them and a new one shows up as a
+    /// length mismatch instead of quietly never being considered.
+    pub const ALL: [GuardCustody; 3] =
+        [GuardCustody::Mining, GuardCustody::Probing, GuardCustody::Halted];
+
+    /// Whether this lane is earning on its own account — the ONLY state in which its
+    /// share counters may be held against (or credited to) the installed build.
+    ///
+    /// Exhaustive on purpose: no `_ =>` arm, so widening this enum is a decision
+    /// somebody has to make here rather than an omission that silently re-narrows
+    /// the abstain back to where it was.
+    pub fn is_ordinary_mining(self) -> bool {
+        match self {
+            GuardCustody::Mining => true,
+            GuardCustody::Probing | GuardCustody::Halted => false,
+        }
+    }
+
+    /// The stronger of two activities, where "stronger" means "further from
+    /// ordinary mining". Used to fold a dual-mine run's lanes into one answer: if
+    /// ANY lane is under the guard, the session is not evidence about the build.
+    pub fn strongest(self, other: GuardCustody) -> GuardCustody {
+        match (self, other) {
+            (GuardCustody::Halted, _) | (_, GuardCustody::Halted) => GuardCustody::Halted,
+            (GuardCustody::Probing, _) | (_, GuardCustody::Probing) => GuardCustody::Probing,
+            _ => GuardCustody::Mining,
+        }
+    }
+
+    /// A stable machine key (snapshots, logs, a front-end that localizes itself).
+    pub fn key(self) -> &'static str {
+        match self {
+            GuardCustody::Mining => "mining",
+            GuardCustody::Probing => "probing",
+            GuardCustody::Halted => "halted",
+        }
+    }
+
+    /// Serde helper: `Mining` is the wire default, so it is omitted from JSON and an
+    /// older stream that never carried the field reads back as `Mining`.
+    pub fn is_mining(&self) -> bool {
+        matches!(self, GuardCustody::Mining)
+    }
+}
+
 /// The evidence behind a [`LaneVerdict::Collapsed`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Collapse {
@@ -411,6 +500,17 @@ impl AcceptanceMonitor {
     /// Nor does carrying the window across a rotation risk a false halt: if the new
     /// region IS healthy its accepts land in the same window and drag the rate UP,
     /// and any accepted share at all disqualifies the shutout rule.
+    ///
+    /// That last paragraph was only true once the SUPERVISOR stopped presenting a
+    /// counter regression here. The replacement child is a new process whose counters
+    /// start at zero, and the supervisor used to feed those straight in — so this
+    /// no-op met a stream that had just fallen off a cliff, [`Self::rebaseline`] fired,
+    /// and the accepts already banked in the open period were subtracted away while the
+    /// period kept its start time and its spent warm-up grace. A slow-but-working rig
+    /// was then judged on the replacement's first twenty submissions alone and reported
+    /// as a total shutout. The supervisor now adds each child's counters to what the run
+    /// already earned (`supervise::adopt_child_accepted`), so the stream is continuous
+    /// across the seam and this really is the no-op it says it is.
     pub fn on_failover(&mut self, _now: Instant) {}
 
     /// Feed the lane's CUMULATIVE counters and get the resulting verdict.
@@ -513,6 +613,13 @@ impl AcceptanceMonitor {
     /// Move every baseline down to a counter stream that restarted beneath us,
     /// preserving elapsed time (so a re-baseline cannot also reset the clock and
     /// hold a period open forever).
+    ///
+    /// Scope: a MID-STREAM glitch — a custom miner re-reading its log, a mis-parsed
+    /// line the `fold_cumulative` belt let through. It is deliberately NOT the engine
+    /// restart path: keeping the clock while erasing the accepts is right for a glitch
+    /// (the shares really were counted, we just lost the reading) and wrong for a new
+    /// process (the shares were counted by somebody else). The supervisor keeps the
+    /// restart path off this function entirely — see [`Self::on_failover`].
     fn rebaseline(&mut self, now: Instant, accepted: u64, rejected: u64) {
         if let Some(b) = self.warm_baseline.as_mut() {
             b.accepted = b.accepted.min(accepted);
@@ -1532,6 +1639,60 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
             assert_eq!(load_halt_record(Lane::Xmr), None, "wrong lane must fail open");
         });
+    }
+
+    // ── The custody state that replaced the `halted` boolean ────────────────
+
+    /// ONLY ordinary mining is evidence about the installed build, and the set of
+    /// states is closed. A future variant must show up here — as a length mismatch on
+    /// [`GuardCustody::ALL`] or as a non-exhaustive match — rather than quietly
+    /// defaulting to "judge it", which is the direction that uninstalls a release.
+    #[test]
+    fn only_ordinary_mining_is_evidence_about_the_installed_build() {
+        assert_eq!(GuardCustody::ALL.len(), 3, "a new custody state must be classified below");
+        for c in GuardCustody::ALL {
+            let ordinary = match c {
+                GuardCustody::Mining => true,
+                GuardCustody::Probing | GuardCustody::Halted => false,
+            };
+            assert_eq!(c.is_ordinary_mining(), ordinary, "{c:?}");
+        }
+        // The one the boolean could not express: a re-probe is RUNNING and not halted,
+        // and is still not the build's session.
+        assert!(!GuardCustody::Probing.is_ordinary_mining());
+        assert_eq!(GuardCustody::default(), GuardCustody::Mining);
+    }
+
+    /// Folding a dual-mine run: any lane under the guard decides for the session, and
+    /// a halt outranks a probe (it is the stronger statement and the better log line).
+    #[test]
+    fn custody_folds_to_the_strongest_answer_across_lanes() {
+        use GuardCustody::*;
+        assert_eq!(Mining.strongest(Mining), Mining);
+        for c in [Probing, Halted] {
+            assert_eq!(Mining.strongest(c), c, "{c:?} must win over ordinary mining");
+            assert_eq!(c.strongest(Mining), c, "and in either order");
+        }
+        assert_eq!(Probing.strongest(Halted), Halted);
+        assert_eq!(Halted.strongest(Probing), Halted);
+        // Folding is what `MiningEvidence::from_snapshot` does over the lane rows.
+        let folded = [Mining, Probing, Mining].iter().fold(Mining, |a, b| a.strongest(*b));
+        assert_eq!(folded, Probing);
+        assert!(!folded.is_ordinary_mining());
+    }
+
+    /// The wire form is a stable lowercase key, `Mining` is the JSON default, and an
+    /// absent field reads back as `Mining` (so an older stream deserializes cleanly —
+    /// its `halted` is what still speaks for it).
+    #[test]
+    fn custody_round_trips_on_the_wire_and_defaults_to_mining() {
+        for c in GuardCustody::ALL {
+            let json = serde_json::to_string(&c).unwrap();
+            assert_eq!(json, format!("\"{}\"", c.key()), "{c:?}");
+            assert_eq!(serde_json::from_str::<GuardCustody>(&json).unwrap(), c);
+        }
+        assert!(GuardCustody::Mining.is_mining());
+        assert!(!GuardCustody::Probing.is_mining());
     }
 
     #[test]

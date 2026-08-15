@@ -24,6 +24,7 @@ use alice_supervise::ProcState;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
+use crate::acceptance::GuardCustody;
 use crate::detect::DeviceProfile;
 use crate::endpoint::{Endpoint, EndpointPlan};
 use crate::identity::{self, Identity};
@@ -319,6 +320,62 @@ pub struct LaneSnapshot {
     /// (nearly) everything it submitted. Nothing will restart it automatically.
     #[serde(default)]
     pub halted: bool,
+    /// LAYER 3 — what the acceptance guard is DOING with this lane: mining on its own
+    /// account, spending a window re-measuring ([`GuardCustody::Probing`]), or stopped.
+    /// Strictly richer than [`Self::halted`], which is false for the whole of a
+    /// re-probe run and therefore cannot answer "is this lane's zero the guard's
+    /// doing?". `#[serde(default)]` + omitted-when-`Mining`, so the wire stays additive
+    /// and an older stream reads back as ordinary mining (its `halted` still speaks).
+    #[serde(default, skip_serializing_if = "GuardCustody::is_mining")]
+    pub activity: GuardCustody,
+}
+
+impl LaneSnapshot {
+    /// The per-lane row for a live supervisor. THE derivation — [`build_snapshot`] is
+    /// its only production caller and the cross-layer tests use it too, so a test can
+    /// never assert against a hand-rolled row that quietly omits the field the bug is
+    /// about (which is how F4's original regression test passed while the wiring was
+    /// broken).
+    pub(crate) fn from_stats(st: &crate::supervise::LaneStats) -> Self {
+        Self {
+            lane: st.lane,
+            state: st.state.into(),
+            hashrate_hs: st.hashrate_hs,
+            hashrate_60s_hs: st.hashrate_60s_hs,
+            hashrate_15m_hs: st.hashrate_15m_hs,
+            shares_accepted: st.accepted,
+            shares_rejected: st.rejected,
+            // This lane's OWN uptime (not the process's) — feeds the per-lane WARMUP
+            // grace so a late-restarting lane isn't mis-flagged STALL (NIT A).
+            uptime_s: st.uptime_s,
+            endpoint: st.endpoint.clone(),
+            failovers: st.failovers,
+            // Per-lane GPU telemetry (engine stdout or nvidia-smi fallback; hottest card).
+            temp_c: st.temp_c,
+            power_w: st.power_w,
+            util_pct: st.util_pct,
+            fan_pct: st.fan_pct,
+            acceptance: st.acceptance.to_string(),
+            accept_pct: st.accept_pct,
+            halted: st.halted,
+            activity: st.activity,
+        }
+    }
+
+    /// What the acceptance guard is doing with this lane, reading BOTH fields.
+    ///
+    /// [`Self::halted`] predates [`Self::activity`] and an older `--json` stream
+    /// carries only the former, so a `halted` row is reported as
+    /// [`GuardCustody::Halted`] even when `activity` deserialized to its default. The
+    /// two can only ever agree upward: nothing here can talk a halted lane back into
+    /// looking like ordinary mining, which is the direction that caused F4.
+    pub fn activity(&self) -> GuardCustody {
+        if self.halted {
+            GuardCustody::Halted
+        } else {
+            self.activity
+        }
+    }
 }
 
 impl Snapshot {
@@ -1560,29 +1617,7 @@ fn build_snapshot(
 
     // Per-lane breakdown (every supervisor in the set).
     for s in &run.supervisors {
-        let st = s.stats();
-        snap.lanes.push(LaneSnapshot {
-            lane: st.lane,
-            state: st.state.into(),
-            hashrate_hs: st.hashrate_hs,
-            hashrate_60s_hs: st.hashrate_60s_hs,
-            hashrate_15m_hs: st.hashrate_15m_hs,
-            shares_accepted: st.accepted,
-            shares_rejected: st.rejected,
-            // This lane's OWN uptime (not the process's) — feeds the per-lane WARMUP
-            // grace so a late-restarting lane isn't mis-flagged STALL (NIT A).
-            uptime_s: st.uptime_s,
-            endpoint: st.endpoint.clone(),
-            failovers: st.failovers,
-            // Per-lane GPU telemetry (engine stdout or nvidia-smi fallback; hottest card).
-            temp_c: st.temp_c,
-            power_w: st.power_w,
-            util_pct: st.util_pct,
-            fan_pct: st.fan_pct,
-            acceptance: st.acceptance.to_string(),
-            accept_pct: st.accept_pct,
-            halted: st.halted,
-        });
+        snap.lanes.push(LaneSnapshot::from_stats(&s.stats()));
     }
 
     // Top-level mirror = the primary lane (single-lane UI compatibility). For the
@@ -1880,6 +1915,7 @@ mod tests {
                     acceptance: "healthy".into(),
                     accept_pct: Some(99.0),
                     halted: false,
+                    activity: GuardCustody::Mining,
                 },
                 LaneSnapshot {
                     lane: Lane::GpuRvn,
@@ -1900,6 +1936,7 @@ mod tests {
                     acceptance: "healthy".into(),
                     accept_pct: Some(99.0),
                     halted: false,
+                    activity: GuardCustody::Mining,
                 },
             ],
             last_line: Some("net accepted (7/1)".into()),

@@ -1128,6 +1128,7 @@ mod tests {
                 acceptance: "healthy".into(),
                 accept_pct: Some(99.0),
                 halted: false,
+                activity: alice_miner_core::acceptance::GuardCustody::Mining,
             }],
             last_line: Some("net accepted (142/1) diff 100".into()),
             message: None,
@@ -1175,6 +1176,7 @@ mod tests {
                     acceptance: "healthy".into(),
                     accept_pct: Some(99.0),
                     halted: false,
+                    activity: alice_miner_core::acceptance::GuardCustody::Mining,
                 },
                 LaneSnapshot {
                     lane: Lane::GpuRvn,
@@ -1194,6 +1196,7 @@ mod tests {
                     acceptance: "healthy".into(),
                     accept_pct: Some(99.0),
                     halted: false,
+                    activity: alice_miner_core::acceptance::GuardCustody::Mining,
                 },
             ],
             last_line: Some("Speed 25.00 Mh/s gpu0".into()),
@@ -1487,6 +1490,7 @@ mod tests {
             acceptance: "healthy".into(),
             accept_pct: Some(99.0),
             halted: false,
+            activity: alice_miner_core::acceptance::GuardCustody::Mining,
         }];
         let t = render_lane_table(&s, false);
         assert!(t.contains("62°C"), "telemetry sub-row present: {t}");
@@ -1521,6 +1525,7 @@ mod tests {
             acceptance: "healthy".into(),
             accept_pct: Some(99.0),
             halted: false,
+            activity: alice_miner_core::acceptance::GuardCustody::Mining,
         }];
         let plain = render_lane_table(&s, false);
         assert!(!plain.contains('\x1b'), "no ANSI when color off");
@@ -1552,6 +1557,7 @@ mod tests {
             acceptance: "healthy".into(),
             accept_pct: Some(99.0),
             halted: false,
+            activity: alice_miner_core::acceptance::GuardCustody::Mining,
         }];
         let t = render_lane_table(&s, false);
         assert!(t.contains("42 sub"), "submitted label: {t}");
@@ -1616,6 +1622,7 @@ mod tests {
             acceptance: "healthy".into(),
             accept_pct: Some(99.0),
             halted: false,
+            activity: alice_miner_core::acceptance::GuardCustody::Mining,
         }];
         let out = render_snapshot(&s);
         assert!(out.contains("42 submitted"), "submitted label + count: {out}");
@@ -2038,6 +2045,7 @@ mod tests {
                 acceptance: "healthy".into(),
                 accept_pct: Some(99.0),
                 halted: false,
+                activity: alice_miner_core::acceptance::GuardCustody::Mining,
             }],
             last_line: None,
             message: None,

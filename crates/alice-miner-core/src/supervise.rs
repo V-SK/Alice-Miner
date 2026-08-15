@@ -39,7 +39,7 @@ use alice_supervise::{sanitize_log_line, ProcState, RestartPolicy, RetryLadder};
 
 use crate::acceptance::{
     self, AcceptanceConfig, AcceptanceMonitor, Attribution, Collapse, HaltRecord, HaltResume,
-    LaneVerdict,
+    GuardCustody, LaneVerdict,
 };
 use crate::endpoint::{Endpoint, EndpointPlan};
 use crate::lane::Lane;
@@ -357,6 +357,13 @@ pub struct LaneStats {
     /// The lane was stopped by the acceptance guard (not a crash, not a user stop).
     /// Nothing will restart it automatically.
     pub halted: bool,
+    /// What the acceptance guard is DOING with this lane — mining, measuring
+    /// ([`GuardCustody::Probing`]) or stopped. Strictly richer than [`Self::halted`]:
+    /// a re-probe run has `halted == false` (it must, or its own child could not
+    /// start) and is still not evidence about the installed build. Anything that
+    /// reasons about "did this lane earn on its own account" must read THIS, not
+    /// `halted` — see [`GuardCustody`].
+    pub activity: GuardCustody,
 }
 
 impl LaneStats {
@@ -387,6 +394,7 @@ impl LaneStats {
             acceptance: "warmup",
             accept_pct: None,
             halted: false,
+            activity: GuardCustody::Mining,
         }
     }
 }
@@ -435,8 +443,32 @@ struct Inner {
     telem_power_w: Option<f64>,
     telem_util_pct: Option<f64>,
     telem_fan_pct: Option<f64>,
+    /// The RUN's cumulative share totals — the numbers the user sees, and the ONLY
+    /// pair anything else in this file compares against a baseline.
+    ///
+    /// They are NOT the engine child's counters. An engine child is replaced on every
+    /// Layer-B failover and on every crash restart, and the replacement's `Total:` line
+    /// starts again at `A:1` — so assigning a child's reading straight into these (which
+    /// is what every parser used to do) silently reset the run to the newest child's
+    /// counts. That is the shared root of four separate bugs: the watchdog's progress
+    /// baseline became unbeatable, the acceptance monitor saw a counter regression and
+    /// re-baselined a still-open period down to zero, and the user's session totals
+    /// visibly went backwards. See [`Inner::carry_accepted`] / [`adopt_child_accepted`].
     accepted: u64,
     rejected: u64,
+    /// What the engine children BEFORE the current one contributed to this run. Frozen
+    /// at each relaunch that keeps the run alive (failover / crash restart) and zero on
+    /// a fresh start or a re-probe, so the run totals are `carry + the current child's
+    /// own cumulative reading` and never move backwards just because a process was
+    /// replaced.
+    carry_accepted: u64,
+    carry_rejected: u64,
+    /// The latest RAW cumulative reading from the CURRENT child — what the parser
+    /// actually saw. Kept so the next reading can be folded against the right thing
+    /// (the [`ParserKind::Generic`] re-baseline belt reasons about the CHILD's counter,
+    /// not the run's) and so a relaunch has an unambiguous zero to start from.
+    child_accepted: u64,
+    child_rejected: u64,
     last_line: String,
     /// When the current run started (for uptime).
     started_at: Option<std::time::Instant>,
@@ -574,6 +606,34 @@ struct Inner {
     /// releasing the lock (disk I/O off the stats hot-path — same pattern as
     /// [`Self::pending_good_region`]).
     pending_halt_clear: bool,
+
+    /// How far the log-file tail ([`tail_log_file_into`]) has read, and in WHICH file.
+    ///
+    /// A file-logging engine (SRBMiner is the PRL lane's) keeps the same `--log-file`
+    /// across a Layer-B failover, because the path is captured once per run by the
+    /// lane's rebuild closure. A replacement child therefore APPENDS to a file that
+    /// already holds the previous child's whole history — and a tail that restarts at
+    /// byte 0 replays it, walking the run's counters up to the old child's totals and
+    /// then back down when the new child's own lines arrive. Remembering the position
+    /// makes the relaunch see only what the NEW child wrote.
+    log_tail_at: Option<(std::path::PathBuf, u64)>,
+}
+
+/// Adopt a raw ACCEPTED reading from the current engine child into the run totals.
+///
+/// The parser hands us the CHILD's cumulative counter; the run's total is that plus
+/// whatever earlier children of this run contributed ([`Inner::carry_accepted`]). One
+/// function so no parser arm can go back to assigning the child's number straight into
+/// the run's — which is the bug this exists to make unrepresentable.
+fn adopt_child_accepted(g: &mut Inner, raw: u64) {
+    g.child_accepted = raw;
+    g.accepted = g.carry_accepted.saturating_add(raw);
+}
+
+/// [`adopt_child_accepted`] for the REJECTED counter.
+fn adopt_child_rejected(g: &mut Inner, raw: u64) {
+    g.child_rejected = raw;
+    g.rejected = g.carry_rejected.saturating_add(raw);
 }
 
 /// Fold a new reading of a CUMULATIVE counter (accepted / rejected shares) coming
@@ -688,6 +748,10 @@ impl LaneSupervisor {
                 telem_fan_pct: None,
                 accepted: 0,
                 rejected: 0,
+                carry_accepted: 0,
+                carry_rejected: 0,
+                child_accepted: 0,
+                child_rejected: 0,
                 last_line: String::new(),
                 started_at: None,
                 stop_requested: false,
@@ -725,6 +789,7 @@ impl LaneSupervisor {
                 halt_probe_at: None,
                 reprobe_override: None,
                 pending_halt_clear: false,
+                log_tail_at: None,
             })),
         }
     }
@@ -861,6 +926,7 @@ impl LaneSupervisor {
             },
             accept_pct: g.acceptance.verdict().accept_pct(),
             halted: g.halted,
+            activity: lane_activity(&g),
         }
     }
 
@@ -1297,9 +1363,21 @@ impl LaneSupervisor {
             // relaunch, KEEP the cumulative accepted/rejected (the user's session
             // totals shouldn't reset just because we rotated endpoints) but re-arm the
             // progress mark so the new child gets a full window to make progress.
+            //
+            // That "KEEP" was the intent and NOT the behaviour: the child we are about
+            // to spawn is a new process whose own counters start again at zero, and
+            // every parser assigned those straight into the run totals — so the totals
+            // fell to the newest child's counts a moment later, taking the watchdog's
+            // progress baseline, the acceptance monitor's open period and the user's
+            // visible numbers with them. The child's counter is now tracked apart from
+            // the run's and added to a carry, so the two can never be confused again.
+            g.child_accepted = 0;
+            g.child_rejected = 0;
             if kind.resets_counters() {
                 g.accepted = 0;
                 g.rejected = 0;
+                g.carry_accepted = 0;
+                g.carry_rejected = 0;
                 g.best_hashrate_hs = 0.0;
                 // A fresh start is the user's explicit act (possibly after updating),
                 // so it also clears an acceptance halt and every judgement behind it —
@@ -1316,6 +1394,14 @@ impl LaneSupervisor {
                     g.halt_probe_at = None;
                 }
             } else {
+                // A failover / crash restart keeps the run alive, so everything the run
+                // has already counted becomes the carry the new child is added to. This
+                // is what makes the acceptance monitor's stream CONTINUOUS across the
+                // seam: it never sees the regression that used to make it re-baseline a
+                // half-finished period down to zero and then call a working rig a total
+                // shutout on the replacement's first twenty submissions.
+                g.carry_accepted = g.accepted;
+                g.carry_rejected = g.rejected;
                 // A failover deliberately carries the evidence over — see
                 // `AcceptanceMonitor::on_failover` for why resetting here would
                 // reproduce the incident.
@@ -2362,6 +2448,29 @@ fn set_halt_status_locked(
     );
 }
 
+/// What Layer 3 is doing with this lane right now — the ONE derivation of
+/// [`GuardCustody`], read by [`LaneStats::activity`] and from there by the
+/// auto-updater's health probation.
+///
+/// The middle case is the one that matters and the one a boolean could not carry.
+/// `halted` is deliberately FALSE for the whole of a re-probe run — `charge_reprobe`
+/// and `spawn_run` both clear it, because the halt gates would otherwise refuse to
+/// start the probe's own child — so `halted` alone reports a re-probing lane as an
+/// ordinary miner that happens to have earned nothing. It is not: the guard still owns
+/// it, which is exactly what an unspent rung (`halt_probes > 0`) or a live halt record
+/// says, and both are retired by the only two things that legitimately hand the lane
+/// back — a MEASURED healthy period (`apply_log_line`) or a user Start
+/// (`clear_halt_state`). Those retirements are why this cannot get stuck abstaining.
+fn lane_activity(g: &Inner) -> GuardCustody {
+    if g.halted {
+        GuardCustody::Halted
+    } else if g.halt_probes > 0 || g.halt_record.is_some() {
+        GuardCustody::Probing
+    } else {
+        GuardCustody::Mining
+    }
+}
+
 /// How long until this lane's next automatic re-probe: the production ladder rung for
 /// the re-probes already spent, unless a test compressed it.
 fn reprobe_wait(g: &Inner) -> Duration {
@@ -3255,9 +3364,9 @@ fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
                 g.hashrate_15m_hs = w15;
             }
             if let Some((accepted, rejected)) = parse_share_counts(&line) {
-                g.accepted = accepted;
-                g.rejected = rejected;
-                note_accepted_progress(g, accepted);
+                adopt_child_accepted(g, accepted);
+                adopt_child_rejected(g, rejected);
+                note_accepted_progress(g, g.accepted);
             }
         }
         ParserKind::Kawpow => {
@@ -3267,9 +3376,9 @@ fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
                     note_hashrate_progress(g, hr);
                 }
                 if let (Some(a), Some(r)) = (sample.accepted, sample.rejected) {
-                    g.accepted = a;
-                    g.rejected = r;
-                    note_accepted_progress(g, a);
+                    adopt_child_accepted(g, a);
+                    adopt_child_rejected(g, r);
+                    note_accepted_progress(g, g.accepted);
                 }
                 apply_telemetry(g, &sample);
             }
@@ -3293,11 +3402,11 @@ fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
                     note_hashrate_progress(g, hr);
                 }
                 if let Some(a) = sample.accepted {
-                    g.accepted = a;
-                    note_accepted_progress(g, a);
+                    adopt_child_accepted(g, a);
+                    note_accepted_progress(g, g.accepted);
                 }
                 if let Some(r) = sample.rejected {
-                    g.rejected = r;
+                    adopt_child_rejected(g, r);
                 }
                 apply_telemetry(g, &sample);
             }
@@ -3315,8 +3424,8 @@ fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
                     note_hashrate_progress(g, hr);
                 }
                 if let Some(a) = sample.accepted {
-                    g.accepted = a;
-                    note_accepted_progress(g, a);
+                    adopt_child_accepted(g, a);
+                    note_accepted_progress(g, g.accepted);
                 }
                 apply_telemetry(g, &sample);
             }
@@ -3341,16 +3450,22 @@ fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
                     g.hashrate_hs = Some(hr);
                     note_hashrate_progress(g, hr);
                 }
+                // Folded against the CHILD's counter, not the run's: `fold_cumulative`
+                // reasons about one process's output stream (a mis-read line versus a
+                // real engine re-baseline), and the run total is that child's folded
+                // value plus the carry.
                 if let Some(a) = sample.accepted {
                     let mut pending = g.generic_accepted_pending;
-                    g.accepted = fold_cumulative(g.accepted, &mut pending, a);
+                    let folded = fold_cumulative(g.child_accepted, &mut pending, a);
                     g.generic_accepted_pending = pending;
+                    adopt_child_accepted(g, folded);
                     note_accepted_progress(g, g.accepted);
                 }
                 if let Some(r) = sample.rejected {
                     let mut pending = g.generic_rejected_pending;
-                    g.rejected = fold_cumulative(g.rejected, &mut pending, r);
+                    let folded = fold_cumulative(g.child_rejected, &mut pending, r);
                     g.generic_rejected_pending = pending;
+                    adopt_child_rejected(g, folded);
                 }
                 apply_telemetry(g, &sample);
             }
@@ -3421,6 +3536,16 @@ fn extract_log_file_arg(args: &[String]) -> Option<std::path::PathBuf> {
 ///   re-read whole next tick (never splits a share/hashrate line). Offset is tracked
 ///   in RAW bytes (not the lossy-decoded string) so multi-byte/invalid bytes can't
 ///   desync it. Bounded per-poll read so a runaway file can't stall the task.
+/// * **resumes where the previous child left off** ([`Inner::log_tail_at`]) when the
+///   path is unchanged. A Layer-B failover relaunches SRBMiner against the SAME
+///   `--log-file` (the lane's rebuild closure captures the path once per run), so a
+///   tail that restarted at byte 0 would re-feed the previous child's entire share
+///   history into the replacement's counters — a spike up to the old totals followed
+///   by a drop back to the new child's, which is precisely the counter regression the
+///   acceptance monitor mistakes for a shutout. Resuming is verified, not assumed: the
+///   byte before the stored offset must still be a newline, so a file that was
+///   truncated and re-grown past the old position is read from the top instead of
+///   mid-line.
 async fn tail_log_file_into(
     path: std::path::PathBuf,
     tx: UnboundedSender<LogLine>,
@@ -3430,7 +3555,16 @@ async fn tail_log_file_into(
     use std::io::{Read, Seek, SeekFrom};
     const POLL: Duration = Duration::from_millis(1000);
     const MAX_READ: usize = 256 * 1024;
-    let mut offset: u64 = 0;
+    let mut offset: u64 = {
+        let g = inner.lock().expect("mutex");
+        match &g.log_tail_at {
+            Some((p, at)) if *p == path => *at,
+            _ => 0,
+        }
+    };
+    if offset > 0 && !resumes_on_a_line_boundary(&path, offset) {
+        offset = 0;
+    }
     loop {
         tokio::time::sleep(POLL).await;
         if inner.lock().expect("mutex").generation != gen {
@@ -3466,6 +3600,16 @@ async fn tail_log_file_into(
             None => continue, // no complete line yet — re-read next tick
         };
         offset += consume as u64;
+        // Publish the position so the NEXT child's tail resumes here instead of
+        // replaying this child's lines. Generation-checked: a stale tail that raced
+        // one poll past the relaunch must not rewind the live one.
+        {
+            let mut g = inner.lock().expect("mutex");
+            if g.generation != gen {
+                return;
+            }
+            g.log_tail_at = Some((path.clone(), offset));
+        }
         for line in String::from_utf8_lossy(&buf[..consume]).lines() {
             if tx
                 .send(LogLine {
@@ -3478,6 +3622,30 @@ async fn tail_log_file_into(
             }
         }
     }
+}
+
+/// Whether `offset` still sits immediately after a newline in `path` — i.e. whether a
+/// resume there would start on a whole line.
+///
+/// The stored offset is only ever advanced past a `\n`, so this is true whenever the
+/// file is the same one that produced it. It is FALSE when the file was truncated and
+/// re-grown past the old position (an engine that rewrites its log rather than
+/// appending, racing our ~1 s poll), which is the one case where resuming would splice
+/// a partial line into the parser. Reads a single byte.
+fn resumes_on_a_line_boundary(path: &std::path::Path, offset: u64) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        // Not created yet: nothing has replaced it, so the recorded position stands.
+        return true;
+    };
+    if f.metadata().map(|m| m.len()).unwrap_or(0) < offset {
+        return false; // shorter than where we were → definitely a new file
+    }
+    if f.seek(SeekFrom::Start(offset - 1)).is_err() {
+        return false;
+    }
+    let mut b = [0u8; 1];
+    matches!(f.read(&mut b), Ok(1) if b[0] == b'\n')
 }
 
 /// One row of the `nvidia-smi` telemetry query (the hottest card is picked across rows).
@@ -3941,6 +4109,21 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("a halt must reach the disk");
+    }
+
+    /// The engine [`crate::engine::Snapshot`] a front-end would see for this lane,
+    /// built through the SHIPPED per-lane derivation. Cross-layer tests must go through
+    /// it: a hand-written `LaneSnapshot` literal is a test that silently stops covering
+    /// every field added after it was written.
+    fn snapshot_of(s: &LaneSupervisor) -> crate::engine::Snapshot {
+        let st = s.stats();
+        let mut snap = crate::engine::Snapshot::idle();
+        snap.lane = Some(st.lane);
+        snap.state = st.state.into();
+        snap.shares_accepted = st.accepted;
+        snap.shares_rejected = st.rejected;
+        snap.lanes = vec![crate::engine::LaneSnapshot::from_stats(&st)];
+        snap
     }
 
     /// Wait (bounded) for `pred` to hold of the lane's stats.
@@ -5909,31 +6092,13 @@ mod tests {
             let st = s.stats();
             assert_eq!(st.accepted, 0, "a halted lane's accepted counter is frozen at 0");
 
-            // What the front-ends now feed the updater, built from this lane.
-            let mut snap = crate::engine::Snapshot::idle();
-            snap.lane = Some(st.lane);
-            snap.shares_accepted = st.accepted;
-            snap.lanes = vec![crate::engine::LaneSnapshot {
-                lane: st.lane,
-                state: st.state.into(),
-                hashrate_hs: st.hashrate_hs,
-                hashrate_60s_hs: None,
-                hashrate_15m_hs: None,
-                shares_accepted: st.accepted,
-                shares_rejected: st.rejected,
-                uptime_s: st.uptime_s,
-                endpoint: st.endpoint.clone(),
-                failovers: st.failovers,
-                temp_c: None,
-                power_w: None,
-                util_pct: None,
-                fan_pct: None,
-                acceptance: st.acceptance.to_string(),
-                accept_pct: st.accept_pct,
-                halted: st.halted,
-            }];
+            // What the front-ends now feed the updater, built from this lane through
+            // the SHIPPED derivation (`LaneSnapshot::from_stats`) — not a hand-rolled
+            // row, which is how a regression test comes to pass over a field it forgot.
+            let snap = snapshot_of(&s);
             let mining = crate::autoupdate::MiningEvidence::from_snapshot(&snap);
-            assert!(mining.halted, "the halt must reach layer 2");
+            assert_eq!(mining.activity, GuardCustody::Halted, "the halt must reach layer 2");
+            assert!(!mining.judges_the_build());
             assert!(!mining.counts_as_earning());
 
             // A build that installed itself yesterday, on a machine that WAS
@@ -5972,6 +6137,194 @@ mod tests {
             // that was started with the process.
             assert!(s.stats().halted);
             assert_eq!(crate::engine_pins::background_refresh_starts(), 1);
+            s.request_stop();
+        });
+    }
+
+    /// **THE CROSS-LAYER HOLE F4 LEFT OPEN: a lane RE-PROBING is not evidence about
+    /// the installed build either.**
+    ///
+    /// F4 wired `halted` from layer 3 to layer 2 and stopped there. But a halt now
+    /// lifts itself on a ladder, and the re-probe that lifts it MUST clear `halted` —
+    /// `charge_reprobe` and `spawn_run` both do, because the halt gates would otherwise
+    /// refuse to start the probe's own child. So for the whole of a re-probe window the
+    /// lane published `halted: false, accepted: 0`: to layer 2, an ordinary miner that
+    /// has stopped earning.
+    ///
+    /// It cannot re-halt inside that window either, which is what makes the exposure
+    /// real rather than theoretical: a period ends only once BOTH ten minutes and
+    /// twenty submissions are in, so a lane submitting slower than ~2/min stays
+    /// `Gathering` past the twenty-minute judging mark. And the network-wide backstop
+    /// cannot save it — `LaneHealth::attribute` answers `Unknown`, never `NetworkWide`,
+    /// for a figure drawn from fewer than two miners, and PRL is a single-miner lane.
+    ///
+    /// The result was v0.6.8 — the release that carries the fixed engine pin —
+    /// uninstalling itself and pinning v0.6.7, during exactly the upstream fork it
+    /// exists to survive, on a machine where the client was never at fault.
+    #[test]
+    fn a_reprobing_lane_is_not_evidence_against_the_installed_build_either() {
+        use alice_release::auto::{
+            judge_session, Probation, SessionAction, SessionEvidence, SessionResult,
+        };
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::GpuPrl);
+            s.set_acceptance_config(fast_acceptance());
+            // Compress only the WAIT; the persisted ladder stays the production one.
+            s.set_reprobe_timing(Duration::from_millis(200));
+            let (program, args) = idle_child();
+            s.start_simple(program, args).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await, "child up");
+            drive_to_halt(&s).await;
+            wait_for_halt_record(Lane::GpuPrl).await;
+
+            // Nobody touches anything: the lane re-probes by itself.
+            assert!(
+                wait_for(&s, 10, |st| st.state == ProcState::Running).await,
+                "the halt must lift itself: {:?}",
+                s.stats()
+            );
+            let st = s.stats();
+            assert!(!st.halted, "the probe child could not start if this were still set");
+            assert_eq!(st.accepted, 0, "and it has not landed a share yet — that IS the probe");
+            assert_eq!(
+                st.activity,
+                GuardCustody::Probing,
+                "so SOMETHING has to say the guard is still holding this lane"
+            );
+
+            // What the front-ends feed the updater, through the shipped derivation.
+            let mining = crate::autoupdate::MiningEvidence::from_snapshot(&snapshot_of(&s));
+            assert_eq!(mining.activity, GuardCustody::Probing, "and it must reach layer 2");
+            assert!(!mining.judges_the_build());
+            assert!(!mining.counts_as_earning());
+            assert!(
+                !crate::autoupdate::session_may_consult_the_network(
+                    alice_release::auto::MIN_JUDGED_SESSION,
+                    &mining
+                ),
+                "a probe is decided locally — the network cannot answer for a single-miner lane"
+            );
+
+            // The probation that used to fire: installed yesterday, on a machine that
+            // WAS earning, one long empty session already recorded.
+            let on_trial = Probation {
+                version: "0.6.8".into(),
+                previous: "0.6.7".into(),
+                armed_at_unix: 0,
+                launches: 1,
+                started_ok: true,
+                previous_productive: true,
+                failed_sessions: alice_release::auto::FAILED_SESSIONS_TO_ROLLBACK - 1,
+            };
+            let ran = alice_release::auto::MIN_JUDGED_SESSION.as_secs();
+            assert_eq!(
+                judge_session(&on_trial, "0.6.8", &SessionResult::judgeable(ran, 0)),
+                SessionAction::RollBack,
+                "this is genuinely the tipping session — otherwise the test proves nothing"
+            );
+            // The GUI reaches it by resetting its session clock every time the halted
+            // lane drops out of `Running`, so every re-probe gets a fresh 20 minutes;
+            // the CLI reaches it on a `--from-service` boot where the probe IS the
+            // whole process session. Both arrive here, and here it abstains.
+            let evidence = crate::autoupdate::evidence_for_session(&mining, true, || false);
+            assert_eq!(
+                evidence,
+                SessionEvidence::AcceptanceProbe,
+                "a deliberate measurement must never be judged as a mining session"
+            );
+            assert_eq!(
+                judge_session(
+                    &on_trial,
+                    "0.6.8",
+                    &SessionResult { ran_secs: ran, accepted: mining.accepted, evidence }
+                ),
+                SessionAction::Abstain(SessionEvidence::AcceptanceProbe),
+                "v0.6.8 must not roll itself back while layer 3 is measuring for it"
+            );
+
+            s.request_stop();
+        });
+    }
+
+    /// The same hole on the CLI's path into it: a `--from-service` boot whose persisted
+    /// cooldown already elapsed spends its window IMMEDIATELY, so the re-probe is the
+    /// entire process session and crosses the judging mark with nothing to show.
+    #[test]
+    fn a_from_service_boot_that_probes_at_once_is_still_the_guards_measurement() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            // A halt recorded a week ago, on the 30-minute rung: long overdue.
+            let week_ago = acceptance::now_unix().saturating_sub(7 * 86_400);
+            let rec = acceptance::HaltRecord::new(
+                Lane::GpuPrl,
+                &Collapse {
+                    period: crate::acceptance::PeriodStat {
+                        accepted: 0,
+                        rejected: 40,
+                        elapsed: Duration::from_secs(900),
+                    },
+                    run_accepted: 0,
+                    run_rejected: 40,
+                    shutout: true,
+                },
+                Attribution::Unknown,
+                0,
+                week_ago,
+            );
+            acceptance::save_halt_record(&rec).expect("seed");
+
+            let s = LaneSupervisor::new(Lane::GpuPrl);
+            s.set_acceptance_config(fast_acceptance());
+            let (program, args) = idle_child();
+            s.start_simple_with_cause(program, args, StartCause::Automatic).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await, "must re-probe");
+
+            let st = s.stats();
+            assert!(!st.halted, "the probe run is not halted while it measures");
+            assert_eq!(st.activity, GuardCustody::Probing);
+            let mining = crate::autoupdate::MiningEvidence::from_snapshot(&snapshot_of(&s));
+            assert!(
+                !mining.judges_the_build(),
+                "the whole process session is one deliberate measurement: {mining:?}"
+            );
+            s.request_stop();
+        });
+    }
+
+    /// A lane the guard has HANDED BACK is evidence again. The abstain must be
+    /// self-clearing, or it becomes a permanent immunity from the health probation —
+    /// which would be the same bug pointing the other way.
+    #[test]
+    fn a_lane_the_guard_has_released_judges_the_build_again() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            let (program, args) = idle_child();
+            s.start_simple(program.clone(), args.clone()).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+            assert_eq!(s.stats().activity, GuardCustody::Mining, "an ordinary run judges");
+
+            drive_to_halt(&s).await;
+            assert_eq!(s.stats().activity, GuardCustody::Halted);
+
+            // A user Start is the one action that means "I have dealt with it" — and it
+            // hands the lane straight back, ladder and all.
+            s.start_simple(program, args).expect("the user may always start again");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+            let st = s.stats();
+            assert!(!st.halted);
+            assert_eq!(
+                st.activity,
+                GuardCustody::Mining,
+                "a user Start clears everything immediately, including the abstain"
+            );
+            assert!(crate::autoupdate::MiningEvidence::from_snapshot(&snapshot_of(&s))
+                .judges_the_build());
             s.request_stop();
         });
     }
@@ -6570,11 +6923,32 @@ mod tests {
     /// A MEASURED recovery — a completed healthy period, the only real evidence that
     /// the pool is accepting again — retires the halt AND its ladder, in memory and on
     /// disk. Nothing weaker (an uptime, a reconnect, a restart) may do it.
+    ///
+    /// # Why this test is shaped the way it is
+    ///
+    /// The version before it fed forty shares in a `sleep(5 ms)` loop and asserted on
+    /// the verdict LEFT AT THE END. That assertion is load-dependent, and the ~200 ms
+    /// of loop against a 120 ms window only LOOKS like a comfortable margin: the tail
+    /// verdict reads `healthy` only if the window is crossed TWICE, because the first
+    /// period consumes 120 ms of it and the ~75 ms / 15 shares left over satisfy
+    /// neither gate. So it passed only when the loop ran slowly enough that period one
+    /// closed on the SUBMISSIONS gate (share 20) rather than the window gate (share
+    /// 25), leaving exactly 20 shares and enough time for a second — i.e. under load,
+    /// which is why it passed in the full suite and failed run alone, eight times out
+    /// of eight. The mechanism was never broken; the assertion was on the wrong thing
+    /// and the timing was a coin flip.
+    ///
+    /// So: drive exactly ONE period, and assert the actual subject (the halt and the
+    /// ladder are retired) rather than the tail of a display string. The only
+    /// wall-clock dependency left is one-sided — `sleep` may overshoot and the period
+    /// is already past its window floor when the shares arrive — and the submissions
+    /// gate is exact, so the period closes on share 20 and on no other.
     #[test]
     fn a_measured_healthy_period_retires_the_halt_and_its_ladder() {
         let _env = temp_home();
         let s = LaneSupervisor::new(Lane::Xmr);
-        s.set_acceptance_config(fast_acceptance());
+        let cfg = fast_acceptance();
+        s.set_acceptance_config(cfg);
         // Stand where a re-probe run stands: two rungs spent, a record on disk.
         let rec = acceptance::HaltRecord::new(
             Lane::Xmr,
@@ -6599,13 +6973,33 @@ mod tests {
             g.halt_record = Some(rec);
             g.acceptance.on_run_start(Instant::now());
         }
-        // The pool starts accepting: past warm-up, then a full healthy window.
-        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            s.stats().activity,
+            GuardCustody::Probing,
+            "a run standing on an unspent rung is the guard's measurement, not mining"
+        );
+
+        // Past warm-up, take the warm baseline, then let the window elapse BEFORE any
+        // share lands. From here the period's window gate is satisfied and only the
+        // share count decides when it closes.
+        std::thread::sleep(cfg.warmup + Duration::from_millis(10));
         feed(&s, "net      accepted (0/0) diff 100 (10 ms)");
-        for i in 1..=40u64 {
+        assert_eq!(s.stats().acceptance, "gathering", "the warm baseline judges nothing");
+        std::thread::sleep(cfg.min_window + Duration::from_millis(30));
+
+        // The pool is accepting again. The period closes on the LAST of these and not
+        // one earlier: `min_submissions` is an exact integer gate.
+        for i in 1..cfg.min_submissions {
             feed(&s, &format!("net      accepted ({i}/0) diff 100 (10 ms)"));
-            std::thread::sleep(Duration::from_millis(5));
+            assert_eq!(
+                s.stats().acceptance,
+                "gathering",
+                "share {i} is below the sample floor — nothing may be decided yet"
+            );
+            assert_eq!(s.halt_probes(), 2, "and the ladder must not move on a partial window");
         }
+        feed(&s, &format!("net      accepted ({}/0) diff 100 (10 ms)", cfg.min_submissions));
+
         assert_eq!(s.stats().acceptance, "healthy", "the recovery must be MEASURED");
         assert_eq!(s.halt_probes(), 0, "a recovery retires the ladder");
         assert_eq!(
@@ -6613,6 +7007,364 @@ mod tests {
             None,
             "and the record, so the next reboot starts clean"
         );
+        assert_eq!(
+            s.stats().activity,
+            GuardCustody::Mining,
+            "and the lane is handed back to the miner — its shares judge the build again"
+        );
+
+        // The NEXT period opens immediately and reads `gathering` until it too fills
+        // up. That is ordinary, and it must not resurrect anything: the old test's
+        // pass/fail hinged on whether this second period happened to close in time.
+        feed(&s, &format!("net      accepted ({}/0) diff 100 (10 ms)", cfg.min_submissions + 1));
+        assert_eq!(s.stats().acceptance, "gathering", "a fresh period judges nothing yet");
+        assert_eq!(s.halt_probes(), 0, "and the retired halt stays retired");
+        assert_eq!(acceptance::load_halt_record(Lane::Xmr), None);
+        assert_eq!(s.stats().activity, GuardCustody::Mining);
+    }
+
+    // ── The replaced-child seam: one root, three symptoms ──────────────────────
+    //
+    // A Layer-B failover (and a crash restart) replaces the engine PROCESS and keeps
+    // the run. The replacement's cumulative counters start again at `A:1`, and every
+    // baseline in this file — the watchdog's progress mark, the acceptance monitor's
+    // period, the user's session totals — belonged to the child that just died.
+
+    /// **A replacement engine CONTINUES the run; it does not restart its counters.**
+    ///
+    /// The bug, in the order it bites: a rig runs for hours to 700 accepted, Layer B
+    /// rotates once, and `spawn_run(Failover)` sets the progress baseline to 700 —
+    /// correctly, from the run totals. But every bundled parser then assigned the NEW
+    /// child's reading straight into those same totals, so 700 became 1 and nothing the
+    /// replacement did could ever beat 700 again. Ten minutes later the watchdog
+    /// declared a perfectly healthy lane stalled and rotated again, and the next
+    /// baseline was whatever the doomed child had reached — a loop that ends only when
+    /// the restart budget is spent. It also silently disabled the "a rejected share is
+    /// progress" rule, and it walked the user's visible session totals backwards.
+    ///
+    /// Runs on every OS: the bug is arithmetic, and the incident was on Windows.
+    #[test]
+    fn a_replacement_engine_continues_the_run_instead_of_restarting_its_counters() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::Xmr);
+            let (program, args) = idle_child();
+            s.start_simple(program.clone(), args.clone()).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await, "child up");
+
+            // Hours of honest mining.
+            feed(&s, "net      accepted (700/5) diff 100 (10 ms)");
+            let st = s.stats();
+            assert_eq!((st.accepted, st.rejected), (700, 5));
+
+            // Layer B rotates the region (or the engine crashed and was relaunched).
+            s.spawn_run(program, args, RunKind::Failover).expect("relaunch");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await, "replacement up");
+            assert_eq!(
+                (s.stats().accepted, s.stats().rejected),
+                (700, 5),
+                "a rotation must not reset the user's session totals"
+            );
+
+            // Age the progress mark so the watchdog would trip on the next check, then
+            // let the REPLACEMENT land its very first share. Its `Total:` line starts
+            // again at A:1 — that is what a new process does.
+            {
+                let mut g = s.inner.lock().unwrap();
+                g.last_progress_at = Some(Instant::now() - Duration::from_secs(3_600));
+            }
+            feed(&s, "net      accepted (1/0) diff 100 (10 ms)");
+
+            let st = s.stats();
+            assert_eq!(
+                st.accepted, 701,
+                "the run continues: 700 from the dead child plus 1 from the live one"
+            );
+            assert_eq!(st.rejected, 5, "and the rejected side carries over identically");
+            {
+                let g = s.inner.lock().unwrap();
+                assert!(
+                    g.last_progress_at.map(|t| t.elapsed() < Duration::from_secs(60)).unwrap(),
+                    "a healthy replacement's first share MUST re-arm the watchdog"
+                );
+                assert_eq!(g.child_accepted, 1, "the child's own counter is tracked separately");
+                assert_eq!(g.carry_accepted, 700);
+            }
+
+            // And a REJECTED share from the replacement is progress too — the rule the
+            // stale baseline used to disable from the first restart onwards.
+            {
+                let mut g = s.inner.lock().unwrap();
+                g.last_progress_at = Some(Instant::now() - Duration::from_secs(3_600));
+            }
+            feed(&s, "net      accepted (1/1) diff 100 (10 ms)");
+            let g = s.inner.lock().unwrap();
+            assert_eq!((g.accepted, g.rejected), (701, 6));
+            assert!(
+                g.last_progress_at.map(|t| t.elapsed() < Duration::from_secs(60)).unwrap(),
+                "the pool answering at all proves the replacement is alive"
+            );
+            drop(g);
+            s.request_stop();
+        });
+    }
+
+    /// **A failover must not turn a slow-but-working rig into a reported total
+    /// shutout.**
+    ///
+    /// `on_failover` is a deliberate no-op and `RunKind::Failover` does not call
+    /// `on_run_start`, so the acceptance monitor keeps its period — INCLUDING its start
+    /// time and its consumed warm-up grace. When the replacement's counters came back
+    /// at zero the monitor saw a regression and re-baselined, which subtracts away the
+    /// accepts the previous child landed inside that still-open period while leaving
+    /// the clock alone. Both gates were then pre-satisfied and the fresh child's first
+    /// twenty submissions decided alone — so a rig that had landed 20 accepted / 0
+    /// rejected, re-handshaking into a stale-share burst on its new region, was halted
+    /// and told it had landed ZERO.
+    ///
+    /// The fix is upstream of the monitor: the supervisor no longer presents a
+    /// regression at all, so `rebaseline` stays what it is for — a genuine mid-stream
+    /// counter glitch.
+    #[test]
+    fn a_failover_mid_period_never_reports_a_working_rig_as_a_shutout() {
+        let _env = temp_home();
+        let _lock = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::GpuPrl);
+            let cfg = fast_acceptance();
+            s.set_acceptance_config(cfg);
+            let (program, args) = idle_child();
+            s.start_simple(program.clone(), args.clone()).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+
+            // A cold-start burst, discarded — which is what leaves the warm baseline
+            // sitting at a NON-ZERO count, the precondition for the erasure.
+            feed(&s, "net      accepted (5/0) diff 100 (10 ms)");
+            tokio::time::sleep(cfg.warmup + Duration::from_millis(10)).await;
+            feed(&s, "net      accepted (5/0) diff 100 (10 ms)"); // warm baseline @ 5
+
+            // A slow but perfectly healthy rig: fifteen more accepts, no rejects. Still
+            // under the twenty-submission floor, so the period is deliberately OPEN.
+            for i in 6..=20u64 {
+                feed(&s, &format!("net      accepted ({i}/0) diff 100 (10 ms)"));
+            }
+            tokio::time::sleep(cfg.min_window + Duration::from_millis(30)).await;
+            assert_eq!(s.stats().acceptance, "gathering", "a thin sample decides nothing");
+
+            // Layer B rotates the region. The new child re-handshakes, re-mints a
+            // region-bound PoP token, and hits a stale-share burst: twenty rejections
+            // in one go, no sleeps.
+            s.spawn_run(program, args, RunKind::Failover).expect("relaunch");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+            let mut measured: Vec<(String, Option<f64>)> = Vec::new();
+            for i in 1..=20u64 {
+                feed(&s, &format!("net      rejected (0/{i}) diff 100 (10 ms)"));
+                let st = s.stats();
+                assert_ne!(
+                    st.acceptance, "collapsed",
+                    "rejection {i} of the burst stopped a working rig: {st:?}"
+                );
+                measured.push((st.acceptance.to_string(), st.accept_pct));
+            }
+
+            // The period that closes inside the burst is a REAL measurement of the
+            // whole period — the fifteen accepts the first child landed have not been
+            // subtracted away — so it reads healthy, not a shutout.
+            let closed: Vec<f64> = measured.iter().filter_map(|(_, p)| *p).collect();
+            assert!(
+                !closed.is_empty(),
+                "a period must have completed inside the burst: {measured:?}"
+            );
+            for pct in &closed {
+                assert!(
+                    *pct >= 20.0,
+                    "every completed period must reflect the accepts too, got {pct}%: {measured:?}"
+                );
+            }
+            let st = s.stats();
+            assert_eq!(st.accepted, 20, "the accepts the first child landed are still counted");
+            assert_eq!(st.rejected, 20);
+
+            // Give the watchdog several ticks to do the wrong thing.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let st = s.stats();
+            assert!(!st.halted, "a working rig must not be stopped by a region rotation: {st:?}");
+            assert!(st.running);
+            assert_eq!(acceptance::load_halt_record(Lane::GpuPrl), None, "and nothing on disk");
+            s.request_stop();
+        });
+    }
+
+    /// The same seam driven END TO END through the real watchdog and the real failover
+    /// path: after ONE legitimate rotation, a replacement engine that lands a share
+    /// every 150 ms is a healthy lane and must never be rotated again. The reporter's
+    /// reproduction rotated it three times in 2.5 s.
+    ///
+    /// Unix-only for the same reason as the other failover tests: it scripts `/bin/sh`.
+    /// The arithmetic itself is covered on every OS by
+    /// `a_replacement_engine_continues_the_run_instead_of_restarting_its_counters`.
+    #[cfg(unix)]
+    #[test]
+    fn a_healthy_replacement_engine_is_never_rotated_again() {
+        let _env = spawn_env_guard();
+        let rt = rt();
+        rt.block_on(async {
+            let plan = EndpointPlan::new(vec![
+                Endpoint::plaintext("blackhole.invalid", 65000),
+                Endpoint::plaintext("hk.aliceprotocol.org", 3333),
+            ])
+            .unwrap();
+            let s = LaneSupervisor::with_endpoints(Lane::Xmr, plan);
+            // A 400 ms no-progress window, so ~2.5 s is six chances to rotate wrongly.
+            s.set_failover_timing(Duration::from_millis(400), Duration::from_millis(10));
+
+            // The replacement: a brand-new process whose counters start at 1, landing a
+            // share every 150 ms — comfortably inside the window.
+            let rebuild: RebuildFn = Arc::new(move |_eps: &[Endpoint]| {
+                Ok((
+                    std::path::PathBuf::from("/bin/sh"),
+                    vec![
+                        "-c".into(),
+                        "i=1; while [ $i -le 200 ]; do \
+                         echo \"net      accepted ($i/0) diff 100 (10 ms)\"; \
+                         i=$((i+1)); sleep 0.15; done"
+                            .into(),
+                    ],
+                ))
+            });
+
+            // The FIRST child mines properly for a while and then goes silent, which is
+            // the stall Layer B legitimately rotates on. Its 300 accepted shares are the
+            // baseline the replacement used to be measured against.
+            s.start(
+                std::path::PathBuf::from("/bin/sh"),
+                vec![
+                    "-c".into(),
+                    "i=1; while [ $i -le 300 ]; do \
+                     echo \"net      accepted ($i/0) diff 100 (10 ms)\"; i=$((i+1)); done; \
+                     sleep 30"
+                        .into(),
+                ],
+                rebuild,
+            )
+            .expect("start");
+
+            // One legitimate rotation.
+            let mut rotated = false;
+            for _ in 0..100 {
+                if s.failovers() >= 1 {
+                    rotated = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(rotated, "the silent first child must be rotated away: {:?}", s.stats());
+
+            // …and then nothing. The replacement is healthy and must be left alone.
+            tokio::time::sleep(Duration::from_millis(2_500)).await;
+            let st = s.stats();
+            assert_eq!(
+                s.failovers(),
+                1,
+                "a healthy replacement landing a share every 150 ms was rotated {} times: {st:?}",
+                s.failovers()
+            );
+            assert!(st.running, "and it must still be running, not out of restart budget: {st:?}");
+            assert!(
+                st.accepted > 300,
+                "and the run kept what it earned and grew past it, got {}: {st:?}",
+                st.accepted
+            );
+            s.request_stop();
+        });
+    }
+
+    /// A relaunched log-file TAIL resumes where the previous child left off.
+    ///
+    /// SRBMiner — the PRL lane's engine, the one in the incident — writes shares only
+    /// to its `--log-file`, and the lane's rebuild closure captures that path ONCE per
+    /// run, so a failover hands the replacement the same file. A tail that restarted at
+    /// byte 0 replayed the dead child's whole share history into the live child's
+    /// counters: a spike up to the old totals and then a drop back down, i.e. exactly
+    /// the counter regression the rest of this section exists to prevent.
+    #[test]
+    fn a_relaunched_tail_resumes_instead_of_replaying_the_previous_childs_log() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let path = crate::settings::alice_home().join("engine.log");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "first-child-line-a\nfirst-child-line-b\n").unwrap();
+
+            let s = LaneSupervisor::new(Lane::GpuPrl);
+            let inner = s.inner.clone();
+            let gen = {
+                let mut g = inner.lock().unwrap();
+                g.generation += 1;
+                g.generation
+            };
+            let (tx, mut rx) = unbounded_channel::<LogLine>();
+            let t1 = tokio::spawn(tail_log_file_into(path.clone(), tx, inner.clone(), gen));
+            let mut first = Vec::new();
+            for _ in 0..2 {
+                match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                    Ok(Some(l)) => first.push(l.text),
+                    other => panic!("the first tail must read the file: {other:?}"),
+                }
+            }
+            assert_eq!(first, vec!["first-child-line-a", "first-child-line-b"]);
+
+            // The child is replaced; the new one APPENDS to the same file.
+            let gen2 = {
+                let mut g = inner.lock().unwrap();
+                g.generation += 1;
+                g.generation
+            };
+            t1.await.expect("the stale tail exits on the generation bump");
+            {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+                writeln!(f, "second-child-line-a").unwrap();
+            }
+            let (tx2, mut rx2) = unbounded_channel::<LogLine>();
+            let _t2 = tokio::spawn(tail_log_file_into(path.clone(), tx2, inner.clone(), gen2));
+            match tokio::time::timeout(Duration::from_secs(5), rx2.recv()).await {
+                Ok(Some(l)) => assert_eq!(
+                    l.text, "second-child-line-a",
+                    "the replacement's tail must NOT replay the dead child's lines"
+                ),
+                other => panic!("the second tail must read the appended line: {other:?}"),
+            }
+            {
+                let mut g = inner.lock().unwrap();
+                g.generation += 1; // let the tail task exit
+            }
+        });
+    }
+
+    /// The resume is VERIFIED, not assumed: an engine that rewrites its log instead of
+    /// appending can leave the stored position mid-line (or past the end), and splicing
+    /// a partial line into the parser would be worse than re-reading from the top.
+    #[test]
+    fn a_tail_resume_is_refused_when_the_file_no_longer_matches() {
+        let _env = temp_home();
+        let dir = crate::settings::alice_home();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("boundary.log");
+        std::fs::write(&path, "alpha\nbravo\n").unwrap();
+
+        assert!(resumes_on_a_line_boundary(&path, 6), "just past 'alpha\\n' is a line start");
+        assert!(resumes_on_a_line_boundary(&path, 12), "end of file is a line start");
+        assert!(!resumes_on_a_line_boundary(&path, 3), "mid-line must be refused");
+        assert!(!resumes_on_a_line_boundary(&path, 99), "past the end must be refused");
+        // A file that was truncated and has not regrown that far.
+        std::fs::write(&path, "x\n").unwrap();
+        assert!(!resumes_on_a_line_boundary(&path, 12));
+        // A file that does not exist yet has not replaced anything.
+        assert!(resumes_on_a_line_boundary(&dir.join("absent.log"), 12));
     }
 
     /// Layer B's progress mark counts SUBMISSIONS, not accepts.
@@ -6657,6 +7409,7 @@ mod tests {
             assert!(stale(&g), "no NEW submission = no new progress");
         }
     }
+
 
     /// The process-level start cause is a plain flag with a safe default: a binary that
     /// never declares itself a service treats every start as a person's.
