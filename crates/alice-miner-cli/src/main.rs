@@ -1045,6 +1045,15 @@ fn main() {
     // `alice_miner_core::console::init_utf8_console` for the full root-cause note.
     alice_miner_core::console::init_utf8_console();
 
+    // Start the engine-pin refresher with the PROCESS (F15), not with the first
+    // lane that resolves an engine. A client the acceptance guard has halted never
+    // starts an engine again, so a pin-refresh gated on that could never deliver
+    // the fixed pin that would un-halt it — the one automatic escape from a
+    // fleet-wide upstream fork would need a human to press Start first. Idempotent,
+    // non-blocking (it spawns its own thread and returns immediately), and off
+    // every hot path.
+    alice_miner_core::engine_pins::start_background_refresh();
+
     // AM-REL-009, step 1: resolve the self-update health gate BEFORE anything that
     // can fail, so a freshly-installed build that dies during startup is on record
     // and gets rolled back on its next attempt. (The CLI never called this; only the
@@ -2812,8 +2821,7 @@ fn cmd_start_with_unlock(
     let mut deferred_update: Option<String> = None;
 
     loop {
-        if let Some(msg) = auto.tick(last_snapshot.as_ref().map(|s| s.shares_accepted).unwrap_or(0))
-        {
+        if let Some(msg) = auto.tick(last_snapshot.as_ref()) {
             if args.json {
                 println!("{}", serde_json::json!({ "update": msg }));
             } else if tui.is_none() {

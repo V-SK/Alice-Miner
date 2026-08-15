@@ -743,11 +743,14 @@ pub fn current_target_triple() -> &'static str {
 /// path that may skip verification, and only behind the explicit
 /// `ALICE_MINER_ALLOW_UNVERIFIED_BIN=1` opt-in (with a loud warning).
 pub fn resolve_miner_binary(kind: MinerKind) -> Result<PathBuf, String> {
-    // 0) One line, every front-end (CLI, GUI, service, fleet): make sure the
-    //    engine-pin refresher is running. It is idempotent, it runs OFF this
-    //    thread, and it never blocks mining — a pin published while we mine takes
-    //    effect the next time a lane starts an engine. Without this, an upstream
-    //    hard fork would again need a full client release to answer.
+    // 0) A BELT, not the primary trigger (F15). The refresher is started by each
+    //    front-end at PROCESS start, because gating it on "a lane started an
+    //    engine" means a client the acceptance guard has halted — which starts no
+    //    engine, ever — can never receive the engine pin that would un-halt it.
+    //    This call remains so that any future entry point which forgets the
+    //    process-start hook still ends up with a running refresher; it is
+    //    idempotent (see `background_refresh_starts`), runs OFF this thread, and
+    //    never blocks mining.
     crate::engine_pins::start_background_refresh();
 
     // 1) explicit override. This is an advanced/test escape hatch (e.g. T-Rex),

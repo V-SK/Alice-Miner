@@ -64,6 +64,14 @@ fn load_icon() -> Option<IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    // Start the engine-pin refresher with the PROCESS (F15), not with the first
+    // lane that resolves an engine. A client whose lanes the acceptance guard has
+    // halted never starts an engine again, so a refresh gated on that could never
+    // deliver the fixed pin that would un-halt it. Idempotent, non-blocking (it
+    // spawns its own thread and returns immediately), and off every hot path —
+    // including this one, which must not delay the first frame.
+    alice_miner_core::engine_pins::start_background_refresh();
+
     // Shot mode frames to the real default size so captures reflect what the
     // owner sees on first run; normal runs use the same default. (Only the inner
     // size changes — the custom titlebar + rail still render so the screenshot

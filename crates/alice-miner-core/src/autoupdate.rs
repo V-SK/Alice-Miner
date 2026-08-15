@@ -670,22 +670,147 @@ pub fn confirm_start() {
     }
 }
 
-/// Report a mining session (elapsed time + accepted shares) against the
+/// What the ACCEPTANCE guard (layer 3) is doing on this machine right now, as
+/// both front-ends read it out of the same engine snapshot.
+///
+/// This exists because layer 2 cannot see layer 3 from where it sits, and the two
+/// disagree in the most damaging possible way if left unwired: layer 3 stops
+/// mining on purpose during an upstream outage, and layer 2 reads the resulting
+/// zero-accepted stretch as "the version I installed does not earn". See F4.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MiningEvidence {
+    /// Accepted shares so far this session (the figure the probation judges).
+    pub accepted: u64,
+    /// Any lane was HALTED or stopped by the acceptance guard. Once that happens
+    /// `accepted` is frozen by design, so the session says nothing about the build.
+    pub halted: bool,
+    /// The lanes this session is mining — the input to the network-wide check.
+    /// Empty means "we do not know which lane", and the check is skipped.
+    pub lanes: Vec<crate::lane::Lane>,
+}
+
+impl MiningEvidence {
+    /// Read the live evidence out of an engine snapshot. ONE copy of this
+    /// derivation, shared by the CLI and the GUI, on purpose.
+    pub fn from_snapshot(s: &crate::engine::Snapshot) -> Self {
+        Self {
+            accepted: s.shares_accepted,
+            halted: s.lanes.iter().any(|l| l.halted),
+            lanes: if s.lanes.is_empty() {
+                s.lane.into_iter().collect()
+            } else {
+                s.lanes.iter().map(|l| l.lane).collect()
+            },
+        }
+    }
+
+    /// Whether this counts as "this machine is earning" for the purposes of the
+    /// baseline a FUTURE update is judged against. A halted lane's frozen counter
+    /// is not evidence of current earning, however large it is.
+    pub fn counts_as_earning(&self) -> bool {
+        self.accepted > 0 && !self.halted
+    }
+}
+
+/// Decide what layer 3 says about the session being reported.
+///
+/// Split out and pure (bar the caller-supplied probe) so the *order* of the two
+/// guards is testable: a halted lane abstains without ever touching the network,
+/// and the network is asked ONLY when a rollback is otherwise imminent — never
+/// once per tick.
+fn resolve_evidence(
+    halted: bool,
+    rollback_imminent: bool,
+    network_wide: impl FnOnce() -> bool,
+) -> auto::SessionEvidence {
+    if halted {
+        return auto::SessionEvidence::MiningHalted;
+    }
+    if rollback_imminent && network_wide() {
+        return auto::SessionEvidence::NetworkWide;
+    }
+    auto::SessionEvidence::Judgeable
+}
+
+/// Whether reporting this session could reach the (bounded, blocking) lane-health
+/// call inside [`note_session`] — the caller's cue to hand the report to a worker
+/// thread instead of running it on a UI / render loop.
+///
+/// Deliberately a SUPERSET of the condition that actually probes: it is cheap and
+/// pure (no disk), and being wrong in this direction costs one idle thread, while
+/// being wrong the other way costs a ten-second freeze. The overwhelmingly common
+/// reports — a session with accepted shares, a short one, a halted lane — are all
+/// `false` here and stay inline.
+pub fn session_may_consult_the_network(ran: Duration, mining: &MiningEvidence) -> bool {
+    !mining.halted
+        && mining.accepted == 0
+        && !mining.lanes.is_empty()
+        && ran.as_secs() >= auto::MIN_JUDGED_SESSION.as_secs()
+}
+
+/// Report a mining session (elapsed time + what layer 3 saw) against the
 /// probation. Returns a line to print when the verdict changed something.
-pub fn note_session(ran: Duration, accepted: u64) -> Option<String> {
+///
+/// **May block** for one bounded HTTP GET — but only when it is about to decide a
+/// rollback, and only when [`session_may_consult_the_network`] said so first. Call
+/// it off the UI thread whenever that predicate is true.
+pub fn note_session(ran: Duration, mining: &MiningEvidence) -> Option<String> {
     let app_path = release::current_app_path().ok()?;
+    let dir = state_dir();
+    let version = release::current_version();
+    let ran_secs = ran.as_secs();
+
+    // A long session with nothing accepted is the only shape that can ever be held
+    // against the build. Everything below is gated on it, so the common paths (a
+    // short session, a session with accepted shares) cost exactly what they did.
+    let counts_against = mining.accepted == 0 && ran_secs >= auto::MIN_JUDGED_SESSION.as_secs();
+
+    // Would this one, taken at face value, roll the build back and pin it forever?
+    // Only THEN is it worth a network call to ask whether the whole network is
+    // being rejected — the answer that makes blaming this build wrong.
+    let rollback_imminent = counts_against
+        && !mining.halted
+        && auto::session_would_roll_back(
+            &app_path,
+            version,
+            &auto::SessionResult::judgeable(ran_secs, 0),
+        );
+    let evidence = resolve_evidence(mining.halted, rollback_imminent, || {
+        crate::acceptance::any_lane_collapsed_network_wide(&mining.lanes)
+    });
+
     let v = auto::note_session(
-        &state_dir(),
+        &dir,
         &app_path,
-        release::current_version(),
+        version,
         auto::SessionResult {
-            ran_secs: ran.as_secs(),
-            accepted,
+            ran_secs,
+            accepted: mining.accepted,
+            evidence,
         },
     );
     match v {
         auto::SessionVerdict::NoChange => None,
         auto::SessionVerdict::Committed { .. } => None,
+        auto::SessionVerdict::Abstained { reason } => {
+            // Log only the abstentions that actually SPARED the build something —
+            // a session that would otherwise have been a strike or a rollback. A
+            // halted rig reports its (frozen, non-zero) counters every tick, and a
+            // history file full of "did nothing" would bury the line that matters.
+            if counts_against {
+                auto::log_event(
+                    &dir,
+                    "probation-abstained",
+                    serde_json::json!({
+                        "version": version,
+                        "reason": reason.key(),
+                        "ran_secs": ran_secs,
+                        "would_have_rolled_back": rollback_imminent,
+                    }),
+                );
+            }
+            None
+        }
         auto::SessionVerdict::RolledBack { failed_version, previous, restored } => {
             if !restored {
                 return Some(tr!(
@@ -703,6 +828,11 @@ pub fn note_session(ran: Duration, accepted: u64) -> Option<String> {
 
 /// Record that accepted shares are landing. Throttled by the caller; this is the
 /// baseline the mining probation judges a future update against.
+///
+/// Callers must gate this on [`MiningEvidence::counts_as_earning`]: a lane the
+/// acceptance guard has halted keeps a non-zero, FROZEN accepted counter, and
+/// refreshing "this machine earns" from it would keep a stale baseline alive for
+/// as long as the rig stays halted.
 pub fn mark_productive() {
     auto::mark_productive(&state_dir());
 }
@@ -806,6 +936,161 @@ mod tests {
         );
         assert!(s.contains("aabbccddeeff") || s.contains("拒绝"));
         assert!(s.to_lowercase().contains("refused") || s.contains("拒绝"));
+    }
+
+    // ── F4: the layer-2 ↔ layer-3 wiring ────────────────────────────────────
+
+    /// A halted lane abstains WITHOUT asking the network, and the network is
+    /// asked only when a rollback is actually imminent.
+    ///
+    /// The "never asked" half is not a nicety: `note_session` runs on the mining
+    /// tick, and a probe on every tick would be a request every few hundred
+    /// milliseconds from every rig on the fleet.
+    #[test]
+    fn evidence_resolution_prefers_the_local_halt_and_asks_the_network_once() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let asked = AtomicU32::new(0);
+        let counter = &asked;
+        // `ask(x)` hands `resolve_evidence` a probe that records that it was called.
+        let ask = move |answer: bool| {
+            move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                answer
+            }
+        };
+        let asked = || counter.load(Ordering::Relaxed);
+
+        // A halted lane: not evidence, and no network call at all.
+        assert_eq!(
+            resolve_evidence(true, false, ask(true)),
+            auto::SessionEvidence::MiningHalted
+        );
+        assert_eq!(
+            resolve_evidence(true, true, ask(true)),
+            auto::SessionEvidence::MiningHalted,
+            "the local halt is conclusive on its own"
+        );
+        assert_eq!(asked(), 0, "a halted lane must not cost a request");
+
+        // Nothing imminent: still no request.
+        assert_eq!(
+            resolve_evidence(false, false, ask(true)),
+            auto::SessionEvidence::Judgeable
+        );
+        assert_eq!(asked(), 0, "the probe is not a per-tick call");
+
+        // A rollback IS imminent and the whole network is down → abstain.
+        assert_eq!(
+            resolve_evidence(false, true, ask(true)),
+            auto::SessionEvidence::NetworkWide
+        );
+        assert_eq!(asked(), 1);
+
+        // …and when the network is fine, the local build stays on trial.
+        assert_eq!(
+            resolve_evidence(false, true, ask(false)),
+            auto::SessionEvidence::Judgeable,
+            "a healthy network must not suppress a real local failure"
+        );
+        assert_eq!(asked(), 2);
+    }
+
+    /// The predicate both front-ends use to decide "inline or worker thread".
+    ///
+    /// It gates a ten-second-timeout HTTP GET, and the callers are a terminal
+    /// render loop and an egui frame. It must be `true` for every shape that can
+    /// reach the probe and `false` for the per-tick reports — otherwise either the
+    /// UI freezes or we spawn a thread twice a second.
+    #[test]
+    fn only_a_long_empty_unhalted_session_is_allowed_to_touch_the_network() {
+        use crate::lane::Lane;
+        let long = auto::MIN_JUDGED_SESSION;
+        let base = MiningEvidence {
+            accepted: 0,
+            halted: false,
+            lanes: vec![Lane::GpuPrl],
+        };
+
+        assert!(session_may_consult_the_network(long, &base));
+        assert!(
+            !session_may_consult_the_network(long - Duration::from_secs(1), &base),
+            "a short session can never roll anything back, so it never probes"
+        );
+        assert!(
+            !session_may_consult_the_network(
+                long,
+                &MiningEvidence { accepted: 1, ..base.clone() }
+            ),
+            "the per-tick earning report must stay inline"
+        );
+        assert!(
+            !session_may_consult_the_network(
+                long,
+                &MiningEvidence { halted: true, ..base.clone() }
+            ),
+            "a halted lane is decided locally — no request, no thread"
+        );
+        assert!(
+            !session_may_consult_the_network(
+                long,
+                &MiningEvidence { lanes: Vec::new(), ..base.clone() }
+            ),
+            "with no lane there is nothing to ask about"
+        );
+    }
+
+    /// The two front-ends must read layer 3 out of the snapshot identically, so
+    /// this derivation lives here and is tested here.
+    #[test]
+    fn mining_evidence_reads_the_halt_out_of_the_snapshot() {
+        use crate::engine::{EngineState, LaneSnapshot, Snapshot};
+        use crate::lane::Lane;
+
+        let lane_row = |lane: Lane, halted: bool| LaneSnapshot {
+            lane,
+            state: EngineState::Running,
+            hashrate_hs: None,
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
+            shares_accepted: 0,
+            shares_rejected: 0,
+            uptime_s: 0,
+            endpoint: None,
+            failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
+            acceptance: "collapsed".to_string(),
+            accept_pct: None,
+            halted,
+        };
+
+        let mut s = Snapshot::idle();
+        s.shares_accepted = 7;
+        s.lane = Some(Lane::GpuPrl);
+        s.lanes = vec![lane_row(Lane::GpuPrl, false)];
+        let e = MiningEvidence::from_snapshot(&s);
+        assert!(!e.halted);
+        assert_eq!(e.lanes, vec![Lane::GpuPrl]);
+        assert!(e.counts_as_earning(), "a running lane with accepted shares earns");
+
+        // ANY halted lane disqualifies the session: in dual mode the accepted
+        // counter can no longer be attributed to a lane that is still allowed to run.
+        s.lanes = vec![lane_row(Lane::Xmr, false), lane_row(Lane::GpuPrl, true)];
+        let e = MiningEvidence::from_snapshot(&s);
+        assert!(e.halted);
+        assert_eq!(e.lanes, vec![Lane::Xmr, Lane::GpuPrl]);
+        assert!(
+            !e.counts_as_earning(),
+            "a frozen counter behind a halt is not proof this machine is earning"
+        );
+
+        // A snapshot with no per-lane rows still names its lane for the network check.
+        s.lanes.clear();
+        assert_eq!(MiningEvidence::from_snapshot(&s).lanes, vec![Lane::GpuPrl]);
+        s.lane = None;
+        assert!(MiningEvidence::from_snapshot(&s).lanes.is_empty());
     }
 
     #[test]

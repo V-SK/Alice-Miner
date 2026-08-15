@@ -1014,21 +1014,45 @@ pub fn refresh_if_due() -> Option<RefreshOutcome> {
     Some(refresh_now())
 }
 
-/// Start the background pin refresher: once at startup, then every
+/// How many times the refresher has actually been started in this process.
+/// Exactly 0 or 1, forever — see [`background_refresh_starts`].
+static REFRESH_STARTS: AtomicU64 = AtomicU64::new(0);
+
+/// How many times [`start_background_refresh`] has claimed the once-per-process
+/// start slot. Zero before the first call, one after — never two, no matter how
+/// many front-ends, lanes or threads call it.
+pub fn background_refresh_starts() -> u64 {
+    REFRESH_STARTS.load(Ordering::Relaxed)
+}
+
+/// Start the background pin refresher: once at process start, then every
 /// [`REFRESH_INTERVAL`]. Idempotent — the second call in a process is a no-op.
 ///
-/// Deliberately off the mining path: a slow or unreachable pin host must never
-/// delay the start of mining. The refreshed pin takes effect when a lane next
-/// starts an engine (see the module note about restarts).
+/// **Call this from `main`, not from the mining path (F15).** It used to have
+/// exactly one caller, inside `resolve_miner_binary`, which runs only when a lane
+/// starts an engine. That inverted the dependency in the one case that matters:
+/// the acceptance guard halts a lane → no engine ever starts → the refresher
+/// never runs → the fixed engine pin that would UN-halt this machine is published
+/// and never seen. The one mechanism that can rescue a halted fleet automatically
+/// was gated behind the very thing that was broken. It now starts with the
+/// process, so it runs in a client whose lanes are all halted — or which never
+/// mined at all.
+///
+/// Deliberately off the mining path in the other direction too: a slow or
+/// unreachable pin host must never delay the start of mining, so the work happens
+/// on its own thread and this call returns immediately. The refreshed pin takes
+/// effect when a lane next starts an engine (see the module note about restarts).
 pub fn start_background_refresh() {
-    // The test suite drives refreshes explicitly and must never spawn a thread
-    // that talks to the network (or writes to the real user's pin store) behind
-    // a test's back.
-    if cfg!(test) {
-        return;
-    }
     static STARTED: OnceLock<()> = OnceLock::new();
     if STARTED.set(()).is_err() {
+        return;
+    }
+    REFRESH_STARTS.fetch_add(1, Ordering::Relaxed);
+    // The test suite drives refreshes explicitly and must never spawn a thread
+    // that talks to the network (or writes to the real user's pin store) behind
+    // a test's back. The slot above is still claimed so the once-only contract
+    // itself stays observable under test.
+    if cfg!(test) {
         return;
     }
     let _ = std::thread::Builder::new()
@@ -1738,6 +1762,50 @@ mod tests {
             pin.source,
             PinSource::Embedded,
             "demoted to the built-in floor"
+        );
+    }
+
+    // ── F15: the refresher must not be gated on a lane starting an engine ────
+
+    /// The pin refresher starts ONCE per process, however many callers ask —
+    /// front-end startup hooks, and every lane that later resolves an engine.
+    ///
+    /// It also must not need a lane at all. That was F15: the only caller was
+    /// inside `resolve_miner_binary`, which runs when a lane starts an engine —
+    /// so a client the acceptance guard had HALTED (which starts no engine, ever)
+    /// could never receive the fixed engine pin that would un-halt it. The rescue
+    /// path was gated behind the very thing that was broken.
+    #[test]
+    fn the_pin_refresher_starts_once_per_process_without_any_lane() {
+        // Holds the engine-binary env lock, so setting the overrides below cannot
+        // race the `binaries` tests.
+        let _env = TestEnv::new();
+
+        // No engine is running, no lane exists, nothing has been resolved: the
+        // front-end startup hook is enough on its own.
+        start_background_refresh();
+        assert_eq!(
+            background_refresh_starts(),
+            1,
+            "process start must be enough to arm the refresher"
+        );
+        for _ in 0..5 {
+            start_background_refresh();
+        }
+
+        // And every lane that later resolves an engine is a no-op (the belt in
+        // `resolve_miner_binary`). The override points at nothing, so resolution
+        // fails immediately — AFTER the refresher call, which is the point: the
+        // refresher does not depend on an engine being resolvable at all.
+        for kind in [MinerKind::CpuXmr, MinerKind::GpuRvn, MinerKind::GpuPrl] {
+            std::env::set_var(kind.env_override(), "/no/such/alice/miner/binary");
+            assert!(binaries::resolve_miner_binary(kind).is_err());
+            std::env::remove_var(kind.env_override());
+        }
+        assert_eq!(
+            background_refresh_starts(),
+            1,
+            "exactly one refresher, no matter how many callers"
         );
     }
 

@@ -130,6 +130,9 @@ pub struct UpdateManager {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     auto_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A session report is in flight on a worker thread (never two — two
+    /// concurrent reports could double-count a strike against the probation).
+    session_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_auto_check: Option<std::time::Instant>,
     last_productive_mark: Option<std::time::Instant>,
     session_start: Option<std::time::Instant>,
@@ -145,6 +148,7 @@ impl Default for UpdateManager {
             tx,
             rx,
             auto_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_auto_check: None,
             last_productive_mark: None,
             session_start: None,
@@ -225,21 +229,24 @@ impl UpdateManager {
     }
 
     /// Feed the mining half of the post-update health probation. Call once per
-    /// frame with the live accepted-share count (`None` when not mining).
+    /// frame with the live mining snapshot (`None` when not mining).
     ///
     /// Identical logic to the CLI's session driver, calling the identical kernel:
     /// an accepted share commits the probation and refreshes the "this machine
     /// earns" baseline; a long stretch with none counts against the build once
-    /// per session, and only when the build it replaced HAD been earning here.
-    pub fn note_mining(&mut self, accepted: Option<u64>) {
-        let Some(accepted) = accepted else {
+    /// per session, and only when the build it replaced HAD been earning here and
+    /// the acceptance guard has not disqualified the session (F4 — a halted lane's
+    /// accepted counter is frozen by design and says nothing about the build).
+    pub fn note_mining(&mut self, snap: Option<&alice_miner_core::engine::Snapshot>) {
+        let Some(snap) = snap else {
             self.session_start = None;
             self.judged_this_session = false;
             return;
         };
+        let mining = alice_miner_core::autoupdate::MiningEvidence::from_snapshot(snap);
         let start = *self.session_start.get_or_insert_with(std::time::Instant::now);
 
-        if accepted > 0 {
+        if mining.counts_as_earning() {
             let due = self
                 .last_productive_mark
                 .map(|t| t.elapsed() >= std::time::Duration::from_secs(10 * 60))
@@ -250,6 +257,7 @@ impl UpdateManager {
             }
         }
 
+        let accepted = mining.accepted;
         let ran = start.elapsed();
         let judge = accepted > 0
             || (!self.judged_this_session
@@ -260,9 +268,30 @@ impl UpdateManager {
         if accepted == 0 {
             self.judged_this_session = true;
         }
-        if let Some(msg) = alice_miner_core::autoupdate::note_session(ran, accepted) {
-            self.auto_note = Some(msg);
+
+        // A report that could decide a ROLLBACK first asks the network whether the
+        // whole lane is down (F4) — a bounded but blocking GET, and this is the UI
+        // thread. That case (at most once per session) goes to a worker and its
+        // verdict arrives through `poll()`; every other report is local-only and
+        // runs inline.
+        if !alice_miner_core::autoupdate::session_may_consult_the_network(ran, &mining) {
+            if let Some(msg) = alice_miner_core::autoupdate::note_session(ran, &mining) {
+                self.auto_note = Some(msg);
+            }
+            return;
         }
+        use std::sync::atomic::Ordering;
+        if self.session_in_flight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let tx = self.tx.clone();
+        let flag = self.session_in_flight.clone();
+        thread::spawn(move || {
+            if let Some(msg) = alice_miner_core::autoupdate::note_session(ran, &mining) {
+                let _ = tx.send(Msg::Auto(msg));
+            }
+            flag.store(false, Ordering::SeqCst);
+        });
     }
 
     /// Drain any completed background results into [`Self::ui`]. Call once per
@@ -674,6 +703,86 @@ mod tests {
         mgr.note_mining(None);
         assert!(mgr.session_start.is_none());
         assert!(!mgr.judged_this_session);
+    }
+
+    /// F4: a HALTED lane must not refresh the "this machine is earning" baseline.
+    /// The acceptance guard freezes the accepted counter when it stops a lane, so
+    /// a halted rig would otherwise keep re-marking itself productive forever off
+    /// a number that stopped moving days ago — and that mark is precisely what
+    /// arms the rollback for the NEXT update.
+    #[test]
+    fn a_halted_lane_does_not_refresh_the_earning_baseline() {
+        use alice_miner_core::autoupdate::MiningEvidence;
+        let mut mgr = UpdateManager::default();
+
+        // Not mining at all: nothing to mark, session accounting reset.
+        mgr.note_mining(None);
+        assert!(mgr.last_productive_mark.is_none());
+
+        let mut snap = running_snapshot();
+        snap.shares_accepted = 12;
+        assert!(
+            MiningEvidence::from_snapshot(&snap).counts_as_earning(),
+            "a running lane with accepted shares is the baseline"
+        );
+        // The same counter, behind a halt, is not.
+        snap.lanes = vec![halted_lane_row()];
+        assert!(!MiningEvidence::from_snapshot(&snap).counts_as_earning());
+        mgr.note_mining(Some(&snap));
+        assert!(
+            mgr.last_productive_mark.is_none(),
+            "a halted lane must not stamp the productive mark"
+        );
+    }
+
+    fn running_snapshot() -> alice_miner_core::engine::Snapshot {
+        alice_miner_core::engine::Snapshot {
+            state: alice_miner_core::EngineState::Running,
+            device: None,
+            lane: Some(alice_miner_core::Lane::GpuPrl),
+            hashrate_hs: Some(8400.0),
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
+            shares_accepted: 0,
+            shares_rejected: 0,
+            endpoint: None,
+            worker_id: None,
+            uptime_s: 5,
+            failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
+            dual: false,
+            lanes: Vec::new(),
+            last_line: None,
+            message: None,
+            message_key: None,
+            message_args: None,
+            prl_payout: None,
+        }
+    }
+
+    fn halted_lane_row() -> alice_miner_core::engine::LaneSnapshot {
+        alice_miner_core::engine::LaneSnapshot {
+            lane: alice_miner_core::Lane::GpuPrl,
+            state: alice_miner_core::EngineState::Error,
+            hashrate_hs: None,
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
+            shares_accepted: 12,
+            shares_rejected: 400,
+            uptime_s: 3600,
+            endpoint: None,
+            failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
+            acceptance: "collapsed".to_string(),
+            accept_pct: Some(0.0),
+            halted: true,
+        }
     }
 
     /// The busy flag drives the disabled-button state.

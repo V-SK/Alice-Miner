@@ -322,7 +322,9 @@ pub struct LaneSnapshot {
 }
 
 impl Snapshot {
-    fn idle() -> Self {
+    /// The zero state. `pub(crate)` so sibling modules (and their tests) can build
+    /// a snapshot without restating every field.
+    pub(crate) fn idle() -> Self {
         Self {
             state: EngineState::Idle,
             device: None,
