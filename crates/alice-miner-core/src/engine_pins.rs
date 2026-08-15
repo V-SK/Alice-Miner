@@ -2160,21 +2160,175 @@ mod tests {
     const SHA_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const SHA_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
-    /// A one-entry document for the **linux gpu-prl** slot — the slot the embedded
-    /// floor pins on every host — with `extra_fields` (raw JSON, each ending in a
-    /// comma) spliced into the entry.
+    // ── Fixture versions are DERIVED from the embedded floor, never written ─────
+    //
+    // The version ratchet in `apply_verified_document` is seeded from the pin
+    // table compiled into this build (`release-assets/miners.json`), and that
+    // table is PER TARGET. A fixture that hard-codes a version is therefore only
+    // ever right against one particular bundled engine on one particular platform:
+    // when the bundled GPU-PRL engine was bumped 3.4.1 → 3.5.4 on 2026-08-14,
+    // every `3.5.3` fixture here stopped being "one step forward" and became a
+    // DOWNGRADE on Linux and Windows — correctly refused whole by the product,
+    // failing eight tests. macOS stayed green for the worst possible reason: the
+    // floor pins no gpu-prl engine for `aarch64-apple-darwin` (SRBMiner-MULTI
+    // ships no macOS build), so on that host the ratchet had nothing to compare
+    // against and never ran at all. Deriving every fixture version from the floor
+    // is what stops the next engine bump doing the same thing on any platform;
+    // `the_ratchet_covers_this_machines_own_target_or_says_why_it_cannot` is what
+    // stops the macOS silence being mistaken for coverage.
+
+    /// The slot the target-independent fixtures pin. Fixed rather than
+    /// host-derived on purpose: the ratchet is keyed per `(kind,target)` and the
+    /// embedded floor pins this slot on every host, so a fixture aimed at it
+    /// exercises the identical rule on macOS, Linux and Windows.
+    /// [`doc_for_this_platform`] is the deliberate exception — it must use the
+    /// running triple, because only a matching triple reaches the staging path.
+    const RATCHET_TARGET: &str = "x86_64-unknown-linux-gnu";
+
+    /// The version the embedded floor pins for `kind` on `target`, or `None` when
+    /// it pins none there. `None` is the honest answer for gpu-prl on
+    /// `aarch64-apple-darwin`.
+    fn floor_version_for(kind: &str, target: &str) -> Option<String> {
+        embedded_entries()
+            .iter()
+            .find(|e| e.kind == kind && e.target == target)
+            .and_then(|e| e.trimmed_version())
+    }
+
+    /// The GPU-PRL floor the [`RATCHET_TARGET`] fixtures are measured against.
+    fn ratchet_floor() -> String {
+        floor_version_for("gpu-prl", RATCHET_TARGET).unwrap_or_else(|| {
+            panic!("the embedded floor must pin a gpu-prl engine for {RATCHET_TARGET}")
+        })
+    }
+
+    /// The GPU-PRL floor for the target [`doc_for_this_platform`] builds for — the
+    /// RUNNING one. `None` where this platform ships no GPU-PRL engine.
+    fn local_floor_prl_version() -> Option<String> {
+        floor_version_for("gpu-prl", binaries::current_target_triple())
+    }
+
+    fn floor_parts(floor: &str) -> Vec<u64> {
+        numeric_version_parts(floor).unwrap_or_else(|| {
+            panic!(
+                "the embedded floor version {floor:?} is not orderable, so no fixture can be \
+                 placed on either side of it"
+            )
+        })
+    }
+
+    fn join_version(parts: &[u64]) -> String {
+        parts
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    /// A version provably NEWER than `floor`, derived from it. Asserts the
+    /// direction it claims, so a fixture can never end up on the wrong side of the
+    /// ratchet without saying so.
+    fn version_above(floor: &str) -> String {
+        let mut parts = floor_parts(floor);
+        parts[0] += 1;
+        for p in parts.iter_mut().skip(1) {
+            *p = 0;
+        }
+        let v = join_version(&parts);
+        assert_eq!(
+            compare_versions(&v, floor),
+            VersionOrder::Newer,
+            "{v} must be provably newer than the floor {floor}"
+        );
+        v
+    }
+
+    /// A version provably OLDER than `floor` — the shape of the signed rollback
+    /// the ratchet exists to refuse.
+    fn version_below(floor: &str) -> String {
+        let mut parts = floor_parts(floor);
+        let i = parts
+            .iter()
+            .position(|p| *p > 0)
+            .unwrap_or_else(|| panic!("nothing can be older than the floor {floor}"));
+        parts[i] -= 1;
+        for p in parts.iter_mut().skip(i + 1) {
+            *p = 0;
+        }
+        let v = join_version(&parts);
+        assert_eq!(
+            compare_versions(&v, floor),
+            VersionOrder::Older,
+            "{v} must be provably older than the floor {floor}"
+        );
+        v
+    }
+
+    /// One step FORWARD of the [`RATCHET_TARGET`] floor: what a fixture uses when
+    /// its subject is anything OTHER than the ratchet, so the ratchet cannot fire
+    /// and mask what the test is really about.
+    fn newer_than_floor() -> String {
+        version_above(&ratchet_floor())
+    }
+
+    /// The "nothing wrong with it" document the validation tests mutate one field
+    /// at a time: the [`RATCHET_TARGET`] gpu-prl slot, at a version above the floor
+    /// so no mutation is ever judged by the ratchet instead of by the rule on trial.
+    fn doc_above_floor(epoch: u64, sha: &str) -> EnginesDoc {
+        serde_json::from_str(&doc_json(epoch, sha, &newer_than_floor()))
+            .expect("the baseline fixture parses")
+    }
+
+    /// One step BACK: the rollback the ratchet must refuse unless it is declared.
+    fn older_than_floor() -> String {
+        version_below(&ratchet_floor())
+    }
+
+    /// The same, one lane over: a CPU-XMR version past the bundled xmrig. The
+    /// cpu-xmr fixtures only reach `validate_doc` today, but they are one refactor
+    /// away from the ratchet and there is no reason for them to carry a literal.
+    fn newer_than_xmr_floor() -> String {
+        let floor = floor_version_for("cpu-xmr", RATCHET_TARGET).unwrap_or_else(|| {
+            panic!("the embedded floor must pin a cpu-xmr engine for {RATCHET_TARGET}")
+        });
+        version_above(&floor)
+    }
+
+    /// A version that clears the floor for THIS machine's target. Where the floor
+    /// pins no GPU-PRL engine for this target there is nothing to clear, and the
+    /// value that clears [`RATCHET_TARGET`] is used instead so the fixture reads
+    /// the same on every OS.
+    fn newer_than_local_floor() -> String {
+        version_above(&local_floor_prl_version().unwrap_or_else(ratchet_floor))
+    }
+
+    /// A version under THIS machine's floor: a real downgrade wherever the floor
+    /// pins this target (Linux, Windows), and merely an older number where it does
+    /// not (macOS) — see
+    /// `the_ratchet_covers_this_machines_own_target_or_says_why_it_cannot`.
+    fn older_than_local_floor() -> String {
+        version_below(&local_floor_prl_version().unwrap_or_else(ratchet_floor))
+    }
+
+    /// A one-entry document for the [`RATCHET_TARGET`] gpu-prl slot — the slot the
+    /// embedded floor pins on every host — with `extra_fields` (raw JSON, each
+    /// ending in a comma) spliced into the entry.
     ///
-    /// Deliberately not `doc_for_this_platform`: these tests exercise validation and
-    /// the version ratchet, both of which must behave identically on macOS, Linux
-    /// and Windows, and the ratchet is seeded from the floor — which has no gpu-prl
-    /// entry for `aarch64-apple-darwin`. Using a fixed linux target also keeps the
-    /// staging step out of the way (a non-matching triple is skipped).
+    /// Deliberately not `doc_for_this_platform`: these tests exercise validation
+    /// and the version ratchet, both of which must behave identically on macOS,
+    /// Linux and Windows, and the ratchet is seeded from the floor — which has no
+    /// gpu-prl entry for `aarch64-apple-darwin`.
+    ///
+    /// A fixed target does NOT keep the staging step out of the way: when the host
+    /// IS [`RATCHET_TARGET`], a document this pipeline accepts stages its engine
+    /// like any other. Every test here that expects acceptance therefore installs
+    /// a fetch hook, or it would reach for the network on a Linux runner.
     fn linux_prl_doc(epoch: u64, version: &str, sha: &str, extra_fields: &str) -> String {
         format!(
             r#"{{"schema":1,"product":"alice-miner-engines","epoch":{epoch},
               "min_engine_epoch":1,"issued":"2026-08-15T00:00:00Z","engines":[
               {{"kind":"gpu-prl","engine":"srbminer-multi","version":"{version}",
-                "target":"x86_64-unknown-linux-gnu","filename":"SRBMiner-MULTI",
+                "target":"{RATCHET_TARGET}","filename":"SRBMiner-MULTI",
                 "sha256":"{sha}",
                 {extra_fields}
                 "archive_url":"https://github.com/doktor83/SRBMiner-Multi/releases/download/{version}/SRBMiner-Multi-Linux.tar.gz",
@@ -2198,7 +2352,7 @@ mod tests {
     fn a_pin_can_carry_the_algorithm_and_the_parser_it_needs() {
         let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
             2,
-            "3.6.0",
+            &newer_than_floor(),
             SHA_A,
             r#""algorithm":"pearlhash2","parser":"srbminer","#,
         ))
@@ -2213,7 +2367,7 @@ mod tests {
         // …and the extra-argv half, on the engine that has a reviewed list.
         let xmr: EnginesDoc = serde_json::from_str(&linux_xmr_doc(
             2,
-            "6.27.0",
+            &newer_than_xmr_floor(),
             SHA_A,
             r#""extra_args":["--randomx-mode=light"],"parser":"xmrig","#,
         ))
@@ -2236,7 +2390,7 @@ mod tests {
         for bad in ["--salted-seed", "--seed-mode", "--privkey-cache"] {
             let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
                 2,
-                "3.6.0",
+                &newer_than_floor(),
                 SHA_A,
                 &format!(r#""extra_args":["{bad}"],"#),
             ))
@@ -2272,7 +2426,7 @@ mod tests {
     fn xmr_extra_args_err(args: &[&str]) -> String {
         let doc: EnginesDoc = serde_json::from_str(&linux_xmr_doc(
             2,
-            "6.27.0",
+            &newer_than_xmr_floor(),
             SHA_A,
             &format!(
                 r#""extra_args":{},"#,
@@ -2291,7 +2445,7 @@ mod tests {
     fn accepted_xmr_extra_args(args: &[&str]) -> Vec<String> {
         let doc: EnginesDoc = serde_json::from_str(&linux_xmr_doc(
             2,
-            "6.27.0",
+            &newer_than_xmr_floor(),
             SHA_A,
             &format!(r#""extra_args":{},"#, serde_json::to_string(args).unwrap()),
         ))
@@ -2370,7 +2524,7 @@ mod tests {
         // checked for it. The formerly-blessed example flag is now a client release.
         let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
             2,
-            "3.6.0",
+            &newer_than_floor(),
             SHA_A,
             r#""extra_args":["--pearl-fork-salt","3"],"#,
         ))
@@ -2719,7 +2873,7 @@ mod tests {
     fn publisher_argv_lands_before_the_clients_first_pool() {
         let doc: EnginesDoc = serde_json::from_str(&linux_xmr_doc(
             2,
-            "6.27.0",
+            &newer_than_xmr_floor(),
             SHA_A,
             r#""extra_args":["--randomx-mode=light","--huge-pages-jit"],"#,
         ))
@@ -2768,7 +2922,7 @@ mod tests {
     fn an_algorithm_on_a_kind_whose_argv_has_no_algorithm_slot_is_refused() {
         let doc: EnginesDoc = serde_json::from_str(&linux_xmr_doc(
             2,
-            "6.27.0",
+            &newer_than_xmr_floor(),
             SHA_A,
             r#""algorithm":"rx/1","#,
         ))
@@ -2781,7 +2935,7 @@ mod tests {
         // The kind that DOES have the slot still takes it.
         let ok: EnginesDoc = serde_json::from_str(&linux_prl_doc(
             2,
-            "3.6.0",
+            &newer_than_floor(),
             SHA_A,
             r#""algorithm":"pearlhash2","#,
         ))
@@ -2800,7 +2954,7 @@ mod tests {
     /// a single existing pin.
     #[test]
     fn a_pin_that_says_nothing_about_the_call_changes_nothing() {
-        let doc: EnginesDoc = serde_json::from_str(&doc_json(2, SHA_A, "3.5.5")).unwrap();
+        let doc = doc_above_floor(2, SHA_A);
         let inv = doc.engines[0].invocation().unwrap();
         assert_eq!(inv, EngineInvocation::default());
         assert!(inv.is_default());
@@ -2828,7 +2982,7 @@ mod tests {
         for bad in ["srbminer-4", "srbminer2", "pearl", ""] {
             let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
                 2,
-                "3.6.0",
+                &newer_than_floor(),
                 SHA_A,
                 &format!(r#""parser":"{bad}","#),
             ))
@@ -2865,7 +3019,7 @@ mod tests {
         ] {
             let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
                 2,
-                "3.6.0",
+                &newer_than_floor(),
                 SHA_A,
                 &format!(r#""extra_args":["{bad}"],"#),
             ))
@@ -2896,7 +3050,7 @@ mod tests {
         for (bad, needle) in cases {
             let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
                 2,
-                "3.6.0",
+                &newer_than_floor(),
                 SHA_A,
                 &format!(r#""extra_args":[{}],"#, serde_json::to_string(bad).unwrap()),
             ))
@@ -2911,7 +3065,7 @@ mod tests {
         let many: Vec<String> = (0..MAX_EXTRA_ARGS + 1).map(|i| format!("--x{i}")).collect();
         let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
             2,
-            "3.6.0",
+            &newer_than_floor(),
             SHA_A,
             &format!(
                 r#""extra_args":{},"#,
@@ -2929,7 +3083,7 @@ mod tests {
         for bad in ["--config", "-a", "pearl hash", "pearl;hash", ""] {
             let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
                 2,
-                "3.6.0",
+                &newer_than_floor(),
                 SHA_A,
                 &format!(r#""algorithm":"{bad}","#),
             ))
@@ -2970,18 +3124,34 @@ mod tests {
         }
     }
 
-    /// THE F8 CASE: a signed list pointing back at SRBMiner 3.4.1 after the fork.
-    /// Every other guard in this file waves it through — the bytes are real, they
-    /// are on an allow-listed upstream page, the hash matches what we already trust
-    /// for that version, and the epoch went up. It is a one-key replay of the
+    /// THE F8 CASE: a signed list pointing the GPU-PRL slot back at an engine older
+    /// than the one this build bundles — the shape of "SRBMiner 3.4.1 after the
+    /// fork". Every other guard in this file waves it through: the bytes are real,
+    /// they are on an allow-listed upstream page, the hash matches what we already
+    /// trust for that version, and the epoch went up. It is a one-key replay of the
     /// 78-hour August outage, and it must be refused.
+    ///
+    /// Both versions come from the floor, so this stays THE downgrade case however
+    /// often the bundled engine is bumped.
     #[test]
     fn an_unmarked_engine_downgrade_is_refused() {
+        // A refusal writes nothing — but if the ratchet ever regressed, this would
+        // ACCEPT, and without a scratch root it would install into the developer's
+        // real engine cache. The env is the seatbelt for the day the test fails.
+        let _env = TestEnv::new();
         let mut st = PinState::default();
-        let bytes = linux_prl_doc(2, "3.4.1", SHA_A, "").into_bytes();
+        let floor = ratchet_floor();
+        let rolled_back = version_below(&floor);
+        let bytes = linux_prl_doc(2, &rolled_back, SHA_A, "").into_bytes();
         let err = apply_verified_document(&bytes, "sig", &mut st).unwrap_err();
-        assert!(err.contains("moves gpu-prl/x86_64-unknown-linux-gnu backwards"), "got: {err}");
-        assert!(err.contains("OLDER than the 3.5.4"), "names both versions: {err}");
+        assert!(
+            err.contains(&format!("moves gpu-prl/{RATCHET_TARGET} backwards")),
+            "got: {err}"
+        );
+        assert!(
+            err.contains(&format!("{rolled_back} is OLDER than the {floor}")),
+            "names both versions: {err}"
+        );
         assert!(err.contains("\"downgrade\": true"), "says how to do it on purpose: {err}");
         assert!(err.contains("Refusing the whole list"), "whole-list refusal: {err}");
     }
@@ -2990,10 +3160,17 @@ mod tests {
     /// exactly like an older one: refused, not guessed at.
     #[test]
     fn a_version_that_cannot_be_ordered_is_refused_like_a_downgrade() {
+        let _env = TestEnv::new(); // see `an_unmarked_engine_downgrade_is_refused`
         let mut st = PinState::default();
-        let bytes = linux_prl_doc(2, "3.5.4-hotfix", SHA_A, "").into_bytes();
+        let floor = ratchet_floor();
+        // The floor's own version with a suffix: numerically it looks like the same
+        // build, and that is exactly what the comparator refuses to assume.
+        let bytes = linux_prl_doc(2, &format!("{floor}-hotfix"), SHA_A, "").into_bytes();
         let err = apply_verified_document(&bytes, "sig", &mut st).unwrap_err();
-        assert!(err.contains("cannot be ordered against the 3.5.4"), "got: {err}");
+        assert!(
+            err.contains(&format!("cannot be ordered against the {floor}")),
+            "got: {err}"
+        );
     }
 
     /// A downgrade IS allowed — sometimes it is the right call — but only as a
@@ -3002,32 +3179,49 @@ mod tests {
     #[test]
     fn a_deliberate_downgrade_is_accepted_marked_and_does_not_lower_the_ratchet() {
         let env = TestEnv::new();
+        // This document is ACCEPTED, so on a host that is itself the pinned target
+        // the pipeline stages the engine. Script the download rather than let a
+        // Linux runner reach for github, and count it: staging must happen exactly
+        // when this host is the target the fixture pins, and never otherwise.
+        let staged_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = staged_calls.clone();
+        env.on_fetch(move |_e| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Ok(b"SRBMiner-MULTI rolled-back payload".to_vec())
+        });
+
+        let floor = ratchet_floor();
+        let rolled_back = version_below(&floor);
+        let reason = format!("{floor} crashes on RDNA3; reverting while upstream fixes it");
         let mut st = load_state();
         let bytes = linux_prl_doc(
             2,
-            "3.4.1",
+            &rolled_back,
             SHA_A,
-            r#""downgrade":true,"downgrade_reason":"3.5.4 crashes on RDNA3; reverting while upstream fixes it","#,
+            &format!(r#""downgrade":true,"downgrade_reason":"{reason}","#),
         )
         .into_bytes();
         let out = apply_verified_document(&bytes, "sig", &mut st).expect("marked downgrade");
         assert!(matches!(out, RefreshOutcome::Updated { epoch: 2, .. }), "got {out:?}");
+        assert_eq!(
+            staged_calls.load(Ordering::Relaxed),
+            usize::from(binaries::current_target_triple() == RATCHET_TARGET),
+            "an accepted document stages exactly the engines THIS machine would run"
+        );
 
         // The ratchet is RAISED-only: accepting a declared downgrade does not re-base
         // it, so republishing the older build has to keep re-stating the marker
         // rather than quietly becoming the new normal.
         let floors = load_state().version_floor;
         assert_eq!(
-            floors
-                .get("gpu-prl/x86_64-unknown-linux-gnu")
-                .map(String::as_str),
-            Some("3.5.4"),
+            floors.get(&format!("gpu-prl/{RATCHET_TARGET}")).map(String::as_str),
+            Some(floor.as_str()),
             "a declared downgrade must not lower the ratchet"
         );
         // Proof that it stays armed: the SAME downgrade without the marker, at a
         // higher epoch, is still refused.
         let mut st = load_state();
-        let unmarked = linux_prl_doc(3, "3.4.1", SHA_A, "").into_bytes();
+        let unmarked = linux_prl_doc(3, &rolled_back, SHA_A, "").into_bytes();
         assert!(apply_verified_document(&unmarked, "sig", &mut st).is_err());
         drop(env);
     }
@@ -3036,6 +3230,7 @@ mod tests {
     /// because the reason is the whole of what a miner gets to judge.
     #[test]
     fn a_downgrade_marker_without_a_reason_is_refused() {
+        let rolled_back = older_than_floor();
         for fields in [
             r#""downgrade":true,"#,
             r#""downgrade":true,"downgrade_reason":"","#,
@@ -3043,7 +3238,7 @@ mod tests {
             r#""downgrade":true,"downgrade_reason":"oops","#,
         ] {
             let doc: EnginesDoc =
-                serde_json::from_str(&linux_prl_doc(2, "3.4.1", SHA_A, fields)).unwrap();
+                serde_json::from_str(&linux_prl_doc(2, &rolled_back, SHA_A, fields)).unwrap();
             let err = validate_doc(&doc).unwrap_err();
             assert!(err.contains("gives no reason"), "got: {err}");
         }
@@ -3054,16 +3249,31 @@ mod tests {
     #[test]
     fn moving_the_engine_forward_is_unaffected_by_the_ratchet() {
         let env = TestEnv::new();
+        // Accepted ⇒ staged on a host that is itself the pinned target. Scripted,
+        // and counted, for the same reason as the downgrade case above.
+        let staged_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = staged_calls.clone();
+        env.on_fetch(move |_e| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Ok(b"SRBMiner-MULTI upgraded payload".to_vec())
+        });
+
+        let upgrade = newer_than_floor();
         let mut st = load_state();
-        let bytes = linux_prl_doc(2, "3.6.0", SHA_A, "").into_bytes();
+        let bytes = linux_prl_doc(2, &upgrade, SHA_A, "").into_bytes();
         let out = apply_verified_document(&bytes, "sig", &mut st).expect("an upgrade is accepted");
         assert!(matches!(out, RefreshOutcome::Updated { epoch: 2, .. }), "got {out:?}");
         assert_eq!(
+            staged_calls.load(Ordering::Relaxed),
+            usize::from(binaries::current_target_triple() == RATCHET_TARGET),
+            "an accepted document stages exactly the engines THIS machine would run"
+        );
+        assert_eq!(
             load_state()
                 .version_floor
-                .get("gpu-prl/x86_64-unknown-linux-gnu")
+                .get(&format!("gpu-prl/{RATCHET_TARGET}"))
                 .map(String::as_str),
-            Some("3.6.0"),
+            Some(upgrade.as_str()),
             "the ratchet follows the upgrade"
         );
         drop(env);
@@ -3071,13 +3281,13 @@ mod tests {
 
     #[test]
     fn a_valid_document_passes_validation() {
-        let doc: EnginesDoc = serde_json::from_str(&doc_json(2, SHA_A, "3.5.3")).unwrap();
+        let doc = doc_above_floor(2, SHA_A);
         validate_doc(&doc).expect("valid");
     }
 
     #[test]
     fn tampered_bytes_fail_the_signature() {
-        let (bytes, sig, pubkey) = sign(&doc_json(2, SHA_A, "3.5.3"));
+        let (bytes, sig, pubkey) = sign(&doc_json(2, SHA_A, &newer_than_floor()));
         alice_release::verify_engine_pin_sig_with(&bytes, &sig, &pubkey)
             .expect("clean doc verifies");
         let mut tampered = bytes.clone();
@@ -3094,7 +3304,7 @@ mod tests {
         let _e = TestEnv::new();
         // This build embeds no sub-key yet: the production entry point must refuse
         // every document, including a perfectly well-formed one.
-        let (bytes, sig, _pk) = sign(&doc_json(2, SHA_A, "3.5.3"));
+        let (bytes, sig, _pk) = sign(&doc_json(2, SHA_A, &newer_than_floor()));
         if alice_release::ENGINE_PIN_PUBKEY_B64.trim().is_empty() {
             let err = alice_release::verify_engine_pin_sig(&bytes, &sig).unwrap_err();
             assert!(err.contains("no engine-pin public key"), "got: {err}");
@@ -3106,7 +3316,7 @@ mod tests {
 
     #[test]
     fn urls_outside_the_upstream_allowlist_are_refused() {
-        let mut doc: EnginesDoc = serde_json::from_str(&doc_json(2, SHA_A, "3.5.3")).unwrap();
+        let mut doc = doc_above_floor(2, SHA_A);
         doc.engines[0].archive_url =
             Some("https://cdn.attacker.example/SRBMiner-Multi-3-5-3-Linux.tar.gz".into());
         let err = validate_doc(&doc).unwrap_err();
@@ -3125,14 +3335,14 @@ mod tests {
     #[test]
     fn unsafe_filenames_and_members_are_refused() {
         for bad in ["../../etc/cron.d/x", "sub/dir", ".hidden", ""] {
-            let mut doc: EnginesDoc = serde_json::from_str(&doc_json(2, SHA_A, "3.5.3")).unwrap();
+            let mut doc = doc_above_floor(2, SHA_A);
             doc.engines[0].filename = bad.to_string();
             assert!(
                 validate_doc(&doc).is_err(),
                 "filename {bad:?} must be refused"
             );
         }
-        let mut doc: EnginesDoc = serde_json::from_str(&doc_json(2, SHA_A, "3.5.3")).unwrap();
+        let mut doc = doc_above_floor(2, SHA_A);
         doc.engines[0].binary_path_in_archive = Some("../../../home/v/.ssh/authorized_keys".into());
         assert!(
             validate_doc(&doc).is_err(),
@@ -3142,7 +3352,7 @@ mod tests {
 
     #[test]
     fn a_newer_schema_is_refused_not_guessed() {
-        let mut doc: EnginesDoc = serde_json::from_str(&doc_json(2, SHA_A, "3.5.3")).unwrap();
+        let mut doc = doc_above_floor(2, SHA_A);
         doc.schema = DOC_SCHEMA + 1;
         let err = validate_doc(&doc).unwrap_err();
         assert!(err.contains("understands at most"), "got: {err}");
@@ -3150,14 +3360,14 @@ mod tests {
 
     #[test]
     fn a_wrong_product_document_is_refused() {
-        let mut doc: EnginesDoc = serde_json::from_str(&doc_json(2, SHA_A, "3.5.3")).unwrap();
+        let mut doc = doc_above_floor(2, SHA_A);
         doc.product = "alice-miner".into(); // the CLIENT manifest, fed here by mistake
         assert!(validate_doc(&doc).is_err());
     }
 
     #[test]
     fn a_document_that_retires_itself_is_refused() {
-        let mut doc: EnginesDoc = serde_json::from_str(&doc_json(2, SHA_A, "3.5.3")).unwrap();
+        let mut doc = doc_above_floor(2, SHA_A);
         doc.min_engine_epoch = 9;
         assert!(
             validate_doc(&doc).is_err(),
@@ -3165,25 +3375,15 @@ mod tests {
         );
     }
 
-    /// The bundled Linux GPU-PRL engine version, read from the embedded floor. Tests
-    /// that need "a version the floor already knows" ask for it here instead of
-    /// hard-coding one, so bumping the bundled engine can never fail them spuriously.
-    fn floor_prl_version() -> String {
-        embedded_entries()
-            .iter()
-            .find(|e| e.kind == "gpu-prl" && e.target == "x86_64-unknown-linux-gnu")
-            .and_then(|e| e.version.clone())
-            .expect("the floor pins a linux gpu-prl engine with a version")
-    }
-
     /// Anti-rollback: a signed but older document is refused against the floor.
     #[test]
     fn a_rolled_back_epoch_is_refused() {
+        let _env = TestEnv::new(); // see `an_unmarked_engine_downgrade_is_refused`
         let mut st = PinState {
             epoch_floor: 5,
             ..Default::default()
         };
-        let bytes = doc_json(4, SHA_A, "3.5.3").into_bytes();
+        let bytes = doc_json(4, SHA_A, &newer_than_floor()).into_bytes();
         let err = apply_verified_document(&bytes, "sig", &mut st).unwrap_err();
         assert!(err.contains("below the floor"), "got: {err}");
     }
@@ -3195,8 +3395,9 @@ mod tests {
     /// engine was bumped, which is drift in the test, not in the ratchet.
     #[test]
     fn reissuing_a_known_version_with_new_bytes_is_refused() {
+        let _env = TestEnv::new(); // see `an_unmarked_engine_downgrade_is_refused`
         let mut st = PinState::default();
-        let known = floor_prl_version();
+        let known = ratchet_floor();
         let bytes = doc_json(2, SHA_B, &known).into_bytes();
         let err = apply_verified_document(&bytes, "sig", &mut st).unwrap_err();
         assert!(err.contains("changes the bytes of"), "got: {err}");
@@ -3213,7 +3414,7 @@ mod tests {
         assert!(entries.len() >= 8, "floor has every bundled engine");
         let prl = entries
             .iter()
-            .find(|e| e.kind == "gpu-prl" && e.target == "x86_64-unknown-linux-gnu")
+            .find(|e| e.kind == "gpu-prl" && e.target == RATCHET_TARGET)
             .expect("linux gpu-prl pin exists");
         assert!(prl.real_sha256().is_some(), "a real pin, not a placeholder");
         // Which version is bundled is a release decision, not a property this test
@@ -3233,10 +3434,13 @@ mod tests {
     #[test]
     fn effective_pin_falls_back_to_the_embedded_floor() {
         let _e = TestEnv::new();
-        let got = effective_pin("gpu-prl", "x86_64-unknown-linux-gnu", "SRBMiner-MULTI")
-            .expect("floor pin");
+        let got = effective_pin("gpu-prl", RATCHET_TARGET, "SRBMiner-MULTI").expect("floor pin");
         assert_eq!(got.source, PinSource::Embedded);
-        assert_eq!(got.entry.version.as_deref(), Some(floor_prl_version().as_str()));
+        assert_eq!(
+            got.entry.version.as_deref(),
+            Some(ratchet_floor().as_str()),
+            "the floor pin reports the version the pin table actually carries"
+        );
     }
 
     #[test]
@@ -3455,8 +3659,17 @@ mod tests {
         }
     }
 
-    /// A document pinning the GPU-PRL engine for THIS machine's triple, so the
-    /// staging path runs identically on macOS, Linux and Windows.
+    /// A document pinning the GPU-PRL engine for THIS machine's triple — the only
+    /// way to reach the staging path, which skips every entry whose target is not
+    /// the running one.
+    ///
+    /// The running triple is also what makes `version` load-bearing and
+    /// platform-dependent: the ratchet is seeded per (kind,target) from the
+    /// embedded floor, which pins gpu-prl on Linux and Windows and NOT on macOS.
+    /// Callers must therefore take `version` from [`newer_than_local_floor`] (or
+    /// [`older_than_local_floor`] when a rollback is the point) rather than write
+    /// one — a literal that reads as an upgrade today becomes a refused downgrade
+    /// on two of the three CI runners the day the bundled engine is bumped.
     fn doc_for_this_platform(epoch: u64, version: &str, sha: &str) -> String {
         doc_for_this_platform_with(epoch, version, sha, "")
     }
@@ -3469,15 +3682,20 @@ mod tests {
         extra_fields: &str,
     ) -> String {
         let filename = MinerKind::GpuPrl.binary_name();
-        let member = if cfg!(windows) {
-            "SRBMiner-Multi-3-5-3/SRBMiner-MULTI.exe"
+        // Upstream names its archive and its top-level directory after the version,
+        // so these follow `version` too — a fixture whose URL says one build and
+        // whose `version` says another is a trap for the next reader.
+        let dashed = version.replace('.', "-");
+        let (member, archive) = if cfg!(windows) {
+            (
+                format!("SRBMiner-Multi-{dashed}/SRBMiner-MULTI.exe"),
+                format!("SRBMiner-Multi-{dashed}-win64.zip"),
+            )
         } else {
-            "SRBMiner-Multi-3-5-3/SRBMiner-MULTI"
-        };
-        let archive = if cfg!(windows) {
-            "SRBMiner-Multi-3-5-3-win64.zip"
-        } else {
-            "SRBMiner-Multi-3-5-3-Linux.tar.gz"
+            (
+                format!("SRBMiner-Multi-{dashed}/SRBMiner-MULTI"),
+                format!("SRBMiner-Multi-{dashed}-Linux.tar.gz"),
+            )
         };
         format!(
             r#"{{"schema":1,"product":"alice-miner-engines","epoch":{epoch},
@@ -3486,9 +3704,9 @@ mod tests {
   "engines":[{{"kind":"gpu-prl","engine":"srbminer-multi","version":"{version}",
     "target":"{target}","filename":"{filename}","sha256":"{sha}",
     {extra_fields}
-    "archive_url":"https://github.com/doktor83/SRBMiner-Multi/releases/download/3.5.3/{archive}",
+    "archive_url":"https://github.com/doktor83/SRBMiner-Multi/releases/download/{version}/{archive}",
     "archive_sha256":"{sha}","binary_path_in_archive":"{member}",
-    "source_url":"https://github.com/doktor83/SRBMiner-Multi/releases/tag/3.5.3",
+    "source_url":"https://github.com/doktor83/SRBMiner-Multi/releases/tag/{version}",
     "endorsed_at":"2026-08-14T09:00:00Z","endorsed_by":"V"}}]}}"#,
             target = binaries::current_target_triple()
         )
@@ -3504,9 +3722,12 @@ mod tests {
     fn a_signed_list_stages_verifies_installs_and_becomes_effective() {
         let env = TestEnv::new();
         env.trust_test_key();
-        let engine_bytes = b"SRBMiner-MULTI 3.5.3 (pearl fork) payload".to_vec();
+        // The subject is "a NEWER pin is accepted and installed", so the version has
+        // to clear this machine's own floor — see `doc_for_this_platform`.
+        let version = newer_than_local_floor();
+        let engine_bytes = format!("SRBMiner-MULTI {version} (pearl fork) payload").into_bytes();
         let sha = sha_of(&engine_bytes);
-        let json = doc_for_this_platform(2, "3.5.3", &sha);
+        let json = doc_for_this_platform(2, &version, &sha);
         let (bytes, sig, _pk) = sign(&json);
         let staged = engine_bytes.clone();
         env.on_fetch(move |_e| Ok(staged.clone()));
@@ -3537,7 +3758,7 @@ mod tests {
         // The resolver now enforces the NEW pin, and can say where it came from.
         let pin = effective_pin_for(MinerKind::GpuPrl).expect("effective pin");
         assert_eq!(pin.entry.real_sha256().as_deref(), Some(sha.as_str()));
-        assert_eq!(pin.entry.version.as_deref(), Some("3.5.3"));
+        assert_eq!(pin.entry.version.as_deref(), Some(version.as_str()));
         assert_eq!(
             pin.source,
             PinSource::Remote {
@@ -3551,12 +3772,12 @@ mod tests {
             .source_url
             .as_deref()
             .unwrap()
-            .contains("SRBMiner-Multi/releases/tag/3.5.3"));
+            .contains(&format!("SRBMiner-Multi/releases/tag/{version}")));
 
         // Persisted: epoch floor raised, version→hash remembered.
         let st2 = load_state();
         assert_eq!(st2.epoch_floor, 2);
-        let key = format!("gpu-prl/{}/3.5.3", binaries::current_target_triple());
+        let key = format!("gpu-prl/{}/{version}", binaries::current_target_triple());
         assert_eq!(st2.seen.get(&key).map(String::as_str), Some(sha.as_str()));
 
         // Status is user-showable and reports the engine as installed.
@@ -3589,11 +3810,14 @@ mod tests {
             "the floor overrides nothing"
         );
 
-        let engine_bytes = b"SRBMiner-MULTI 3.6.0 (next fork) payload".to_vec();
+        // The subject is the invocation, not the ratchet: sit above this machine's
+        // floor so the ratchet cannot fire and hide what is being tested.
+        let version = newer_than_local_floor();
+        let engine_bytes = format!("SRBMiner-MULTI {version} (next fork) payload").into_bytes();
         let sha = sha_of(&engine_bytes);
         let json = doc_for_this_platform_with(
             2,
-            "3.6.0",
+            &version,
             &sha,
             r#""algorithm":"pearlhash2","parser":"generic","#,
         );
@@ -3634,10 +3858,11 @@ mod tests {
         let env = TestEnv::new();
         env.trust_test_key();
         // Byte-for-byte the attack: an alias of --user/--pass the old deny-list did
-        // not name, on the engine whose reviewed list is empty.
+        // not name, on the engine whose reviewed list is empty. Above this machine's
+        // floor, so the refusal on show is the argv rule and not the ratchet.
         let json = doc_for_this_platform_with(
             2,
-            "3.6.0",
+            &newer_than_local_floor(),
             SHA_A,
             r#""extra_args":["--userpass=5Gw3sAttackerAddress:zz"],"#,
         );
@@ -3676,17 +3901,26 @@ mod tests {
     /// render — with the published reason, verbatim. A signed rollback to an older
     /// engine is the shape of the August outage; it may happen, and it may not be
     /// quiet.
+    ///
+    /// The version is taken from BELOW this machine's floor, so on Linux and
+    /// Windows the marker is doing real work (without it the ratchet would refuse
+    /// the list outright). On a target the floor pins no GPU-PRL engine for the
+    /// marker is decorative and only the reporting is under test — which is the
+    /// point of
+    /// `the_ratchet_covers_this_machines_own_target_or_says_why_it_cannot`.
     #[test]
     fn a_deliberate_downgrade_is_loud_in_the_status_a_miner_sees() {
         let env = TestEnv::new();
         env.trust_test_key();
-        let engine_bytes = b"SRBMiner-MULTI 3.5.0 payload".to_vec();
+        let version = older_than_local_floor();
+        let reason = format!("{version} crashes on RDNA3; reverting while upstream fixes it");
+        let engine_bytes = format!("SRBMiner-MULTI {version} payload").into_bytes();
         let sha = sha_of(&engine_bytes);
         let json = doc_for_this_platform_with(
             2,
-            "3.5.0",
+            &version,
             &sha,
-            r#""downgrade":true,"downgrade_reason":"3.5.4 crashes on RDNA3; reverting while upstream fixes it","#,
+            &format!(r#""downgrade":true,"downgrade_reason":"{reason}","#),
         );
         let (bytes, sig, _pk) = sign(&json);
         let staged = engine_bytes.clone();
@@ -3696,10 +3930,7 @@ mod tests {
 
         let status = status_for_current_platform();
         let prl = status.iter().find(|s| s.kind == "gpu-prl").expect("status");
-        assert_eq!(
-            prl.downgrade_reason.as_deref(),
-            Some("3.5.4 crashes on RDNA3; reverting while upstream fixes it")
-        );
+        assert_eq!(prl.downgrade_reason.as_deref(), Some(reason.as_str()));
     }
 
     /// A tampered document is refused, and refusal changes NOTHING: no document is
@@ -3709,7 +3940,10 @@ mod tests {
         let env = TestEnv::new();
         env.trust_test_key();
         env.on_fetch(|_e| panic!("a refused list must never trigger a download"));
-        let json = doc_for_this_platform(2, "3.5.3", SHA_A);
+        // The signature check refuses this long before the ratchet is consulted;
+        // keep it above the floor anyway so the failure on show can only be the one
+        // this test is named after.
+        let json = doc_for_this_platform(2, &newer_than_local_floor(), SHA_A);
         let (bytes, sig, _pk) = sign(&json);
         let mut tampered = bytes.clone();
         let pos = tampered.windows(4).position(|w| w == b"1111").unwrap();
@@ -3732,7 +3966,7 @@ mod tests {
     fn bytes_that_do_not_match_the_pin_are_refused_without_fallback() {
         let env = TestEnv::new();
         env.trust_test_key();
-        let json = doc_for_this_platform(2, "3.5.3", SHA_A);
+        let json = doc_for_this_platform(2, &newer_than_local_floor(), SHA_A);
         let (bytes, sig, _pk) = sign(&json);
         env.on_fetch(|_e| {
             Err(binaries::FetchFail::Integrity(
@@ -3766,7 +4000,7 @@ mod tests {
             "a refused list must not raise the floor"
         );
         // And the pin the resolver enforces is still the built-in floor.
-        let pin = effective_pin("gpu-prl", "x86_64-unknown-linux-gnu", "SRBMiner-MULTI").unwrap();
+        let pin = effective_pin("gpu-prl", RATCHET_TARGET, "SRBMiner-MULTI").unwrap();
         assert_eq!(pin.source, PinSource::Embedded);
     }
 
@@ -3776,7 +4010,7 @@ mod tests {
     fn a_download_failure_defers_and_keeps_the_current_pin() {
         let env = TestEnv::new();
         env.trust_test_key();
-        let json = doc_for_this_platform(2, "3.5.3", SHA_A);
+        let json = doc_for_this_platform(2, &newer_than_local_floor(), SHA_A);
         let (bytes, sig, _pk) = sign(&json);
         env.on_fetch(|_e| Err(binaries::FetchFail::Network("connection timed out".into())));
 
@@ -3807,8 +4041,11 @@ mod tests {
     fn an_epoch_is_published_once() {
         let env = TestEnv::new();
         env.trust_test_key();
+        // The epoch rule is the subject; the version only has to stay out of its
+        // way, on every platform.
+        let version = newer_than_local_floor();
         let engine_bytes = b"engine v1".to_vec();
-        let json = doc_for_this_platform(2, "3.5.3", &sha_of(&engine_bytes));
+        let json = doc_for_this_platform(2, &version, &sha_of(&engine_bytes));
         let (bytes, sig, _pk) = sign(&json);
         let staged = engine_bytes.clone();
         env.on_fetch(move |_e| Ok(staged.clone()));
@@ -3823,8 +4060,8 @@ mod tests {
             "got {out:?}"
         );
 
-        // Same epoch, different content → refused.
-        let json2 = doc_for_this_platform(2, "3.5.4", SHA_B);
+        // Same epoch, different content (same version, other bytes) → refused.
+        let json2 = doc_for_this_platform(2, &version, SHA_B);
         let (bytes2, sig2, _pk) = sign(&json2);
         let mut st = load_state();
         let err = apply_document(&bytes2, &sig2, &mut st).unwrap_err();
@@ -3838,8 +4075,11 @@ mod tests {
     fn a_locally_edited_cached_document_is_ignored() {
         let env = TestEnv::new();
         env.trust_test_key();
+        // Re-verification is the subject; the version only has to clear this
+        // machine's floor so the document is accepted in the first place.
+        let version = newer_than_local_floor();
         let engine_bytes = b"engine v1".to_vec();
-        let json = doc_for_this_platform(2, "3.5.3", &sha_of(&engine_bytes));
+        let json = doc_for_this_platform(2, &version, &sha_of(&engine_bytes));
         let (bytes, sig, _pk) = sign(&json);
         let staged = engine_bytes.clone();
         env.on_fetch(move |_e| Ok(staged.clone()));
@@ -3849,16 +4089,16 @@ mod tests {
 
         // Edit the cached document in place, as a local attacker would.
         let path = env.dir.join("pins/engines.json");
-        let edited = String::from_utf8(std::fs::read(&path).unwrap())
-            .unwrap()
-            .replace("3.5.3", "9.9.9");
+        let cached = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        let edited = cached.replace(&version, "9.9.9");
+        assert_ne!(edited, cached, "the local edit must actually change the file");
         std::fs::write(&path, edited).unwrap();
         invalidate_cache();
         assert!(
             active_doc().is_none(),
             "an unsigned edit must not be honoured"
         );
-        let pin = effective_pin("gpu-prl", "x86_64-unknown-linux-gnu", "SRBMiner-MULTI").unwrap();
+        let pin = effective_pin("gpu-prl", RATCHET_TARGET, "SRBMiner-MULTI").unwrap();
         assert_eq!(
             pin.source,
             PinSource::Embedded,
@@ -3910,14 +4150,84 @@ mod tests {
         );
     }
 
+    /// THE PLATFORM ASYMMETRY, stated out loud instead of left to be discovered.
+    ///
+    /// The version ratchet is keyed per (kind,target) and seeded from the embedded
+    /// floor, so on a target the floor pins no GPU-PRL engine for it cannot fire at
+    /// all. That is exactly true of macOS: SRBMiner-MULTI ships no macOS build, so
+    /// `aarch64-apple-darwin` has no gpu-prl entry in `release-assets/miners.json`.
+    ///
+    /// This is not a footnote. It is why a whole set of `doc_for_this_platform`
+    /// fixtures pinned at `3.5.3` stayed green on macOS while Linux and Windows CI
+    /// correctly refused them as downgrades the day the bundled engine went
+    /// 3.4.1 → 3.5.4: a macOS-green run proves nothing about the ratchet for the
+    /// running target. So assert it either way — on a host whose slot IS pinned,
+    /// that a rollback for THIS machine's own target is refused; on a host whose
+    /// slot is not, that the slot really is unpinned and that a rollback therefore
+    /// sails straight through. Add a macOS gpu-prl pin to the floor one day and
+    /// this test switches arms by itself.
+    #[test]
+    fn the_ratchet_covers_this_machines_own_target_or_says_why_it_cannot() {
+        let env = TestEnv::new();
+        let triple = binaries::current_target_triple();
+        match local_floor_prl_version() {
+            Some(floor) => {
+                // Linux and Windows: the rule is live for the running target.
+                env.on_fetch(|_e| panic!("a refused list must never trigger a download"));
+                let mut st = PinState::default();
+                let rolled_back = version_below(&floor);
+                let bytes = doc_for_this_platform(2, &rolled_back, SHA_A).into_bytes();
+                let err = apply_verified_document(&bytes, "sig", &mut st).unwrap_err();
+                assert!(
+                    err.contains(&format!("moves gpu-prl/{triple} backwards")),
+                    "got: {err}"
+                );
+                assert!(
+                    err.contains(&format!("{rolled_back} is OLDER than the {floor}")),
+                    "names both versions: {err}"
+                );
+            }
+            None => {
+                // macOS. Say why, and prove the silence is the floor's doing rather
+                // than an assertion that quietly stopped being reached.
+                eprintln!(
+                    "NOTE: the engine-pin version ratchet cannot fire for {triple}: the embedded \
+                     floor pins no gpu-prl engine there (SRBMiner-MULTI ships no macOS build), so \
+                     every fixture built for this triple is un-ratcheted. The rule itself is \
+                     covered against {RATCHET_TARGET} by `an_unmarked_engine_downgrade_is_refused`; \
+                     its per-running-target half is only exercised on Linux and Windows CI."
+                );
+                assert!(
+                    !embedded_entries()
+                        .iter()
+                        .any(|e| e.kind == "gpu-prl" && e.target == triple),
+                    "no gpu-prl pin for {triple} is the ONLY reason the ratchet is quiet here"
+                );
+                env.on_fetch(|_e| Ok(b"SRBMiner-MULTI payload".to_vec()));
+                let mut st = PinState::default();
+                let bytes =
+                    doc_for_this_platform(2, &version_below(&ratchet_floor()), SHA_A).into_bytes();
+                let out = apply_verified_document(&bytes, "sig", &mut st)
+                    .expect("with no floor for this target there is nothing to ratchet against");
+                assert!(
+                    matches!(out, RefreshOutcome::Updated { epoch: 2, .. }),
+                    "the no-op is real, not assumed: got {out:?}"
+                );
+            }
+        }
+        drop(env);
+    }
+
     /// `min_engine_epoch` retires older documents: after a list that raises the
     /// floor, the previously-cached one is no longer honoured.
     #[test]
     fn min_engine_epoch_retires_an_older_cached_document() {
         let env = TestEnv::new();
         env.trust_test_key();
+        // The EPOCH floor is the subject; the version stays above this machine's
+        // engine floor so the version ratchet cannot fire and take the credit.
         let engine_bytes = b"engine v1".to_vec();
-        let json = doc_for_this_platform(2, "3.5.3", &sha_of(&engine_bytes));
+        let json = doc_for_this_platform(2, &newer_than_local_floor(), &sha_of(&engine_bytes));
         let (bytes, sig, _pk) = sign(&json);
         let staged = engine_bytes.clone();
         env.on_fetch(move |_e| Ok(staged.clone()));
