@@ -1315,13 +1315,25 @@ impl LaneSupervisor {
     /// was off longer than the rung, or the clock says so). Charges the ladder BEFORE
     /// launching, so a machine that dies mid-probe resumes on the next rung instead of
     /// probing again the moment it boots.
+    ///
+    /// What that pre-charge writes is a PUNISHMENT, so paying it for a probe that never
+    /// launched is the conservative error and it stays. What must not stand is the
+    /// in-memory half: `charge_reprobe` and `spawn_run` both clear `halted`, so a spawn
+    /// that failed used to leave the lane in [`GuardCustody::Probing`] — "the guard is
+    /// measuring" — with no child, nothing armed, and no way back until the next process
+    /// start. Same contract as [`Self::run_reprobe`]: a re-probe that could not even be
+    /// launched re-arms on the rung it already charged.
     fn launch_reprobe_now(
         &self,
         program: std::path::PathBuf,
         args: Vec<String>,
     ) -> Result<(), String> {
         let rec = self.charge_reprobe();
-        self.spawn_run(program, args, RunKind::Probe)?;
+        if let Err(e) = self.spawn_run(program, args, RunKind::Probe) {
+            log_verbose("halt re-probe failed to spawn", &e);
+            self.rearm_halt_probe(None);
+            return Err(e);
+        }
         if let Some(rec) = rec {
             self.publish_reprobe_status(&rec);
         }
@@ -1338,18 +1350,59 @@ impl LaneSupervisor {
     /// for evidence of health.
     ///
     /// The flag IS cleared (and the clearing persisted), so the next restart needs a
-    /// fresh accepted share to take this path again.
+    /// fresh accepted share to take this path again — but ONLY ONCE THE CHILD IS UP.
+    ///
+    /// **R5: a spawn that never happened may not consume the evidence that authorised
+    /// it.** The clear used to be written to disk before `spawn_run`, so every reason a
+    /// spawn fails — the engine quarantined by an antivirus (the BUG#4 trigger), a
+    /// half-applied self-update, a volume not mounted yet at boot, a lost execute bit —
+    /// deleted the one fact that postdates the halt while launching nothing. The next
+    /// automatic start then found a record holding the rung and none of the evidence,
+    /// took [`HaltGate::Waiting`] with a perfectly good engine, and parked the lane for
+    /// the rest of the cooldown (up to the six-hour cap) on a pool that had been
+    /// accepting shares a moment earlier. For the case this path exists to rescue — a
+    /// lane too slow to complete a period between restarts — the resume is the only
+    /// escape, so losing it returns that lane to never escaping at all.
+    ///
+    /// [`Self::charge_reprobe`] persists before launching too, and deliberately: what
+    /// IT writes is a punishment, so surviving a crash is the conservative direction.
+    /// Here it is a permission, and the same ordering is the dangerous one.
+    ///
+    /// **The crash window is resolved the cheap way.** If the process dies between a
+    /// successful spawn and the write below, the disk still says the flag is unspent
+    /// and the next start resumes the probe again, free, on the same rung: the lane
+    /// measures one more window. The opposite error — parking a healthy lane for six
+    /// hours — is the one that cost 78 hours, and this cannot loop on a REJECTING pool,
+    /// which never sets the flag at all and walks the ladder exactly as before.
     fn resume_reprobe(
         &self,
         program: std::path::PathBuf,
         args: Vec<String>,
     ) -> Result<(), String> {
-        let rec = {
+        {
             let mut g = self.inner.lock().expect("mutex");
             g.halt_probe_at = None;
             g.halted = false; // the gates must let this one child through
-            if let Some(rec) = g.halt_record.as_mut() {
-                rec.probe_earned = false;
+        }
+        if let Err(e) = self.spawn_run(program, args, RunKind::Probe) {
+            // No child, so nothing consumed the flag: the record on disk was never
+            // rewritten and still authorises this resume. Put the lane back into its
+            // halted, waiting state (`spawn_run` cleared `halted` on its way out) so it
+            // does not sit in `GuardCustody::Probing` with nothing probing.
+            log_verbose("halt re-probe resume failed to spawn", &e);
+            self.rearm_halt_probe(None);
+            return Err(e);
+        }
+        let rec = {
+            let mut g = self.inner.lock().expect("mutex");
+            // The resumed child zeroed the counters, so ANY accepted share here is one
+            // this run landed in the moments since the spawn — fresh evidence, about
+            // the probe now in flight, which this resume was not authorised by and may
+            // not spend.
+            if g.accepted == 0 {
+                if let Some(rec) = g.halt_record.as_mut() {
+                    rec.probe_earned = false;
+                }
             }
             g.halt_record.clone()
         };
@@ -1358,7 +1411,6 @@ impl LaneSupervisor {
                 log_verbose("halt record not persisted", &e);
             }
         }
-        self.spawn_run(program, args, RunKind::Probe)?;
         if let Some(rec) = rec {
             self.publish_reprobe_status(&rec);
         }
@@ -7660,6 +7712,179 @@ mod tests {
             assert_eq!(third.pid(), None);
             assert!(st.halted);
             third.request_stop();
+        });
+    }
+
+    /// R5. **A PROBE THAT NEVER RAN MAY NOT CONSUME THE EVIDENCE THAT AUTHORISED IT.**
+    ///
+    /// `resume_reprobe` cleared `probe_earned`, wrote that to disk, and only THEN tried
+    /// to spawn. Every reason a spawn fails — the engine quarantined by an antivirus, a
+    /// half-applied self-update, a volume not mounted yet at boot, a lost execute bit —
+    /// therefore destroyed the one fact in the record that postdates the halt while
+    /// launching nothing at all. The very next automatic start, with a perfectly good
+    /// engine, then found `Wait` with no evidence beside it, took `HaltGate::Waiting`,
+    /// and parked the lane with NO CHILD for the rest of the cooldown — up to the
+    /// six-hour cap — on a pool that had been accepting shares a moment earlier. For
+    /// the lane this path exists to rescue (one too slow to complete a period between
+    /// restarts) the resume is the ONLY escape, so losing it is "never escapes at all".
+    ///
+    /// The pre-charge in `charge_reprobe` writes before launching too, and correctly:
+    /// what it writes is a punishment. This one is a permission.
+    #[test]
+    fn a_resume_whose_spawn_fails_keeps_the_evidence_that_authorised_it() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            // A halt on rung 1 with an hour still to run, whose in-flight probe HAD
+            // landed an accepted share before the process died: exactly the record
+            // R4-2 resumes instead of parking.
+            let now = acceptance::now_unix();
+            let mut rec = acceptance::HaltRecord::new(
+                Lane::Xmr,
+                &Collapse {
+                    period: crate::acceptance::PeriodStat {
+                        accepted: 0,
+                        rejected: 40,
+                        elapsed: Duration::from_secs(900),
+                    },
+                    run_accepted: 0,
+                    run_rejected: 40,
+                    shutout: true,
+                },
+                Attribution::NetworkWide,
+                1,
+                now,
+            );
+            rec.probe_earned = true;
+            assert!(
+                matches!(rec.resume(now), acceptance::HaltResume::Wait(_)),
+                "the cooldown must NOT be over — this is the resume path, not ProbeNow"
+            );
+            acceptance::save_halt_record(&rec).expect("seed");
+
+            // The engine cannot start. The service manager relaunches us anyway.
+            let missing = std::env::temp_dir().join("alice-no-such-engine-r5resume");
+            let _ = std::fs::remove_file(&missing);
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            // A long rung, so nothing fires behind the assertions below.
+            s.set_reprobe_timing(Duration::from_secs(3_600));
+            let err = s
+                .start_simple_with_cause(missing, vec![], StartCause::Automatic)
+                .expect_err("a missing engine cannot start");
+            assert!(err.to_lowercase().contains("failed to start"), "{err}");
+
+            // NOTHING RAN, so nothing may have been spent on it.
+            let after = acceptance::load_halt_record(Lane::Xmr).expect("still recorded");
+            assert!(
+                after.probe_earned,
+                "the evidence for a probe that never launched must survive: {after:?}"
+            );
+            assert_eq!(after.probes, 1, "and a resume charges no rung either");
+
+            // …and the lane reports what is true: held by the guard, counting down —
+            // not `Probing`, which would tell layer 2 a measurement is under way.
+            let st = s.stats();
+            assert!(st.halted, "a resume that did not happen leaves the halt: {st:?}");
+            assert_eq!(st.activity, GuardCustody::Halted);
+            assert_eq!(s.pid(), None, "there is no child");
+            assert!(
+                st.message_args.and_then(|a| a.retry_in_s).is_some(),
+                "and the re-probe is armed again"
+            );
+            s.request_stop();
+            drop(s);
+
+            // The next automatic start finds a working engine — and the record still
+            // authorises the resume, so the lane MEASURES instead of parking.
+            let second = LaneSupervisor::new(Lane::Xmr);
+            second.set_acceptance_config(fast_acceptance());
+            second.set_reprobe_timing(Duration::from_secs(3_600));
+            let (program, args) = idle_child();
+            second
+                .start_simple_with_cause(program, args, StartCause::Automatic)
+                .expect("automatic start");
+            assert!(
+                wait_for(&second, 5, |st| st.state == ProcState::Running).await,
+                "the resume must still be available to a good engine: {:?}",
+                second.stats()
+            );
+            assert_eq!(second.halt_probes(), 1, "on the SAME rung");
+            assert_eq!(
+                second.stats().activity,
+                GuardCustody::Probing,
+                "the guard still owns the lane until a period is measured"
+            );
+            let spent = acceptance::load_halt_record(Lane::Xmr).expect("recorded");
+            assert!(
+                !spent.probe_earned,
+                "NOW it is spent — a child is up, so the resume really happened: {spent:?}"
+            );
+            assert_eq!(spent.probes, 1, "and still no rung charged for resuming");
+            second.request_stop();
+        });
+    }
+
+    /// The same failure on the OTHER re-probe entry point. `launch_reprobe_now` charges
+    /// the ladder before launching, which is right — a punishment that survives a crash
+    /// is the conservative error — but a spawn that then failed left the lane in
+    /// `GuardCustody::Probing` ("the guard is measuring this lane") with no child, no
+    /// countdown, and no way back until the next process start. `run_reprobe` has always
+    /// re-armed after the same failure; this path must too.
+    #[test]
+    fn a_reprobe_whose_spawn_fails_rearms_instead_of_claiming_to_be_probing() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            // A halt whose cooldown elapsed while the box was off ⇒ probe at once.
+            let week_ago = acceptance::now_unix().saturating_sub(7 * 86_400);
+            let rec = acceptance::HaltRecord::new(
+                Lane::Xmr,
+                &Collapse {
+                    period: crate::acceptance::PeriodStat {
+                        accepted: 0,
+                        rejected: 40,
+                        elapsed: Duration::from_secs(900),
+                    },
+                    run_accepted: 0,
+                    run_rejected: 40,
+                    shutout: true,
+                },
+                Attribution::NetworkWide,
+                0,
+                week_ago,
+            );
+            acceptance::save_halt_record(&rec).expect("seed");
+
+            let missing = std::env::temp_dir().join("alice-no-such-engine-r5probenow");
+            let _ = std::fs::remove_file(&missing);
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            s.set_reprobe_timing(Duration::from_secs(3_600));
+            let err = s
+                .start_simple_with_cause(missing, vec![], StartCause::Automatic)
+                .expect_err("a missing engine cannot start");
+            assert!(err.to_lowercase().contains("failed to start"), "{err}");
+
+            let st = s.stats();
+            assert!(st.halted, "a re-probe that never launched must not end the halt: {st:?}");
+            assert_eq!(
+                st.activity,
+                GuardCustody::Halted,
+                "layer 2 must not be told a measurement is under way"
+            );
+            assert_eq!(s.pid(), None, "there is no child");
+            assert!(
+                st.message_args.and_then(|a| a.retry_in_s).is_some(),
+                "the countdown is armed again, on the rung already charged"
+            );
+
+            // The rung stays spent — deliberately. It is a punishment, and the
+            // record must never rewind.
+            assert_eq!(s.halt_probes(), 1);
+            let after = acceptance::load_halt_record(Lane::Xmr).expect("still recorded");
+            assert_eq!(after.probes, 1);
+            s.request_stop();
         });
     }
 
