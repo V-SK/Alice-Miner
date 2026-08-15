@@ -1,38 +1,37 @@
 {
   "_comment": "ENDORSEMENT INPUT for the signed engine-pin document (engines.json). This file is the human decision — which upstream engine build we are willing to run — and it is deliberately NOT what the client trusts: `scripts/build_engines_manifest.py` downloads every artifact listed here, reproduces its SHA-256 itself, and fails if a declared `expected_*` hash does not match. Only then does it emit engines.json for V to sign OFFLINE with the engine-pin sub-key. Every change here must land in ENGINE-TRUST-LOG.md with the same evidence. Seeded 2026-08-14 with the EXACT pins currently compiled into the client (release-assets/miners.json), so a first run reproduces today's state byte-for-byte and proves the pipeline before it is ever used to change an engine. macOS xmrig and the kawpowminer placeholders are intentionally absent: they have no fetch URL, so the client keeps using its built-in pin for them.",
-  "_stale_warning": "⛔ These entries still pin SRBMiner-MULTI 3.4.1, the build that could not mine post-fork Pearl. Every v0.6.8 client compiles in 3.5.4 and REFUSES a document that moves an engine backwards without a `downgrade` marker, so publishing this file unchanged would be rejected fleet-wide (correctly). Bump the two gpu-prl entries to the 3.5.4 hashes endorsed in ENGINE-TRUST-LOG.md epoch 2 before the first real publish.",
   "_optional_fields": "Beyond the bytes, an entry may also say HOW to call the engine and which way its version moves. All are optional; omitted means the client uses what it was compiled with. `algorithm`: the algorithm token to pass instead of the compiled-in one (short ASCII, never flag-shaped) -- accepted ONLY on kind gpu-prl, the one kind whose argv carries an algorithm token; on any other kind it is refused rather than accepted-and-ignored. `extra_args`: a LIST of argv tokens spliced in BEFORE every flag the client owns. CHANGED 2026-08-15: this is now an ALLOW-list, not a deny-list -- every flag must appear in engine_pins::extra_arg_allowlist for that engine kind. CHANGED AGAIN 2026-08-16: write ONE TOKEN PER FLAG in exact case -- \"--flag\" or \"--flag=value\", each flag at most once. [\"--randomx-mode=light\"] is accepted; [\"--randomx-mode\", \"light\"] and [\"--Randomx-Mode=light\"] are refused. The old two-token spelling put a value in a positional slot that was never checked against either list, and whether the engine consumed that slot was our guess about someone else's parser: xmrig's --randomx-wrmsr takes an optional argument (consumes nothing) and --asm does not exist on ARM despite its own --help, so [\"--randomx-wrmsr\",\"-o127.0.0.1\",\"--randomx-wrmsr\",\"-uATTACKER\"] was fully allow-listed and became POOL #1 plus a login. Values are still restricted to [A-Za-z0-9.,+_-], and may look flag-shaped when the flag wants that (--randomx-wrmsr=-1) because they ride inside the token. Reviewed today: cpu-xmr (xmrig) has 13 RandomX/CPU tuning flags; gpu-prl, gpu-rvn and gpu-alpha have NONE, because nobody has read those engines' flag surfaces against the binaries. The deny-list-only rule failed against the engine we ship: xmrig spells --user/--pass also as --userpass, --proxy as -x and --log-file as -l, and all three were live-verified to redirect credit, transport and writes. Adding a flag is a client release, on purpose. `parser`: which compiled-in log parser reads this engine's output -- one of xmrig|kawpow|srbminer|alpha|generic; an id the client does not have refuses the whole document. `downgrade` + `downgrade_reason`: REQUIRED together when the version is not provably newer than one already in force (a real rollback, or a version string the client cannot order); the reason is shown verbatim to every miner. See docs/engine-pin-publishing.md §2a and §2b.",
   "notes": "Baseline: the engines compiled into client v0.6.7.",
   "engines": [
     {
       "kind": "gpu-prl",
       "engine": "srbminer-multi",
-      "version": "3.4.1",
+      "version": "3.5.4",
       "target": "x86_64-unknown-linux-gnu",
       "filename": "SRBMiner-MULTI",
-      "archive_url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.4.1/SRBMiner-Multi-3-4-1-Linux.tar.gz",
-      "binary_path_in_archive": "SRBMiner-Multi-3-4-1/SRBMiner-MULTI",
-      "expected_archive_sha256": "c2de6da87afad6d536573084a46cfb08e2bd5b38cdbf9245199d093a6ea6970f",
-      "expected_binary_sha256": "9335b57a97396b9f8a83b9953f69384704443469279694e34eb76cce2b7296f7",
-      "source_url": "https://github.com/doktor83/SRBMiner-Multi/releases/tag/3.4.1",
+      "archive_url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.5.4/SRBMiner-Multi-3-5-4-Linux.tar.gz",
+      "binary_path_in_archive": "SRBMiner-Multi-3-5-4/SRBMiner-MULTI",
+      "expected_archive_sha256": "3127ace7c6f9a6ed0f86b1c96020aeac1cf2d32db2acdd78ba307894f48c366a",
+      "expected_binary_sha256": "e3eebefd4911c0d656e8e17116338a11abea17588161aa6b23acf2071b8e3f87",
+      "source_url": "https://github.com/doktor83/SRBMiner-Multi/releases/tag/3.5.4",
       "endorsed_by": "V",
-      "endorsed_at": "2026-06-25T00:00:00Z",
-      "notes": "Vendor archive md5 834f26b94aa17064d17f4649d9ea98e7 matched locally; archive + extracted-binary sha256 reproduced 2026-06-25."
+      "endorsed_at": "2026-08-15T00:00:00Z",
+      "notes": "Post-fork engine. Pearl hard-forked at height 99000 on 2026-08-11T12:03:43Z; the previous pin (3.4.1, released 2026-06-25) predates that spec by seven weeks and every share it produced from the fork block on was invalid. EVIDENCE: archive + extracted-binary sha256 independently reproduced twice — once on a rented Linux GPU box 2026-08-14 and once on the release Mac 2026-08-15 — and both match the pin compiled into this client byte for byte; vendor .md5 also matched. REAL-HARDWARE VERIFIED, which 3.4.1 never was: 2026-08-14 22:51-23:11Z, RTX 3060 via the Asia relay, 8 accepted / 0 rejected at 44.8 TH/s, confirmed independently in the engine counter, the relay logs (a post-fork job at height 99953 with cert_version:3 answered result:true) and the central share ledger. HONEST LIMIT: single source. The vendor hash and our recomputation both come from the same GitHub release; see the accepted-risk section of ENGINE-TRUST-LOG.md."
     },
     {
       "kind": "gpu-prl",
       "engine": "srbminer-multi",
-      "version": "3.4.1",
+      "version": "3.5.4",
       "target": "x86_64-pc-windows-msvc",
       "filename": "SRBMiner-MULTI.exe",
-      "archive_url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.4.1/SRBMiner-Multi-3-4-1-win64.zip",
-      "binary_path_in_archive": "SRBMiner-Multi-3-4-1/SRBMiner-MULTI.exe",
-      "expected_archive_sha256": "73451074129cda947c9c63c0b7a08230dc71d589606bbc0664a09a58bfcf0a81",
-      "expected_binary_sha256": "e2fa2dd25f6afc5aed66af29e2616fd9c4223d577f23ce92d5b9f75feb1bb39a",
-      "source_url": "https://github.com/doktor83/SRBMiner-Multi/releases/tag/3.4.1",
+      "archive_url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.5.4/SRBMiner-Multi-3-5-4-win64.zip",
+      "binary_path_in_archive": "SRBMiner-Multi-3-5-4/SRBMiner-MULTI.exe",
+      "expected_archive_sha256": "51c03bd926c62f53c87be298d724543ead244e63cc69dcd55a0c3eb50eb483aa",
+      "expected_binary_sha256": "1926cc1d4756506a6fd24360969593ae47fd8397508f93293449a017ec35449e",
+      "source_url": "https://github.com/doktor83/SRBMiner-Multi/releases/tag/3.5.4",
       "endorsed_by": "V",
-      "endorsed_at": "2026-06-25T00:00:00Z",
-      "notes": "Vendor archive md5 5962b5e4a67789c4bdd6cdcfdf3a70a0 matched locally."
+      "endorsed_at": "2026-08-15T00:00:00Z",
+      "notes": "Same upstream release as the Linux entry. HASH-VERIFIED ONLY — this binary has never been EXECUTED by us on any machine. The Linux build of the same 3.5.4 release was proven on real hardware (see that entry); this one was not. Say so rather than imply parity."
     },
     {
       "kind": "cpu-xmr",
@@ -90,5 +89,6 @@
       "endorsed_at": "2026-06-26T00:00:00Z",
       "notes": "Matches the vendor's published SHA256SUMS; NOT yet live-validated on Windows-NVIDIA."
     }
-  ]
+  ],
+  "_endorsement_note": "`endorsed_by` records WHO decided to trust these bytes. That decision is enacted by V's offline signature over the built engines.json — the field is prepared here, the signature is what makes it true. An agent prepared the technical facts (hashes, URLs, the real-hardware evidence in the notes) and did not, and cannot, endorse on V's behalf."
 }
