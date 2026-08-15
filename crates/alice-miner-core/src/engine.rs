@@ -1287,19 +1287,19 @@ fn bundled_kind_for(lane: Lane) -> crate::binaries::MinerKind {
 /// client owns (pool, login, password, log file, device selection).
 ///
 /// Read the position honestly: it is a default chosen on evidence, **not** the
-/// invariant. Precedence belongs to the engine's own parser, so whichever end we
-/// pick is the winning end for one of {last-wins, first-wins} and the losing end for
-/// the other; no ordering can be safe against both. xmrig 6.26 — the only bundled
-/// engine whose binary lives in this repo, so the only one we can test — is
-/// last-wins (verified), and no bundled engine is known to be first-wins, so first
-/// is where a publisher token loses today. Until 2026-08-15 this appended, and said
-/// that end was safe "even on an engine whose own parsing is last-wins", which had
-/// it exactly backwards: an appended `--userpass=<attacker>` beat the client's own
-/// `-u`, and every share went to the publisher.
+/// invariant. Precedence belongs to the engine's own parser, and "first vs last" is
+/// not even the right axis for xmrig — its `-o` **accumulates** into an ordered pool
+/// list rather than overriding, so a publisher `-o` spliced first would become POOL
+/// #1, the pool actually mined. The 2026-08-15 note here said xmrig "is last-wins",
+/// which was a third of the truth; the measured three rules and the reason first is
+/// still the safer default (it puts publisher argv before the client's first `-o`,
+/// where xmrig's per-pool credit flags attach to nothing) are written out in
+/// `EngineInvocation::apply_extra_args`.
 ///
-/// The actual invariant is `engine_pins::extra_arg_allowlist`: publisher argv can
-/// only name flags reviewed for that specific engine, so it does not matter who
-/// wins the tie. See `EngineInvocation::apply_extra_args`.
+/// The actual invariant is `engine_pins::extra_arg_allowlist` plus the one-token
+/// `--flag=value` rule: publisher argv can only name flags reviewed for that specific
+/// engine, spelled exactly as reviewed, with no positional value slot for anything
+/// else to ride in.
 ///
 /// Re-resolved on every rebuild (not captured), and fails the rebuild CLOSED if the
 /// pin's invocation stops validating — a lane that will not start with a reason beats
@@ -1783,7 +1783,7 @@ mod tests {
   "issued":"2026-08-15T00:00:00Z","engines":[
   {{"kind":"cpu-xmr","engine":"xmrig","version":"9.9.9","target":"{target}",
     "filename":"{filename}","sha256":"{sha}",
-    "extra_args":["--randomx-mode","light"],
+    "extra_args":["--randomx-mode=light"],
     "archive_url":"https://github.com/xmrig/xmrig/releases/download/v9.9.9/a.tar.gz",
     "archive_sha256":"{sha}","binary_path_in_archive":"{member}",
     "source_url":"https://github.com/xmrig/xmrig/releases/tag/v9.9.9",
@@ -1798,8 +1798,8 @@ mod tests {
         let got = wrapped(&[]).unwrap().1;
         assert_eq!(
             got,
-            ["--randomx-mode", "light", "-o", "relay:3333", "-u", "VICTIM", "-p", "x"],
-            "the pin's argv goes FIRST — the client's login flags are the last word"
+            ["--randomx-mode=light", "-o", "relay:3333", "-u", "VICTIM", "-p", "x"],
+            "the pin's argv goes FIRST, as ONE canonical token per reviewed flag"
         );
 
         // Another lane's engine is unaffected — the pin is per (kind, target).

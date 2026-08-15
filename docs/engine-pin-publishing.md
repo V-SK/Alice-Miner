@@ -82,7 +82,7 @@ So an entry in `engines-sources.json` may now also carry:
 | field | what it does | bound |
 |---|---|---|
 | `algorithm` | replaces the client's compiled-in algorithm token (`pearlhash`) wherever a lane's argv carries one | short ASCII token, never flag-shaped, ≤ 64 chars; **only on `gpu-prl`** — it is the one kind whose argv has an algorithm slot, and setting it on another kind is refused rather than accepted-and-ignored |
-| `extra_args` | argv spliced in **before** every flag the client owns | ≤ 16 tokens, and every flag must be on the **reviewed allow-list for that engine kind** (`engine_pins::extra_arg_allowlist`); values only in the slot their flag opened, and restricted to letters, digits and `. - _ , +` |
+| `extra_args` | argv spliced in **before** every flag the client owns | ≤ 16 tokens; **every** token must be a flag on the **reviewed allow-list for that engine kind** (`engine_pins::extra_arg_allowlist`), spelled in exact case, named at most once, and written as ONE token — `--flag` or `--flag=value`, never two list entries. Values are restricted to letters, digits and `. - _ , +` |
 | `parser` | which compiled-in log parser reads this engine's output — `xmrig`, `kawpow`, `srbminer`, `alpha`, `generic` | must be an id **this client has**; an unknown id refuses the document whole |
 
 All three are optional. Omitted ⇒ byte-for-byte the behaviour that shipped before
@@ -103,11 +103,10 @@ third-party binary. It failed on the engine we ship. xmrig 6.26 spells `--user` 
 `--pass` also as **`--userpass`**, `--proxy` also as **`-x`**, and `--log-file`
 also as **`-l`**; none were on the deny-list, and each was verified against
 `release-assets/aarch64-apple-darwin/xmrig` to work:
-`--userpass=<attacker>:x` put the attacker's address in the stratum login (xmrig is
-last-wins, and the pin's argv was appended *last*), `-x host:port` routed the
-plaintext session through a chosen host, `-l file` created a file. No new engine
-version was needed — re-publishing the current entry with the flag added is
-accepted as `Same` and skips staging entirely.
+`--userpass=<attacker>:x` put the attacker's address in the stratum login, `-x
+host:port` routed the plaintext session through a chosen host, `-l file` created a
+file. No new engine version was needed — re-publishing the current entry with the
+flag added is accepted as `Same` and skips staging entirely.
 
 So the rule is inverted, and the allow-list currently reads:
 
@@ -130,6 +129,49 @@ What the allow-list guarantees: an alias nobody enumerated cannot pass, because
 passing requires being *named*. What it does not: that a reviewed flag stays
 harmless on a future version of the same engine — only re-review catches a vendor
 repurposing a flag.
+
+### How to WRITE one (changed 2026-08-16 — the old spelling is now refused)
+
+**One token per flag. `--flag`, or `--flag=value`. Exact case. Each flag once.**
+
+```jsonc
+"extra_args": ["--randomx-mode=light", "--huge-pages-jit"]   // ✅
+"extra_args": ["--randomx-mode", "light"]                    // ❌ refused
+"extra_args": ["--Randomx-Mode=light"]                       // ❌ refused (case)
+"extra_args": ["--randomx-mode=light", "--randomx-mode=fast"]// ❌ refused (twice)
+```
+
+The two-token spelling used to be accepted, and it was the hole. A value sat in a
+*positional slot* that was checked only for content and charset — never against the
+allow-list or the client-owned deny-list — and whether the engine actually consumed
+that slot was our guess about someone else's argv parser. Two ways it was wrong, both
+proved live against `release-assets/aarch64-apple-darwin/xmrig`:
+
+* **Arity.** `--randomx-wrmsr` takes an *optional* argument and so consumes nothing;
+  `--asm` is printed in that binary's own `--help` but is x86-only and answers
+  ``unrecognized option``. `["--randomx-wrmsr", "-o127.0.0.1", "--randomx-wrmsr",
+  "-uATTACKER"]` was fully allow-listed, lower-case and colon-free, and xmrig read it
+  as a real pool plus a real login. Because `-o` **accumulates**, that pool became
+  POOL #1 — the one actually mined.
+* **Case.** The lookup case-folded, the emitted token did not. `--RANDOMX-MODE` was a
+  reviewed value-taking flag to the client and `unrecognized option` to xmrig, which
+  does not abort on one — so it consumed nothing and the "value" behind it became a
+  real flag. That generalised the hole from those two flags to all six.
+
+With a value inside its flag's token there is no slot, so a wrong guess about arity —
+or about whether the flag exists on this platform at all — is at worst one word the
+engine skips, and never a door. (Verified: `--asm=-lFILE`, `--randomx-wrmsr=-lFILE`,
+`--randomx-mode=-lFILE`, `--dns-ttl=-lFILE` all left no file behind.)
+
+Two things follow for a publisher. A value may still look flag-shaped when the flag
+wants that — `--randomx-wrmsr=-1` is fine, because it is inside the token. And the
+value charset is unchanged: letters, digits and `. - _ , +`, so no `:`, `/`, `\` or
+`@`, which is what stops a value spelling `host:port`, `user:pass` or a path.
+
+Note also what this fixed for **honest** publishing: `--Randomx-Mode=light` used to be
+a document every rig accepted and no engine ever honoured — you would have believed
+the fleet moved when it had not. It is now refused at validation, with the correct
+spelling in the message.
 
 ### What this still does NOT remove
 

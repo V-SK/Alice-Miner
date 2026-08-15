@@ -104,6 +104,48 @@
 //! (it can only ever refuse more), and a test asserts the two lists are disjoint so
 //! it cannot rot into decoration.
 //!
+//! ### …and the allow-list is only sound if we stop predicting the parse (2026-08-16)
+//!
+//! Inverting the list was necessary and not sufficient. A second adversarial pass
+//! re-exploited it twice, both proved live against the bundled
+//! `release-assets/aarch64-apple-darwin/xmrig`, and both from the same root cause:
+//! **the validator held a model of how the engine would parse the argv it approved,
+//! and every wrong guess in that model was a bypass.**
+//!
+//! * *Arity.* A value was accepted in a positional slot after any flag declared
+//!   value-taking, and in that slot the allow-list and [`CLIENT_OWNED_FLAGS`] were
+//!   never consulted — only the content/charset scans, which `-o127.0.0.1` and
+//!   `-uATTACKER` pass cleanly. `--randomx-wrmsr` takes an *optional* argument and so
+//!   consumes nothing; `--asm` is not implemented at all on the ARM build (its own
+//!   `--help` says otherwise). Either way the "value" reached the engine as a real
+//!   option, and — because `-o` accumulates rather than overrides — the publisher's
+//!   pool became POOL #1.
+//! * *Case.* The lookup case-folded and the emitted token did not, so
+//!   `--RANDOMX-MODE` was a value-taking reviewed flag to us and `unrecognized
+//!   option` to xmrig, which does not abort on one. It consumed nothing, and the
+//!   token our validator had waved through as "just a value" became a real flag.
+//!   This generalised the first hole from two flags to all six.
+//!
+//! So the rule no longer predicts anything. Extra argv is now **one canonical token
+//! per reviewed flag**: `--flag` or `--flag=value`, exact case, long form, each flag
+//! named at most once, every token checked against both lists. There is no value
+//! position, so there is nothing for a mis-guessed arity to leave behind; an
+//! unrecognised token is one word the engine skips whole (measured: an inline value
+//! cannot escape its token); and a token we accept is byte-for-byte the token the
+//! engine matches. The property is: **a token that passes either does what we
+//! believe it does, or is refused — it is never silently inert to the engine while
+//! opening a door.**
+//!
+//! The same change closes an honest-operator bug with the same root: `--Randomx-Mode=light`
+//! used to be a document every rig accepted and no engine ever honoured — a signed
+//! instruction silently dropped, which is the hazard [`KINDS_WITH_ALGORITHM_SLOT`]
+//! exists to prevent one field over.
+//!
+//! What is *not* claimed: that a reviewed flag is harmless on a future build of that
+//! engine. Only re-review catches a repurposed flag. What is also not claimed is that
+//! `--help` is evidence — on this very binary it documents an option the binary does
+//! not implement.
+//!
 //! The price is stated plainly rather than hidden: a fork that needs a switch we
 //! have never reviewed now costs a **client release** (a one-line table entry),
 //! where the deny-list would have published it. That is the trade the August
@@ -218,11 +260,20 @@ const CLIENT_OWNED_FLAGS: &[&str] = &[
 
 /// One flag a signed pin is allowed to add to a given engine's argv.
 ///
-/// `flag` is the exact **lower-case** spelling; `takes_value` says whether it is
-/// followed by a value (either `--flag=v` or `--flag` `v` as two list entries).
-/// Getting `takes_value` wrong is fail-closed in the safe direction: a value-taking
-/// flag declared `false` refuses the `=` form and leaves its value token orphaned
-/// (refused), and a boolean declared `true` refuses for want of a value.
+/// `flag` is the exact spelling, which must be a **long, lower-case `--flag`** —
+/// pinned by [`the_argv_allow_list_is_limited_to_forms_this_rule_can_express`] and
+/// re-checked at validation time, because the one-token rule below is only well
+/// defined for long options (`-t=4` would give getopt a value of `=4`).
+///
+/// `takes_value` says whether it must be written `--flag=value`. It is the ONLY
+/// spelling accepted: a value never gets an argv token of its own
+/// ([`check_extra_args`]). That is what makes a wrong `takes_value` harmless rather
+/// than a bypass — either way the engine receives exactly one word it either
+/// understands or rejects, with no orphaned second token to re-parse as an option.
+/// Verified on the bundled xmrig 6.26: a boolean given a value prints
+/// ``option `--randomx-no-numa' doesn't allow an argument`` and carries on; an
+/// unknown flag prints `unrecognized option` and carries on; in neither case does a
+/// following token change meaning, because there is none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtraArgSpec {
     pub flag: &'static str,
@@ -248,19 +299,37 @@ const fn valued(flag: &'static str) -> ExtraArgSpec {
 /// device, none detaches the process (`-B/--background`), exits early
 /// (`--dry-run`, `--print-platforms`, `--export-topology`), disables mining
 /// (`--no-cpu`) or touches the donation cut — those were considered and left off.
+///
+/// **2026-08-16, measured rather than read.** `--help` is not a reliable statement
+/// of a build's flag surface, and neither is `takes_value` a reliable statement of
+/// its arity:
+///
+/// * `--asm` is printed by this binary's own `--help`, and this binary answers
+///   ``unrecognized option `--asm'`` — it is an x86-only option and the help text is
+///   shared across platforms. It is kept (it is real and useful on the x86 fleet,
+///   which is most of it) and is harmless where it is absent *only because* a value
+///   now rides inside its flag's token.
+/// * `--randomx-wrmsr` takes an OPTIONAL argument, so it consumes nothing in the
+///   two-token spelling; `--randomx-wrmsr=-1` is the form that works.
+///
+/// Both facts were bypasses while a value could occupy an argv token of its own.
+/// Neither is a bypass now, and neither is why the flags are listed here — that is
+/// still the review. The lesson recorded for the next reviewer: an entry here is a
+/// claim about what a flag CAN do, and it is never a claim that the engine will
+/// parse it the way we expect.
 const XMRIG_EXTRA_ARGS: &[ExtraArgSpec] = &[
     valued("--randomx-mode"),      // auto | fast | light
     valued("--randomx-init"),      // dataset init threads
     boolean("--randomx-1gb-pages"),
     boolean("--randomx-no-numa"),
-    valued("--randomx-wrmsr"),     // MSR tweak value, or -1 to disable
+    valued("--randomx-wrmsr"),     // MSR tweak value, or -1 to disable (optional_argument)
     boolean("--randomx-no-rdmsr"),
     boolean("--randomx-cache-qos"),
     boolean("--huge-pages-jit"),
     boolean("--no-huge-pages"),
     valued("--cpu-max-threads-hint"),
     boolean("--cpu-no-yield"),
-    valued("--asm"),               // auto | none | intel | ryzen | bulldozer
+    valued("--asm"),               // auto | none | intel | ryzen | bulldozer (x86 builds only)
     valued("--dns-ttl"),
 ];
 
@@ -443,13 +512,19 @@ pub struct PinEntry {
     /// Extra argv spliced in BEFORE every flag the client controls, for a reviewed
     /// tuning switch this engine build wants.
     ///
+    /// **One canonical token per flag**: `"--flag"` or `"--flag=value"`, exact case,
+    /// each flag at most once. A value never gets a list entry of its own — the
+    /// two-token spelling `["--randomx-mode", "light"]` is refused, because a
+    /// positional value slot is a slot the engine may decline to consume (module
+    /// header, 2026-08-16).
+    ///
     /// Bounded by [`extra_arg_allowlist`] — the flag must be one a human has checked
     /// against THAT engine's own flag surface — plus the same credit-only /
     /// anti-leak scan a bring-your-own miner's argv gets
     /// ([`crate::backend::forbidden_in_arg`]) and, as a second belt,
-    /// [`CLIENT_OWNED_FLAGS`]. It is deliberately NOT a general "add any switch a
-    /// fork needs" channel any more: see the module header for the aliases that
-    /// broke that version of the rule.
+    /// [`CLIENT_OWNED_FLAGS`]. Every one of those applies to every token. It is
+    /// deliberately NOT a general "add any switch a fork needs" channel any more:
+    /// see the module header for the aliases that broke that version of the rule.
     #[serde(default)]
     pub extra_args: Option<Vec<String>>,
     /// Which compiled-in log parser reads this engine's output
@@ -588,28 +663,50 @@ impl EngineInvocation {
     /// Splice this invocation's extra argv into a launch plan's args, **before**
     /// every flag the client built.
     ///
-    /// ## Why first, and what that is and is not worth
+    /// ## Why first — and what "xmrig is last-wins" got wrong
     ///
-    /// It is NOT the invariant. Ordering cannot be a security control here, because
-    /// precedence is the engine's choice, not ours: on a **last-wins** parser the
-    /// last occurrence of a flag wins, on a **first-wins** parser the first does,
-    /// and a pin's argv can only be on one side. Whichever end we pick is the
-    /// winning end for exactly one of those two families. The invariant is
-    /// [`extra_arg_allowlist`]: publisher argv can only contain flags reviewed for
-    /// that engine, so it does not matter who wins.
+    /// Ordering is NOT the invariant. Precedence is the engine's choice, not ours,
+    /// so whichever end we pick is the winning end for some family of parsers and the
+    /// losing end for another. The invariant is [`extra_arg_allowlist`]. This choice
+    /// is damage limitation for the case where the allow-list is one day wrong, and
+    /// it should therefore be made on measurement, not on a slogan.
     ///
-    /// Given that, first is the better *default*, on evidence rather than on
-    /// symmetry: xmrig 6.26 — the one bundled engine whose binary is in this repo,
-    /// so the only one we can actually test — is last-wins (verified: an appended
-    /// `--userpass=…` overrode an earlier `-u`, and the same token placed first lost
-    /// to it). No bundled engine is known to be first-wins. The previous code
-    /// appended, and its doc comment claimed that end was the safe one "even on an
-    /// engine whose own parsing is last-wins", which was backwards.
+    /// The previous slogan was "xmrig 6.26 is last-wins, so first is where a
+    /// publisher token loses". That is only a third of the truth. Measured against
+    /// the bundled binary, xmrig has **three** precedence rules, not one:
     ///
-    /// One behavioural note this position does carry: xmrig applies *per-pool* flags
-    /// to the most recent preceding `-o`, so a pool-scoped flag placed here is
-    /// global instead. No allow-listed flag is pool-scoped, and a pin cannot add
-    /// `-o` itself.
+    /// 1. **Global scalars** (`--randomx-mode`, …) are last-wins.
+    /// 2. **Per-pool options** (`-u`, `-p`, `--userpass`, `--rig-id`, `--keepalive`,
+    ///    `--coin`, `--tls`, …) attach to the pool created by the most recent
+    ///    PRECEDING `-o`, and to that pool only (see `lane::xmr::POOL_SCOPED_FLAGS`,
+    ///    which established this independently from the miner's own `/1/config`).
+    /// 3. **`-o`/`--url` ACCUMULATE.** They are not a scalar at all: each one appends
+    ///    a pool, and list order is failover priority. POOL #1 is the pool actually
+    ///    mined.
+    ///
+    /// Rule 3 is the one that matters, and it inverts the usual reasoning: splicing
+    /// first does not make a publisher `-o` *lose*, it makes it **POOL #1**. Measured
+    /// on a loopback listener, with the client's own pool second:
+    ///
+    /// ```text
+    ///   publisher -o FIRST → honest pool never contacted; evil pool got the login
+    ///   publisher -o LAST  → honest pool got the login; evil pool never contacted
+    /// ```
+    ///
+    /// So neither end dominates, and the honest question is which end limits more
+    /// damage. First does, for two measured reasons:
+    ///
+    /// * The client's xmrig argv **begins with `-o`** (`lane::xmr::push_pool_group`).
+    ///   Publisher argv spliced at index 0 therefore sits before ANY pool exists, and
+    ///   rule 2 makes the entire per-pool credit class inert there — measured:
+    ///   `--userpass=EVIL:zz` placed first left the login as the client's
+    ///   `HONESTWALLET`, while the same token appended replaced it with `EVIL`.
+    /// * That class is large (`-u`, `-p`, `-O/--userpass`, `--rig-id`, `--tls`, `-x`,
+    ///   `--coin`, …); the class first-splicing exposes is `-o`/`--url` alone, and
+    ///   naming a pool requires spelling a host, which the deny-list, the allow-list
+    ///   and [`check_extra_arg_value`]'s charset each independently forbid.
+    ///
+    /// Appending would trade many inert flags for one demoted one. First stays.
     pub fn apply_extra_args(&self, args: &mut Vec<String>) {
         if self.extra_args.is_empty() {
             return;
@@ -1011,18 +1108,32 @@ fn check_algorithm(a: &str) -> Result<String, String> {
 
 /// The extra argv, validated **against the allow-list for that engine kind**.
 ///
-/// The rule, in one sentence: a token passes only if it is a flag this client has
-/// reviewed for this engine ([`extra_arg_allowlist`]), or the value of one. That is
-/// the inversion described in the module header — the old rule ("anything not on a
-/// deny-list") could not survive an engine whose aliases we had not enumerated, and
-/// did not survive the one this repo ships.
+/// The rule, in one sentence: **every** token must be a reviewed flag for this
+/// engine ([`extra_arg_allowlist`]), spelled exactly as reviewed, written as one
+/// self-contained argv word, and named at most once.
 ///
-/// The walk is positional, because a flag's value is a separate argv token: a value
-/// is accepted **only** in the slot immediately after a flag declared
-/// [`ExtraArgSpec::takes_value`]. A stray token in any other position — including a
-/// dangling value at the end of the list — refuses the whole document. Values are
-/// held to [`check_extra_arg_value`], which is narrower than the token scan: it
-/// cannot spell a host:port, a `user:pass` pair or a path.
+/// There is deliberately **no positional value slot**. The previous version walked
+/// the list and accepted any token that followed a flag declared
+/// [`ExtraArgSpec::takes_value`], checking it only for content and charset — never
+/// against the allow-list or [`CLIENT_OWNED_FLAGS`]. That made the validator's model
+/// of the engine's own argv parse load-bearing, and the model was wrong twice over
+/// on the very binary this repo ships (see the module header, and the `S3` tests).
+/// A value now lives *inside* its flag's token, so:
+///
+/// * being wrong about a flag's **arity** cannot open a door. There is no second
+///   token for a mis-declared flag to leave behind; at worst the engine refuses the
+///   one token and says so.
+/// * being wrong about a flag's **existence** cannot open a door either — an
+///   unrecognised `--flag=value` is one word the engine skips whole. Measured
+///   against the bundled xmrig: `--asm=-lFILE`, `--randomx-wrmsr=-lFILE`,
+///   `--randomx-mode=-lFILE` and `--dns-ttl=-lFILE` all left no file behind, i.e. an
+///   inline value cannot escape its token and be re-parsed as an option.
+/// * the **case** we accept is the case the engine sees, so a token we believe is a
+///   reviewed flag cannot be inert garbage to the engine.
+///
+/// What is left for the validator to be wrong about is a reviewed flag doing
+/// something we did not think it did — which only re-review catches, and which is
+/// stated as the residual risk in the module header rather than papered over.
 fn check_extra_args(kind: &str, list: &[String]) -> Result<Vec<String>, String> {
     if list.len() > MAX_EXTRA_ARGS {
         return Err(format!(
@@ -1031,10 +1142,8 @@ fn check_extra_args(kind: &str, list: &[String]) -> Result<Vec<String>, String> 
         ));
     }
     let allowed = extra_arg_allowlist(kind);
-    let mut out = Vec::with_capacity(list.len());
-    // `Some(spec)` while the previous token was a value-taking flag written in the
-    // two-token form, i.e. THIS token must be its value.
-    let mut awaiting_value: Option<&ExtraArgSpec> = None;
+    let mut out: Vec<String> = Vec::with_capacity(list.len());
+    let mut seen: Vec<&'static str> = Vec::with_capacity(list.len());
     for raw in list {
         let t = raw.trim();
         if t.is_empty() || t.len() > MAX_EXTRA_ARG_LEN {
@@ -1051,26 +1160,19 @@ fn check_extra_args(kind: &str, list: &[String]) -> Result<Vec<String>, String> 
                  characters; give each argv token its own list entry"
             ));
         }
-        // ── The value slot ────────────────────────────────────────────────────
-        if let Some(spec) = awaiting_value.take() {
-            check_extra_arg_token_content(raw, t)?;
-            check_extra_arg_value(spec.flag, t)?;
-            out.push(t.to_string());
-            continue;
-        }
 
-        // ── Otherwise this token must be a flag ───────────────────────────────
-        let (flag_part, inline_value) = match t.split_once('=') {
+        // Split at the FIRST `=`. A second `=` would land in the value, where the
+        // value charset refuses it.
+        let (flag, inline_value) = match t.split_once('=') {
             Some((f, v)) => (f, Some(v)),
             None => (t, None),
         };
-        let flag = flag_part.to_ascii_lowercase();
 
-        // Belt: the deny-list still speaks first, for a sharper message. It cannot
-        // be the only check (that is the whole bug) but it can never be wrong.
+        // Belt: the deny-list still speaks first, for a sharper message, and stays
+        // case-INSENSITIVE — it may only ever refuse more than the rule below.
         if let Some(owned) = CLIENT_OWNED_FLAGS
             .iter()
-            .find(|f| f.eq_ignore_ascii_case(&flag))
+            .find(|f| f.eq_ignore_ascii_case(flag))
         {
             return Err(format!(
                 "engine pin entry's extra argument {raw:?} restates `{owned}`, which this client \
@@ -1081,7 +1183,21 @@ fn check_extra_args(kind: &str, list: &[String]) -> Result<Vec<String>, String> 
         }
         check_extra_arg_token_content(raw, t)?;
 
+        // EXACT-CASE lookup: the token we accept must be the token the engine
+        // recognises. xmrig does not case-fold and does not abort on an option it
+        // does not know — it warns and carries on — so a case-folded match would let
+        // us believe a token is a reviewed flag while the engine treats it as noise.
         let Some(spec) = allowed.iter().find(|s| s.flag == flag) else {
+            if let Some(near) = allowed.iter().find(|s| s.flag.eq_ignore_ascii_case(flag)) {
+                return Err(format!(
+                    "engine pin entry's extra argument {raw:?} differs only in CASE from the \
+                     reviewed flag `{}`. Engines do not case-fold their argv: this token would be \
+                     an unrecognised option to the engine — silently ignored, or worse, ignored \
+                     while the rest of the line is re-parsed around it. Write it exactly as \
+                     reviewed (`{}`) — refusing the whole list",
+                    near.flag, near.flag
+                ));
+            }
             let known = if allowed.is_empty() {
                 "no extra argument at all has been reviewed for this engine yet".to_string()
             } else {
@@ -1096,19 +1212,51 @@ fn check_extra_args(kind: &str, list: &[String]) -> Result<Vec<String>, String> 
             };
             return Err(format!(
                 "engine pin entry's extra argument {raw:?} is not on the reviewed argv allow-list \
-                 for engine kind '{kind}' ({known}). A signed pin may only pass switches a human \
-                 has checked against THIS engine's own flag surface — a deny-list cannot be trusted \
-                 to have enumerated every alias of a third-party binary (xmrig spells --user as \
-                 --userpass, --proxy as -x and --log-file as -l). Adding one is a client release, \
-                 on purpose — refusing the whole list"
+                 for engine kind '{kind}' ({known}). Every token must be a reviewed flag — there is \
+                 no 'value' position a bare token may sit in. A signed pin may only pass switches a \
+                 human has checked against THIS engine's own flag surface — a deny-list cannot be \
+                 trusted to have enumerated every alias of a third-party binary (xmrig spells \
+                 --user as --userpass, --proxy as -x and --log-file as -l). Adding one is a client \
+                 release, on purpose — refusing the whole list"
             ));
         };
 
+        // Fail-closed on a malformed TABLE, not only in the test that pins its shape.
+        // The canonical `--flag=value` rule is sound only for long options: `-t=4`
+        // would hand getopt a value of `=4`, which is a different parse model again.
+        if !spec.flag.starts_with("--") || spec.flag.len() < 4 {
+            return Err(format!(
+                "engine pin argv allow-list entry `{}` for kind '{kind}' is not a long `--flag`; \
+                 the one-token `--flag=value` rule this client enforces is only well defined for \
+                 long options — refusing rather than guessing how the engine clusters it",
+                spec.flag
+            ));
+        }
+
+        // One flag, once. Which of two occurrences an engine honours is the engine's
+        // business; a repeated flag has no legitimate use in a tuning list, and
+        // repeating one is the shape the value-slot exploit needed.
+        if seen.contains(&spec.flag) {
+            return Err(format!(
+                "engine pin entry names `{}` twice. Which occurrence an engine honours is its own \
+                 choice, not something this client can check — refusing the whole list",
+                spec.flag
+            ));
+        }
+        seen.push(spec.flag);
+
         match (spec.takes_value, inline_value) {
-            // `--flag=value`
             (true, Some(v)) => check_extra_arg_value(spec.flag, v)?,
-            // `--flag` `value` — the value must be the very next token.
-            (true, None) => awaiting_value = Some(spec),
+            (true, None) => {
+                return Err(format!(
+                    "engine pin entry's extra argument {raw:?} needs a value, and a value must ride \
+                     INSIDE its flag's token: write it as one token, `{}=value`. The two-token \
+                     spelling is refused because whether the engine consumes the next token is the \
+                     engine's decision — on the bundled xmrig, `--randomx-wrmsr` and `--asm` consume \
+                     nothing, and the token behind them is parsed as a real option",
+                    spec.flag
+                ))
+            }
             (false, Some(_)) => {
                 return Err(format!(
                     "engine pin entry's extra argument {raw:?} gives a value to `{}`, which takes \
@@ -1120,28 +1268,16 @@ fn check_extra_args(kind: &str, list: &[String]) -> Result<Vec<String>, String> 
         }
         out.push(t.to_string());
     }
-    if let Some(spec) = awaiting_value {
-        return Err(format!(
-            "engine pin entry's extra argument `{}` needs a value and the list ends there; \
-             a half-written flag is refused, never sent",
-            spec.flag
-        ));
-    }
     Ok(out)
 }
 
-/// Characters an allow-listed flag's VALUE may contain.
+/// The content scans EVERY extra-argv token faces: no URL, no filesystem path, and
+/// the same credit-only / anti-leak scan a bring-your-own miner's argv gets.
+/// Independent of the allow-list, and kept because a token can be shaped wrong in
+/// ways the allow-list would never see (an `=` tail it does not look at).
 ///
-/// Deliberately narrower than the token scan above: a value is the half an attacker
-/// would need to name a destination, so it may not contain `:` (host:port,
-/// `user:pass`), `/` or `\` (paths, URLs), `@`, or anything else outside this set.
-/// Every value the reviewed flags actually take — `light`, `75`, `-1`, `intel`,
-/// `auto` — is inside it. A future flag needing a richer value shape is a client
-/// release, which is the same price as the flag itself.
-/// The content scans every extra-argv token faces, flag or value: no URL, no
-/// filesystem path, and the same credit-only / anti-leak scan a bring-your-own
-/// miner's argv gets. Independent of the allow-list, and kept because a token can
-/// be shaped wrong in ways the allow-list would never see (a value, an `=` tail).
+/// The whole token is scanned, `--flag=value` included, so the value half gets this
+/// as well as the narrower [`check_extra_arg_value`].
 fn check_extra_arg_token_content(raw: &str, t: &str) -> Result<(), String> {
     if t.contains("://") {
         return Err(format!(
@@ -1164,6 +1300,20 @@ fn check_extra_arg_token_content(raw: &str, t: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Characters an allow-listed flag's VALUE may contain.
+///
+/// Deliberately narrower than the whole-token scan: a value is the half an attacker
+/// would need to name a destination, so it may not contain `:` (host:port,
+/// `user:pass`), `/` or `\` (paths, URLs), `@`, or anything else outside this set.
+/// Every value the reviewed flags actually take — `light`, `75`, `-1`, `intel`,
+/// `auto` — is inside it. A future flag needing a richer value shape is a client
+/// release, which is the same price as the flag itself.
+///
+/// A leading `-` stays legal (`--randomx-wrmsr=-1` needs it) and is safe, because
+/// since 2026-08-16 a value only ever exists INSIDE its flag's argv word — measured
+/// against the bundled xmrig, `--randomx-wrmsr=-lFILE`, `--asm=-lFILE`,
+/// `--randomx-mode=-lFILE` and `--dns-ttl=-lFILE` created no file, i.e. an inline
+/// value is never re-parsed as an option.
 fn is_extra_arg_value_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ',' | '+')
 }
@@ -2065,15 +2215,12 @@ mod tests {
             2,
             "6.27.0",
             SHA_A,
-            r#""extra_args":["--randomx-mode","light"],"parser":"xmrig","#,
+            r#""extra_args":["--randomx-mode=light"],"parser":"xmrig","#,
         ))
         .unwrap();
         validate_doc(&xmr).expect("a reviewed tuning flag is publishable");
         let inv = xmr.engines[0].invocation().expect("invocation");
-        assert_eq!(
-            inv.extra_args,
-            vec!["--randomx-mode".to_string(), "light".to_string()]
-        );
+        assert_eq!(inv.extra_args, vec!["--randomx-mode=light".to_string()]);
         assert_eq!(inv.parser, Some(crate::stats::ParserKind::Xmr));
     }
 
@@ -2137,6 +2284,20 @@ mod tests {
             Err(e) => e,
             Ok(()) => panic!("extra args {args:?} must be refused"),
         }
+    }
+
+    /// The mirror of [`xmr_extra_args_err`]: accept a one-entry cpu-xmr document and
+    /// return the argv the launch path would actually splice.
+    fn accepted_xmr_extra_args(args: &[&str]) -> Vec<String> {
+        let doc: EnginesDoc = serde_json::from_str(&linux_xmr_doc(
+            2,
+            "6.27.0",
+            SHA_A,
+            &format!(r#""extra_args":{},"#, serde_json::to_string(args).unwrap()),
+        ))
+        .unwrap();
+        validate_doc(&doc).unwrap_or_else(|e| panic!("extra args {args:?} must be accepted: {e}"));
+        doc.engines[0].invocation().unwrap().extra_args
     }
 
     // ── S2: the argv allow-list (2026-08-15) ───────────────────────────────────
@@ -2221,62 +2382,36 @@ mod tests {
         );
     }
 
-    /// The capability that survives: a reviewed tuning flag, in both argv spellings,
-    /// with its value. Without this the allow-list would just be an off switch.
+    /// There is no value SLOT any more, so a bare token has nowhere to be legal, and
+    /// a half-written flag is refused for the right reason. The inline value is still
+    /// held to a charset that cannot spell a destination — that check did not fail,
+    /// it was simply never the one an attacker had to beat.
     #[test]
-    fn a_reviewed_flag_and_its_value_are_accepted_in_both_spellings() {
+    fn there_is_no_value_slot_and_an_inline_value_cannot_spell_a_destination() {
+        // A bare token behind a flag, and a bare token alone: same refusal.
         for args in [
-            vec!["--randomx-1gb-pages"],
-            vec!["--randomx-mode=light"],
-            vec!["--randomx-mode", "light"],
-            vec!["--cpu-max-threads-hint", "75", "--huge-pages-jit"],
-            vec!["--randomx-wrmsr", "-1"], // a value may itself look like a flag
-            vec!["--asm=intel", "--randomx-no-numa", "--dns-ttl=30"],
+            vec!["--randomx-1gb-pages", "198.51.100.9:1080"],
+            vec!["evil.example.com"],
         ] {
-            let doc: EnginesDoc = serde_json::from_str(&linux_xmr_doc(
-                2,
-                "6.27.0",
-                SHA_A,
-                &format!(r#""extra_args":{},"#, serde_json::to_string(&args).unwrap()),
-            ))
-            .unwrap();
-            validate_doc(&doc).unwrap_or_else(|e| panic!("args {args:?} must be accepted: {e}"));
-            assert_eq!(doc.engines[0].invocation().unwrap().extra_args, args);
+            assert!(
+                xmr_extra_args_err(&args).contains("not on the reviewed argv allow-list"),
+                "a bare token must be refused wherever it sits: {args:?}"
+            );
         }
-    }
-
-    /// A value is accepted ONLY in the slot a value-taking flag opened, and only if
-    /// it cannot spell a destination. Both halves matter: the first stops a bare
-    /// token riding along behind an innocent flag, the second stops the reviewed
-    /// flag's own value from becoming the redirect.
-    #[test]
-    fn a_reviewed_flags_value_slot_is_positional_and_cannot_spell_a_destination() {
-        // A bare token no flag opened a slot for.
+        // A flag that needs a value, written without one.
         assert!(
-            xmr_extra_args_err(&["--randomx-1gb-pages", "198.51.100.9:1080"])
-                .contains("not on the reviewed argv allow-list"),
-            "a value with no flag before it must be refused"
-        );
-        assert!(
-            xmr_extra_args_err(&["evil.example.com"])
-                .contains("not on the reviewed argv allow-list"),
-            "a lone bare token must be refused"
-        );
-        // A flag that needs a value, with the list ending there.
-        assert!(
-            xmr_extra_args_err(&["--randomx-mode"]).contains("needs a value and the list ends"),
-            "a half-written flag must be refused"
+            xmr_extra_args_err(&["--randomx-mode"]).contains("--randomx-mode=value"),
+            "a half-written flag must be refused, and told the canonical spelling"
         );
         // A boolean handed a value.
         let err = xmr_extra_args_err(&["--randomx-1gb-pages=1"]);
         assert!(err.contains("which takes none"), "got: {err}");
-        // And the value charset: no host:port, no user:pass, no path-ish token, in
-        // either spelling.
+        // And the value charset: no host:port, no user:pass, no path.
         for args in [
             vec!["--randomx-mode=198.51.100.9:1080"],
-            vec!["--randomx-mode", "198.51.100.9:1080"],
-            vec!["--asm", "a:b"],
+            vec!["--asm=a:b"],
             vec!["--asm=x@y"],
+            vec!["--dns-ttl=a/b"],
         ] {
             let err = xmr_extra_args_err(&args);
             assert!(
@@ -2286,25 +2421,220 @@ mod tests {
         }
     }
 
+    // ── S3: the validator stops modelling the engine's parse (2026-08-16) ──────
+    //
+    // Everything above assumed the validator could predict how the engine would
+    // parse the argv it approved. Two live re-exploits and one measurement say it
+    // cannot, so the rule below removes the prediction rather than improving it.
+    // Each of these was verified against `release-assets/aarch64-apple-darwin/xmrig`
+    // (XMRig 6.26.0) before it was written; the commands are in the doc comments.
+
+    /// **RE-EXPLOIT 1.** A value slot is a hole, because whether a flag consumes the
+    /// next token is the ENGINE's decision and the validator was guessing at it.
+    ///
+    /// Measured, one `-l<file>` probe per value-taking entry, against the bundled
+    /// binary (`xmrig --<flag> -lFILE --dry-run -o 127.0.0.1:1 -u H -p x`, then
+    /// checking whether FILE appeared):
+    ///
+    /// ```text
+    ///   --randomx-mode            consumed its value
+    ///   --randomx-init            consumed its value
+    ///   --randomx-wrmsr           FILE CREATED  ← optional_argument: consumes nothing
+    ///   --cpu-max-threads-hint    consumed its value
+    ///   --asm                     FILE CREATED  ← not implemented on this ARM build
+    ///   --dns-ttl                 consumed its value
+    /// ```
+    ///
+    /// Two of six. `--randomx-wrmsr` takes an OPTIONAL argument, so getopt only
+    /// accepts it in the `=` form and a following token is left to be parsed as a
+    /// real option; `--asm` is printed by this binary's own `--help` but is x86-only
+    /// and is `unrecognized option` here — the vendor's documentation is wrong about
+    /// the vendor's own flag surface, which is exactly the thing an allow-list review
+    /// cannot catch by reading.
+    ///
+    /// The live capture, with publisher argv spliced first as the client splices it.
+    /// Note the PORT-LESS host: that is what clears the value charset, which forbids
+    /// `:` — and xmrig supplies the default port itself, so it costs the attacker
+    /// nothing (verified: `POOL #1  127.0.0.1` was created and dialled).
+    ///
+    /// ```text
+    /// $ xmrig --randomx-wrmsr -o127.0.0.1 --randomx-wrmsr -uATTACKER_WALLET_5Gw \
+    ///         --no-color -o 127.0.0.1:1 -u HONEST -p x
+    ///  * POOL #1   127.0.0.1          ← the publisher's
+    ///  * POOL #2   127.0.0.1:1        ← the client's
+    /// ```
+    ///
+    /// Every token is on the reviewed allow-list, lower-case, and free of `:`/`/`/`@`.
+    /// POOL #1 is the pool xmrig actually mines — verified on a loopback listener,
+    /// which received `login: "ATTACKER_WALLET"` while the honest port was never
+    /// contacted at all.
+    #[test]
+    fn a_token_in_a_value_slot_is_not_trusted_to_stay_a_value() {
+        // Byte-for-byte the live reproduction.
+        xmr_extra_args_err(&[
+            "--randomx-wrmsr",
+            "-o127.0.0.1",
+            "--randomx-wrmsr",
+            "-uATTACKER_WALLET_5Gw",
+        ]);
+        // …and the same shape behind the flags whose arity we happened to get RIGHT.
+        // The rule may not depend on which of those two sets a flag is in, because
+        // that set is the engine's to change between versions and between platforms.
+        for opener in [
+            "--randomx-wrmsr",
+            "--asm",
+            "--randomx-mode",
+            "--randomx-init",
+            "--cpu-max-threads-hint",
+            "--dns-ttl",
+        ] {
+            for smuggled in ["-o198.51.100.9", "-uATTACKER", "-lstolen.log", "-x198.51.100.9"] {
+                let err = xmr_extra_args_err(&[opener, smuggled]);
+                assert!(
+                    !err.is_empty(),
+                    "{opener} {smuggled} must be refused, got: {err}"
+                );
+            }
+        }
+    }
+
+    /// **THE GENERAL PROPERTY** behind re-exploit 1, stated so it cannot regress into
+    /// "we patched the two flags that were optional_argument": a token is checked the
+    /// same way wherever it appears in the list. Anything refused as the FIRST token
+    /// is refused as the SECOND token, behind an innocent flag.
+    #[test]
+    fn every_extra_argv_token_faces_the_same_checks_wherever_it_sits() {
+        for smuggled in [
+            "-o198.51.100.9",
+            "-uATTACKER",
+            "-lstolen.log",
+            "-x198.51.100.9",
+            "--userpass",
+            "--verbose",
+            "--background",
+            "evil.example.com",
+        ] {
+            let alone = xmr_extra_args_err(&[smuggled]);
+            let behind = xmr_extra_args_err(&["--randomx-mode", smuggled]);
+            assert!(
+                !alone.is_empty() && !behind.is_empty(),
+                "{smuggled:?} refused alone ({alone}) must also be refused behind a flag ({behind})"
+            );
+        }
+    }
+
+    /// **RE-EXPLOIT 2.** The lookup case-folded and the emitted token did not, so a
+    /// token could be a reviewed value-taking flag to us and inert garbage to the
+    /// engine. xmrig does not case-fold and does NOT abort on an unrecognised option:
+    ///
+    /// ```text
+    /// $ xmrig --RANDOMX-MODE -lprobe.log --dry-run -o 127.0.0.1:1 -u AAA -p x
+    /// xmrig: unrecognized option `--RANDOMX-MODE'
+    ///  * POOL #1   127.0.0.1:1          ← it carried on
+    /// $ ls probe.log → created           ← the "value" was parsed as --log-file
+    /// ```
+    ///
+    /// That generalises the hole from the two `optional_argument` flags to ALL of
+    /// them, with no dependence on getting an engine's arity right.
+    ///
+    /// The same bug has an honest-operator face, and it is not an inference — it is
+    /// what the engine's own effective config says. Read back from xmrig's HTTP API
+    /// (`GET /1/config`, the same technique that established
+    /// `lane::xmr::POOL_SCOPED_FLAGS`), with the client's pool block otherwise
+    /// identical:
+    ///
+    /// ```text
+    ///   (no extra argv)            randomx.mode = "auto"   huge-pages-jit = false
+    ///   --randomx-mode=light
+    ///        --huge-pages-jit      randomx.mode = "light"  huge-pages-jit = TRUE
+    ///   --randomx-mode=fast        randomx.mode = "fast"
+    ///   --RANDOMX-MODE=light       randomx.mode = "auto"   ← SILENTLY IGNORED
+    /// ```
+    ///
+    /// So the canonical spelling is genuinely honoured (the capability survives this
+    /// tightening), and the wrongly-cased one is a signed instruction the whole fleet
+    /// accepts and no engine ever obeys. Both faces are one fix: the token we accept
+    /// is the token the engine recognises, byte for byte.
+    #[test]
+    fn a_reviewed_flag_spelled_in_another_case_is_refused_not_waved_through() {
+        // The exploit shape.
+        assert!(!xmr_extra_args_err(&["--RANDOMX-MODE", "-lprobe.log"]).is_empty());
+        // The honest-operator shape: a lone, well-formed, wrongly-cased flag.
+        for bad in [
+            "--Randomx-Mode=light",
+            "--RANDOMX-MODE=light",
+            "--randomx-MODE=light",
+            "--RANDOMX-1GB-PAGES",
+            "--Dns-Ttl=30",
+        ] {
+            let err = xmr_extra_args_err(&[bad]);
+            assert!(
+                err.contains("case") || err.contains("spelled"),
+                "{bad:?} must be refused for its CASE, clearly; got: {err}"
+            );
+        }
+        // …and the exact spelling still works, so this is a spelling rule and not an
+        // off switch.
+        assert_eq!(
+            accepted_xmr_extra_args(&["--randomx-mode=light"]),
+            vec!["--randomx-mode=light".to_string()]
+        );
+    }
+
+    /// The canonical form, which is what removes the value slot: a value-taking flag
+    /// is ONE token, `--flag=value`. The two-token spelling is refused — it is the
+    /// spelling that created the slot, and for xmrig's `optional_argument` flags it
+    /// is not even the spelling that works (`--randomx-wrmsr 5` leaves `5` on the
+    /// line; `--randomx-wrmsr=-1` is the documented form).
+    #[test]
+    fn a_reviewed_flag_and_its_value_must_be_one_canonical_token() {
+        for args in [
+            vec!["--randomx-1gb-pages"],
+            vec!["--randomx-mode=light"],
+            vec!["--randomx-wrmsr=-1"], // a value may still look flag-shaped: it is INSIDE the token
+            vec!["--cpu-max-threads-hint=75", "--huge-pages-jit"],
+            vec!["--asm=intel", "--randomx-no-numa", "--dns-ttl=30"],
+        ] {
+            assert_eq!(
+                accepted_xmr_extra_args(&args),
+                args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "{args:?} is the canonical form and must be accepted unchanged"
+            );
+        }
+        for args in [
+            vec!["--randomx-mode", "light"],
+            vec!["--cpu-max-threads-hint", "75"],
+            vec!["--randomx-wrmsr", "-1"],
+            vec!["--asm", "intel"],
+        ] {
+            let err = xmr_extra_args_err(&args);
+            assert!(
+                err.contains("--flag=value") || err.contains("one token"),
+                "the two-token spelling {args:?} must be refused; got: {err}"
+            );
+        }
+    }
+
+    /// One flag, once. Which of two occurrences an engine honours is another thing
+    /// only the engine knows, and a repeated flag has no legitimate use here — so it
+    /// is refused rather than resolved. (It is also the shape re-exploit 1 needed
+    /// twice over.)
+    #[test]
+    fn a_reviewed_flag_may_not_be_repeated() {
+        let err = xmr_extra_args_err(&["--randomx-mode=light", "--randomx-mode=fast"]);
+        assert!(err.contains("twice") || err.contains("more than once"), "got: {err}");
+        let err = xmr_extra_args_err(&["--randomx-no-numa", "--dns-ttl=30", "--randomx-no-numa"]);
+        assert!(err.contains("twice") || err.contains("more than once"), "got: {err}");
+    }
+
     /// The two tables must never overlap, and the allow-list must be spelled the way
     /// the lookup spells it. Without this a future "harmless" allow-list entry could
     /// silently re-open a flag the deny-list exists to forbid, and the belt would go
     /// on looking like it was holding.
     #[test]
     fn the_deny_list_and_the_allow_list_can_never_overlap() {
-        for kind in ["cpu-xmr", "gpu-rvn", "gpu-prl", "gpu-alpha"] {
+        for kind in ALL_ENGINE_KINDS {
             for spec in extra_arg_allowlist(kind) {
-                assert_eq!(
-                    spec.flag,
-                    spec.flag.to_ascii_lowercase(),
-                    "allow-list entries are compared lower-cased: {}",
-                    spec.flag
-                );
-                assert!(
-                    spec.flag.starts_with("--") && spec.flag.len() > 3,
-                    "allow-list entries are long-form flags: {}",
-                    spec.flag
-                );
                 assert!(
                     !CLIENT_OWNED_FLAGS
                         .iter()
@@ -2324,24 +2654,79 @@ mod tests {
         }
     }
 
-    /// **DEFECT 2.** Publisher argv is spliced in BEFORE every flag the client built,
-    /// not after. On a last-wins engine — which xmrig 6.26, the one bundled engine we
-    /// can actually run, was verified to be — "last" is the position from which an
-    /// override WINS, so appending handed the publisher the tie it should always
-    /// lose. Ordering is not the invariant (the allow-list is), but it must not be
-    /// documented backwards, and the safe default must be the one the evidence
-    /// supports.
+    /// Every engine kind the pin schema accepts, so a table sweep cannot quietly miss
+    /// one that a future release adds.
+    const ALL_ENGINE_KINDS: &[&str] = &["cpu-xmr", "gpu-prl", "gpu-rvn", "gpu-alpha"];
+
+    /// The allow-list may only contain flags whose spelling the one-token rule can
+    /// actually express. This is a guard, not a defect reproduction: today's table
+    /// already satisfies it. It exists because the rule
+    /// ([`check_extra_args`]) silently stops being sound the moment someone adds a
+    /// SHORT flag — `-t=4` hands getopt a value of `=4`, which is a third parse model
+    /// and exactly the kind of guess this whole change removed. The validator refuses
+    /// such an entry at run time too; this test makes it a build-time failure.
     #[test]
-    fn publisher_argv_is_placed_before_every_flag_the_client_owns() {
+    fn the_argv_allow_list_is_limited_to_forms_this_rule_can_express() {
+        for kind in ALL_ENGINE_KINDS {
+            let specs = extra_arg_allowlist(kind);
+            for spec in specs {
+                assert_eq!(
+                    spec.flag,
+                    spec.flag.to_ascii_lowercase(),
+                    "{kind}: allow-list entries are lower-case: {}",
+                    spec.flag
+                );
+                assert!(
+                    spec.flag.starts_with("--") && spec.flag.len() > 3,
+                    "{kind}: allow-list entries are LONG flags — the `--flag=value` rule is not \
+                     well defined for a short one: {}",
+                    spec.flag
+                );
+                assert!(
+                    !spec.flag.contains('=')
+                        && !spec.flag.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()),
+                    "{kind}: an allow-list entry is a bare flag, never a flag=value or two words: {}",
+                    spec.flag
+                );
+                assert_eq!(
+                    specs.iter().filter(|s| s.flag == spec.flag).count(),
+                    1,
+                    "{kind}: `{}` is listed twice — the duplicate rule keys on the spec's flag",
+                    spec.flag
+                );
+            }
+        }
+        // And the run-time belt agrees with the compile-time table: a kind we do not
+        // know gets an empty list rather than a guess.
+        assert!(extra_arg_allowlist("gpu-something-new").is_empty());
+    }
+
+    /// Publisher argv is spliced in BEFORE every flag the client built, not after.
+    ///
+    /// The reason changed on 2026-08-16 even though the position did not. It used to
+    /// be "xmrig is last-wins, so first is where a publisher token loses". Measured,
+    /// xmrig has three precedence rules, and the one that decides credit is that
+    /// `-o` **accumulates**: spliced first, a publisher `-o` becomes POOL #1 — the
+    /// pool actually mined — so first is not simply the losing end.
+    ///
+    /// First is still right, and this test pins the property that makes it right:
+    /// **every publisher token lands before the client's first `-o`**, which is the
+    /// position where xmrig's per-pool credit flags (`-u`, `-p`, `--userpass`,
+    /// `--rig-id`, `--tls`, …) attach to no pool and do nothing. Measured on a
+    /// loopback listener: `--userpass=EVIL:zz` placed first left the stratum login as
+    /// the client's own address; appended, it replaced it.
+    #[test]
+    fn publisher_argv_lands_before_the_clients_first_pool() {
         let doc: EnginesDoc = serde_json::from_str(&linux_xmr_doc(
             2,
             "6.27.0",
             SHA_A,
-            r#""extra_args":["--randomx-mode","light"],"#,
+            r#""extra_args":["--randomx-mode=light","--huge-pages-jit"],"#,
         ))
         .unwrap();
         validate_doc(&doc).expect("a reviewed flag is accepted");
         let inv = doc.engines[0].invocation().unwrap();
+        // The shape `lane::xmr::push_pool_group` builds: the pool flag comes first.
         let mut args: Vec<String> = ["-o", "relay:3333", "-u", "VICTIM", "-p", "x"]
             .iter()
             .map(|s| s.to_string())
@@ -2349,11 +2734,30 @@ mod tests {
         inv.apply_extra_args(&mut args);
         assert_eq!(
             args,
-            ["--randomx-mode", "light", "-o", "relay:3333", "-u", "VICTIM", "-p", "x"],
-            "the pin's argv goes FIRST, so the client's login is the last word"
+            [
+                "--randomx-mode=light",
+                "--huge-pages-jit",
+                "-o",
+                "relay:3333",
+                "-u",
+                "VICTIM",
+                "-p",
+                "x"
+            ],
+            "the pin's argv goes FIRST, before any pool exists"
         );
-        // Order among the publisher's own tokens is preserved (a flag keeps its value).
-        assert_eq!(&args[0..2], ["--randomx-mode", "light"]);
+        // THE PROPERTY, not the literal: no publisher token may sit at or after the
+        // client's first `-o`, because that is where a per-pool flag would bite.
+        let first_pool = args.iter().position(|a| a == "-o").expect("-o present");
+        for tok in &inv.extra_args {
+            let at = args.iter().position(|a| a == tok).expect("spliced");
+            assert!(
+                at < first_pool,
+                "publisher token {tok:?} must precede the client's first -o"
+            );
+        }
+        // Order among the publisher's own tokens is preserved.
+        assert_eq!(&args[0..2], ["--randomx-mode=light", "--huge-pages-jit"]);
     }
 
     /// **DEFECT 3.** Only the GPU-PRL lane's argv carries an algorithm token. A pin
@@ -2923,9 +3327,10 @@ mod tests {
     /// The gpu-prl entry is the script's own smoke output, verbatim, with one
     /// edit made on 2026-08-15: its `extra_args` moved to a second `cpu-xmr` entry
     /// carrying a REVIEWED flag, because extra argv became bounded by a per-engine
-    /// allow-list that (deliberately) has no SRBMiner entries. Everything the
-    /// contract is about — the key shape of `extra_args` as a JSON list of argv
-    /// tokens — is still exercised.
+    /// allow-list that (deliberately) has no SRBMiner entries. Re-spelled on
+    /// 2026-08-16 into the canonical one-token form, which is now the only accepted
+    /// spelling. Everything the contract is about — the key shape of `extra_args` as
+    /// a JSON list of argv tokens — is still exercised.
     #[test]
     fn the_publishing_scripts_invocation_and_downgrade_output_validates() {
         let produced = r#"{
@@ -2964,8 +3369,7 @@ mod tests {
       "endorsed_by": "V",
       "endorsed_at": "2026-08-15T00:00:00Z",
       "extra_args": [
-        "--randomx-mode",
-        "light"
+        "--randomx-mode=light"
       ],
       "parser": "xmrig",
       "sha256": "43224fd816f8416299aeff9d6e4cf5633c34113c9029a8347f95f66256c1a278",
@@ -2989,7 +3393,7 @@ mod tests {
             Some("smoke test of the marker path")
         );
         let xmr = doc.engines[1].invocation().expect("invocation");
-        assert_eq!(xmr.extra_args.len(), 2);
+        assert_eq!(xmr.extra_args, vec!["--randomx-mode=light".to_string()]);
         assert_eq!(xmr.parser, Some(crate::stats::ParserKind::Xmr));
         assert!(xmr.algorithm.is_none());
     }
