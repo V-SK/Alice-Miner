@@ -312,6 +312,22 @@ impl UpdateManager {
     }
 
     /// Kick a background `check_for_update`. No-op if a job is already running.
+    /// Whether the ONE-SHOT launch-time check may run, given the update mode.
+    ///
+    /// `off` has to mean off on this front-end too. The CLI's startup banner learned
+    /// this the hard way: it gated only on `quiet` and an undocumented env var, so a
+    /// miner who had explicitly turned updates off still got a banner and a TLS
+    /// connection to the release host — while the client's own text promised "never
+    /// check, never notify, never install". The release notes make that promise for
+    /// both front-ends.
+    ///
+    /// Deliberately NOT applied inside [`UpdateManager::check`]: the Settings →
+    /// "Check for updates" button calls that same function, and that is the user
+    /// asking. A mode is a default, not a gag.
+    pub fn may_check_at_launch(mode: release::auto::Mode) -> bool {
+        mode.checks()
+    }
+
     pub fn check(&mut self) {
         if self.ui.is_busy() {
             return;
@@ -659,6 +675,26 @@ mod tests {
             matches!(mgr.ui, UpdateUi::UpToDate { .. }),
             "apply must not transition out of a non-Available state"
         );
+    }
+
+    /// `off` must mean off on the GUI too — the launch-time check is the one that
+    /// runs without anyone asking for it. The Settings button deliberately is NOT
+    /// gated by this, which is why the gate lives beside `check` rather than inside.
+    #[test]
+    fn the_launch_check_obeys_the_update_mode_but_the_settings_button_does_not() {
+        use release::auto::Mode;
+        assert!(!UpdateManager::may_check_at_launch(Mode::Off), "off means off");
+        for m in [Mode::Notify, Mode::SecurityOnly, Mode::Full] {
+            assert!(
+                UpdateManager::may_check_at_launch(m),
+                "{m:?} still surfaces a new version at launch"
+            );
+        }
+        // The Settings button calls `check()` itself, which must stay reachable in
+        // every mode: a person clicking "Check for updates" has asked.
+        let mut mgr = UpdateManager::default();
+        mgr.check();
+        assert!(mgr.ui.is_busy(), "an explicit check runs regardless of mode");
     }
 
     /// `check()` does not start a second job while one is in flight.

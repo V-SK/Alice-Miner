@@ -2216,7 +2216,17 @@ impl eframe::App for MinerApp {
         // (this runs after the shot early-return above).
         if !self.launch_update_checked {
             self.launch_update_checked = true;
-            self.updater.check();
+            // `off` means off, on this path too. The CLI's startup banner learned this
+            // the hard way — it gated only on `quiet` and an undocumented env var, so a
+            // miner who had explicitly turned updates off still got a banner and a TLS
+            // connection to the release host. This is the same check on the other
+            // front-end, and the release notes promise both. The Settings → "Check for
+            // updates" button stays ungated on purpose: that is the user asking.
+            if crate::update::UpdateManager::may_check_at_launch(
+                alice_miner_core::autoupdate::mode(),
+            ) {
+                self.updater.check();
+            }
             // …and one GUARDED automatic cycle, which is a different thing: the
             // check above only ever populates the UI, while this one may install
             // (subject to the mode, the day-long hold, the rollout slice, the

@@ -327,10 +327,17 @@ pub const PRL_RETURN_BODY_BOUND_ZH: &str =
 pub fn prl_return_body_bound() -> &'static str {
     tr!(PRL_RETURN_BODY_BOUND_EN, PRL_RETURN_BODY_BOUND_ZH)
 }
-/// The body when NOT yet bound but a return address is configured (the bind runs
-/// automatically once GPU-PRL mining proves possession).
+/// The body when NOT yet bound but a return address is configured.
+///
+/// This panel is only built for a snapshot whose run set already contains a
+/// pearlhash lane, so the old copy — "mine GPU-PRL to bind your return wallet" —
+/// was shown *exclusively* to miners who already had GPU-PRL running. It told them
+/// to do the thing they were doing, while the actual reason (an enrol in flight, an
+/// enrol that failed and retries next start, or a watch-only identity that can never
+/// sign one) went unsaid. The panel is handed a boolean, so this says what that
+/// boolean knows and nothing more — matching the CLI's wording exactly.
 pub const PRL_RETURN_BODY_UNBOUND: &str =
-    "Mine GPU · PRL to bind your return wallet · 启动 GPU-PRL 挖矿以绑定返还地址.";
+    "Not bound yet · the return address is set, but has not been bound to your reward address this session · 未绑定 · 返还地址已设置,但本次会话尚未把它绑定到你的奖励地址.";
 /// The body when no return address is configured at all. (We do NOT spell the
 /// env-var name here — it contains a forbidden token; the docs carry the exact
 /// name. The honest user-facing copy just says a return wallet isn't set.)
