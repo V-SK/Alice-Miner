@@ -99,7 +99,7 @@ pub const RELEASE_PUBKEY_B64: &str = "8P+XmZZFEsUHLmqeB62Xqr5GnwW5K9vf2sQHvRzfi5
 /// miner's machine.
 ///
 /// **EMPTY = fail-closed.** Until V generates the sub-key offline (same custody
-/// as the release key: `~/AliceRelease.sparseimage`, signed by hand, agent never
+/// as the release key: held offline in encrypted storage, signed by hand, agent never
 /// reads it) this constant stays empty and the client uses ONLY the pins baked
 /// into its own binary. An empty key never "verifies" anything — see
 /// [`engine_pin_key_status`].
