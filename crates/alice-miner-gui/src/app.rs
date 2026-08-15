@@ -307,8 +307,13 @@ pub struct MinerApp {
     /// is healthy. Single-lane runs read the top-level clock (sum == lane) unchanged.
     pub lane_acc_clocks: std::collections::HashMap<Lane, (u64, Instant)>,
     pub copied_at: Option<Instant>,
-    /// Language toggle (display-only; copy is bilingual already).
-    pub lang_zh: bool,
+    // NOTE: there is no `lang_zh` FIELD. The UI language is one thing per process —
+    // `alice_miner_core::i18n`'s process language, resolved once in `main` — and the
+    // EN/中 chip is a view of it: read through [`MinerApp::lang_zh`], written through
+    // [`MinerApp::set_lang_zh`]. It was a field, initialized to a hard-coded `false`
+    // and mirrored into the process language on EVERY FRAME; that mirror is what
+    // overwrote a resolved 中文 with English on frame 1, and the field is what made
+    // the chip's choice die with the window.
     /// Reduced-motion setting (Settings · Appearance). When on, the breathing
     /// glow / gauge sweep / number tween are disabled but the colour + state
     /// semantics are KEPT, so the app stays legible + calm for motion-sensitive
@@ -512,7 +517,6 @@ impl MinerApp {
             last_acc_change: None,
             lane_acc_clocks: std::collections::HashMap::new(),
             copied_at: None,
-            lang_zh: false,
             reduce_motion: false,
             confirm_targets: Vec::new(),
             confirm_pool: Vec::new(),
@@ -1323,6 +1327,32 @@ impl MinerApp {
             .host_port()
     }
 
+    /// Whether the UI is in 中文 — a VIEW of the process language
+    /// (`alice_miner_core::i18n`), which `main` resolves once at startup from the flag,
+    /// the saved preference and the environment, exactly like the CLI.
+    ///
+    /// Deliberately not a field. One language per process is the whole design of the
+    /// shared `tr!` mechanism, and a second copy on the app can only ever disagree with
+    /// it — which is precisely what happened: the copy started hard-coded to English and
+    /// was mirrored OVER the resolved language on every frame.
+    pub fn lang_zh(&self) -> bool {
+        alice_miner_core::i18n::lang() == alice_miner_core::i18n::Lang::Zh
+    }
+
+    /// Switch the UI language from the EN/中 chip: apply it to the whole process (so
+    /// every `tr!` — including the ones evaluated on the engine, updater and log-pump
+    /// threads — follows immediately) and PERSIST it, so the choice survives the window
+    /// closing and is the same preference `alice-miner lang` reads and writes.
+    ///
+    /// Best-effort on the write: a read-only home means the user may have to choose
+    /// again next launch, which is not worth failing a click over.
+    pub fn set_lang_zh(&mut self, zh: bool) {
+        use alice_miner_core::i18n::{set_process_lang, Lang};
+        let lang = if zh { Lang::Zh } else { Lang::En };
+        set_process_lang(lang);
+        let _ = alice_miner_core::settings::save_lang(lang);
+    }
+
     /// A compact, read-only label of the effective GPU-PRL region MODE for the Settings
     /// "Region" row (B-line transparency): whether the lane is LOCKED to one region (no
     /// auto-failover) or will auto-failover from a preferred / nearest primary. Reads the
@@ -1334,7 +1364,7 @@ impl MinerApp {
         use alice_miner_core::lane::gpu_prl::{self, RegionDecision};
         let s = alice_miner_core::settings::load();
         let env = std::env::var(gpu_prl::ENV_REGION).ok();
-        let zh = self.lang_zh;
+        let zh = self.lang_zh();
         match gpu_prl::decide_region(s.region_lock.as_deref(), env.as_deref(), s.last_good_region.as_deref()) {
             RegionDecision::Locked(tag) => {
                 if zh {
@@ -2180,14 +2210,12 @@ impl Drop for MinerApp {
 impl eframe::App for MinerApp {
     fn ui(&mut self, ui_root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui_root.ctx().clone();
-        // Mirror the GUI's language toggle into the shared core i18n so every
-        // `tr!`-localized string (the titlebar pill, Settings labels, and any engine
-        // status text) follows the user's EN/中 choice. One cheap atomic store/frame.
-        alice_miner_core::i18n::set_process_lang(if self.lang_zh {
-            alice_miner_core::i18n::Lang::Zh
-        } else {
-            alice_miner_core::i18n::Lang::En
-        });
+        // NOTE: this frame used to begin by mirroring `self.lang_zh` into the process
+        // language. It does not any more, and must not again: the language is resolved
+        // ONCE in `main` and changed only by `set_lang_zh` (the EN/中 chip). A per-frame
+        // write cannot express "the user changed the language once" — it can only
+        // repeat whatever this struct believed, which on frame 1 was a hard-coded
+        // English that overwrote the user's real, resolved choice.
         // Scale the whole UI proportionally to the window FIRST (drives egui's
         // zoom factor), so every screen fills a consistent fraction at any size.
         self.apply_window_scaling(&ctx);
@@ -4218,5 +4246,112 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         // A device with a DIFFERENT card count resets to all-checked.
         app.set_device(multigpu_device(2));
         assert_eq!(app.gpu_selected, vec![true, true], "count change → reset to All");
+    }
+
+    // ── The UI language: resolved at startup, changed by the chip, remembered ──
+
+    /// The chip is a VIEW of the process language, not a copy of it. It used to be a
+    /// `bool` field initialized to a hard-coded `false`, which is why a 中文 user got
+    /// an English window on every launch — and, because the field was mirrored into
+    /// the process language on the first frame, why the whole PROCESS (engine worker,
+    /// updater thread, log pump) was forced back to English along with it.
+    ///
+    /// Thread-scoped `set_lang` here on purpose: this test states the wiring and must
+    /// disturb nothing else in the binary.
+    #[test]
+    fn the_language_chip_reads_the_resolved_language_not_a_hard_coded_default() {
+        use alice_miner_core::i18n::{clear_lang_override, set_lang, Lang};
+
+        set_lang(Lang::Zh);
+        let app = MinerApp::new().expect("engine spawns");
+        assert!(app.lang_zh(), "a 中文 process must open a 中文 window");
+
+        // A live view, not a snapshot taken in `new()`.
+        set_lang(Lang::En);
+        assert!(!app.lang_zh(), "and an English process an English one");
+
+        clear_lang_override();
+    }
+
+    /// The whole journey the GUI used to lose: pick 中文, close the window, open it
+    /// again. The chip was session-only (nothing ever wrote the preference) AND the
+    /// next launch never read one (nothing ever called `settings::load()` or looked at
+    /// `LANG`), so the choice died twice over.
+    ///
+    /// This test moves the PROCESS language, so it holds the crate-wide env lock for
+    /// its whole body and restores the English default on the way out.
+    #[test]
+    fn the_language_the_user_picks_survives_the_window_closing() {
+        use alice_miner_core::i18n::{init_startup_lang, lang, set_process_lang, Lang};
+        let _g = crate::ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // A pristine `~/.alice`, and no locale env leaking in from the developer's
+        // shell (it is one of the sources under test).
+        let home = std::env::temp_dir().join(format!(
+            "alice-gui-lang-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_id_dir = std::env::var("ALICE_IDENTITY_DIR").ok();
+        let prev_locale: Vec<(&str, Option<String>)> = ["LC_ALL", "LANG", "LANGUAGE"]
+            .iter()
+            .map(|v| (*v, std::env::var(v).ok()))
+            .collect();
+        for (v, _) in &prev_locale {
+            std::env::remove_var(v);
+        }
+        std::env::set_var("ALICE_IDENTITY_DIR", &home);
+
+        // First launch, no preference anywhere → English.
+        assert_eq!(init_startup_lang(), Lang::En, "no preference → the English default");
+        let mut app = MinerApp::new().expect("engine spawns");
+        assert!(!app.lang_zh());
+
+        // The user clicks 中.
+        app.set_lang_zh(true);
+        assert!(app.lang_zh(), "the window switches");
+        assert_eq!(
+            lang(),
+            Lang::Zh,
+            "and so does the PROCESS — the engine, updater and log-pump threads read \
+             their `tr!` strings from here, not from the app struct"
+        );
+        let raw = std::fs::read_to_string(home.join("settings.json"))
+            .expect("the chip must WRITE the preference, not just hold it");
+        assert!(raw.contains("\"lang\": \"zh\""), "persisted as the CLI writes it: {raw}");
+        assert_eq!(
+            alice_miner_core::settings::load().parsed_lang(),
+            Some(Lang::Zh),
+            "and it is the same preference `alice-miner lang` reads"
+        );
+
+        // ── the window closes, and the app is launched again ──
+        drop(app);
+        set_process_lang(Lang::En); // a fresh process starts at the English default
+        assert_eq!(
+            init_startup_lang(),
+            Lang::Zh,
+            "startup must RESOLVE the saved preference (the GUI resolved nothing at all)"
+        );
+        let app2 = MinerApp::new().expect("engine spawns");
+        assert!(app2.lang_zh(), "the second launch opens in 中文");
+
+        // Leave the binary exactly as we found it.
+        set_process_lang(Lang::En);
+        match prev_id_dir {
+            Some(v) => std::env::set_var("ALICE_IDENTITY_DIR", v),
+            None => std::env::remove_var("ALICE_IDENTITY_DIR"),
+        }
+        for (v, old) in prev_locale {
+            match old {
+                Some(val) => std::env::set_var(v, val),
+                None => std::env::remove_var(v),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

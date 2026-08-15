@@ -61,6 +61,20 @@ fn load_icon() -> Option<IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    // FIRST, before anything that can produce a user-facing STRING: resolve the UI
+    // language, from the SAME precedence the CLI uses (`--lang` → the preference
+    // saved in `~/.alice/settings.json` → `LANG`/`LC_ALL`/`LANGUAGE` → English).
+    //
+    // The GUI used to resolve nothing at all: `MinerApp::new` hard-coded English and
+    // then forced the process language to English on the first frame. A user who had
+    // chosen 中文 — with the chip, or with `alice-miner lang zh` — opened an English
+    // window every single launch, and every worker thread in the process (the engine
+    // supervisor's failover status, the updater's rollback notice) inherited that
+    // English. `MinerApp::new` reads the language this line installs, so it has to
+    // run before the app is built — the auto-update rollback notice is FORMATTED
+    // inside `MinerApp::new`, ahead of the first frame.
+    alice_miner_core::i18n::init_startup_lang();
+
     // Start the engine-pin refresher with the PROCESS (F15), not with the first
     // lane that resolves an engine. A client whose lanes the acceptance guard has
     // halted never starts an engine again, so a refresh gated on that could never
