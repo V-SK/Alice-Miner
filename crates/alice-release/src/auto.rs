@@ -266,6 +266,21 @@ pub enum Hold {
     Revoked,
     /// No artifact for this platform (manual download only).
     NoArtifact,
+    /// This machine has ALREADY installed this exact version — the swap is on
+    /// disk and the process running it has not started yet.
+    ///
+    /// Almost always the ordinary state of affairs between an install and the
+    /// next restart, which on a mining rig can be a week. It is a hold rather
+    /// than a no-op because the alternative is installing the same build again on
+    /// every re-check: each install moves the current app aside into `.lkg`, so
+    /// the second one overwrites the real rollback copy with the new build and
+    /// quietly disarms the probation it just armed.
+    ///
+    /// It also covers the case nobody wants to be in: a build that answers with a
+    /// different version than the one it was published under. There, the restart
+    /// never resolves this, and `installed_ago_s` is what lets a caller tell the
+    /// two apart out loud rather than repeating "restart to run it" for ever.
+    AlreadyInstalled { installed_ago_s: u64 },
     /// The version was previously seen with DIFFERENT artifact bytes. Refuse and
     /// shout: a re-published version is either a mistake or an attack, and we do
     /// not need to know which to know we should not install it.
@@ -279,6 +294,18 @@ pub enum Hold {
     /// we do not perform the act. A human can still install by hand and is told
     /// what is missing (see [`ManualConcern::UnrecordedSighting`]).
     LedgerUnwritable,
+    /// The ledger on disk could not be READ, so it was replaced with a fresh one
+    /// holding only this sighting. Every earlier record is gone — including,
+    /// possibly, the bytes this very version first arrived carrying.
+    ///
+    /// Kept distinct from [`Self::LedgerUnwritable`] because the remedy and the
+    /// honest sentence are different ones: nothing is wrong with the permissions
+    /// or the disk, and there is nothing for the user to fix. What there is, is
+    /// a comparison we can no longer make, on the one refusal with no override
+    /// anywhere. So this install waits — and the version starts its soak again
+    /// from the sighting we just wrote, because that is genuinely all this
+    /// machine now knows about it.
+    LedgerReset,
 }
 
 /// A version newer than the one we are running, together with the only fact
@@ -358,13 +385,17 @@ pub struct Input<'a> {
     /// The artifact sha256 this machine recorded the first time it saw this
     /// version, if any.
     pub seen_sha256: Option<&'a str>,
-    /// Whether that sighting is actually ON RECORD — i.e. whether the local
-    /// ledger accepted the write. `false` means `seen_sha256` is a value we
-    /// invented this run and will invent again next run, so it can never
-    /// disagree with the manifest and the hash-conflict refusal is dead.
-    pub sighting_on_record: bool,
+    /// What the local ledger can actually vouch for after recording that
+    /// sighting (see [`LedgerStatus`]). Anything but [`LedgerStatus::Intact`]
+    /// means `seen_sha256` is a value we invented this run, so it cannot
+    /// disagree with the manifest and the hash-conflict refusal is not running.
+    pub ledger: LedgerStatus,
     /// Versions that failed a health probation here.
     pub pinned: &'a [String],
+    /// The last unattended install this machine performed, if it remembers one
+    /// (see [`Installed`]). `None` on a machine that has never auto-installed —
+    /// or that installed with a client older than this record.
+    pub installed: Option<&'a Installed>,
     /// Whether a last-known-good copy exists on disk right now.
     pub lkg_present: bool,
 }
@@ -421,8 +452,27 @@ pub fn decide(input: &Input<'_>) -> Decision {
             });
         }
     }
-    if input.pinned.iter().any(|p| p == &m.version) {
+    if input.pinned.iter().any(|p| crate::same_version(p, &m.version)) {
         return notify(Hold::Pinned);
+    }
+
+    // 2b. Have we already done exactly this? An install does not replace the
+    //     running process, so between the swap and the next restart `current` is
+    //     STILL the old version and every check would otherwise install the same
+    //     build again — each one moving the app into `.lkg` and so overwriting
+    //     the rollback copy with the build on trial. Checked BEFORE the mode
+    //     gates: a machine set to `notify` that already has the swap on disk
+    //     needs to hear "restart to run it", not "run `alice-miner update`".
+    //
+    //     This is also the only thing standing between a version-mismatched build
+    //     and an unbounded install loop, because for such a build the restart
+    //     never reconciles `current` with the manifest. See [`Installed`].
+    if let Some(rec) = input.installed {
+        if crate::same_version(&rec.version, &m.version) {
+            return notify(Hold::AlreadyInstalled {
+                installed_ago_s: input.now_unix.saturating_sub(rec.at_unix),
+            });
+        }
     }
 
     // 3. Mode gates.
@@ -440,8 +490,13 @@ pub fn decide(input: &Input<'_>) -> Decision {
     //     says forever, so the check is not merely failing — it is gone. Hold.
     //     (This is checked HERE, after the mode gates, so a machine set to
     //     `off`/`notify` still hears the reason it actually cares about.)
-    if !input.sighting_on_record {
-        return notify(Hold::LedgerUnwritable);
+    //     Both failure directions hold, and they say different things: one is a
+    //     write we could not make, the other is a read that came back empty and
+    //     took the prior records with it. Neither is "recorded".
+    match input.ledger {
+        LedgerStatus::Intact => {}
+        LedgerStatus::Unwritable => return notify(Hold::LedgerUnwritable),
+        LedgerStatus::Reset => return notify(Hold::LedgerReset),
     }
 
     // 4. Soak. Anchored on OUR first sighting, floored by OUR constant; the
@@ -507,11 +562,18 @@ pub struct ManualInput<'a> {
     pub artifact_sha256: Option<&'a str>,
     /// The sha256 this machine recorded the FIRST time it saw this version.
     pub seen_sha256: Option<&'a str>,
-    /// Whether that sighting is actually on record (see
-    /// [`Input::sighting_on_record`]). `true` when there was nothing to record.
-    pub sighting_on_record: bool,
+    /// What the local ledger can vouch for (see [`Input::ledger`]).
+    /// [`LedgerStatus::Intact`] when there was nothing to record.
+    pub ledger: LedgerStatus,
     /// Versions that failed a health probation here.
     pub pinned: &'a [String],
+    /// The last unattended install this machine performed, if any (see
+    /// [`Installed`]). The manual path needs it for the same reason the
+    /// automatic one does — applying an update that is already on disk moves the
+    /// genuine last-known-good copy aside and replaces it with the build being
+    /// tested — and because a check the automatic path makes and the manual path
+    /// skips is a check with a front door around it.
+    pub installed: Option<&'a Installed>,
 }
 
 /// A refusal on the manual path. These are not negotiable by a "don't ask me"
@@ -570,6 +632,24 @@ pub enum ManualConcern {
     /// it must not pass silently under `--yes`: "stop asking me questions" was
     /// typed before anyone knew the machine had stopped remembering answers.
     UnrecordedSighting,
+    /// This machine has already installed this exact version; the swap is on
+    /// disk and takes effect at the next start.
+    ///
+    /// A second question rather than a refusal: someone who believes the
+    /// installed copy is damaged is entitled to re-apply it, and it is their
+    /// machine. But it must not pass silently under `--yes`, because applying it
+    /// again moves the CURRENT app into the last-known-good slot — i.e. it
+    /// replaces the copy the machine would roll back to with the build that has
+    /// not proven itself yet, and the rollback then restores the same build it is
+    /// rolling back from.
+    AlreadyInstalled,
+    /// The ledger could not be read and has been replaced, so this machine's
+    /// memory of which package each version arrived with starts again from this
+    /// sighting. A concern for the same reason as
+    /// [`Self::UnrecordedSighting`] — and a DIFFERENT sentence, because nothing
+    /// here is the user's to fix and telling them to go and check their disk
+    /// permissions would be a guess dressed up as a diagnosis.
+    LedgerReset,
 }
 
 /// What the manual path may do.
@@ -613,11 +693,21 @@ pub fn decide_manual(input: &ManualInput<'_>) -> ManualVerdict {
     if m.is_revoked(&m.version) {
         return ManualVerdict::Refuse(ManualRefusal::Revoked);
     }
-    if input.pinned.iter().any(|p| p == &m.version) {
+    if input.pinned.iter().any(|p| crate::same_version(p, &m.version)) {
         return ManualVerdict::ConfirmFirst(ManualConcern::Pinned);
     }
-    if !input.sighting_on_record {
-        return ManualVerdict::ConfirmFirst(ManualConcern::UnrecordedSighting);
+    if input
+        .installed
+        .is_some_and(|rec| crate::same_version(&rec.version, &m.version))
+    {
+        return ManualVerdict::ConfirmFirst(ManualConcern::AlreadyInstalled);
+    }
+    match input.ledger {
+        LedgerStatus::Intact => {}
+        LedgerStatus::Unwritable => {
+            return ManualVerdict::ConfirmFirst(ManualConcern::UnrecordedSighting)
+        }
+        LedgerStatus::Reset => return ManualVerdict::ConfirmFirst(ManualConcern::LedgerReset),
     }
     ManualVerdict::Proceed
 }
@@ -772,27 +862,97 @@ fn seen_path(state_dir: &Path) -> PathBuf {
     state_dir.join("update-seen.json")
 }
 
-fn read_seen(state_dir: &Path) -> Vec<Seen> {
-    std::fs::read(seen_path(state_dir))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Vec<Seen>>(&b).ok())
-        .unwrap_or_default()
+/// Where an unreadable ledger is moved before it is replaced, so the evidence
+/// survives for whoever asks what happened. One slot, deliberately: a machine
+/// that damages its ledger repeatedly should not accumulate files.
+fn seen_quarantine_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("update-seen.json.unreadable")
+}
+
+/// The ledger as found on disk, and whether reading it lost anything.
+struct LedgerRead {
+    entries: Vec<Seen>,
+    /// A ledger file was PRESENT and could not be read or parsed. `entries` is
+    /// therefore empty for a reason that is not "this machine has never seen a
+    /// version" — the distinction the old `unwrap_or_default()` erased.
+    damaged: bool,
+}
+
+fn read_seen(state_dir: &Path) -> LedgerRead {
+    let empty = |damaged| LedgerRead {
+        entries: Vec::new(),
+        damaged,
+    };
+    match std::fs::read(seen_path(state_dir)) {
+        // No ledger yet: an ordinary first run, and nothing was lost.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => empty(false),
+        // A file we cannot read is a record we cannot consult. Whatever the
+        // reason, we no longer know what this machine used to know.
+        Err(_) => empty(true),
+        Ok(bytes) => match serde_json::from_slice::<Vec<Seen>>(&bytes) {
+            Ok(entries) => LedgerRead {
+                entries,
+                damaged: false,
+            },
+            Err(_) => empty(true),
+        },
+    }
+}
+
+/// What this machine's own update ledger can vouch for, after a sighting.
+///
+/// Three states, not two, and the third is the whole point: the old boolean
+/// collapsed "we wrote it and everything we knew is still there" together with
+/// "we wrote it over the top of a ledger we could not read", and reported both as
+/// recorded. The second one is the erasure of the only check in the update path
+/// that does not rest on the release key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerStatus {
+    /// The sighting is on disk and every earlier sighting is still with it.
+    /// This is the only state in which the hash-conflict refusal is actually
+    /// running on this machine.
+    Intact,
+    /// The ledger on disk could not be read, so it was replaced with a fresh one
+    /// holding this sighting alone. Everything this machine had written down —
+    /// including, possibly, the bytes this very version first arrived with — is
+    /// gone.
+    ///
+    /// The replacement is deliberate and is NOT the bug: refusing to overwrite
+    /// would let a single bad byte permanently disable auto-update on a rig
+    /// nobody visits, which is a worse failure than starting the record again.
+    /// What was the bug is doing it silently and calling it recorded.
+    Reset,
+    /// The sighting could not be written at all.
+    Unwritable,
 }
 
 /// A sighting, plus the one thing the caller cannot see from the record itself:
-/// whether the ledger actually kept it.
+/// what the ledger it went into can still vouch for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sighting {
     pub seen: Seen,
-    /// `true` when this sighting is on disk — either because it was already
-    /// there, or because we just wrote it successfully.
+    /// What the ledger can vouch for. Anything but [`LedgerStatus::Intact`] is a
+    /// statement that the hash-conflict refusal did not run here.
     ///
-    /// `false` is not a detail. [`note_seen`] hands back the record it MADE
-    /// whether or not the write landed, and that record trivially agrees with
+    /// This is not a detail. [`note_seen`] hands back the record it MADE
+    /// whenever it has no earlier one, and that record trivially agrees with
     /// the manifest it was built from, so a caller that cannot tell the two
     /// apart will compare the server's hash against the server's hash and
     /// conclude, forever, that nothing is wrong.
-    pub on_record: bool,
+    pub ledger: LedgerStatus,
+}
+
+impl Sighting {
+    /// Whether this sighting can be used as evidence — i.e. whether it came out
+    /// of a ledger that still holds what it held before.
+    ///
+    /// False in BOTH failure directions, on purpose: "we could not write it" and
+    /// "we wrote it over records we had already lost" are different sentences to
+    /// a human and the same answer to this question. Nothing that lost the
+    /// record may ever render as "recorded".
+    pub fn on_record(&self) -> bool {
+        self.ledger == LedgerStatus::Intact
+    }
 }
 
 /// Record that we have seen `version` carrying `sha256`, and return the record
@@ -813,16 +973,38 @@ pub struct Sighting {
 /// forward can only ever make the soak longer, so the clamp is safe in the one
 /// direction it acts.
 pub fn note_seen(state_dir: &Path, version: &str, sha256: &str) -> Sighting {
-    let mut all = read_seen(state_dir);
-    if let Some(existing) = all.iter().find(|s| s.version == version) {
+    let LedgerRead {
+        entries: mut all,
+        damaged,
+    } = read_seen(state_dir);
+    // Keyed by the CANONICAL version (see `crate::normalize_version`). Two
+    // spellings of one version must be one entry, or re-spelling the number is a
+    // free reset of both the soak clock and the recorded bytes — i.e. a way
+    // around the hash-conflict refusal, the one check with no override anywhere.
+    if let Some(existing) = all.iter().find(|s| crate::same_version(&s.version, version)) {
         return Sighting {
             seen: existing.clone(),
-            on_record: true,
+            ledger: LedgerStatus::Intact,
         };
+    }
+    if damaged {
+        // Move the unreadable file aside before replacing it, so the evidence
+        // survives for whoever asks, and say so in the local history — this is
+        // the moment a machine forgets what it saw, and it must not be the
+        // quietest line in the file.
+        let _ = std::fs::rename(seen_path(state_dir), seen_quarantine_path(state_dir));
+        log_event(
+            state_dir,
+            "ledger-reset",
+            serde_json::json!({
+                "version": crate::normalize_version(version),
+                "kept_at": seen_quarantine_path(state_dir).display().to_string(),
+            }),
+        );
     }
     let floor = all.iter().map(|s| s.first_seen_unix).max().unwrap_or(0);
     let rec = Seen {
-        version: version.to_string(),
+        version: crate::normalize_version(version).to_string(),
         first_seen_unix: now_unix().max(floor),
         sha256: sha256.to_ascii_lowercase(),
     };
@@ -834,14 +1016,19 @@ pub fn note_seen(state_dir: &Path, version: &str, sha256: &str) -> Sighting {
         let drop = all.len() - 200;
         all.drain(..drop);
     }
-    let on_record = serde_json::to_vec_pretty(&all)
+    let written = serde_json::to_vec_pretty(&all)
         .ok()
         .map(|bytes| write_atomic(&seen_path(state_dir), &bytes).is_ok())
         .unwrap_or(false);
-    Sighting {
-        seen: rec,
-        on_record,
-    }
+    // Precedence: a write we could not make outranks a read we could not make.
+    // If the write failed there is no fresh ledger either, so calling it a reset
+    // would claim a self-heal that did not happen.
+    let ledger = match (written, damaged) {
+        (false, _) => LedgerStatus::Unwritable,
+        (true, true) => LedgerStatus::Reset,
+        (true, false) => LedgerStatus::Intact,
+    };
+    Sighting { seen: rec, ledger }
 }
 
 fn pins_path(state_dir: &Path) -> PathBuf {
@@ -877,7 +1064,11 @@ const MAX_PINS: usize = 512;
 /// this rule that needs 512 distinct failed auto-updates on one machine first.)
 pub fn pin(state_dir: &Path, version: &str) {
     let mut all = pins(state_dir);
-    if all.iter().any(|v| v == version) {
+    // Canonical in, canonical compared: a pin written from a `v`-prefixed
+    // probation record must still match a manifest that spells the same version
+    // without the prefix, and vice versa.
+    let version = crate::normalize_version(version);
+    if all.iter().any(|v| crate::same_version(v, version)) {
         return;
     }
     all.push(version.to_string());
@@ -897,6 +1088,79 @@ pub fn pin(state_dir: &Path, version: &str) {
     if let Ok(bytes) = serde_json::to_vec_pretty(&all) {
         let _ = write_atomic(&pins_path(state_dir), &bytes);
     }
+}
+
+/// What this machine did the last time it installed something without being
+/// asked — the durable answer to "have I already applied this?".
+///
+/// Nothing on the automatic path used to record it, and the omission had a
+/// reachable cost. [`decide`] gates on `is_newer(manifest.version, current)` and
+/// nothing else, where `current` is what the RUNNING BINARY answers
+/// (`CARGO_PKG_VERSION`). Those two disagree in two ordinary situations:
+///
+///   * **between the swap and the restart.** An install does not replace the
+///     running process — the new build takes over at the next start. A rig that
+///     mines for a week therefore keeps reporting the old version, and the
+///     six-hourly re-check kept seeing "newer version available" and installing
+///     it again. Each install moves the app aside into `.lkg`, so the SECOND one
+///     overwrote the genuine rollback copy with the new build: the probation
+///     would then "roll back" to the same build it was rolling back FROM, and
+///     report a restore that restores nothing.
+///   * **when the published number and the binary's own number differ at all.**
+///     Ship a tree that says `0.6.7` as `0.6.8` and the disagreement is
+///     permanent: install, arm a probation for `0.6.8`, discard it at the next
+///     launch because the binary says `0.6.7`, and install again six hours
+///     later, for ever.
+///
+/// The version bump fixes the second case for this release. It does not fix the
+/// first, and it does not fix the class: `decide` had no memory of a completed
+/// install, so any future disagreement between the manifest's claim and the
+/// binary's answer becomes an unbounded loop. This record is that memory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Installed {
+    /// The version this machine installed, in its canonical spelling.
+    pub version: String,
+    /// The artifact sha256 it installed, for the local history.
+    pub sha256: String,
+    pub at_unix: u64,
+}
+
+fn installed_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("update-installed.json")
+}
+
+/// The last unattended install this machine performed, if it remembers one.
+///
+/// A record that cannot be read reads as `None` — i.e. as the behaviour that
+/// existed before this record did. That is a deliberate fail-OPEN, and it is the
+/// same trade the seen ledger makes: the alternative, holding on an unreadable
+/// file, would let one bad byte disable auto-update permanently on a machine
+/// nobody visits, and unlike the ledger there would be nothing to self-heal it —
+/// the only thing that rewrites this file is an install we would be refusing to
+/// perform. The exposure is bounded by what it protects: worst case we are back
+/// to re-installing, which is what happened before.
+pub fn installed(state_dir: &Path) -> Option<Installed> {
+    let b = std::fs::read(installed_path(state_dir)).ok()?;
+    serde_json::from_slice(&b).ok()
+}
+
+/// Record that this machine has installed `version`. Called by the driver
+/// immediately after the swap succeeds — never before, because a record of an
+/// install that did not happen would hold every future check on a build the
+/// machine has not got.
+///
+/// Returns whether it reached disk. A failure here costs the loop protection and
+/// nothing else, so the caller logs it rather than failing the install.
+pub fn note_installed(state_dir: &Path, version: &str, sha256: &str) -> bool {
+    let rec = Installed {
+        version: crate::normalize_version(version).to_string(),
+        sha256: sha256.to_ascii_lowercase(),
+        at_unix: now_unix(),
+    };
+    serde_json::to_vec_pretty(&rec)
+        .ok()
+        .map(|bytes| write_atomic(&installed_path(state_dir), &bytes).is_ok())
+        .unwrap_or(false)
 }
 
 fn productive_path(state_dir: &Path) -> PathBuf {
@@ -1076,8 +1340,12 @@ pub fn arm(
     write_probation(
         app_path,
         &Probation {
-            version: version.to_string(),
-            previous: previous.to_string(),
+            // Canonical, so a record written from a `v`-prefixed manifest names
+            // the build the way the binary will answer. Records written by an
+            // earlier client still parse and still match: every comparison below
+            // goes through `crate::same_version`.
+            version: crate::normalize_version(version).to_string(),
+            previous: crate::normalize_version(previous).to_string(),
             armed_at_unix: now_unix(),
             launches: 0,
             started_ok: false,
@@ -1128,10 +1396,14 @@ pub fn register_launch(
         return LaunchVerdict::Normal;
     };
 
-    if p.version != running_version {
+    if !crate::same_version(&p.version, running_version) {
         // We are not running the build on trial — either a rollback already took
         // effect or the user installed something else by hand. Either way the
         // trial is over and its record is stale.
+        //
+        // `same_version`, never `!=`: this is the check that a `v`-prefixed
+        // manifest version used to fail, discarding an entirely healthy trial on
+        // its first launch and leaving the build with no rollback of any kind.
         clear_probation(app_path);
         return LaunchVerdict::Normal;
     }
@@ -1204,7 +1476,7 @@ pub fn note_launch_ok(app_path: &Path, running_version: &str) -> bool {
     let Some(mut p) = probation(app_path) else {
         return false;
     };
-    if p.version != running_version || p.started_ok {
+    if !crate::same_version(&p.version, running_version) || p.started_ok {
         return false;
     }
     p.started_ok = true;
@@ -1225,7 +1497,7 @@ pub fn confirm_start(state_dir: &Path, app_path: &Path, running_version: &str) -
     let Some(mut p) = probation(app_path) else {
         return false;
     };
-    if p.version != running_version {
+    if !crate::same_version(&p.version, running_version) {
         return false;
     }
     if p.baseline() == EarningBaseline::NotEarning {
@@ -1369,7 +1641,7 @@ pub enum SessionAction {
 /// zero is layer 3's doing) nor commit it (we did not watch it earn — we watched
 /// it not run).
 pub fn judge_session(p: &Probation, running_version: &str, result: &SessionResult) -> SessionAction {
-    if p.version != running_version {
+    if !crate::same_version(&p.version, running_version) {
         return SessionAction::Ignore;
     }
     match p.baseline() {
@@ -1539,8 +1811,9 @@ mod tests {
             now_unix: 1_000_000_000,
             first_seen_unix: 1_000_000_000 - 10 * 24 * 3600,
             seen_sha256: None,
-            sighting_on_record: true,
+            ledger: LedgerStatus::Intact,
             pinned: pins,
+            installed: None,
             lkg_present: true,
         }
     }
@@ -1783,7 +2056,7 @@ mod tests {
         .unwrap();
 
         let s = note_seen(&d, "0.6.8", &"aa".repeat(32));
-        assert!(s.on_record);
+        assert!(s.on_record());
         assert!(
             s.seen.first_seen_unix >= now + 3600,
             "a sighting must not be recorded before the ledger's own high-water mark: {} < {}",
@@ -1889,6 +2162,192 @@ mod tests {
         }
     }
 
+    // ── an install this machine has already performed ───────────────────────
+
+    /// **The loop.** `decide` gated on `is_newer(manifest, current)` and nothing
+    /// else, and `current` is what the running BINARY answers — which is not the
+    /// version on disk between an install and the next restart, and is not the
+    /// published version at all if the two were ever cut apart.
+    ///
+    /// A rig mines for days between restarts and re-checks every six hours, so
+    /// the same version was installed again, and again. Each install moves the
+    /// current app into `.lkg`: the second one therefore overwrites the genuine
+    /// rollback copy with the build being tested, and the probation's "rolled back
+    /// to v0.6.7, restart to run it" becomes a sentence about a file that is
+    /// v0.6.8. The version bump makes today's instance of this go away. It does
+    /// not make the class go away, because nothing recorded that an install had
+    /// happened at all.
+    #[test]
+    fn a_version_this_machine_has_already_installed_is_not_installed_again() {
+        let m = manifest("0.6.8");
+
+        // The control: no install on record, everything else identical.
+        assert!(matches!(decide(&input(&m, &[])), Decision::Install { .. }));
+
+        // We installed it four hours ago; this process is still the old build,
+        // because an install does not replace a running process.
+        let rec = Installed {
+            version: "0.6.8".into(),
+            sha256: "aa".repeat(32),
+            at_unix: 1_000_000_000 - 4 * 3600,
+        };
+        let mut i = input(&m, &[]);
+        i.installed = Some(&rec);
+        assert_eq!(
+            decide(&i),
+            Decision::Notify {
+                version: "0.6.8".into(),
+                hold: Hold::AlreadyInstalled { installed_ago_s: 4 * 3600 },
+            },
+            "the swap is already on disk — installing it again overwrites the rollback copy"
+        );
+
+        // A record of a DIFFERENT version says nothing about this one: a machine
+        // that took 0.6.8 last month must still be offered 0.6.9.
+        let old = Installed {
+            version: "0.6.7".into(),
+            sha256: "cc".repeat(32),
+            at_unix: 1,
+        };
+        let mut i = input(&m, &[]);
+        i.installed = Some(&old);
+        assert!(
+            matches!(decide(&i), Decision::Install { .. }),
+            "a stale record must not block the next real update"
+        );
+
+        // …and the spelling of the record cannot get in the way either.
+        let v_spelled = Installed {
+            version: "0.6.8".into(),
+            sha256: "aa".repeat(32),
+            at_unix: 1_000_000_000,
+        };
+        let vm = manifest("v0.6.8");
+        let mut i = input(&vm, &[]);
+        i.installed = Some(&v_spelled);
+        assert!(matches!(
+            decide(&i),
+            Decision::Notify { hold: Hold::AlreadyInstalled { .. }, .. }
+        ));
+    }
+
+    /// The loop as it actually runs, on the machine described in Defect 1: the
+    /// published version is `0.6.8` and the binary answers `0.6.7`, so no restart
+    /// ever reconciles them. Before the record, this installed on every check
+    /// until the rig was rebuilt. After it, it installs exactly once and then
+    /// says so — with the age that lets the caller tell "restart pending" from
+    /// "this build is not the version it claims to be".
+    #[test]
+    fn a_build_that_never_reports_the_version_it_was_published_as_installs_once() {
+        let m = manifest("0.6.8");
+        let mut i = input(&m, &[]); // current: "0.6.7", for ever
+        assert!(matches!(decide(&i), Decision::Install { .. }), "check 1: installs");
+
+        // …which the driver records. Every later check, at any distance:
+        let rec = Installed {
+            version: "0.6.8".into(),
+            sha256: "aa".repeat(32),
+            at_unix: 1_000_000_000,
+        };
+        i.installed = Some(&rec);
+        for (n, ahead) in [6 * 3600u64, 24 * 3600, 30 * 24 * 3600].iter().enumerate() {
+            i.now_unix = 1_000_000_000 + ahead;
+            match decide(&i) {
+                Decision::Notify { hold: Hold::AlreadyInstalled { installed_ago_s }, .. } => {
+                    assert_eq!(installed_ago_s, *ahead, "check {}", n + 2);
+                }
+                other => panic!("check {}: expected a hold, got {other:?}", n + 2),
+            }
+        }
+    }
+
+    /// The record must not outrank the findings that are about the ARTIFACT. A
+    /// version that has been re-published with different bytes, or withdrawn, is
+    /// not "already installed, nothing to see here" — those are the loud ones and
+    /// they stay loud.
+    #[test]
+    fn an_install_on_record_does_not_mask_a_hash_conflict_or_a_withdrawal() {
+        let rec = Installed {
+            version: "0.6.8".into(),
+            sha256: "aa".repeat(32),
+            at_unix: 1_000_000_000,
+        };
+        let other = "bb".repeat(32);
+
+        let m = manifest("0.6.8");
+        let mut i = input(&m, &[]);
+        i.installed = Some(&rec);
+        i.seen_sha256 = Some(&other);
+        assert!(
+            matches!(decide(&i), Decision::Notify { hold: Hold::HashConflict { .. }, .. }),
+            "a re-published version outranks 'we already installed it'"
+        );
+
+        let mut m = manifest("0.6.8");
+        m.revoked = vec!["0.6.8".into()];
+        let mut i = input(&m, &[]);
+        i.installed = Some(&rec);
+        assert!(matches!(decide(&i), Decision::Notify { hold: Hold::Revoked, .. }));
+    }
+
+    /// The manual path must not be the front door around the new hold. Applying
+    /// an update that is already on disk moves the CURRENT app into `.lkg` — so
+    /// the copy the machine would roll back to becomes the build on trial — and
+    /// `--yes` must not be able to do that silently.
+    #[test]
+    fn the_manual_path_asks_before_applying_an_update_that_is_already_installed() {
+        let m = manifest("0.6.8");
+        assert_eq!(decide_manual(&manual(&m, &[])), ManualVerdict::Proceed);
+
+        let rec = Installed {
+            version: "v0.6.8".into(),
+            sha256: "aa".repeat(32),
+            at_unix: 1,
+        };
+        let mut i = manual(&m, &[]);
+        i.installed = Some(&rec);
+        assert_eq!(
+            decide_manual(&i),
+            ManualVerdict::ConfirmFirst(ManualConcern::AlreadyInstalled),
+            "a second question, not a refusal: re-applying is the user's call to make"
+        );
+
+        // A record about another version is not about this one.
+        let other = Installed {
+            version: "0.6.7".into(),
+            sha256: "cc".repeat(32),
+            at_unix: 1,
+        };
+        let mut i = manual(&m, &[]);
+        i.installed = Some(&other);
+        assert_eq!(decide_manual(&i), ManualVerdict::Proceed);
+
+        // …and the findings that rest on evidence the publisher cannot restate
+        // still outrank it.
+        let seen = "bb".repeat(32);
+        let mut i = manual(&m, &[]);
+        i.installed = Some(&rec);
+        i.seen_sha256 = Some(&seen);
+        assert!(matches!(
+            decide_manual(&i),
+            ManualVerdict::Refuse(ManualRefusal::HashConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn the_install_record_round_trips_and_is_canonical() {
+        let d = tmp("installed");
+        assert_eq!(installed(&d), None, "a machine that has never auto-installed");
+        assert!(note_installed(&d, "v0.6.8", &"AA".repeat(32)));
+        let rec = installed(&d).expect("the record is on disk");
+        assert_eq!(rec.version, "0.6.8", "stored in the canonical spelling");
+        assert_eq!(rec.sha256, "aa".repeat(32));
+        // An unreadable record reads as "no memory", i.e. as the behaviour that
+        // existed before the record did — never as a permanent hold.
+        std::fs::write(installed_path(&d), b"not json").unwrap();
+        assert_eq!(installed(&d), None);
+    }
+
     // ── the manual path ─────────────────────────────────────────────────────
 
     fn manual<'a>(m: &'a Manifest, pins: &'a [String]) -> ManualInput<'a> {
@@ -1897,8 +2356,9 @@ mod tests {
             current: "0.6.7",
             artifact_sha256: Some(&m.artifacts[0].sha256),
             seen_sha256: None,
-            sighting_on_record: true,
+            ledger: LedgerStatus::Intact,
             pinned: pins,
+            installed: None,
         }
     }
 
@@ -2052,7 +2512,7 @@ mod tests {
         assert!(matches!(decide(&input(&m, &[])), Decision::Install { .. }));
 
         let mut i = input(&m, &[]);
-        i.sighting_on_record = false;
+        i.ledger = LedgerStatus::Unwritable;
         assert_eq!(
             decide(&i),
             Decision::Notify { version: "0.6.8".into(), hold: Hold::LedgerUnwritable },
@@ -2063,11 +2523,120 @@ mod tests {
         // refusing, but it must not pass silently under `--yes`.
         let mut mi = manual(&m, &[]);
         assert_eq!(decide_manual(&mi), ManualVerdict::Proceed);
-        mi.sighting_on_record = false;
+        mi.ledger = LedgerStatus::Unwritable;
         assert_eq!(
             decide_manual(&mi),
             ManualVerdict::ConfirmFirst(ManualConcern::UnrecordedSighting)
         );
+    }
+
+    /// The SAME two consumers, for the other way a ledger fails: the records were
+    /// there, we could not read them, and they are now gone. Both directions hold
+    /// — and each says what actually happened, because "fix your disk permissions"
+    /// is a guess when the disk is fine, and a client that guesses a cause is
+    /// worse than one that says what it knows.
+    #[test]
+    fn a_reset_ledger_holds_the_automatic_path_and_asks_on_the_manual_one() {
+        let m = manifest("0.6.8");
+
+        let mut i = input(&m, &[]);
+        i.ledger = LedgerStatus::Reset;
+        assert_eq!(
+            decide(&i),
+            Decision::Notify { version: "0.6.8".into(), hold: Hold::LedgerReset },
+            "an unattended install must not rest on a comparison we have just lost"
+        );
+
+        let mut mi = manual(&m, &[]);
+        mi.ledger = LedgerStatus::Reset;
+        assert_eq!(
+            decide_manual(&mi),
+            ManualVerdict::ConfirmFirst(ManualConcern::LedgerReset)
+        );
+
+        // …and the two failures are not interchangeable: each renders as itself.
+        assert_ne!(Hold::LedgerReset, Hold::LedgerUnwritable);
+        assert_ne!(
+            ManualConcern::LedgerReset,
+            ManualConcern::UnrecordedSighting
+        );
+    }
+
+    /// A ledger that cannot be PARSED is a ledger whose records are gone, and the
+    /// record it holds that matters most is the one with no override on any path:
+    /// the bytes a version first arrived carrying. Overwriting it and carrying on
+    /// is the deliberate trade (refusing would let one bad byte permanently
+    /// disable auto-update on a rig nobody visits) — but doing it silently, and
+    /// then reporting the write as if the sighting were on record, told every
+    /// consumer the republish check was running at the exact moment it was erased.
+    #[test]
+    fn a_ledger_that_cannot_be_parsed_is_never_reported_as_recorded() {
+        let d = tmp("corrupt");
+        // What this machine actually knew: 0.6.9 arrived carrying bb…
+        assert!(note_seen(&d, "0.6.9", &"bb".repeat(32)).on_record());
+        // …and then the file stopped being readable.
+        std::fs::write(seen_path(&d), b"{ not json at all").unwrap();
+
+        let s = note_seen(&d, "0.6.9", &"aa".repeat(32));
+        assert!(
+            !s.on_record(),
+            "a sighting written over a ledger we could not read must not be reported as recorded"
+        );
+        assert_eq!(
+            s.ledger,
+            LedgerStatus::Reset,
+            "and it says WHICH failure this was: nothing here is a permissions problem"
+        );
+        assert_eq!(
+            s.seen.sha256,
+            "aa".repeat(32),
+            "the trap: the record handed back is the one we just built from the server's own answer"
+        );
+
+        // The evidence is kept rather than destroyed, and the moment this machine
+        // forgot what it saw is in its own history file.
+        assert_eq!(
+            std::fs::read(seen_quarantine_path(&d)).unwrap(),
+            b"{ not json at all",
+            "the unreadable ledger must be moved aside, not overwritten in place"
+        );
+        let hist = std::fs::read_to_string(d.join("update-history.jsonl")).unwrap_or_default();
+        assert!(hist.contains("ledger-reset"), "history: {hist}");
+
+        // The self-heal is real and is NOT the bug: the very next check finds a
+        // readable ledger and reports the truth in the other direction. One bad
+        // byte must not disable auto-update on a rig nobody visits.
+        let after = note_seen(&d, "0.6.10", &"cc".repeat(32));
+        assert_eq!(after.ledger, LedgerStatus::Intact);
+        assert_eq!(read_seen(&d).entries.len(), 2);
+
+        // Stated plainly because it is the residual we are accepting: the bytes
+        // 0.6.9 first arrived with are gone, and the re-recorded ones are
+        // whatever the server said this time. The soak clock restarts with them.
+        assert_eq!(
+            read_seen(&d)
+                .entries
+                .iter()
+                .find(|e| e.version == "0.6.9")
+                .map(|e| e.sha256.clone()),
+            Some("aa".repeat(32)),
+            "the reset really did lose the original bytes — the hold and the fresh \
+             soak are what stand in for the comparison we can no longer make"
+        );
+    }
+
+    /// A ledger that is simply ABSENT is not a ledger that was lost. The ordinary
+    /// first run on a fresh machine must report `Intact`, or every new install
+    /// would spend its first check holding on a failure that did not happen.
+    #[test]
+    fn a_first_run_with_no_ledger_at_all_is_intact_not_reset() {
+        let d = tmp("noledger");
+        assert!(!seen_path(&d).exists());
+        assert_eq!(
+            note_seen(&d, "0.6.8", &"aa".repeat(32)).ledger,
+            LedgerStatus::Intact
+        );
+        assert!(!seen_quarantine_path(&d).exists(), "nothing was quarantined");
     }
 
     /// …and the write failure is actually detected, rather than being a flag no
@@ -2081,7 +2650,7 @@ mod tests {
 
         let s = note_seen(&not_a_dir, "0.6.8", &"aa".repeat(32));
         assert!(
-            !s.on_record,
+            !s.on_record(),
             "a sighting that never reached disk must not be reported as recorded"
         );
         // And the trap it used to lay: the record handed back agrees with the
@@ -2090,7 +2659,7 @@ mod tests {
         assert_eq!(s.seen.sha256, "aa".repeat(32));
 
         // A writable directory reports the truth in the other direction.
-        assert!(note_seen(&d, "0.6.8", &"aa".repeat(32)).on_record);
+        assert!(note_seen(&d, "0.6.8", &"aa".repeat(32)).on_record());
     }
 
     /// With no artifact for this platform there are no bytes to compare, and the
@@ -2104,8 +2673,9 @@ mod tests {
             current: "0.6.7",
             artifact_sha256: None,
             seen_sha256: Some(&seen),
-            sighting_on_record: true,
+            ledger: LedgerStatus::Intact,
             pinned: &[],
+            installed: None,
         };
         assert_eq!(decide_manual(&i), ManualVerdict::Proceed);
     }
@@ -2189,7 +2759,10 @@ mod tests {
         let again = note_seen(&d, "0.6.8", "BB");
         assert_eq!(first.seen.first_seen_unix, again.seen.first_seen_unix);
         assert_eq!(again.seen.sha256, "aa", "first bytes win; the ledger is append-only");
-        assert!(first.on_record && again.on_record, "a writable dir records both");
+        assert!(
+            first.on_record() && again.on_record(),
+            "a writable dir records both"
+        );
     }
 
     #[test]
@@ -2781,6 +3354,110 @@ mod tests {
         assert!(!keys.contains(SessionEvidence::Judgeable.key()));
     }
 
+    // ── version IDENTITY vs version ORDERING ────────────────────────────────
+
+    /// A manifest publishing `"v0.6.9"` soaks, orders and installs exactly like
+    /// `"0.6.9"` — every ordering check (`parse_version`, `is_revoked`) trims the
+    /// leading `v`. Every IDENTITY check used to byte-compare the raw string, and
+    /// that asymmetry voided the entire probation: `arm` stored `"v0.6.9"`, the
+    /// binary answers `"0.6.9"`, and on the very first launch the trial was
+    /// discarded as belonging to some other build. No crash-on-launch rollback, no
+    /// stopped-earning rollback, and a `.lkg` copy that is never dropped — leaked
+    /// on every rig.
+    ///
+    /// This is not an exotic manifest. `scripts/release.sh` took `--version`
+    /// verbatim, `parse_verified_manifest` checked only `schema` and `product`,
+    /// and the repo tags its releases `v0.6.7`: typing the tag is the natural
+    /// mistake, and it is a silent one.
+    #[test]
+    fn a_v_prefixed_version_names_the_same_build_everywhere() {
+        let d = tmp("vprefix");
+        let app = fake_app(&d, "NEW", "OLD");
+        let mut lkg = app.as_os_str().to_os_string();
+        lkg.push(".lkg");
+        let lkg = PathBuf::from(lkg);
+
+        // The manifest spelling goes in…
+        arm(&app, "v0.6.9", "0.6.8", EarningBaseline::Earning).unwrap();
+        // …and the BINARY's own answer comes out. These name one build.
+        assert!(
+            matches!(register_launch(&d, &app, "0.6.9"), LaunchVerdict::OnTrial { .. }),
+            "the running build IS the one on trial"
+        );
+        assert!(probation(&app).is_some(), "the trial must survive its first launch");
+        assert!(note_launch_ok(&app, "0.6.9"), "and the launch must register");
+        assert!(
+            !confirm_start(&d, &app, "0.6.9"),
+            "an earning baseline is not satisfied by starting"
+        );
+        assert!(lkg.exists(), "last-known-good must still be there to roll back to");
+
+        // The mining half judges it too, rather than ignoring it as another build.
+        let p = probation(&app).unwrap();
+        assert_eq!(
+            judge_session(&p, "0.6.9", &SessionResult::judgeable(60, 1)),
+            SessionAction::Commit
+        );
+        assert_eq!(
+            note_session(&d, &app, "0.6.9", SessionResult::judgeable(60, 1)),
+            SessionVerdict::Committed { version: "0.6.9".into() },
+            "the committed version is reported in its canonical spelling"
+        );
+        assert!(!lkg.exists(), "the commit drops last-known-good");
+    }
+
+    /// The other end of the same trial: a `v`-prefixed build that dies on launch
+    /// must actually roll back and pin, and the pin it writes must be the one
+    /// `decide` later matches against a manifest spelling it either way.
+    #[test]
+    fn a_v_prefixed_version_rolls_back_and_the_pin_matches_either_spelling() {
+        let d = tmp("vprefix-rollback");
+        let app = fake_app(&d, "NEW", "OLD");
+        arm(&app, "v0.6.9", "0.6.8", EarningBaseline::Earning).unwrap();
+        register_launch(&d, &app, "0.6.9");
+        match register_launch(&d, &app, "0.6.9") {
+            LaunchVerdict::RolledBack { failed_version, restored, .. } => {
+                assert_eq!(failed_version, "0.6.9");
+                assert!(restored);
+            }
+            other => panic!("expected a rollback, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&app).unwrap(), "OLD");
+        assert_eq!(
+            pins(&d),
+            vec!["0.6.9".to_string()],
+            "a pin is stored in the canonical spelling"
+        );
+
+        // …and it is honoured whichever way the manifest spells it next time.
+        for spelling in ["0.6.9", "v0.6.9"] {
+            let m = manifest(spelling);
+            let pinned = pins(&d);
+            assert!(
+                matches!(decide(&input(&m, &pinned)), Decision::Notify { hold: Hold::Pinned, .. }),
+                "a machine that rolled this back must not auto-install it as {spelling}"
+            );
+        }
+    }
+
+    /// The ledger is keyed by version, so it has to agree with everything else
+    /// about what a version IS. Two spellings of one version must be one entry —
+    /// otherwise re-spelling the number is a free reset of both the soak clock and
+    /// the hash-conflict record, which is the one refusal with no override.
+    #[test]
+    fn the_seen_ledger_treats_both_spellings_as_one_version() {
+        let d = tmp("vprefix-seen");
+        let first = note_seen(&d, "0.6.9", &"aa".repeat(32));
+        let again = note_seen(&d, "v0.6.9", &"bb".repeat(32));
+        assert_eq!(
+            again.seen.sha256,
+            "aa".repeat(32),
+            "the first bytes must still win: re-spelling a version is not a new sighting"
+        );
+        assert_eq!(again.seen.first_seen_unix, first.seen.first_seen_unix);
+        assert_eq!(read_seen(&d).entries.len(), 1, "one version, one ledger entry");
+    }
+
     #[test]
     fn a_stale_probation_for_another_version_is_discarded() {
         let d = tmp("stale");
@@ -2905,6 +3582,39 @@ mod tests {
         let mut i = input(&m, &[]);
         i.current = "0.6.6";
         assert!(matches!(decide(&i), Decision::CurrentRevoked { .. }));
+    }
+
+    /// The publisher's spelling is canonicalised at the ONE boundary where an
+    /// untrusted manifest becomes a `Manifest` — so nothing downstream can key
+    /// off `"v0.6.9"` even in a code path nobody has written yet.
+    ///
+    /// Normalising rather than rejecting is the deliberate direction: refusing a
+    /// manifest over a cosmetic spelling would stop a whole fleet from seeing
+    /// updates at all, which is the same self-inflicted blackout as bumping
+    /// `schema`. The install this produces is the ordinary one, named the
+    /// ordinary way.
+    #[test]
+    fn a_v_prefixed_manifest_version_is_canonical_by_the_time_policy_sees_it() {
+        let json = br#"{"schema":1,"product":"alice-miner","version":"v0.6.9","min_supported":"0.3.0","released":"2026-08-14T00:00:00Z","notes":"n","artifacts":[{"platform":"macos-arm64","url":"https://example.invalid/a.zip","sha256":"aa","size":1}]}"#;
+        let m = crate::parse_verified_manifest(json).expect("a v-prefixed manifest still parses");
+        assert_eq!(m.version, "0.6.9", "the leading v is gone by the time we hold it");
+
+        // And the whole decision runs on it as if it had never been there. (The
+        // artifact only matches this platform on macos-arm64; the point being
+        // asserted is the version, so drive `decide` with the fixture manifest
+        // carrying the parsed version.)
+        let mut policy = manifest(&m.version);
+        policy.revoked = vec!["v0.6.7".into()];
+        let i = input(&policy, &[]);
+        assert!(
+            matches!(decide(&i), Decision::CurrentRevoked { .. }),
+            "a v-prefixed revocation withdraws the running build"
+        );
+        let policy = manifest(&m.version);
+        match decide(&input(&policy, &[])) {
+            Decision::Install { version, .. } => assert_eq!(version, "0.6.9"),
+            other => panic!("expected an ordinary install, got {other:?}"),
+        }
     }
 
     #[test]

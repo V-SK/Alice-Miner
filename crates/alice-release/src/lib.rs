@@ -450,10 +450,7 @@ impl Manifest {
 
     /// Whether the publisher has withdrawn `version`.
     pub fn is_revoked(&self, version: &str) -> bool {
-        let v = version.trim().trim_start_matches('v');
-        self.revoked
-            .iter()
-            .any(|r| r.trim().trim_start_matches('v') == v)
+        self.revoked.iter().any(|r| same_version(r, version))
     }
 
     /// Whether this release is flagged as a security / emergency fix.
@@ -684,8 +681,26 @@ pub fn verify_with_embedded_key(manifest_bytes: &[u8], sig_b64: &str) -> Result<
 /// verified, enforcing schema + product. Parsing an unverified manifest is a
 /// bug, so this is intentionally separate from the fetch.
 pub fn parse_verified_manifest(bytes: &[u8]) -> Result<Manifest> {
-    let manifest: Manifest =
+    let mut manifest: Manifest =
         serde_json::from_slice(bytes).map_err(|e| UpdateError::Manifest(format!("parse: {e}")))?;
+    // Canonicalise the one field that is used as an IDENTITY KEY — by the seen
+    // ledger, the pins, and the probation record — before anything downstream can
+    // key off the publisher's spelling of it. See [`normalize_version`]: the
+    // field is documented as "no leading v" and the repo tags releases `v0.6.7`,
+    // so typing the tag is the natural mistake and it used to be a silent one.
+    //
+    // Normalising rather than REJECTING is deliberate, and the direction is the
+    // same argument as keeping `schema` at 1: a client that refuses a manifest
+    // over a cosmetic spelling stops seeing updates entirely, which turns a
+    // publisher typo into a fleet-wide blackout. Downstream comparisons are
+    // normalised too ([`same_version`]), so this is defence in depth rather than
+    // the only line — and `scripts/release.sh` refuses to emit the bad spelling
+    // in the first place.
+    //
+    // Safe with respect to the signature: verification is over the RAW bytes as
+    // fetched and has already happened by the time anything calls this. Nothing
+    // re-serializes a `Manifest` and verifies the result.
+    manifest.version = normalize_version(&manifest.version).to_string();
     if manifest.schema > SUPPORTED_SCHEMA {
         return Err(UpdateError::Manifest(format!(
             "manifest schema {} newer than supported {}",
@@ -705,11 +720,48 @@ pub fn parse_verified_manifest(bytes: &[u8]) -> Result<Manifest> {
 // Version comparison (semver-lite, no extra dependency)
 // ────────────────────────────────────────────────────────────────────────────
 
+/// The canonical spelling of a version string, and the ONE place the leading
+/// `v` is dealt with.
+///
+/// `Manifest::version` is documented as "semver, no leading v" and nothing
+/// enforced it, so the two families of check drifted apart: every ORDERING check
+/// (`parse_version`, `Manifest::is_revoked`) trimmed the `v` and every IDENTITY
+/// check byte-compared the raw string. A manifest publishing `"v0.6.9"` —
+/// the spelling of this repo's own git tags — therefore soaked, ordered and
+/// installed normally, and then failed to be recognised as itself: the probation
+/// armed as `"v0.6.9"`, the binary answered `"0.6.9"`, and the trial was
+/// discarded on the first launch as belonging to another build. The build ran
+/// with no crash-on-launch rollback, no stopped-earning rollback, and a
+/// last-known-good copy nothing would ever drop.
+///
+/// Two rules keep that from coming back:
+///
+///   * this function is the only normaliser — `parse_version` and `is_revoked`
+///     call it rather than repeating the trim, so a change here cannot leave one
+///     family of check behind;
+///   * identity is [`same_version`], which is string equality AFTER this
+///     normalisation and deliberately NOT numeric equality: `0.6.8-rc1` and
+///     `0.6.8` order the same and are different builds.
+pub(crate) fn normalize_version(v: &str) -> &str {
+    v.trim().trim_start_matches('v')
+}
+
+/// Whether two version strings name the SAME build.
+///
+/// String identity after [`normalize_version`], never `parse_version` equality:
+/// the numeric triple deliberately discards the pre-release suffix for ordering,
+/// and two builds that merely sort the same are not one build. Every place that
+/// asks "is this record about the build in front of me" — the probation, the
+/// pins, the seen ledger — goes through here.
+pub(crate) fn same_version(a: &str, b: &str) -> bool {
+    normalize_version(a) == normalize_version(b)
+}
+
 /// Parse a dotted numeric version ("1.4.0", "v1.4", "1.4.0-rc1") into a numeric
 /// triple for ordering. Any pre-release suffix after '-' is ignored for the
 /// ordering of the release line; build metadata is not used in our scheme.
 pub(crate) fn parse_version(v: &str) -> (u64, u64, u64) {
-    let core = v.trim().trim_start_matches('v');
+    let core = normalize_version(v);
     let core = core.split(['-', '+']).next().unwrap_or(core);
     let mut it = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
     let major = it.next().unwrap_or(0);
@@ -2161,6 +2213,30 @@ mod tests {
         assert!(is_newer("v1.4.0", "1.3.0")); // tolerate leading v
                                               // pre-release suffix is ignored for the release-line ordering
         assert_eq!(parse_version("1.4.0-rc1"), (1, 4, 0));
+    }
+
+    /// ORDERING and IDENTITY are different questions and must not be answered by
+    /// the same comparison. Ordering trims the `v` and throws away the
+    /// pre-release suffix, which is right for "is this newer" and catastrophic
+    /// for "is this record about the build in front of me": a probation armed for
+    /// `1.4.0-rc1` would then be satisfied by a running `1.4.0`, and the rc would
+    /// commit itself on the release build's evidence.
+    ///
+    /// The `v` half is the defect this pair exists for — every ordering check
+    /// trimmed it and every identity check did not, so a manifest publishing
+    /// `v1.4.0` installed normally and then failed to recognise itself.
+    #[test]
+    fn version_identity_normalises_the_v_but_never_collapses_a_pre_release() {
+        assert!(same_version("v1.4.0", "1.4.0"));
+        assert!(same_version(" 1.4.0 ", "1.4.0"));
+        assert!(same_version("v1.4.0", "v1.4.0"));
+        assert_eq!(normalize_version("v1.4.0"), "1.4.0");
+
+        // Ordering says these are the same release line…
+        assert_eq!(parse_version("1.4.0-rc1"), parse_version("1.4.0"));
+        // …and identity must still say they are two different builds.
+        assert!(!same_version("1.4.0-rc1", "1.4.0"));
+        assert!(!same_version("1.4.0", "1.4.1"));
     }
 
     #[test]

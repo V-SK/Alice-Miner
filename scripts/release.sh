@@ -202,9 +202,49 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# The version in the manifest is an IDENTITY, not a label: the client keys its
+# seen ledger, its failure pins and its health probation off it, and compares
+# every one of them against what the installed BINARY answers. Two rules follow,
+# and neither was enforced before — `--version` was taken verbatim.
+CRATE_VERSION="$(grep -m1 '^version' "${GUI_CRATE_DIR}/Cargo.toml" | sed -E 's/version *= *"([^"]+)".*/\1/')"
 if [[ -z "${VERSION}" ]]; then
   # Default to the GUI crate version so the manifest never drifts from the binary.
-  VERSION="$(grep -m1 '^version' "${GUI_CRATE_DIR}/Cargo.toml" | sed -E 's/version *= *"([^"]+)".*/\1/')"
+  VERSION="${CRATE_VERSION}"
+fi
+
+# 1. No leading `v`, and nothing that is not a version. The client documents the
+#    field as "semver, no leading v"; the repo TAGS releases `v0.6.7`, so typing
+#    the tag here is the natural mistake. Modern clients normalise it, but every
+#    already-shipped one (0.6.5 … 0.6.7) compares the raw string, so a
+#    `v`-prefixed manifest silently voids their entire update probation: the
+#    trial is discarded on first launch, the build gets no rollback of any kind,
+#    and its last-known-good copy leaks on every rig. Refuse at the source.
+if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+  echo "REFUSING to cut a release as '${VERSION}': the manifest version must be bare semver" >&2
+  echo "  (X.Y.Z, optional -prerelease) with NO leading 'v'. The git TAG is v${VERSION#v}; the" >&2
+  echo "  manifest field is not. Pass --version ${VERSION#v}." >&2
+  exit 2
+fi
+
+# 2. The number must be the number the built binary answers to. `current_version()`
+#    is CARGO_PKG_VERSION, so publishing 0.6.8 from a tree that still says 0.6.7
+#    ships a client that reports the old version forever: it installs the update,
+#    arms a probation for a version it then denies being, discards it, and — with
+#    nothing on the automatic path recording "I installed X" — installs the same
+#    build again on the next check, every check, overwriting its own rollback copy
+#    each time. Bump the crates, or pass the version they already carry.
+if [[ "${VERSION}" != "${CRATE_VERSION}" ]]; then
+  echo "REFUSING to cut a release as '${VERSION}': this tree builds ${CRATE_VERSION}" >&2
+  echo "  (crates/alice-miner-gui/Cargo.toml). The manifest version and the version the" >&2
+  echo "  binary reports MUST be the same string, or every client that takes this update" >&2
+  echo "  re-installs it forever. Bump the workspace crates to ${VERSION}, or drop --version." >&2
+  exit 2
+fi
+
+# `min_supported` is compared the same way; keep it in the same shape.
+if [[ ! "${MIN_SUPPORTED:-0.3.0}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+  echo "REFUSING: --min-supported '${MIN_SUPPORTED}' must be bare semver with no leading 'v'." >&2
+  exit 2
 fi
 # min_supported is the FLOOR below which a client is hard-blocked ("must
 # download manually") instead of offered a one-click update — see
