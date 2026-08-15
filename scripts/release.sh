@@ -210,7 +210,32 @@ done
 # seen ledger, its failure pins and its health probation off it, and compares
 # every one of them against what the installed BINARY answers. Two rules follow,
 # and neither was enforced before — `--version` was taken verbatim.
-CRATE_VERSION="$(grep -m1 '^version' "${GUI_CRATE_DIR}/Cargo.toml" | sed -E 's/version *= *"([^"]+)".*/\1/')"
+# Read EVERY crate, not one. Four of them each compile their own CARGO_PKG_VERSION
+# in as "the client version", on four different surfaces that must agree:
+#   alice-release      current_version()  → the probation, the seen ledger, install-once identity
+#   alice-miner-core   CLIENT_VERSION     → the X-Alice-Client token the SERVER's fleet floor keys off
+#   alice-miner-cli    BUILD_VERSION      → --version and the doctor build line
+#   alice-miner-gui    (bundle version)   → CFBundleShortVersionString, via release.yml
+# A partial bump passes a one-crate guard, passes CI, and passes the whole test
+# suite — and then ships a client that answers a different version to the server
+# than it does to the updater. Disagreement is refused here, where it is cheap.
+crate_versions=""
+crate_report=""
+for _ct in "${ROOT_DIR}"/crates/*/Cargo.toml; do
+  _cv="$(grep -m1 '^version' "${_ct}" | sed -E 's/version *= *"([^"]+)".*/\1/')"
+  [[ -z "${_cv}" ]] && continue
+  crate_report="${crate_report}
+    $(basename "$(dirname "${_ct}")")  ${_cv}"
+  case " ${crate_versions} " in *" ${_cv} "*) ;; *) crate_versions="${crate_versions} ${_cv}" ;; esac
+done
+crate_versions="$(echo ${crate_versions})"
+if [[ "${crate_versions}" == *" "* ]]; then
+  echo "REFUSING: the workspace crates do not agree on a version:${crate_report}" >&2
+  echo "  Every crate must carry the same version — four of them embed it as 'the" >&2
+  echo "  client version' on surfaces that are compared against each other at runtime." >&2
+  exit 2
+fi
+CRATE_VERSION="${crate_versions}"
 if [[ -z "${VERSION}" ]]; then
   # Default to the GUI crate version so the manifest never drifts from the binary.
   VERSION="${CRATE_VERSION}"
