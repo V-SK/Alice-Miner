@@ -41,9 +41,10 @@ use alice_crypto::WalletSecrets;
 /// wins over the on-disk file.
 pub const ENV_PAYOUT_ADDRESS: &str = "ALICE_GPU_PRL_PAYOUT_ADDRESS";
 
-/// On-disk fallback location for the payout address: `~/.alice/prl_payout_address`
-/// (first non-empty line, trimmed).
-const PAYOUT_FILE_REL: &str = ".alice/prl_payout_address";
+/// On-disk fallback location for the payout address: `prl_payout_address` inside the
+/// Alice home (`~/.alice`, or `$ALICE_IDENTITY_DIR` when set) — first non-empty line,
+/// trimmed. See [`payout_file_path`].
+const PAYOUT_FILE_NAME: &str = "prl_payout_address";
 
 /// Public read-model `miner-lookup` base used by the display block (per task:
 /// `https://api.aliceprotocol.org/read/miner-lookup?address=<alice>`).
@@ -284,18 +285,21 @@ pub fn decide_payout_confirm(is_tty: bool, explicit_yes: bool, answer: Option<&s
     }
 }
 
-/// The `~/.alice/prl_payout_address` path (or `None` if no home dir is resolvable).
-fn payout_file_path() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(PAYOUT_FILE_REL))
-}
-
-/// Resolve the user's home directory without pulling in an extra crate: prefer
-/// `$HOME` (unix/mac), fall back to `$USERPROFILE` (windows).
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+/// The `~/.alice/prl_payout_address` path.
+///
+/// Resolved through [`crate::settings::alice_home`], like `settings.json`, the
+/// identity pointer, the ai config and the halt records — so `$ALICE_IDENTITY_DIR`
+/// moves this file with the rest of `~/.alice`.
+///
+/// It used to read `$HOME` / `$USERPROFILE` directly and join `.alice/…` itself,
+/// which made it the ONE `~/.alice` artifact that ignored the isolation env var: a
+/// miner running with a separate identity dir had their payout address written into
+/// their real home directory, and every test that touched this path wrote into the
+/// developer's actual `$HOME`. With no override set the path is byte-identical to
+/// what it always was (`alice_home()` is `dirs::home_dir()/.alice`), so nothing
+/// moves for an existing install.
+fn payout_file_path() -> PathBuf {
+    crate::settings::alice_home().join(PAYOUT_FILE_NAME)
 }
 
 /// Load + shape-validate the payout address: env [`ENV_PAYOUT_ADDRESS`] first,
@@ -309,13 +313,11 @@ pub fn load_payout_address() -> Result<Option<String>, String> {
         validate_payout_address(&addr)?;
         return Ok(Some(addr));
     }
-    if let Some(path) = payout_file_path() {
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Some(line) = contents.lines().map(str::trim).find(|l| !l.is_empty()) {
-                let addr = line.to_string();
-                validate_payout_address(&addr)?;
-                return Ok(Some(addr));
-            }
+    if let Ok(contents) = std::fs::read_to_string(payout_file_path()) {
+        if let Some(line) = contents.lines().map(str::trim).find(|l| !l.is_empty()) {
+            let addr = line.to_string();
+            validate_payout_address(&addr)?;
+            return Ok(Some(addr));
         }
     }
     Ok(None)
@@ -334,7 +336,7 @@ pub fn load_payout_address() -> Result<Option<String>, String> {
 pub fn save_payout_address(addr: &str) -> Result<PathBuf, String> {
     let trimmed = addr.trim();
     validate_payout_address(trimmed)?;
-    let path = payout_file_path().ok_or("no home directory to store the payout address")?;
+    let path = payout_file_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
@@ -351,8 +353,7 @@ pub fn save_payout_address(addr: &str) -> Result<PathBuf, String> {
 /// Remove the stored payout address (the user opts out of the 15% return). `Ok` if
 /// it was already absent.
 pub fn clear_payout_address() -> Result<(), String> {
-    let Some(path) = payout_file_path() else { return Ok(()) };
-    match std::fs::remove_file(&path) {
+    match std::fs::remove_file(payout_file_path()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("failed to remove payout address: {e}")),
@@ -505,6 +506,16 @@ impl PrlPayoutDisplay {
 
 /// The default pending text given the enrolled / has-address state. No numbers —
 /// just an honest status word for the panel.
+///
+/// The `(false, true)` line used to read "start GPU-PRL mining to bind the return
+/// address", which is advice this panel can never sensibly give: the block is built
+/// ONLY from a snapshot that already has a pearlhash lane in its run set
+/// (`engine::build_snapshot` → `build_prl_payout_display`), so every reader of that
+/// sentence was, by construction, already mining GPU-PRL. It told a miner to do the
+/// thing they were doing while the real states behind it — the enrol still in
+/// flight, an enrol that failed and will retry on the next start, or a watch-only
+/// identity that can never sign one — went unsaid. This layer is only handed a
+/// boolean, so it now states exactly what that boolean knows and nothing more.
 fn default_pending_text(enrolled: bool, has_address: bool) -> String {
     match (enrolled, has_address) {
         (true, _) => crate::tr!(
@@ -513,8 +524,8 @@ fn default_pending_text(enrolled: bool, has_address: bool) -> String {
         )
         .into(),
         (false, true) => crate::tr!(
-            "not bound · start GPU-PRL mining to bind the return address",
-            "未绑定 · 启动 GPU-PRL 挖矿以绑定返还地址"
+            "not bound · the return address is set, but has not been bound to your reward address this session",
+            "未绑定 · 返还地址已设置,但本次会话尚未把它绑定到你的奖励地址"
         )
         .into(),
         (false, false) => crate::tr!(
@@ -693,6 +704,45 @@ mod tests {
         assert_eq!(d2.payout_masked, None);
     }
 
+    /// The unbound-with-an-address panel line must not tell the miner to start the
+    /// mining they are already doing.
+    ///
+    /// This block is only ever built for a snapshot whose run set already contains a
+    /// pearlhash lane, so "start GPU-PRL mining to bind the return address" was shown
+    /// exclusively to miners who had GPU-PRL running — while the actual reason
+    /// (enrol in flight, enrol failed, or a watch-only identity that cannot sign one)
+    /// was never said.
+    #[test]
+    fn the_unbound_panel_line_does_not_tell_a_mining_rig_to_start_mining() {
+        use crate::i18n::{set_lang, Lang, LANG_TEST_LOCK};
+        // The language is a PROCESS global shared by every module's tests in this
+        // binary, so pinning it takes the crate-wide lang lock — not just this
+        // module's env guard, which would only order this test against itself.
+        let _l = LANG_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let restore = crate::i18n::lang();
+
+        set_lang(Lang::En);
+        let en = PrlPayoutDisplay::new(false, Some(PAYOUT_OK)).pending_text;
+        assert!(!en.contains("start GPU-PRL mining"), "no false instruction: {en}");
+        assert!(en.contains("not bound"), "still says it is not bound: {en}");
+        assert!(en.contains("set"), "…and that the address itself is configured: {en}");
+
+        set_lang(Lang::Zh);
+        let zh = PrlPayoutDisplay::new(false, Some(PAYOUT_OK)).pending_text;
+        assert!(!zh.contains("启动 GPU-PRL 挖矿"), "no false instruction: {zh}");
+        assert!(zh.contains("未绑定"), "still says it is not bound: {zh}");
+        assert!(zh.contains("返还地址已设置"), "…and that the address is set: {zh}");
+
+        // The other two states are unchanged and stay distinguishable.
+        set_lang(Lang::En);
+        assert!(PrlPayoutDisplay::new(true, Some(PAYOUT_OK)).pending_text.contains("bound ·"));
+        assert!(PrlPayoutDisplay::new(false, None)
+            .pending_text
+            .contains("no return address set"));
+
+        set_lang(restore);
+    }
+
     #[test]
     fn display_block_serializes_without_paid_amount_leak() {
         // Defense-in-depth on the credit-only invariant: paid is 0.0 and there is
@@ -720,12 +770,21 @@ mod tests {
 
     #[test]
     fn pending_text_from_envelope_clean_confirmed() {
+        // The confirming line is localized and the language is a PROCESS global that
+        // other tests flip, so an assertion on the ENGLISH form has to hold the
+        // crate-wide language lock (see `i18n::LANG_TEST_LOCK`) rather than trust the
+        // default — "default language is English" is only true until someone else's
+        // test is mid-中文.
+        let _l = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let restore = crate::i18n::lang();
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+
         let ok = r#"{"found":true,"paid_acu":"0","summary":{"pending_alice":12.56}}"#;
         let t = pending_text_from_envelope(ok).expect("clean confirmed → text");
         assert!(t.contains("credit"));
         // Never a "$".
         assert!(!t.contains('$'));
-        // not-found → confirming (default language is English).
+        // not-found → confirming.
         let nf = r#"{"found":false,"paid_acu":"0"}"#;
         assert_eq!(
             pending_text_from_envelope(nf).as_deref(),
@@ -733,6 +792,7 @@ mod tests {
         );
         // garbage → fail-open None.
         assert_eq!(pending_text_from_envelope("not json"), None);
+        crate::i18n::set_lang(restore);
     }
 
     #[test]
@@ -754,33 +814,13 @@ mod tests {
 
     #[test]
     fn enroll_no_address_is_not_an_error() {
-        // With NO payout env AND no file (we point HOME at an empty temp dir), the
+        // With NO payout env AND no file (an empty private identity dir), the
         // outcome is NoPayoutAddress — never a panic / Err / fake signature.
-        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        let prev_addr = std::env::var(ENV_PAYOUT_ADDRESS).ok();
-        let prev_home = std::env::var("HOME").ok();
-        let prev_up = std::env::var("USERPROFILE").ok();
-        std::env::remove_var(ENV_PAYOUT_ADDRESS);
-        let empty = std::env::temp_dir().join(format!("alice-prl-empty-home-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&empty);
-        std::env::set_var("HOME", &empty);
-        std::env::remove_var("USERPROFILE");
-
-        let watch = WalletSecrets::display_only(ADDR);
-        let out = run_enroll_best_effort(ADDR, "worker-abc", "us", &watch);
-        assert_eq!(out, EnrollOutcome::NoPayoutAddress);
-
-        match prev_addr {
-            Some(v) => std::env::set_var(ENV_PAYOUT_ADDRESS, v),
-            None => std::env::remove_var(ENV_PAYOUT_ADDRESS),
-        }
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        if let Some(v) = prev_up {
-            std::env::set_var("USERPROFILE", v);
-        }
+        with_temp_alice_home(|_home| {
+            let watch = WalletSecrets::display_only(ADDR);
+            let out = run_enroll_best_effort(ADDR, "worker-abc", "us", &watch);
+            assert_eq!(out, EnrollOutcome::NoPayoutAddress);
+        });
     }
 
     #[test]
@@ -818,49 +858,90 @@ mod tests {
 
     #[test]
     fn save_then_load_round_trips_and_clear() {
+        with_temp_alice_home(|home| {
+            // Nothing stored yet.
+            assert_eq!(load_payout_address().unwrap(), None);
+            // A typo is rejected and NEVER written.
+            assert!(save_payout_address("not-a-prl1p").is_err());
+            assert_eq!(load_payout_address().unwrap(), None);
+            // Save a legal address → load reads it back, from the Alice home.
+            let p = save_payout_address(PAYOUT_OK).expect("save ok");
+            assert_eq!(p, home.join("prl_payout_address"));
+            assert_eq!(load_payout_address().unwrap().as_deref(), Some(PAYOUT_OK));
+            // Whitespace is trimmed on save.
+            save_payout_address(&format!("  {PAYOUT_OK}  ")).unwrap();
+            assert_eq!(load_payout_address().unwrap().as_deref(), Some(PAYOUT_OK));
+            // Clear → back to None; clearing again is Ok (idempotent).
+            clear_payout_address().unwrap();
+            assert_eq!(load_payout_address().unwrap(), None);
+            clear_payout_address().unwrap();
+        });
+    }
+
+    /// The payout file must live in the Alice home like every other `~/.alice`
+    /// artifact — which means honoring `$ALICE_IDENTITY_DIR`.
+    ///
+    /// It did not: it resolved `$HOME` / `$USERPROFILE` itself and appended
+    /// `.alice/…`, so a miner running with an isolated identity dir had their payout
+    /// address written into their real home directory, and every test that touched
+    /// this path wrote into the developer's actual `$HOME`.
+    #[test]
+    fn the_payout_file_follows_alice_identity_dir_not_the_real_home() {
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         let prev_addr = std::env::var(ENV_PAYOUT_ADDRESS).ok();
-        let prev_home = std::env::var("HOME").ok();
-        let prev_up = std::env::var("USERPROFILE").ok();
-        std::env::remove_var(ENV_PAYOUT_ADDRESS); // force the FILE path (not the env override)
-        let home = std::env::temp_dir().join(format!(
-            "alice-prl-save-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let prev_id = std::env::var_os("ALICE_IDENTITY_DIR");
+        let prev_home = std::env::var_os("HOME");
+        let prev_up = std::env::var_os("USERPROFILE");
+        std::env::remove_var(ENV_PAYOUT_ADDRESS); // force the FILE path
+
+        let root = temp_root("alice-prl-iddir");
+        let id_dir = root.join("identity");
+        let home = root.join("home");
+        std::fs::create_dir_all(&id_dir).unwrap();
         std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &id_dir);
         std::env::set_var("HOME", &home);
-        std::env::remove_var("USERPROFILE");
+        std::env::set_var("USERPROFILE", &home);
 
-        // Nothing stored yet.
-        assert_eq!(load_payout_address().unwrap(), None);
-        // A typo is rejected and NEVER written.
-        assert!(save_payout_address("not-a-prl1p").is_err());
-        assert_eq!(load_payout_address().unwrap(), None);
-        // Save a legal address → load reads it back; the file lives under ~/.alice.
-        let p = save_payout_address(PAYOUT_OK).expect("save ok");
-        assert!(p.ends_with(".alice/prl_payout_address"));
+        let written = save_payout_address(PAYOUT_OK).expect("save");
+        assert_eq!(
+            written,
+            id_dir.join("prl_payout_address"),
+            "the override is where it must land"
+        );
+        assert!(written.exists(), "and it must actually be there");
+        assert!(
+            !home.join(".alice").exists(),
+            "nothing may be written under the operator's real home: {}",
+            home.display()
+        );
+        // …and the reader agrees with the writer.
         assert_eq!(load_payout_address().unwrap().as_deref(), Some(PAYOUT_OK));
-        // Whitespace is trimmed on save.
-        save_payout_address(&format!("  {PAYOUT_OK}  ")).unwrap();
-        assert_eq!(load_payout_address().unwrap().as_deref(), Some(PAYOUT_OK));
-        // Clear → back to None; clearing again is Ok (idempotent).
         clear_payout_address().unwrap();
-        assert_eq!(load_payout_address().unwrap(), None);
-        clear_payout_address().unwrap();
+        assert!(!written.exists(), "clear removes the same file");
 
-        let _ = std::fs::remove_dir_all(&home);
+        // With NO override the path is what it always was — `<home>/.alice/…` — so an
+        // existing install does not lose its address. Asserted on the resolved PATH
+        // and not by writing: without the override this test would be writing into
+        // (and then deleting from) the real home directory on any platform where
+        // `dirs::home_dir()` does not follow `$HOME` — which is the very hazard this
+        // fix exists to remove.
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let fallback = payout_file_path();
+        assert!(
+            fallback.ends_with(".alice/prl_payout_address"),
+            "unchanged for an ordinary install: {}",
+            fallback.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
         match prev_addr {
             Some(v) => std::env::set_var(ENV_PAYOUT_ADDRESS, v),
             None => std::env::remove_var(ENV_PAYOUT_ADDRESS),
         }
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        if let Some(v) = prev_up {
-            std::env::set_var("USERPROFILE", v);
-        }
+        restore("ALICE_IDENTITY_DIR", prev_id);
+        restore("HOME", prev_home);
+        restore("USERPROFILE", prev_up);
     }
 
     // ── AM-SEC-008: full bech32m checksum before we ever sign ──────────────────
@@ -1005,48 +1086,22 @@ mod tests {
 
     #[test]
     fn bad_checksum_is_never_written_and_never_loaded() {
-        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        let prev_addr = std::env::var(ENV_PAYOUT_ADDRESS).ok();
-        let prev_home = std::env::var("HOME").ok();
-        let prev_up = std::env::var("USERPROFILE").ok();
-        std::env::remove_var(ENV_PAYOUT_ADDRESS);
-        let home = std::env::temp_dir().join(format!(
-            "alice-prl-cksum-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir_all(&home).unwrap();
-        std::env::set_var("HOME", &home);
-        std::env::remove_var("USERPROFILE");
-
-        // (a) save refuses it and writes nothing.
-        assert!(save_payout_address(PAYOUT_BAD_CKSUM).is_err());
-        assert_eq!(load_payout_address().unwrap(), None);
-        // (b) a file that somehow already holds a bad-checksum address surfaces as an
-        //     Err on load — it is NOT silently used to build an enroll signature.
-        let dir = home.join(".alice");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("prl_payout_address"), format!("{PAYOUT_BAD_CKSUM}\n")).unwrap();
-        assert!(load_payout_address().is_err());
-        // (c) and the enroll path reports it instead of signing.
-        let watch = WalletSecrets::display_only(ADDR);
-        match run_enroll_best_effort(ADDR, "worker-abc", "us", &watch) {
-            EnrollOutcome::Failed(e) => assert!(e.contains("payout address invalid")),
-            other => panic!("a bad-checksum address must not reach signing: {other:?}"),
-        }
-
-        let _ = std::fs::remove_dir_all(&home);
-        match prev_addr {
-            Some(v) => std::env::set_var(ENV_PAYOUT_ADDRESS, v),
-            None => std::env::remove_var(ENV_PAYOUT_ADDRESS),
-        }
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        if let Some(v) = prev_up {
-            std::env::set_var("USERPROFILE", v);
-        }
+        with_temp_alice_home(|home| {
+            // (a) save refuses it and writes nothing.
+            assert!(save_payout_address(PAYOUT_BAD_CKSUM).is_err());
+            assert_eq!(load_payout_address().unwrap(), None);
+            // (b) a file that somehow already holds a bad-checksum address surfaces as
+            //     an Err on load — it is NOT silently used to build an enroll signature.
+            std::fs::write(home.join("prl_payout_address"), format!("{PAYOUT_BAD_CKSUM}\n"))
+                .unwrap();
+            assert!(load_payout_address().is_err());
+            // (c) and the enroll path reports it instead of signing.
+            let watch = WalletSecrets::display_only(ADDR);
+            match run_enroll_best_effort(ADDR, "worker-abc", "us", &watch) {
+                EnrollOutcome::Failed(e) => assert!(e.contains("payout address invalid")),
+                other => panic!("a bad-checksum address must not reach signing: {other:?}"),
+            }
+        });
     }
 
     #[test]
@@ -1076,4 +1131,48 @@ mod tests {
     // Process env is global; serialize every test that reads/writes a payout/lookup
     // env key through this lock so parallel cargo threads can't race.
     static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A fresh, uniquely-named temp directory.
+    fn temp_root(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Put a value back, or remove the variable if there was none.
+    fn restore(key: &str, prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// Run `f` with a private Alice home (`$ALICE_IDENTITY_DIR`) and no payout env
+    /// override, so anything the payout file paths touch stays inside it.
+    ///
+    /// `$ALICE_IDENTITY_DIR` — not `$HOME` — because that is the isolation switch the
+    /// whole `~/.alice` family honors, and it is the only one that works on every
+    /// platform: `dirs::home_dir()` does NOT follow `$HOME` on Windows, so a test that
+    /// isolates itself by pointing `$HOME` at a temp dir is, there, reading and
+    /// DELETING the real user's `~/.alice/prl_payout_address`.
+    fn with_temp_alice_home<F: FnOnce(&std::path::Path)>(f: F) {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_addr = std::env::var_os(ENV_PAYOUT_ADDRESS);
+        let prev_id = std::env::var_os("ALICE_IDENTITY_DIR");
+        let home = temp_root("alice-prl-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::remove_var(ENV_PAYOUT_ADDRESS); // force the FILE path
+        std::env::set_var("ALICE_IDENTITY_DIR", &home);
+
+        f(&home);
+
+        restore("ALICE_IDENTITY_DIR", prev_id);
+        restore(ENV_PAYOUT_ADDRESS, prev_addr);
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

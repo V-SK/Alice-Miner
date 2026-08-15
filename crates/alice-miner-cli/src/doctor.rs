@@ -187,6 +187,10 @@ fn kind_for_lane(lane: Lane) -> MinerKind {
 /// network). Returns the checks in display order.
 pub fn run_checks(lane: Lane, cap: &CapabilityProfile) -> Vec<Check> {
     let mut checks = vec![
+        // FIRST, deliberately. Everything below this line diagnoses whether the rig
+        // COULD mine; this one says whether we have already decided it must not, and
+        // a miner reading a report top-down should meet that before anything else.
+        check_acceptance_halt(lane),
         check_identity(),
         check_config(),
         check_lane_support(lane, cap),
@@ -293,6 +297,130 @@ fn prl_region_checks(view: &crate::region::RegionView) -> Vec<Check> {
         out.push(Check::pass("PRL effective endpoints", detail));
     }
     out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The stop we imposed ourselves (the acceptance halt, layer 3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A localized, rounded span ("20 minutes" / "5 hours" / "3 days") for the halt
+/// timings. Deliberately coarse: the exact second is noise, and a number the user
+/// can hold in their head is what makes the line answer "when".
+fn human_span(secs: u64) -> String {
+    if secs < 60 {
+        return tr!("less than a minute", "不到一分钟").to_string();
+    }
+    if secs < 90 * 60 {
+        let n = secs / 60;
+        return tr!(format!("{n} minutes"), format!("{n} 分钟"));
+    }
+    if secs < 48 * 3600 {
+        let n = secs / 3600;
+        return tr!(format!("{n} hours"), format!("{n} 小时"));
+    }
+    let n = secs / (24 * 3600);
+    tr!(format!("{n} days"), format!("{n} 天"))
+}
+
+/// Is this lane parked by the acceptance guard? Read from the record the guard
+/// persists ([`alice_miner_core::acceptance::load_halt_record`]).
+///
+/// `doctor` is the command we point people at when something is wrong, so it is the
+/// last place that may be silent about a stop WE decided. Without this check the
+/// report on a deliberately-halted rig was a clean bill of health — "Ready to mine."
+/// on a machine that will not mine, and no hint of why — which is the same shape of
+/// untruth as a dashboard inventing telemetry or a monitor reporting healthy through
+/// 78 hours of earning nothing.
+///
+/// FAIL, not WARN: a WARN still summarises as "Ready to mine.", and the whole point
+/// is that this machine is not. Two things follow from that and are deliberate — the
+/// report's exit code is non-zero (a harness notices), and `--json` says
+/// `ready: false`.
+///
+/// The timing comes from [`alice_miner_core::acceptance::HaltRecord::resume`] — the
+/// SAME function the supervisor's automatic start consults — rather than from a
+/// second reading of `next_probe_at` here, so `doctor` cannot promise a re-check at a
+/// time the supervisor disagrees with (it also inherits the clamp that keeps a
+/// backwards clock jump from stranding the rig).
+fn check_acceptance_halt(lane: Lane) -> Check {
+    use alice_miner_core::acceptance::{self, HaltResume};
+    const NAME: &str = "acceptance halt";
+
+    let Some(rec) = acceptance::load_halt_record(lane) else {
+        return Check::pass(
+            NAME,
+            tr!(
+                "not halted — no acceptance halt is recorded for this lane",
+                "未被停机 —— 本通道没有任何接受率停机记录"
+            ),
+        );
+    };
+
+    let collapse = rec.collapse();
+    let ago = human_span(acceptance::now_unix().saturating_sub(rec.halted_at));
+    let probes = rec.probes;
+    let spent = match probes {
+        0 => String::new(),
+        1 => format!(
+            " {}",
+            tr!(
+                "(1 automatic re-check spent so far)",
+                "（至今已自动复查 1 次）"
+            )
+        ),
+        n => format!(
+            " {}",
+            tr!(
+                format!("({n} automatic re-checks spent so far)"),
+                format!("（至今已自动复查 {n} 次）")
+            )
+        ),
+    };
+    // Sentence break: a Chinese line ends its clause with 。, not ". " — the
+    // explanation that follows is a full paragraph in both languages.
+    let stop = tr!(". ", "。");
+    // The full explanation (measurement + whose problem it is) is the paragraph this
+    // release exists to make sure a halted miner actually gets; reuse it verbatim
+    // rather than paraphrasing it here, so the two can never drift apart. Its two
+    // parts are joined by a newline, which would break this report's one-line-per-
+    // check layout — flatten it to spaces.
+    // (a Chinese sentence needs no space after 。; an English one does)
+    let explanation =
+        acceptance::halt_explanation(&collapse, rec.attribution()).replace('\n', tr!(" ", ""));
+    let detail = format!(
+        "{} — {}{spent}{stop}{explanation}",
+        acceptance::halt_status_line(&collapse),
+        tr!(
+            format!("this client halted the lane on purpose {ago} ago"),
+            format!("本客户端在 {ago}前主动停止了该通道")
+        )
+    );
+
+    let when = match rec.resume(acceptance::now_unix()) {
+        HaltResume::ProbeNow => tr!(
+            "the next automatic re-check is already due: it runs the next time this machine starts mining on its own (a service / agent start).",
+            "下一次自动复查已到期:本机下次自行启动挖矿时(由服务 / 代理启动)就会执行。"
+        )
+        .to_string(),
+        HaltResume::Wait(d) => {
+            let left = human_span(d.as_secs());
+            tr!(
+                format!("the next automatic re-check is due in about {left}; until then a service / agent start waits instead of mining."),
+                format!("下一次自动复查大约在 {left}后;在那之前,由服务 / 代理发起的启动只会等待,不会挖矿。")
+            )
+        }
+    };
+    Check::fail(
+        NAME,
+        detail,
+        format!(
+            "{when} {}",
+            tr!(
+                "To mine now instead of waiting, run `alice-miner start` yourself — a start you type clears the halt (and the wait ladder with it).",
+                "若不想等待、现在就挖,请自己运行 `alice-miner start` —— 你亲手发起的启动会清除该停机记录(以及等待阶梯)。"
+            )
+        ),
+    )
 }
 
 /// Config file integrity: the non-secret `settings.json` (language / lane prefs) must
@@ -1985,6 +2113,10 @@ mod tests {
     /// fiat/paid/earned/payout token, and it never prints a seed/mnemonic/password.
     #[test]
     fn report_is_credit_only_and_secret_free() {
+        // In a private Alice home: the battery now reads on-disk state (the halt
+        // record) as well as probing hardware, and a content assertion over a report
+        // built from the DEVELOPER's `~/.alice` is an assertion about their machine.
+        let _home = TempHome::new("alice-doctor-creditonly");
         // Build a battery that hits every render branch, including a synthetic FAIL.
         let mut checks = run_checks(Lane::GpuPrl, &cap());
         checks.push(Check::fail("synthetic", "a forced failure", "do the fix"));
@@ -2096,6 +2228,10 @@ mod tests {
         ];
         // A prompt that would PANIC if called — proving the non-interactive path never asks.
         let mut never = |_: &str| panic!("must not prompt when non-interactive");
+        // "Manual steps" is localized, and the language is a process global other
+        // tests flip: pin it, like every other language-dependent assertion.
+        let _g = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        alice_miner_core::i18n::set_lang(alice_miner_core::i18n::Lang::En);
         let report = apply_fixes(&checks, /*interactive=*/ false, &mut never);
         assert!(report.contains("background service"), "service line present: {report}");
         assert!(report.to_lowercase().contains("skip") || report.contains("跳过"), "skipped: {report}");
@@ -2151,6 +2287,267 @@ mod tests {
 
         std::env::remove_var("ALICE_IDENTITY_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── The halt we imposed ourselves ────────────────────────────────────────
+    //
+    // The acceptance guard persists a halt WITH its evidence, and an automatic
+    // start honors it: the rig is deliberately not mining. `doctor` never read
+    // that record, so on exactly the machine it exists to help it printed a clean
+    // battery and "Ready to mine." — and could not tell the miner why the rig was
+    // idle or when it would try again.
+
+    /// A private `$ALICE_IDENTITY_DIR` (where the halt record lives) and a pinned
+    /// language, for the length of a test — both restored on drop, including on a
+    /// panic, so one failing assertion cannot leave the rest of the suite pointed at
+    /// a deleted directory or speaking the wrong language.
+    ///
+    /// Both process globals are held, in THIS order (env, then language). No other
+    /// test in this binary takes both, so the order is free — but it must stay
+    /// consistent, and this is the only place that decides it.
+    struct TempHome {
+        _env: std::sync::MutexGuard<'static, ()>,
+        _lang: std::sync::MutexGuard<'static, ()>,
+        lang_prev: alice_miner_core::i18n::Lang,
+        dir: std::path::PathBuf,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl TempHome {
+        fn new(tag: &str) -> Self {
+            use alice_miner_core::i18n::{self, Lang};
+            let env = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lang = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lang_prev = i18n::lang();
+            i18n::set_lang(Lang::En);
+            let dir = std::env::temp_dir().join(format!(
+                "{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let prev = std::env::var_os("ALICE_IDENTITY_DIR");
+            std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+            TempHome { _env: env, _lang: lang, lang_prev, dir, prev }
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            alice_miner_core::i18n::set_lang(self.lang_prev);
+            match self.prev.take() {
+                Some(p) => std::env::set_var("ALICE_IDENTITY_DIR", p),
+                None => std::env::remove_var("ALICE_IDENTITY_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Run `f` with a private Alice home and English wording.
+    fn with_temp_home<F: FnOnce()>(f: F) {
+        let _home = TempHome::new("alice-doctor-halt");
+        f();
+    }
+
+    /// A shutout collapse: 260 submitted this period, none accepted.
+    fn a_shutout() -> alice_miner_core::acceptance::Collapse {
+        alice_miner_core::acceptance::Collapse {
+            period: alice_miner_core::acceptance::PeriodStat {
+                accepted: 0,
+                rejected: 260,
+                elapsed: Duration::from_secs(900),
+            },
+            run_accepted: 0,
+            run_rejected: 7743,
+            shutout: true,
+        }
+    }
+
+    /// The battery must carry the halt, as a FAIL, with the evidence and the
+    /// countdown — and the report must stop calling the rig ready.
+    #[test]
+    fn doctor_surfaces_a_persisted_acceptance_halt() {
+        use alice_miner_core::acceptance::{self, Attribution, HaltRecord};
+        with_temp_home(|| {
+            // (a) No record → the check is present and passes; nothing is invented.
+            let clean = check_acceptance_halt(Lane::Xmr);
+            assert_eq!(clean.status, Status::Pass, "no record must not read as halted");
+
+            // (b) A halt written by the guard's own writer, one rung in (probes=1 ⇒
+            // a 1-hour cooldown), 30½ minutes ago.
+            //
+            // The HALF minute is load-bearing. `check_acceptance_halt` reads the clock
+            // again, so a whole-minute offset puts both rendered spans exactly on a
+            // minute boundary: when the wall clock ticks between the two reads (a real
+            // few-percent chance) the remaining cooldown rounds down and "30 minutes"
+            // becomes "29". A test that fails a few runs in a hundred is worse than no
+            // test, so the fixture sits 30s away from every boundary it asserts on.
+            let now = acceptance::now_unix();
+            let rec = HaltRecord::new(
+                Lane::Xmr,
+                &a_shutout(),
+                Attribution::NetworkWide,
+                /* probes */ 1,
+                now - (30 * 60 + 30),
+            );
+            acceptance::save_halt_record(&rec).expect("persist the halt");
+
+            let checks = run_checks(Lane::Xmr, &cap());
+            let halt = checks
+                .iter()
+                .find(|c| c.name == "acceptance halt")
+                .expect("the battery must include the halt this client imposed");
+            assert_eq!(halt.status, Status::Fail, "a parked rig is not a healthy rig");
+
+            // The evidence, in the miner's own numbers.
+            assert!(halt.detail.contains("7743"), "the run totals: {}", halt.detail);
+            assert!(
+                halt.detail.contains("30 minutes ago"),
+                "when it stopped: {}",
+                halt.detail
+            );
+            // Whose problem it is — reused verbatim from the guard's explanation.
+            assert!(
+                halt.detail.contains("not your machine"),
+                "the attribution must survive into the report: {}",
+                halt.detail
+            );
+            // The question a halted miner actually has: when does it try again?
+            // 1h rung − 30½m elapsed = 29½m left, which renders as "29 minutes"
+            // whichever side of a clock tick the check lands on.
+            assert!(
+                halt.fix.contains("29 minutes"),
+                "the remaining cooldown (1h rung, 30½m elapsed): {}",
+                halt.fix
+            );
+            assert!(
+                halt.fix.contains("alice-miner start"),
+                "…and how to mine now without waiting: {}",
+                halt.fix
+            );
+
+            // (c) The headline: a report whose OTHER checks all pass used to end in
+            // "Ready to mine." on this very machine. It must not any more — and this
+            // fails if the halt check is absent from the battery at all.
+            let only_halt: Vec<Check> = checks
+                .into_iter()
+                .filter(|c| c.name == "acceptance halt")
+                .collect();
+            let report = render_report(&only_halt, Lane::Xmr);
+            assert!(
+                !report.contains("Ready to mine."),
+                "a deliberately parked rig must never render as ready:\n{report}"
+            );
+            assert!(has_blocking_failure(&only_halt), "and `doctor` must exit non-zero");
+
+            // …and this branch keeps the module's credit-only invariant. The
+            // whole-report scan cannot reach it (its battery has no halt record, so
+            // this check is a one-line PASS there), and the halted wording is the
+            // wordiest thing `doctor` prints — so it is scanned here, in all three
+            // attributions and in both languages.
+            for attribution in [Attribution::NetworkWide, Attribution::LocalOnly, Attribution::Unknown] {
+                let r = HaltRecord::new(Lane::Xmr, &a_shutout(), attribution, 1, now);
+                acceptance::save_halt_record(&r).expect("persist");
+                for lang in [alice_miner_core::i18n::Lang::En, alice_miner_core::i18n::Lang::Zh] {
+                    alice_miner_core::i18n::set_lang(lang);
+                    let one = vec![check_acceptance_halt(Lane::Xmr)];
+                    let blobs = [render_report(&one, Lane::Xmr), render_json(&one, Lane::Xmr)];
+                    for blob in &blobs {
+                        let lower = blob.to_ascii_lowercase();
+                        for forbidden in [
+                            "$", "usd", "fiat", "paid", "earned", "待发放", "已发放",
+                            "mnemonic", "seed", "password", "private key",
+                        ] {
+                            assert!(
+                                !lower.contains(forbidden),
+                                "halt line leaked `{forbidden}` ({attribution:?}/{lang:?}): {blob}"
+                            );
+                        }
+                        // "payout" is admitted in exactly one place and only as a
+                        // WORD: the local-fault advice names the miner's OWN return
+                        // address as a thing to re-check. Never a figure, never the
+                        // collection address — so it is pinned rather than banned.
+                        if lower.contains("payout") {
+                            assert_eq!(
+                                attribution,
+                                Attribution::LocalOnly,
+                                "only the local-fault advice may say `payout`: {blob}"
+                            );
+                            assert!(
+                                lower.contains("mistyped payout address"),
+                                "…and only as the user's own address: {blob}"
+                            );
+                        }
+                    }
+                }
+            }
+            alice_miner_core::i18n::set_lang(alice_miner_core::i18n::Lang::En);
+
+            // (d) A cooldown that has already elapsed reads as due, not as a
+            // negative countdown.
+            let old = HaltRecord::new(
+                Lane::Xmr,
+                &a_shutout(),
+                Attribution::Unknown,
+                0,
+                now - 4 * 3600,
+            );
+            acceptance::save_halt_record(&old).expect("persist");
+            let due = check_acceptance_halt(Lane::Xmr);
+            assert_eq!(due.status, Status::Fail);
+            assert!(
+                due.fix.contains("already due"),
+                "an elapsed cooldown is due now: {}",
+                due.fix
+            );
+
+            acceptance::clear_halt_record(Lane::Xmr);
+            assert_eq!(
+                check_acceptance_halt(Lane::Xmr).status,
+                Status::Pass,
+                "clearing the record clears the check"
+            );
+        });
+    }
+
+    /// Both languages, since a halted miner is exactly the reader who cannot afford
+    /// a half-translated line.
+    #[test]
+    fn the_halt_check_speaks_both_languages() {
+        use alice_miner_core::acceptance::{self, Attribution, HaltRecord};
+        use alice_miner_core::i18n::{set_lang, Lang};
+        with_temp_home(|| {
+            // 30½ minutes ago, off every minute boundary — see the note in
+            // `doctor_surfaces_a_persisted_acceptance_halt`.
+            let rec = HaltRecord::new(
+                Lane::GpuPrl,
+                &a_shutout(),
+                Attribution::NetworkWide,
+                1,
+                acceptance::now_unix() - (30 * 60 + 30),
+            );
+            acceptance::save_halt_record(&rec).expect("persist");
+
+            set_lang(Lang::Zh);
+            let zh = check_acceptance_halt(Lane::GpuPrl);
+            assert!(zh.detail.contains("主动停止"), "zh detail: {}", zh.detail);
+            assert!(zh.detail.contains("30 分钟前"), "zh detail: {}", zh.detail);
+            assert!(zh.fix.contains("自动复查"), "zh fix: {}", zh.fix);
+            assert!(zh.fix.contains("alice-miner start"), "zh fix: {}", zh.fix);
+            assert!(
+                !zh.detail.contains("halted the lane"),
+                "no English left in the Chinese line: {}",
+                zh.detail
+            );
+
+            set_lang(Lang::En);
+            let en = check_acceptance_halt(Lane::GpuPrl);
+            assert!(en.detail.contains("halted the lane"), "en detail: {}", en.detail);
+            acceptance::clear_halt_record(Lane::GpuPrl);
+        });
     }
 
     /// The json form is valid JSON with the expected shape (lane, ready, checks[]).
