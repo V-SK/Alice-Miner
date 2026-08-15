@@ -21,20 +21,25 @@
 //! (e.g. `Apple M2 Max · 12 cores`), per PLAN §6 (model string only, no emoji).
 //!
 //! M3 adds GPU-vendor detection ([`GpuVendor`] / [`GpuInfo`]) via `nvidia-smi`
-//! (NVIDIA name + VRAM) — AMD is **label-only** ("detected, lane coming soon")
-//! and Apple Silicon's GPU shares unified memory (so `vram_gb` stays 0). The
+//! (NVIDIA name + VRAM); AMD is identified from the Linux DRM sysfs tree
+//! (**PCI device id** per card → [`amd::AmdArch`], plus VRAM), which is what lets
+//! the lane matrix refuse GPU-PRL on an RDNA2 card the pinned SRBMiner dropped;
+//! Apple Silicon's GPU shares unified memory (so `vram_gb` stays 0). The
 //! [`capability`] submodule derives the **lane-viability matrix** from the
 //! profile. PRL is deliberately NOT a client lane (ruled fake-AI per MEMORY /
 //! PLAN §6 D-lanes), so this Rust port omits it from the viable set entirely.
 
 #![allow(dead_code)]
 
+pub mod amd;
 pub mod capability;
 pub mod scan;
 
+pub use amd::AmdArch;
 pub use capability::{CapabilityProfile, LaneSupport, LaneViability};
 pub use scan::{scan_installed_miners, DetectedMiner};
 
+use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -116,8 +121,8 @@ pub struct GpuDevice {
 }
 
 /// The detected GPU. For NVIDIA we read the model + VRAM from `nvidia-smi`; for
-/// AMD we record the vendor as **label-only** (no confirmed KawPoW path bundled
-/// yet, so `vram_gb` stays 0 and the lane is "coming soon"); for Apple Silicon
+/// AMD we read the per-card PCI device id (and VRAM) from the Linux DRM sysfs
+/// tree, which is what makes the RDNA2-vs-RDNA3+ split possible; for Apple Silicon
 /// the GPU shares unified memory so `vram_gb` is 0 and the system RAM is the
 /// real budget. Mirrors the relevant subset of the Python `HardwareProfile`
 /// GPU fields (`gpu_vendor`, `gpu_model`, `vram_gb`).
@@ -125,10 +130,12 @@ pub struct GpuDevice {
 pub struct GpuInfo {
     /// Vendor classification.
     pub vendor: GpuVendor,
-    /// Model string when a probe succeeded (e.g. `NVIDIA GeForce RTX 3070 Ti`),
-    /// else empty.
+    /// Model string when a probe succeeded (e.g. `NVIDIA GeForce RTX 3070 Ti`,
+    /// or `AMD Navi 21` from the AMD sysfs probe), else empty.
     pub model: String,
-    /// Dedicated GPU VRAM in whole GB (NVIDIA only; 0 for Apple/AMD/none).
+    /// Dedicated GPU VRAM in whole GB (0 for Apple's unified memory / no GPU).
+    /// NVIDIA reads it from `nvidia-smi`; AMD from the largest card's
+    /// `mem_info_vram_total` when the kernel exposes it (0 otherwise).
     pub vram_gb: u32,
     /// The per-GPU enumeration (one entry per physical card) — the prerequisite
     /// for per-card lane scheduling. NVIDIA-only in v1 (populated from
@@ -190,6 +197,23 @@ pub struct DeviceProfile {
     pub display: String,
     /// Any probe that fell back (never fatal) — mirrors `probe_warnings`.
     pub warnings: Vec<String>,
+    /// The **PCI device ids** of every AMD (vendor `0x1002`) GPU this machine
+    /// exposes, in card-index order — the AMD analogue of
+    /// [`GpuInfo::max_compute_cap_x10`], and the input the lane-viability matrix
+    /// needs to tell an **RDNA2** card (which SRBMiner ≥ 3.5.0 cannot mine
+    /// pearlhash on, so GPU-PRL must be Unavailable) from an RDNA3-or-newer one.
+    /// See [`amd`] for the classifier and [`capability`] for the decision; read
+    /// it through [`DeviceProfile::amd_arch`] rather than directly.
+    ///
+    /// Empty for non-AMD machines AND for an AMD machine whose ids could not be
+    /// read; both fail safe to [`AmdArch::Unknown`], never to "supported".
+    /// `#[serde(default)]` keeps older serialized profiles deserializable.
+    ///
+    /// (This is per-card *enumeration* data, which is why it sits on the profile
+    /// next to the rest of the machine inventory rather than inside the
+    /// single-GPU `gpu` summary.)
+    #[serde(default)]
+    pub amd_gpu_pci_ids: Vec<u16>,
 }
 
 impl DeviceProfile {
@@ -212,7 +236,8 @@ impl DeviceProfile {
 
         let mut warnings = Vec::new();
         let cpu_model = probe_cpu_model(os, &mut warnings);
-        let gpu = probe_gpu(os, apple_silicon, &cpu_model, runner, &mut warnings);
+        let amd = if apple_silicon { None } else { probe_amd(os) };
+        let gpu = probe_gpu(apple_silicon, &cpu_model, amd.as_ref(), runner, &mut warnings);
         let memory_gb = probe_memory_gb(os, &mut warnings);
         let display = assemble_display(os, &arch, &cpu_model, logical_cores);
 
@@ -226,7 +251,19 @@ impl DeviceProfile {
             memory_gb,
             display,
             warnings,
+            amd_gpu_pci_ids: amd.map(|a| a.device_ids).unwrap_or_default(),
         }
+    }
+
+    /// The AMD architecture verdict for this machine — [`AmdArch::Unknown`] for
+    /// anything that is not an AMD GPU box, and for an AMD box whose cards we
+    /// could not place. This is the single accessor the lane matrix and the UIs
+    /// should use; never read `amd_gpu_pci_ids` directly.
+    pub fn amd_arch(&self) -> AmdArch {
+        if self.gpu.vendor != GpuVendor::Amd {
+            return AmdArch::Unknown;
+        }
+        amd::fleet_arch(&self.amd_gpu_pci_ids)
     }
 
     /// The viable mining lanes for this device (the M3 lane-viability matrix).
@@ -414,13 +451,13 @@ fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> Result<String
 ///
 /// Apple Silicon → `apple` (unified memory; VRAM reported 0, model = the chip
 /// brand string). Otherwise we ask `nvidia-smi`; absent/error → we then look for
-/// an AMD signal (label-only, no VRAM). Mirrors the Python `_probe_gpu`, except
-/// AMD is *detected and labelled* (so the UI can say "coming soon") rather than
-/// silently folded into `none`.
+/// an AMD signal (per-card PCI device ids + VRAM, Linux only). Mirrors the Python
+/// `_probe_gpu`, except AMD is *identified* — down to the architecture
+/// generation — rather than silently folded into `none`.
 fn probe_gpu(
-    os: OsFamily,
     apple_silicon: bool,
     cpu_model: &str,
+    amd: Option<&AmdProbe>,
     runner: &dyn Runner,
     warnings: &mut Vec<String>,
 ) -> GpuInfo {
@@ -448,15 +485,19 @@ fn probe_gpu(
         return info;
     }
 
-    // No NVIDIA — look for an AMD signal so the UI can say "detected · coming
-    // soon" (label-only; no confirmed KawPoW path bundled for AMD yet).
-    if let Some(model) = probe_amd_label(os, runner) {
+    // No NVIDIA — fall back to the AMD signal the caller probed. This USED to be
+    // label-only (a literal "AMD GPU" string), which is why the lane matrix could
+    // only reason about the vendor and handed GPU-PRL to RDNA2 cards that cannot
+    // run it. The ids that make the generations distinguishable ride on
+    // `DeviceProfile::amd_gpu_pci_ids`.
+    if let Some(probe) = amd {
         return GpuInfo {
             vendor: GpuVendor::Amd,
-            model,
-            vram_gb: 0,
-            // AMD is label-only in v1 (no bundled lane); per-card enumeration is
-            // NVIDIA-only, so the list stays empty.
+            model: probe.model.clone(),
+            vram_gb: probe.vram_gb,
+            // Per-card enumeration (index/uuid) stays NVIDIA-only: `nvidia-smi` is
+            // the only probe that exposes a stable index + UUID, and `--gpus` is
+            // defined against those.
             gpus: Vec::new(),
             max_compute_cap_x10: None,
         };
@@ -607,30 +648,108 @@ fn parse_mib_to_gb(value: &str) -> u32 {
     ((mib as f64) / 1024.0).round() as u32
 }
 
-/// Best-effort AMD detection (label-only). On Linux we look for an `amdgpu`
-/// device via a couple of cheap, optional signals; on Windows/other we don't
-/// guess (returns `None`). This NEVER enables a lane — it only lets the UI show
-/// "AMD detected · lane coming soon". Fail-safe (any error → `None`).
-fn probe_amd_label(os: OsFamily, _runner: &dyn Runner) -> Option<String> {
+/// What the AMD probe found: a display label, the per-card PCI device ids (the
+/// input the lane-viability matrix needs to tell RDNA2 from RDNA3+), and the
+/// largest card's VRAM in whole GB (0 when the kernel doesn't expose it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmdProbe {
+    pub model: String,
+    pub device_ids: Vec<u16>,
+    pub vram_gb: u32,
+}
+
+/// The Linux DRM sysfs root the AMD probe walks. Split out as a constant so the
+/// pure walker below can be pointed at a synthetic tree in tests.
+const DRM_SYSFS_ROOT: &str = "/sys/class/drm";
+
+/// Best-effort AMD detection. **Linux only** — on Windows/macOS we do not guess
+/// and return `None`, which classifies the box as "no GPU" (see the caller).
+///
+/// LIMITATION, STATED PLAINLY: on **Windows** an AMD GPU is therefore not
+/// detected at all, so every GPU lane reads Unavailable there with the reason
+/// "no GPU" rather than the true one. That is the safe direction for the RDNA2
+/// promise (the lane is unavailable either way) but it is the wrong *reason*,
+/// and it also means a Windows RX 7900 XTX cannot use GPU-PRL. Closing it needs
+/// a WMI/registry probe validated on a real Windows box with an AMD card, which
+/// we do not have; the classifier in [`amd`] is platform-independent and ready
+/// for that probe to feed it.
+///
+/// Fail-safe: any IO error → `None` / an empty id list, never a panic.
+fn probe_amd(os: OsFamily) -> Option<AmdProbe> {
     if os != OsFamily::Linux {
         return None;
     }
-    // /sys/class/drm/card*/device/vendor == 0x1002 (PCI vendor id for AMD/ATI).
-    let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+    probe_amd_from_drm_root(Path::new(DRM_SYSFS_ROOT))
+}
+
+/// The pure-ish walker behind [`probe_amd`]: enumerate `<root>/card<N>/device/`,
+/// keep the nodes whose `vendor` is `0x1002` (AMD/ATI), and read each one's
+/// `device` (PCI device id) and `mem_info_vram_total` (bytes, amdgpu-only).
+///
+/// Returns `None` when no AMD DRM node exists at all. Returns `Some` with an
+/// EMPTY `device_ids` when an AMD node exists but its ids were unreadable —
+/// which [`amd::fleet_arch`] maps to `Unknown`, i.e. the fail-safe direction.
+///
+/// Takes a root path so tests can drive it against a synthetic sysfs tree; the
+/// production caller always passes [`DRM_SYSFS_ROOT`].
+fn probe_amd_from_drm_root(root: &Path) -> Option<AmdProbe> {
+    let entries = std::fs::read_dir(root).ok()?;
+    // (card index, device id) so the reported order follows card0, card1, … and
+    // not the arbitrary order `read_dir` hands back.
+    let mut found: Vec<(u32, Option<u16>)> = Vec::new();
+    let mut max_vram_bytes: u64 = 0;
+
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !name.starts_with("card") || name.contains('-') {
-            continue; // skip connectors like card0-DP-1
+        // `cardN` only — skip connectors like `card0-DP-1` and the `renderD*`
+        // nodes (which are the same device seen a second time).
+        let Some(index) = name.strip_prefix("card").and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let dev_dir = entry.path().join("device");
+        let is_amd = std::fs::read_to_string(dev_dir.join("vendor"))
+            .ok()
+            .and_then(|v| amd::parse_pci_id_hex(&v))
+            .map(|v| v == PCI_VENDOR_AMD)
+            .unwrap_or(false);
+        if !is_amd {
+            continue;
         }
-        let vendor_path = entry.path().join("device").join("vendor");
-        if let Ok(v) = std::fs::read_to_string(&vendor_path) {
-            if v.trim().eq_ignore_ascii_case("0x1002") {
-                return Some("AMD GPU".to_string());
-            }
+        let device_id = std::fs::read_to_string(dev_dir.join("device"))
+            .ok()
+            .and_then(|d| amd::parse_pci_id_hex(&d));
+        // amdgpu exposes total VRAM in bytes here; the `radeon` driver and some
+        // kernels do not, so a miss is normal and simply leaves VRAM at 0.
+        if let Some(bytes) = std::fs::read_to_string(dev_dir.join("mem_info_vram_total"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            max_vram_bytes = max_vram_bytes.max(bytes);
         }
+        found.push((index, device_id));
     }
-    None
+
+    if found.is_empty() {
+        return None;
+    }
+    found.sort_unstable_by_key(|&(index, _)| index);
+    let device_ids: Vec<u16> = found.into_iter().filter_map(|(_, id)| id).collect();
+    Some(AmdProbe {
+        model: amd::model_label(&device_ids),
+        device_ids,
+        vram_gb: vram_bytes_to_gb(max_vram_bytes),
+    })
+}
+
+/// The PCI vendor id for AMD/ATI.
+const PCI_VENDOR_AMD: u16 = 0x1002;
+
+/// Whole GB from a VRAM byte count, rounded. Unlike [`bytes_to_gb`] (system RAM,
+/// which floors at 1 GB) this returns **0** for 0 bytes — "the kernel did not
+/// tell us" must not read as "1 GB".
+fn vram_bytes_to_gb(bytes: u64) -> u32 {
+    ((bytes as f64) / (1024.0 * 1024.0 * 1024.0)).round() as u32
 }
 
 /// System RAM in whole GB. **Fail-safe** to [`FALLBACK_MEMORY_GB`]. Mirrors the
@@ -963,7 +1082,7 @@ mod tests {
         // regardless of the host this test compiles on.
         let runner = FakeRunner::nvidia("NVIDIA GeForce RTX 4090, 24564 MiB\n");
         let mut warnings = Vec::new();
-        let gpu = probe_gpu(OsFamily::Linux, false, "Intel Core i9", &runner, &mut warnings);
+        let gpu = probe_gpu(false, "Intel Core i9", None, &runner, &mut warnings);
         assert_eq!(gpu.vendor, GpuVendor::Nvidia);
         assert_eq!(gpu.vram_gb, 24);
         assert!(gpu.model.contains("4090"));
@@ -975,7 +1094,7 @@ mod tests {
         // Apple with 0 dedicated VRAM and the chip brand as its label.
         let runner = FakeRunner::no_gpu();
         let mut warnings = Vec::new();
-        let gpu = probe_gpu(OsFamily::Macos, true, "Apple M2 Max", &runner, &mut warnings);
+        let gpu = probe_gpu(true, "Apple M2 Max", None, &runner, &mut warnings);
         assert_eq!(gpu.vendor, GpuVendor::Apple);
         assert_eq!(gpu.vram_gb, 0);
         assert_eq!(gpu.model, "Apple M2 Max");
@@ -986,8 +1105,9 @@ mod tests {
         // A non-Apple box with no NVIDIA and no AMD signal → none (CPU-only).
         let runner = FakeRunner::no_gpu();
         let mut warnings = Vec::new();
-        // OsFamily::Windows so the AMD /sys probe (Linux-only) is skipped too.
-        let gpu = probe_gpu(OsFamily::Windows, false, "AMD Ryzen 9", &runner, &mut warnings);
+        // `None` for the AMD probe = a box with no AMD DRM node (or Windows,
+        // where the probe never runs at all).
+        let gpu = probe_gpu(false, "AMD Ryzen 9", None, &runner, &mut warnings);
         assert_eq!(gpu.vendor, GpuVendor::None);
         assert_eq!(gpu.vram_gb, 0);
     }
@@ -997,6 +1117,149 @@ mod tests {
         assert_eq!(bytes_to_gb(16 * 1024 * 1024 * 1024), 16);
         assert_eq!(bytes_to_gb(1), 1); // floor
         assert_eq!(bytes_to_gb(0), 1); // floor (never 0)
+    }
+
+    // ── The AMD sysfs walker, driven against a SYNTHETIC /sys/class/drm tree ──
+    //
+    // No AMD hardware was available, so the tree is fabricated. What these tests
+    // DO prove is the file layout, filtering and parsing this walker performs
+    // against a real filesystem; what they do NOT prove is that a real amdgpu
+    // kernel lays out exactly these files (that is transcribed from the sysfs
+    // ABI, not observed here).
+
+    /// One synthetic DRM node: `(node name, vendor body, device body, vram
+    /// bytes)`. A `None` field means "that file does not exist" — which is what a
+    /// `radeon`-driver card or a permissions failure looks like.
+    type FakeCard<'a> = (&'a str, Option<&'a str>, Option<&'a str>, Option<u64>);
+
+    /// Build a throwaway `<tmp>/card*/device/...` tree from [`FakeCard`] rows.
+    fn fake_drm_root(tag: &str, cards: &[FakeCard<'_>]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "alice-miner-drm-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for (node, vendor, device, vram) in cards {
+            let dev = root.join(node).join("device");
+            std::fs::create_dir_all(&dev).expect("mkdir fake drm node");
+            if let Some(v) = vendor {
+                std::fs::write(dev.join("vendor"), v).expect("write vendor");
+            }
+            if let Some(d) = device {
+                std::fs::write(dev.join("device"), d).expect("write device");
+            }
+            if let Some(b) = vram {
+                std::fs::write(dev.join("mem_info_vram_total"), format!("{b}\n"))
+                    .expect("write vram");
+            }
+        }
+        root
+    }
+
+    #[test]
+    fn amd_sysfs_walk_reads_the_device_id_of_an_rx_6800() {
+        // A single Navi 21 (RX 6800 XT) with 16 GiB of VRAM.
+        let root = fake_drm_root(
+            "rx6800",
+            &[("card0", Some("0x1002\n"), Some("0x73bf\n"), Some(17_163_091_968))],
+        );
+        let probe = probe_amd_from_drm_root(&root).expect("AMD node found");
+        assert_eq!(probe.device_ids, vec![0x73BF]);
+        assert_eq!(probe.model, "AMD Navi 21");
+        assert_eq!(probe.vram_gb, 16);
+        // ...and that id is what makes the RDNA2 verdict possible at all.
+        assert_eq!(amd::fleet_arch(&probe.device_ids), AmdArch::Rdna2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn amd_sysfs_walk_skips_connectors_render_nodes_and_other_vendors() {
+        // `card0-DP-1` is a connector, `renderD128` is the same GPU's render
+        // node, and card1 is an Intel iGPU — none may be counted. card2 is the
+        // one real AMD card (an RX 7900 XTX).
+        let root = fake_drm_root(
+            "mixed",
+            &[
+                ("card0-DP-1", Some("0x1002\n"), Some("0x73bf\n"), None),
+                ("renderD128", Some("0x1002\n"), Some("0x73bf\n"), None),
+                ("card1", Some("0x8086\n"), Some("0x4680\n"), None),
+                ("card2", Some("0x1002\n"), Some("0x744c\n"), Some(25_753_026_560)),
+            ],
+        );
+        let probe = probe_amd_from_drm_root(&root).expect("AMD node found");
+        assert_eq!(probe.device_ids, vec![0x744C]);
+        assert_eq!(amd::fleet_arch(&probe.device_ids), AmdArch::Rdna3OrNewer);
+        assert_eq!(probe.vram_gb, 24);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn amd_sysfs_walk_orders_by_card_index_not_readdir_order() {
+        // Two different cards; the reported order must be card0 then card1
+        // regardless of the order the directory happens to enumerate in.
+        let root = fake_drm_root(
+            "order",
+            &[
+                ("card1", Some("0x1002\n"), Some("0x744c\n"), None),
+                ("card0", Some("0x1002\n"), Some("0x73bf\n"), None),
+            ],
+        );
+        let probe = probe_amd_from_drm_root(&root).expect("AMD nodes found");
+        assert_eq!(probe.device_ids, vec![0x73BF, 0x744C]);
+        // A mixed rig still runs: the RDNA3 card can mine.
+        assert_eq!(amd::fleet_arch(&probe.device_ids), AmdArch::Rdna3OrNewer);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn amd_sysfs_walk_with_unreadable_device_id_is_unknown_not_supported() {
+        // An AMD DRM node whose `device` file is missing (older driver, or a
+        // permissions failure). The node still proves the vendor, but with no id
+        // the verdict MUST be Unknown — never "supported".
+        let root = fake_drm_root("noid", &[("card0", Some("0x1002\n"), None, None)]);
+        let probe = probe_amd_from_drm_root(&root).expect("AMD node found");
+        assert!(probe.device_ids.is_empty());
+        assert_eq!(probe.model, "AMD GPU");
+        assert_eq!(probe.vram_gb, 0);
+        assert_eq!(amd::fleet_arch(&probe.device_ids), AmdArch::Unknown);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn amd_sysfs_walk_is_none_without_an_amd_node_and_never_panics() {
+        // Only an NVIDIA card → no AMD probe result.
+        let root = fake_drm_root(
+            "nvidia-only",
+            &[("card0", Some("0x10de\n"), Some("0x2484\n"), None)],
+        );
+        assert!(probe_amd_from_drm_root(&root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+        // A root that does not exist at all → None, not a panic.
+        assert!(probe_amd_from_drm_root(Path::new(
+            "/nonexistent-alice-miner-drm-root"
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn probe_amd_is_linux_only() {
+        // The walker is Linux-only by contract; Windows/macOS return None (and
+        // the caller then reports "no GPU" — see `probe_amd`'s LIMITATION note).
+        assert!(probe_amd(OsFamily::Windows).is_none());
+        assert!(probe_amd(OsFamily::Macos).is_none());
+        assert!(probe_amd(OsFamily::Unknown).is_none());
+    }
+
+    #[test]
+    fn vram_bytes_to_gb_reports_zero_for_unknown_not_one() {
+        assert_eq!(vram_bytes_to_gb(0), 0); // "not reported" must not read as 1 GB
+        assert_eq!(vram_bytes_to_gb(8 * 1024 * 1024 * 1024), 8);
+        assert_eq!(vram_bytes_to_gb(17_163_091_968), 16);
     }
 
     #[cfg(target_os = "macos")]
