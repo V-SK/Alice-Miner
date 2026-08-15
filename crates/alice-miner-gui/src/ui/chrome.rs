@@ -319,7 +319,6 @@ mod tests {
     #[test]
     fn status_pill_label_localizes_with_language() {
         use alice_miner_core::i18n::{set_lang, Lang};
-        let _g = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let app = MinerApp::new().expect("engine spawns"); // Idle (no snapshot)
         set_lang(Lang::En);
         let (_t, en, _b) = status_for(&app);

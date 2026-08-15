@@ -174,7 +174,7 @@ pub fn run() -> MenuAction {
     if alice_miner_core::settings::load().parsed_lang().is_none() {
         match pick_language(&mut term) {
             Some(lang) => {
-                i18n::set_lang(lang);
+                i18n::set_process_lang(lang);
                 let _ = alice_miner_core::settings::save_lang(lang);
             }
             // User quit the language screen → quit the whole launcher cleanly.
@@ -397,20 +397,14 @@ mod tests {
     use super::*;
     use alice_miner_core::i18n::{set_lang, Lang};
 
-    /// The language global is process-wide, so language-sensitive tests serialize on
-    /// this lock (Rust runs a crate's tests in parallel). Returns the held guard.
-    // The PROCESS-GLOBAL language is shared by EVERY module's tests in this one test
-    // binary, so they serialize on the CRATE-wide lock (see `main.rs::LANG_TEST_LOCK`) —
-    // a module-private mutex would only order this module against itself.
-    fn lang_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    // `set_lang` is scoped to the calling thread and libtest gives each test its own, so
+    // the language-sensitive tests below need no lock: pinning a language here is
+    // invisible to every test running beside them.
 
     /// Every menu item has a localized label + hint in BOTH languages (no empty
     /// strings, no missing translation).
     #[test]
     fn all_items_localized_both_languages() {
-        let _g = lang_lock();
         for lang in [Lang::En, Lang::Zh] {
             set_lang(lang);
             for item in ITEMS {
@@ -446,7 +440,6 @@ mod tests {
     /// does not show the hint.
     #[test]
     fn option_line_shows_hint_only_when_selected() {
-        let _g = lang_lock();
         set_lang(Lang::En);
         let sel: String = option_line("1", "Start mining", "mine now", true)
             .spans

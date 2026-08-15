@@ -458,12 +458,9 @@ mod tests {
     /// Empty roster renders a placeholder (never a bare header), no panic.
     #[test]
     fn render_roster_empty_is_safe() {
-        // The placeholder is localized and the language is a PROCESS global that
-        // other modules' tests flip. This asserts the ENGLISH form, so it must hold
-        // the crate-wide language lock like every other language-dependent assertion
-        // (see `main.rs::LANG_TEST_LOCK`) — without it, it fails whenever it happens
-        // to render while another test has 中文 set.
-        let _g = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The placeholder is localized, so pin English rather than trust the default.
+        // `set_lang` is scoped to this thread — no other test can see it, and no other
+        // test's language can reach this assertion.
         alice_miner_core::i18n::set_lang(alice_miner_core::i18n::Lang::En);
         let t = render_roster(&[]);
         assert!(t.contains("(no sources)"));

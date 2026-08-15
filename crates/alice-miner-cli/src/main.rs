@@ -63,17 +63,12 @@ mod train;
 mod tui;
 mod update;
 
-/// ONE crate-wide serialization lock for tests that pin the PROCESS-GLOBAL language
-/// ([`alice_miner_core::i18n::set_lang`]).
-///
-/// Until now each module kept its own private `LANG_LOCK`, which serializes a module's
-/// tests against *itself* but not against the five other modules doing the same thing —
-/// cargo runs the whole bin's unit tests in one process, on parallel threads, so
-/// `balance`'s EN test could observe the `zh` that `region` had just set. Nothing had
-/// tripped it yet; adding a sixth participant (`errmsg`, whose whole point is an
-/// EN-mode-emits-no-Chinese assertion) makes an actual flake likely. Test-only.
-#[cfg(test)]
-pub(crate) static LANG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// NOTE: there used to be a crate-wide `LANG_TEST_LOCK` here for tests that pinned the
+// UI language. It is gone. `alice_miner_core::i18n::set_lang` is now scoped to the
+// CALLING THREAD, and libtest gives every test its own thread, so a test that pins a
+// language cannot be observed by the tests running beside it. The lock only ever
+// worked if the READERS took it too, and the ~174 tests in this workspace that assert
+// on localized text never did.
 
 // ── Exit codes ──────────────────────────────────────────────────────────────
 /// Success.
@@ -1151,7 +1146,7 @@ fn resolve_language(flag: Option<&str>, command: Option<&Command>) {
     if let Some(raw) = flag {
         match raw.parse::<Lang>() {
             Ok(lang) => {
-                i18n::set_lang(lang);
+                i18n::set_process_lang(lang);
                 let _ = alice_miner_core::settings::save_lang(lang);
                 return;
             }
@@ -1165,7 +1160,7 @@ fn resolve_language(flag: Option<&str>, command: Option<&Command>) {
 
     // (b) persisted preference.
     if let Some(lang) = alice_miner_core::settings::load().parsed_lang() {
-        i18n::set_lang(lang);
+        i18n::set_process_lang(lang);
         return;
     }
 
@@ -1174,7 +1169,7 @@ fn resolve_language(flag: Option<&str>, command: Option<&Command>) {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if interactive && command_allows_prompt(command) {
         if let Some(lang) = prompt_for_language() {
-            i18n::set_lang(lang);
+            i18n::set_process_lang(lang);
             // Persist so we never ask again (best-effort; a write failure just means
             // we may ask next time — never fatal).
             let _ = alice_miner_core::settings::save_lang(lang);
@@ -1184,12 +1179,12 @@ fn resolve_language(flag: Option<&str>, command: Option<&Command>) {
 
     // (d) environment locale.
     if let Some(lang) = lang_from_env() {
-        i18n::set_lang(lang);
+        i18n::set_process_lang(lang);
         return;
     }
 
     // (e) default English (the global already starts at En; set explicitly for clarity).
-    i18n::set_lang(Lang::En);
+    i18n::set_process_lang(Lang::En);
 }
 
 /// Whether a subcommand is one where an interactive first-run language prompt is
@@ -1269,7 +1264,7 @@ fn cmd_lang(args: LangArgs) -> i32 {
     match args.lang.as_deref() {
         Some(raw) => match raw.parse::<Lang>() {
             Ok(lang) => {
-                i18n::set_lang(lang);
+                i18n::set_process_lang(lang);
                 match alice_miner_core::settings::save_lang(lang) {
                     Ok(path) => {
                         println!(

@@ -714,11 +714,9 @@ mod tests {
     /// was never said.
     #[test]
     fn the_unbound_panel_line_does_not_tell_a_mining_rig_to_start_mining() {
-        use crate::i18n::{set_lang, Lang, LANG_TEST_LOCK};
-        // The language is a PROCESS global shared by every module's tests in this
-        // binary, so pinning it takes the crate-wide lang lock — not just this
-        // module's env guard, which would only order this test against itself.
-        let _l = LANG_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use crate::i18n::{set_lang, Lang};
+        // `set_lang` is scoped to this thread, so pinning a language here is invisible
+        // to every other test running beside this one — no lock needed.
         let restore = crate::i18n::lang();
 
         set_lang(Lang::En);
@@ -770,12 +768,9 @@ mod tests {
 
     #[test]
     fn pending_text_from_envelope_clean_confirmed() {
-        // The confirming line is localized and the language is a PROCESS global that
-        // other tests flip, so an assertion on the ENGLISH form has to hold the
-        // crate-wide language lock (see `i18n::LANG_TEST_LOCK`) rather than trust the
-        // default — "default language is English" is only true until someone else's
-        // test is mid-中文.
-        let _l = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // The confirming line is localized, so pin English rather than trust the
+        // default. `set_lang` is scoped to this thread, so pinning it here cannot be
+        // observed by any test running beside this one.
         let restore = crate::i18n::lang();
         crate::i18n::set_lang(crate::i18n::Lang::En);
 

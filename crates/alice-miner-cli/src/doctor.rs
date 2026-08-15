@@ -2230,7 +2230,6 @@ mod tests {
         let mut never = |_: &str| panic!("must not prompt when non-interactive");
         // "Manual steps" is localized, and the language is a process global other
         // tests flip: pin it, like every other language-dependent assertion.
-        let _g = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         alice_miner_core::i18n::set_lang(alice_miner_core::i18n::Lang::En);
         let report = apply_fixes(&checks, /*interactive=*/ false, &mut never);
         assert!(report.contains("background service"), "service line present: {report}");
@@ -2302,12 +2301,13 @@ mod tests {
     /// panic, so one failing assertion cannot leave the rest of the suite pointed at
     /// a deleted directory or speaking the wrong language.
     ///
-    /// Both process globals are held, in THIS order (env, then language). No other
-    /// test in this binary takes both, so the order is free — but it must stay
-    /// consistent, and this is the only place that decides it.
+    /// Only `$ALICE_IDENTITY_DIR` needs a lock — it is a PROCESS-WIDE env var. The
+    /// language does not: `set_lang` is scoped to the calling thread, so pinning it
+    /// here is invisible to every test running beside this one. (There used to be a
+    /// second `LANG_TEST_LOCK` taken here, which made this the only place in the crate
+    /// deciding a lock ORDER; with it gone there is no order left to get wrong.)
     struct TempHome {
         _env: std::sync::MutexGuard<'static, ()>,
-        _lang: std::sync::MutexGuard<'static, ()>,
         lang_prev: alice_miner_core::i18n::Lang,
         dir: std::path::PathBuf,
         prev: Option<std::ffi::OsString>,
@@ -2317,7 +2317,6 @@ mod tests {
         fn new(tag: &str) -> Self {
             use alice_miner_core::i18n::{self, Lang};
             let env = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let lang = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let lang_prev = i18n::lang();
             i18n::set_lang(Lang::En);
             let dir = std::env::temp_dir().join(format!(
@@ -2331,7 +2330,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let prev = std::env::var_os("ALICE_IDENTITY_DIR");
             std::env::set_var("ALICE_IDENTITY_DIR", &dir);
-            TempHome { _env: env, _lang: lang, lang_prev, dir, prev }
+            TempHome { _env: env, lang_prev, dir, prev }
         }
     }
 

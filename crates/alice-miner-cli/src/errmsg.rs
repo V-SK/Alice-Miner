@@ -643,14 +643,13 @@ mod tests {
     use super::*;
     use alice_miner_core::i18n::{set_lang, Lang};
 
-    /// A serialized guard so the VERBOSE-toggling and language-pinning tests don't race
-    /// each other. Both `ALICE_MINER_VERBOSE` and the current language are PROCESS
-    /// globals, and cargo runs this bin's unit tests on parallel threads — so the lock
-    /// is the CRATE-wide one (`main.rs::LANG_TEST_LOCK`), shared with every other module
-    /// that pins a language. A module-private mutex would only order `errmsg` against
-    /// itself, and `en_mode_never_emits_chinese` would then be at the mercy of whatever
-    /// `region` / `balance` / `menu` happened to set.
-    use crate::LANG_TEST_LOCK as ENV_LOCK;
+    /// `ALICE_MINER_VERBOSE` is a PROCESS-WIDE env var, and cargo runs this bin's unit
+    /// tests on parallel threads, so every test that toggles it serializes on the
+    /// CRATE-wide env lock. A module-private mutex would only order `errmsg` against
+    /// itself while another module's `set_var` ran underneath it.
+    ///
+    /// The LANGUAGE needs no lock — `set_lang` is scoped to the calling thread.
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     fn with_verbose<T>(on: bool, f: impl FnOnce() -> T) -> T {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

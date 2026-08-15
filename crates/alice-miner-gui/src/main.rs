@@ -18,12 +18,9 @@ mod shot;
 mod ui;
 mod update;
 
-/// Process-global-language test serialization lock. The current UI language is a
-/// PROCESS global (in `alice-miner-core`), so ANY test in this binary that mutates it
-/// via `i18n::set_lang` must hold this lock — the parallel test runner otherwise
-/// interleaves two languages and flakes. Test-only.
-#[cfg(test)]
-pub(crate) static LANG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// NOTE: there used to be a `LANG_TEST_LOCK` here for tests that pinned the UI
+// language. It is gone: `alice_miner_core::i18n::set_lang` is scoped to the CALLING
+// THREAD, and libtest gives every test its own, so there is nothing left to serialize.
 
 /// Process-environment test serialization lock. `$HOME` and
 /// `$ALICE_IDENTITY_DIR` are process globals, and a test that points them at a
