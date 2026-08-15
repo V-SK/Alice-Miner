@@ -247,6 +247,74 @@ pub fn build_miner_launch_plan(
     Ok(MinerLaunchPlan { program, args })
 }
 
+/// The xmrig flags that are **POOL-SCOPED**: xmrig attaches each of them to the
+/// pool created by the most recent `-o`, and to that pool ONLY — it does not
+/// broadcast them across every `-o` on the line.
+///
+/// This is not a guess. Run against the bundled **XMRig 6.26.0** with
+/// `-o A -o B -o C -u <addr> -p x --keepalive --rig-id <rig> --coin monero`, the
+/// effective config read back from the miner's own HTTP API (`GET /1/config`) is:
+///
+/// ```text
+/// POOL #1 {"url":"A","user":null,"pass":null,"rig-id":null,"coin":null,"keepalive":false}
+/// POOL #2 {"url":"B","user":null,"pass":null,"rig-id":null,"coin":null,"keepalive":false}
+/// POOL #3 {"url":"C","user":"<addr>","pass":"x","rig-id":"<rig>","coin":"XMR","keepalive":true}
+/// ```
+///
+/// A pool with `"user": null` still gets mined — it just logs in with no Alice
+/// address, so the relay cannot attribute the shares and **the miner earns
+/// nothing while every local indicator looks healthy**. Since
+/// [`EndpointPlan::ordered_from_cursor`] puts the ACTIVE endpoint FIRST, the pool
+/// actually mined was precisely the one left credential-less. Hence
+/// [`push_pool_group`]: every `-o` is emitted together with its own full set.
+///
+/// (`--tls` is pool-scoped too, but it is conditional on the endpoint's
+/// transport, so it is not in this always-emitted list.)
+const POOL_SCOPED_FLAGS: [&str; 5] = ["-u", "-p", "--keepalive", "--rig-id", "--coin"];
+
+/// Emit ONE complete xmrig pool: the `-o` plus **every** pool-scoped flag that
+/// pool needs, as a single indivisible block.
+///
+/// The credentials are produced by the same function that produces the `-o`, so
+/// there is no argv-assembly order in which a pool can be emitted without them —
+/// which is the specific way this used to break (the `-u/-p/--rig-id/--coin/
+/// --keepalive` block sat once at the END of the argv and therefore landed only
+/// on the last `-o`).
+///
+/// `--retries` / `--retry-pause` are GLOBAL in xmrig (they appear at the config
+/// top level, not inside a pool object) and are repeated here per pool anyway,
+/// for two reasons: it keeps the single-endpoint argv byte-identical to the
+/// historical one, and if a future xmrig ever made them pool-scoped, repeating
+/// them is the correct shape rather than a new silent loss. Repetition is
+/// verified harmless — with three pool groups the effective config still reads
+/// `retries=5, retry-pause=5`.
+fn push_pool_group(args: &mut Vec<String>, ep: &Endpoint, reward: &str, rig_id: &str) {
+    args.push("-o".into());
+    args.push(ep.host_port());
+    // Per-pool TLS: only a `stratum+ssl` (T1) endpoint gets it.
+    if ep.transport == Transport::Tls {
+        args.push("--tls".into());
+    }
+    // Login: the user's OWN Alice reward identity, password "x" (see
+    // build_miner_launch_plan for the honesty invariant).
+    args.push("-u".into());
+    args.push(reward.to_string());
+    args.push("-p".into());
+    args.push("x".into());
+    // Stratum keepalive + reconnect — see build_miner_launch_plan. `--keepalive`
+    // is POOL-SCOPED, so a backup pool without it inherits the very idle-drop
+    // stall the flag exists to prevent.
+    args.push("--keepalive".into());
+    args.push("--retries".into());
+    args.push("5".into());
+    args.push("--retry-pause".into());
+    args.push("5".into());
+    args.push("--rig-id".into());
+    args.push(rig_id.to_string());
+    args.push("--coin".into());
+    args.push("monero".into());
+}
+
 /// Build the validated XMRig launch plan with **multi-endpoint failover (Layer A)
 /// + a thread override** — the M4 generalization of [`build_miner_launch_plan`].
 ///
@@ -254,17 +322,21 @@ pub fn build_miner_launch_plan(
 /// proven path (byte-faithful); this variant adds exactly two things, both
 /// additive:
 ///   * **Layer A failover:** xmrig accepts MULTIPLE `-o` pools and fails over
-///     between them itself (fast, in-process). We emit one `-o <host:port>` per
-///     endpoint in `endpoints` IN ORDER (the supervisor passes them rotated so
-///     the active endpoint is primary — see [`EndpointPlan::ordered_from_cursor`]).
-///     A `stratum+ssl` (TLS, T1) endpoint also gets `--tls` appended for that
-///     pool (xmrig's per-pool TLS flag); plaintext (T0) endpoints don't.
+///     between them itself (fast, in-process). We emit one COMPLETE pool group
+///     per endpoint in `endpoints` IN ORDER — `-o <host:port>` plus that pool's
+///     own `-u/-p/--keepalive/--rig-id/--coin` (and `--tls` when the endpoint is
+///     T1) — see [`push_pool_group`] and [`POOL_SCOPED_FLAGS`] for why the
+///     credentials MUST be repeated. (The supervisor passes the endpoints
+///     rotated so the active one is primary — [`EndpointPlan::ordered_from_cursor`].)
 ///   * **`threads_override`:** when `Some(n)`, pins `--threads n` (dual-mine
 ///     uses `cores-2` headroom). `None` keeps the single-lane "拉满" default
 ///     ([`miner_thread_count`]).
 ///
+/// For a SINGLE endpoint the emitted argv is byte-identical to the historical one
+/// (asserted by `single_endpoint_argv_is_byte_identical_to_the_frozen_golden`).
+///
 /// Same HONESTY invariant as [`build_miner_launch_plan`]: every `-o` value is an
-/// Alice-relay endpoint, the login `-u` is the user's OWN address, and no
+/// Alice-relay endpoint, every login `-u` is the user's OWN address, and no
 /// collection / seed / upstream-pool string is present. (The endpoints come from
 /// an [`EndpointPlan`], whose default is relay-only and whose only non-relay
 /// source is the operator `ALICE_MINER_ENDPOINTS_JSON` override.)
@@ -286,32 +358,16 @@ pub fn build_miner_launch_plan_with_endpoints(
         .map(|n| n.clamp(1, MINER_MAX_THREADS))
         .unwrap_or_else(miner_thread_count);
 
-    let mut args: Vec<String> = Vec::with_capacity(endpoints.len() * 3 + 16);
-    // Layer A: one `-o` per endpoint, in order. A TLS endpoint gets `--tls`
-    // appended immediately after its `-o` (xmrig applies per-pool flags to the
-    // most-recent `-o`).
+    let mut args: Vec<String> = Vec::with_capacity(endpoints.len() * 16 + 9);
+    // Layer A: one COMPLETE pool group per endpoint, in order. xmrig applies
+    // pool-scoped flags to the most-recent `-o` ONLY, so each endpoint carries
+    // its own credentials — see `push_pool_group` / `POOL_SCOPED_FLAGS`.
     for ep in endpoints {
-        args.push("-o".into());
-        args.push(ep.host_port());
-        if ep.transport == Transport::Tls {
-            args.push("--tls".into());
-        }
+        push_pool_group(&mut args, ep, reward, &rig_id);
     }
+    // Everything below is GLOBAL in xmrig (top-level config keys, not pool
+    // fields), so it is emitted exactly once.
     args.extend([
-        "-u".into(),
-        reward.to_string(),
-        "-p".into(),
-        "x".into(),
-        // Stratum keepalive + reconnect — see build_miner_launch_plan.
-        "--keepalive".into(),
-        "--retries".into(),
-        "5".into(),
-        "--retry-pause".into(),
-        "5".into(),
-        "--rig-id".into(),
-        rig_id,
-        "--coin".into(),
-        "monero".into(),
         "--no-color".into(),
         "--print-time".into(),
         "10".into(),
@@ -621,6 +677,207 @@ mod tests {
             plan.args[first_o + 1],
             format!("{ALICE_POOL_HOST}:{ALICE_POOL_PORT}")
         );
+    }
+
+    /// Split an xmrig argv into one segment per pool: segment `i` runs from the
+    /// `i`-th `-o` up to (but excluding) the next `-o`, or to the end of the argv
+    /// for the last pool. This mirrors how xmrig's own parser scopes flags — each
+    /// pool-scoped flag belongs to the pool created by the preceding `-o`.
+    fn pool_segments(args: &[String]) -> Vec<&[String]> {
+        let starts: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "-o")
+            .map(|(i, _)| i)
+            .collect();
+        starts
+            .iter()
+            .enumerate()
+            .map(|(n, &start)| {
+                let end = starts.get(n + 1).copied().unwrap_or(args.len());
+                &args[start..end]
+            })
+            .collect()
+    }
+
+    /// **THE REGRESSION GATE for the "only the last pool is credited" bug.**
+    ///
+    /// HONEST SCOPE: this is an ARGV-SHAPE assertion. It proves the client emits
+    /// every pool-scoped flag once per `-o`, in that pool's own segment. It does
+    /// NOT execute xmrig and is therefore NOT evidence about how xmrig behaves —
+    /// that half was established by hand against the bundled XMRig 6.26.0 by
+    /// reading its effective config over its HTTP API, and the observed output is
+    /// recorded verbatim on [`POOL_SCOPED_FLAGS`]. The two together are the proof;
+    /// this test is the half a later refactor could silently break.
+    ///
+    /// Why it matters: `ordered_from_cursor()` puts the ACTIVE endpoint first, so
+    /// the pool that loses its `-u` is the pool actually being mined. The miner
+    /// hashes, the process looks healthy, and the relay cannot attribute a single
+    /// share.
+    #[test]
+    fn multi_endpoint_every_pool_carries_its_own_credentials() {
+        let addr = valid_address();
+        let rig = derive_worker_id(addr).unwrap();
+        let eps = vec![
+            Endpoint::plaintext("us.aliceprotocol.org", 3333),
+            Endpoint::tls("asia.aliceprotocol.org", 3334),
+            Endpoint::plaintext("eu.aliceprotocol.org", 3333),
+        ];
+        let plan =
+            build_miner_launch_plan_with_endpoints(PathBuf::from("xmrig"), addr, &eps, None)
+                .expect("plan");
+
+        let segments = pool_segments(&plan.args);
+        assert_eq!(segments.len(), eps.len(), "one `-o` segment per endpoint");
+
+        for (seg, ep) in segments.iter().zip(&eps) {
+            let seg_join = seg.join(" ");
+            // The segment opens with this endpoint's `-o <host:port>`.
+            assert_eq!(seg[0], "-o", "segment must start at its own -o: {seg_join}");
+            assert_eq!(seg[1], ep.host_port(), "wrong pool target: {seg_join}");
+
+            // Every always-emitted pool-scoped flag is present IN THIS SEGMENT —
+            // i.e. it binds to THIS pool, not to whichever `-o` came last.
+            for flag in POOL_SCOPED_FLAGS {
+                assert!(
+                    seg.iter().any(|a| a == flag),
+                    "pool {} is missing the pool-scoped flag {flag}: {seg_join}",
+                    ep.host_port()
+                );
+            }
+            // ...and carries the right VALUES, not just the right flags.
+            let val = |flag: &str| -> &str {
+                let i = seg.iter().position(|a| a == flag).expect("flag present");
+                seg[i + 1].as_str()
+            };
+            assert_eq!(val("-u"), addr, "pool {} logs in as someone else", ep.host_port());
+            assert_eq!(val("-p"), "x");
+            assert_eq!(val("--rig-id"), rig.as_str());
+            assert_eq!(val("--coin"), "monero");
+
+            // Per-pool TLS follows the endpoint's OWN transport.
+            assert_eq!(
+                seg.iter().any(|a| a == "--tls"),
+                ep.transport == Transport::Tls,
+                "pool {} has the wrong --tls state: {seg_join}",
+                ep.host_port()
+            );
+        }
+
+        // Belt: each pool-scoped flag appears exactly once per endpoint overall —
+        // catches a stray extra copy as well as a missing one.
+        for flag in POOL_SCOPED_FLAGS {
+            assert_eq!(
+                plan.args.iter().filter(|a| *a == flag).count(),
+                eps.len(),
+                "{flag} must appear exactly once per endpoint"
+            );
+        }
+        // Exactly one `--tls` (only the asia endpoint is T1).
+        assert_eq!(plan.args.iter().filter(|a| *a == "--tls").count(), 1);
+
+        // The GLOBAL flags stay emitted exactly once, at the end.
+        for flag in ["--no-color", "--print-time", "--donate-level", "--cpu-priority", "--threads"] {
+            assert_eq!(
+                plan.args.iter().filter(|a| *a == flag).count(),
+                1,
+                "{flag} is global and must be emitted once"
+            );
+        }
+    }
+
+    /// The multi-endpoint honesty gate: with SEVERAL pools on the line, EVERY
+    /// `-u` is the user's own address — a backup pool must not log in as anyone
+    /// else (or as nobody).
+    #[test]
+    fn multi_endpoint_every_login_is_the_users_own_address() {
+        let addr = valid_address();
+        let eps = vec![
+            Endpoint::plaintext("us.aliceprotocol.org", 3333),
+            Endpoint::plaintext("eu.aliceprotocol.org", 3333),
+        ];
+        let plan =
+            build_miner_launch_plan_with_endpoints(PathBuf::from("xmrig"), addr, &eps, None)
+                .unwrap();
+        let logins: Vec<&String> = plan
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && plan.args[i - 1] == "-u")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(logins.len(), eps.len());
+        assert!(logins.iter().all(|v| v.as_str() == addr), "{logins:?}");
+        // No Monero-mainnet-shaped collection address anywhere in the argv.
+        assert!(!plan.args.iter().any(|a| a.len() == 95 && a.starts_with('4')));
+        assert!(!plan.args.join(" ").contains("46knTVDfa5CMtFLvVuFdHWPSv7FCnfSbQ"));
+    }
+
+    /// **THE FROZEN SINGLE-ENDPOINT ARGV.** The one-endpoint case is what ships
+    /// (`EndpointPlan::default_for_lane(Lane::Xmr)` is a `single`), so its argv is
+    /// pinned here byte-for-byte. The multi-endpoint fix above was shaped
+    /// deliberately so that this vector did not move a single token.
+    #[test]
+    fn single_endpoint_argv_is_byte_identical_to_the_frozen_golden() {
+        let addr = valid_address();
+        let rig = derive_worker_id(addr).unwrap();
+        let threads = miner_thread_count().to_string();
+        let golden: Vec<String> = [
+            "-o",
+            "hk.aliceprotocol.org:3333",
+            "-u",
+            addr,
+            "-p",
+            "x",
+            "--keepalive",
+            "--retries",
+            "5",
+            "--retry-pause",
+            "5",
+            "--rig-id",
+            rig.as_str(),
+            "--coin",
+            "monero",
+            "--no-color",
+            "--print-time",
+            "10",
+            "--donate-level",
+            "0",
+            "--cpu-priority",
+            "1",
+            "--threads",
+            threads.as_str(),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // (a) The proven single-endpoint builder.
+        let single = build_miner_launch_plan(PathBuf::from("/usr/local/bin/xmrig"), addr).unwrap();
+        assert_eq!(single.args, golden, "the shipped single-endpoint argv moved");
+
+        // (b) The multi-endpoint builder handed exactly one endpoint must produce
+        //     the SAME bytes — this is the assertion the fix had to not break.
+        let eps = vec![Endpoint::plaintext(ALICE_POOL_HOST, ALICE_POOL_PORT)];
+        let multi = build_miner_launch_plan_with_endpoints(
+            PathBuf::from("/usr/local/bin/xmrig"),
+            addr,
+            &eps,
+            None,
+        )
+        .unwrap();
+        assert_eq!(multi.args, golden, "the one-endpoint argv is no longer the golden one");
+
+        // (c) And via the EndpointPlan convenience, i.e. the path the engine takes
+        //     for the shipped relay-only default plan.
+        let plan_for = build_miner_launch_plan_for(
+            PathBuf::from("/usr/local/bin/xmrig"),
+            addr,
+            &EndpointPlan::default_for_lane(crate::lane::Lane::Xmr),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan_for.args, golden);
     }
 
     #[test]
