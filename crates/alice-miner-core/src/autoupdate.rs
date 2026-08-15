@@ -158,6 +158,7 @@ pub fn tick(quiet_holds: bool) -> Outcome {
 
     let app_path = release::current_app_path().ok();
     let pins = auto::pins(&dir);
+    let installed = auto::installed(&dir);
     let input = auto::Input {
         manifest: &manifest,
         current,
@@ -171,8 +172,12 @@ pub fn tick(quiet_holds: bool) -> Outcome {
         seen_sha256: seen.as_ref().map(|s| s.seen.sha256.as_str()),
         // Nothing to record (no package for this platform) is not a failure to
         // record; that path holds on `NoArtifact` long before this matters.
-        sighting_on_record: seen.as_ref().map(|s| s.on_record).unwrap_or(true),
+        ledger: seen
+            .as_ref()
+            .map(|s| s.ledger)
+            .unwrap_or(auto::LedgerStatus::Intact),
         pinned: &pins,
+        installed: installed.as_ref(),
         lkg_present: app_path
             .as_deref()
             .map(release::has_last_known_good)
@@ -229,15 +234,25 @@ pub fn tick(quiet_holds: bool) -> Outcome {
 
         Decision::Notify { version, hold } => {
             let message = describe_hold(&version, &hold);
-            // A hash conflict is never routine and is never quiet.
-            let loud = matches!(hold, Hold::HashConflict { .. });
-            if loud {
-                auto::log_event(
-                    &dir,
-                    "hash-conflict",
-                    serde_json::json!({ "version": version }),
-                );
-            }
+            let loud = match &hold {
+                // A hash conflict is never routine and is never quiet.
+                Hold::HashConflict { .. } => {
+                    auto::log_event(
+                        &dir,
+                        "hash-conflict",
+                        serde_json::json!({ "version": version }),
+                    );
+                    true
+                }
+                // Nor is losing the record that check runs on. It self-heals on
+                // the very next tick, so there is exactly ONE check at which this
+                // can be said out loud — and suppressing it because the tick
+                // happened to be a quiet one would mean nobody ever hears it.
+                // (`note_seen` has already written it to the local history; it is
+                // the only code that knows the reset happened.)
+                Hold::LedgerReset => true,
+                _ => false,
+            };
             if quiet_holds && !loud {
                 Outcome::Quiet
             } else {
@@ -266,7 +281,7 @@ pub fn tick(quiet_holds: bool) -> Outcome {
                     "baseline": format!("{baseline:?}"),
                 }),
             );
-            match install(&artifact, &version, current, baseline) {
+            match install(&dir, &artifact, &version, current, baseline) {
                 Ok(()) => Outcome::Installed {
                     version: version.clone(),
                     message: tr!(
@@ -300,6 +315,7 @@ pub fn tick(quiet_holds: bool) -> Outcome {
 /// nobody asked for. See `alice_release::auto` for why the two gates are
 /// separate rather than one with a flag.
 fn install(
+    dir: &std::path::Path,
     artifact: &release::Artifact,
     version: &str,
     previous: &str,
@@ -307,6 +323,22 @@ fn install(
 ) -> Result<(), String> {
     let bytes = release::download_and_verify(artifact).map_err(|e| e.to_string())?;
     let applied = release::apply_update(artifact, &bytes).map_err(|e| e.to_string())?;
+    // Record the install the moment the swap lands, and BEFORE arming — never
+    // before the swap, because a record of an install that did not happen would
+    // hold every future check on a build this machine has not got.
+    //
+    // Before arming, because the probation is not this record's substitute: it is
+    // discarded the first time the running version disagrees with it, which is
+    // exactly the situation the record exists to survive. If the write fails we
+    // say so and continue — the install itself has already succeeded, and the
+    // cost is only that a re-check may repeat it.
+    if !auto::note_installed(dir, version, &artifact.sha256) {
+        auto::log_event(
+            dir,
+            "install-unrecorded",
+            serde_json::json!({ "version": version }),
+        );
+    }
     auto::arm(&applied.app_path, version, previous, baseline).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -535,6 +567,30 @@ fn describe_hold(version: &str, hold: &Hold) -> String {
             format!("v{version} is available but was NOT installed automatically: this machine could not write its update ledger, so it cannot remember which package a version number arrived with — the check that catches a version being re-published with different bytes. Fix the permissions on the alice-miner data directory (or free some disk) and it will resume on its own. `alice-miner update` still works and will say the same thing before it installs anything."),
             format!("有新版本 v{version},但未自动安装:本机无法写入更新台账,也就记不住某个版本号当初对应的安装包 —— 那正是用来发现「同一版本号换了字节」的检查。请修复 alice-miner 数据目录的权限(或清出磁盘空间),之后会自动恢复。`alice-miner update` 仍可使用,并会在安装前给出同样的提示。")
         ),
+        Hold::AlreadyInstalled { installed_ago_s } => {
+            let age = age_phrase(*installed_ago_s);
+            // Under a day this is simply the ordinary state of affairs: the swap
+            // is on disk and the process running it has not started yet. Past
+            // that, on a machine that is plainly being restarted and still
+            // reports the old version, the honest reading is different — and
+            // saying "restart to run it" for the tenth day running would be the
+            // client insisting on something the machine has already disproved.
+            if *installed_ago_s < 24 * 3600 {
+                tr!(
+                    format!("v{version} is already installed on this machine ({age} ago) and runs the next time you start alice-miner. Your current session was not interrupted and there is nothing to do."),
+                    format!("v{version} 已安装到本机({age}前),下次启动 alice-miner 时生效。当前会话未被打断,你无需做任何事。")
+                )
+            } else {
+                tr!(
+                    format!("v{version} was installed on this machine {age} ago, but this program is still reporting an older version, so it has NOT been installed again. If you have restarted alice-miner since then, the installed build is not reporting the version it was published under — that is a fault at our end, not yours: please report it. Until it is sorted out this machine stays on the version it is running, which is the safe direction."),
+                    format!("v{version} 已在 {age}前安装到本机,但本程序报告的仍是更旧的版本,因此没有重复安装。如果你在那之后重启过 alice-miner,说明安装上去的版本并未报告它发布时的版本号 —— 这是我方的问题,不是你的:请上报。在弄清之前,本机会停留在当前运行的版本,这是安全的方向。")
+                )
+            }
+        }
+        Hold::LedgerReset => tr!(
+            format!("v{version} is available but was NOT installed automatically this time: this machine's update ledger could not be read, so what it remembered — which package each version number arrived with — is gone. The old file has been kept as `update-seen.json.unreadable` and a fresh ledger starts from what the server offered just now. Nothing here is yours to fix and nothing is wrong with this machine's disk. What is missing is the comparison that catches a version being re-published with different bytes, and it has nothing to compare against for v{version} any more, so this install waits and the version soaks again from today. `alice-miner update` still works and will say the same thing before it installs anything."),
+            format!("有新版本 v{version},但这次未自动安装:本机的更新台账读不出来,它记住的东西 —— 每个版本号当初对应哪个安装包 —— 已经没了。原文件已保留为 `update-seen.json.unreadable`,新的台账从服务器刚才给出的内容重新开始。这不需要你做什么,本机磁盘也没有问题。缺的是用来发现「同一版本号被换成不同字节」的那次比对,它对 v{version} 已无可比之物,因此本次安装暂缓,该版本从今天起重新计算观察期。`alice-miner update` 仍可使用,并会在安装前给出同样的提示。")
+        ),
         Hold::HashConflict { seen_sha256, now_sha256 } => {
             let seen = short(seen_sha256);
             let now = short(now_sha256);
@@ -628,13 +684,18 @@ pub fn manual_check(
         .unwrap_or(0);
     let inside_soak = auto::inside_soak(visible_for_s);
     let pins = auto::pins(&dir);
+    let installed = auto::installed(&dir);
     let verdict = auto::decide_manual(&auto::ManualInput {
         manifest,
         current,
         artifact_sha256: artifact.map(|a| a.sha256.as_str()),
         seen_sha256: seen.as_ref().map(|s| s.seen.sha256.as_str()),
-        sighting_on_record: seen.as_ref().map(|s| s.on_record).unwrap_or(true),
+        ledger: seen
+            .as_ref()
+            .map(|s| s.ledger)
+            .unwrap_or(auto::LedgerStatus::Intact),
         pinned: &pins,
+        installed: installed.as_ref(),
     });
 
     let version = &manifest.version;
@@ -687,6 +748,28 @@ pub fn manual_check(
                 format!("本机曾安装过 v{version} 并自动回滚,原因是它要么无法启动,要么在本机不再有被接受的份额。")
             ),
         },
+        auto::ManualVerdict::ConfirmFirst(auto::ManualConcern::AlreadyInstalled) => {
+            ManualOutcome::Confirm {
+                message: tr!(
+                    format!("this machine has already installed v{version} — it takes effect the next time you start alice-miner, and there is nothing to download. Applying it a second time replaces the copy this machine would roll back to (the version you are running now) with v{version} itself, so if v{version} then fails there is nothing left to go back to."),
+                    format!("本机已经安装过 v{version} —— 下次启动 alice-miner 时即生效,无需再下载。再装一次会把本机用于回滚的那份副本(也就是你现在运行的版本)替换成 v{version} 自己,那样一来若 v{version} 出问题,就没有可回退的版本了。")
+                ),
+            }
+        }
+        auto::ManualVerdict::ConfirmFirst(auto::ManualConcern::LedgerReset) => {
+            auto::log_event(
+                &dir,
+                "ledger-reset-manual",
+                serde_json::json!({ "version": version }),
+            );
+            ManualOutcome::Confirm {
+                message: tr!(
+                    "this machine's update ledger could not be read and has been replaced, so what it remembered — which package each version number arrived with — is gone. The old file was kept as `update-seen.json.unreadable`. The check that catches the same version being re-published with different bytes has nothing to compare this version against any more; it will work again for versions seen from now on.",
+                    "本机的更新台账读不出来,已被替换,它记住的东西 —— 每个版本号当初对应哪个安装包 —— 已经没了。原文件保留为 `update-seen.json.unreadable`。用于发现「同一版本号被换成不同字节」的检查,对这个版本已无可比之物;从现在起新见到的版本会重新受它保护。"
+                )
+                .to_string(),
+            }
+        }
         auto::ManualVerdict::ConfirmFirst(auto::ManualConcern::UnrecordedSighting) => {
             auto::log_event(
                 &dir,
@@ -1076,6 +1159,9 @@ mod tests {
                 now_sha256: "bb".repeat(32),
             },
             Hold::LedgerUnwritable,
+            Hold::LedgerReset,
+            Hold::AlreadyInstalled { installed_ago_s: 4 * 3600 },
+            Hold::AlreadyInstalled { installed_ago_s: 9 * 24 * 3600 },
         ];
         for h in holds {
             let s = describe_hold("0.6.8", &h);
@@ -1347,6 +1433,7 @@ mod tests {
             Hold::Rollout { bucket: 42, pct: 10 },
             Hold::Pinned,
             Hold::LedgerUnwritable,
+            Hold::LedgerReset,
         ];
         let preference = [Hold::ModeOff, Hold::NotifyOnly, Hold::NotSecurity];
 
@@ -1819,6 +1906,119 @@ mod tests {
             }
             other => panic!("expected a second question, got {other:?}"),
         }
+    }
+
+    /// The two sentences the "already installed" hold has to be able to say, and
+    /// why there are two. Inside a day it is the ordinary state of affairs — the
+    /// swap is on disk, the process running it has not started yet, and there is
+    /// nothing for anyone to do. Past that, on a machine that is plainly being
+    /// restarted and still reports the old version, repeating "restart to run it"
+    /// would be the client insisting on something the machine has already
+    /// disproved; the honest reading is that the installed build does not report
+    /// the version it was published under, and that is ours to fix, not theirs.
+    #[test]
+    fn the_already_installed_line_stops_saying_restart_once_that_is_disproved() {
+        let _g = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+
+        let fresh = describe_hold("0.6.8", &Hold::AlreadyInstalled { installed_ago_s: 4 * 3600 });
+        assert!(fresh.contains("next time you start"), "{fresh}");
+        assert!(fresh.contains("nothing to do"), "{fresh}");
+
+        let stale = describe_hold(
+            "0.6.8",
+            &Hold::AlreadyInstalled { installed_ago_s: 9 * 24 * 3600 },
+        );
+        assert!(
+            !stale.contains("nothing to do"),
+            "nine days of this is not 'nothing to do': {stale}"
+        );
+        assert!(
+            stale.contains("report it"),
+            "it must say whose problem this is and what to do with it: {stale}"
+        );
+        assert!(
+            stale.contains("has NOT been installed again"),
+            "and that the client stopped rather than looping: {stale}"
+        );
+    }
+
+    /// The manual path is not a way around the hold above. Applying an update
+    /// that is already on disk moves the CURRENT app into the last-known-good
+    /// slot, so the copy the machine would roll back to becomes the build on
+    /// trial — and `--yes` must not reach that.
+    #[test]
+    fn the_manual_path_asks_before_re_applying_an_update_already_on_disk() {
+        let _l = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        with_state_dir("already", |dir| {
+            let m = test_manifest("9.9.9");
+            // Control: nothing installed yet, the ordinary manual update.
+            assert_eq!(
+                manual_check(&m, Some(&m.artifacts[0]), "0.6.7").outcome,
+                ManualOutcome::Proceed
+            );
+
+            assert!(auto::note_installed(dir, "9.9.9", &"aa".repeat(32)));
+            match manual_check(&m, Some(&m.artifacts[0]), "0.6.7").outcome {
+                ManualOutcome::Confirm { message } => {
+                    assert!(message.contains("already installed"), "{message}");
+                    assert!(
+                        message.contains("roll back"),
+                        "it must say what a second install costs, not just that it is redundant: {message}"
+                    );
+                }
+                other => panic!("expected a second question, got {other:?}"),
+            }
+        });
+    }
+
+    /// The other ledger failure, through the real driver: the file was there, it
+    /// could not be read, and the records it held are gone.
+    ///
+    /// The old behaviour was the worst of both directions at once — the ledger was
+    /// silently overwritten AND the sighting was reported as recorded, so the
+    /// manual path proceeded as if the republish check had passed on a machine
+    /// where it had just been erased. It must ask instead, and it must say what
+    /// actually happened: nothing here is a permissions problem, and telling
+    /// someone to go and check their disk would be a guess wearing a diagnosis.
+    #[test]
+    fn the_manual_path_says_when_its_ledger_was_lost_rather_than_unwritable() {
+        let _l = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        with_state_dir("ledgerreset", |dir| {
+            // This machine had a record, and then the file stopped being readable.
+            auto::note_seen(dir, "9.9.9", "bb".repeat(32).as_str());
+            std::fs::write(dir.join("update-seen.json"), b"<<<not json>>>").unwrap();
+
+            let m = test_manifest("9.9.9");
+            match manual_check(&m, Some(&m.artifacts[0]), "0.6.7").outcome {
+                ManualOutcome::Confirm { message } => {
+                    assert!(
+                        message.contains("could not be read"),
+                        "it must name the failure it actually had: {message}"
+                    );
+                    assert!(
+                        !message.contains("could not write"),
+                        "and must not blame the write, which succeeded: {message}"
+                    );
+                    assert!(
+                        message.contains("re-published") || message.contains("different bytes"),
+                        "it must name the check that is missing, not just the file: {message}"
+                    );
+                }
+                other => panic!("expected a second question, got {other:?}"),
+            }
+            let hist =
+                std::fs::read_to_string(dir.join("update-history.jsonl")).unwrap_or_default();
+            assert!(hist.contains("ledger-reset"), "history: {hist}");
+        });
     }
 
     /// With no package for this platform there is nothing to compare, and the
