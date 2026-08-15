@@ -12,8 +12,9 @@
 //!   * drains the stdout/stderr `LogLine` channel on a background task and parses
 //!     hashrate + accepted/rejected shares with [`parse_hashrate_hs`] /
 //!     [`parse_share_counts`] (ported **VERBATIM** from the Wallet, ~L273/L299);
-//!   * runs the **Layer-B "no-progress" watchdog** (M4): if no accepted share /
-//!     no hashrate progress for [`NO_PROGRESS_WINDOW`] (~600s), it advances the
+//!   * runs the **Layer-B "no-progress" watchdog** (M4): if no SUBMITTED share
+//!     (accepted or rejected) / no hashrate progress for [`NO_PROGRESS_WINDOW`]
+//!     (~600s — see the constant for its known mis-sizing), it advances the
 //!     [`crate::endpoint::EndpointPlan`] cursor and `restart_with`s the child
 //!     pointed at the NEXT endpoint — **gated by [`alice_supervise::RestartPolicy`]**
 //!     (bounded retries + backoff; budget exhaustion → clean `Error`, no
@@ -26,6 +27,7 @@
 
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,7 +38,8 @@ use alice_supervise::child::{spawn_supervised, LogLine, LogStream, OwnedChild};
 use alice_supervise::{sanitize_log_line, ProcState, RestartPolicy, RetryLadder};
 
 use crate::acceptance::{
-    self, AcceptanceConfig, AcceptanceMonitor, Attribution, Collapse, LaneVerdict,
+    self, AcceptanceConfig, AcceptanceMonitor, Attribution, Collapse, HaltRecord, HaltResume,
+    LaneVerdict,
 };
 use crate::endpoint::{Endpoint, EndpointPlan};
 use crate::lane::Lane;
@@ -47,22 +50,52 @@ use crate::stats::{parse_generic, ParserKind};
 /// Grace period for a graceful miner stop before SIGKILL (verbatim from Wallet).
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
-/// Layer-B failover window: if the lane makes no progress (no new accepted share
-/// AND no hashrate increase) for this long, the watchdog advances the endpoint
-/// cursor and restarts on the next endpoint.
+/// Layer-B failover window: if the lane makes no progress (no new SUBMITTED share —
+/// accepted or rejected — AND no hashrate increase) for this long, the watchdog
+/// advances the endpoint cursor and restarts on the next endpoint.
 ///
 /// Sized from a LIVE measurement (2026-06-26 — shipped v0.3.0 SRBMiner `pearlhash`
 /// on an RTX A4000 vs `us.aliceprotocol.org:3340`, credit-only): the PRL pool is
-/// low-traffic and after warm-up the hashrate plateaus, so ONLY new accepted
-/// shares mark progress. Observed accepted-share gaps ranged 6–110s, with the max
-/// (110s) sitting right at the old 120s window — on weaker GPUs / after a vardiff
-/// difficulty bump, gaps routinely exceed 120s, which spuriously tripped this
-/// watchdog and caused region churn (each failover costs a ~15s SRBMiner re-init
-/// and the lane never settles). 600s gives comfortable headroom for a
-/// healthy-but-slow lane (any device, weak GPUs included) while still catching a
-/// genuinely dead endpoint within 10 min; a hard disconnect is caught sooner by
-/// the engine's own connection handling. Generous so it never trips during normal
-/// warm-up or slow-pool operation.
+/// low-traffic and after warm-up the hashrate plateaus, so in practice only new
+/// shares mark progress. Observed share gaps ranged 6–110s, with the max (110s)
+/// sitting right at the old 120s window — on weaker GPUs / after a difficulty bump,
+/// gaps routinely exceed 120s, which spuriously tripped this watchdog and caused
+/// region churn (each failover costs a ~15s SRBMiner re-init and the lane never
+/// settles). 600s gives headroom for a healthy-but-slow lane while still catching a
+/// genuinely dead endpoint within 10 min; a hard disconnect is caught sooner by the
+/// engine's own connection handling.
+///
+/// ⚠ **KNOWN MIS-SIZING at the current fixed difficulty — deliberately NOT changed
+/// here; it needs a fleet decision.** Share discovery is a Poisson process, so a
+/// FIXED window can only ever be a bet on the rig's hashrate. At the pool's fixed
+/// share difficulty `D = 2097152`, a share costs `D · 2^32 = 2^53 ≈ 9.007e15` hashes,
+/// so the mean gap is `9.007e15 / H` and the chance a HEALTHY rig exceeds a window
+/// `W` is `exp(-W·H / 9.007e15)`:
+///
+/// | hashrate | mean gap | P(gap > 600 s) | spurious failovers/day |
+/// |---------:|---------:|---------------:|-----------------------:|
+/// | 125 TH/s |    72 s  |         0.02 % |                   0.03 |
+/// | 100 TH/s |    90 s  |         0.13 % |                   0.18 |
+/// |  44.8 TH/s |  201 s  |         5.06 % |                   7.3  |
+/// |  30 TH/s |   300 s  |        13.6 %  |                  19.5  |
+/// |  15 TH/s |   600 s  |        36.8 %  |                  53    |
+/// |   5 TH/s |  1801 s  |        71.7 %  |                 103    |
+///
+/// (The 125 TH/s row matches the real 12-hour capture `parse_srbminer` is validated
+/// against — `719` accepted shares in 12 h at `125.35 TH/s` ⇒ ~60 s observed vs ~72 s
+/// predicted — which is what confirms `D` and therefore the whole table.)
+///
+/// So 600s is comfortable for the 100 TH/s+ cards the fleet runs today and gets
+/// steadily worse below ~50 TH/s, where a HEALTHY rig is torn down and rotated
+/// several times a day for nothing. Raising the window to 1800s drops 44.8 TH/s to
+/// ~0.01 trips/day and 15 TH/s to ~2.4, at the cost of taking up to 30 min (instead
+/// of 10) to notice a genuinely void lane — which is affordable, because a lane that
+/// is merely disconnected is caught far sooner by the engine's own reconnect, and a
+/// lane that submits but is REJECTED is now caught by [`crate::acceptance`] in ~15
+/// min regardless of this window. The principled fix is not a bigger constant but an
+/// ADAPTIVE one — a few multiples of the rig's own observed inter-submission
+/// interval, which self-sizes to any difficulty and any card — and that is a change
+/// worth reviewing rather than slipping in beside a halt fix.
 pub const NO_PROGRESS_WINDOW: Duration = Duration::from_secs(600);
 
 /// How often the watchdog wakes to check progress. Cheap; just compares the
@@ -95,6 +128,97 @@ const NVIDIA_TELEMETRY_TIMEOUT: Duration = Duration::from_secs(4);
 /// cursor is primary). `Send + Sync` so the watchdog task can call it.
 pub type RebuildFn =
     Arc<dyn Fn(&[Endpoint]) -> Result<(std::path::PathBuf, Vec<String>), String> + Send + Sync>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F5: who asked for this start?
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Why a lane is being started — the ONE distinction a persisted acceptance halt
+/// turns on.
+///
+/// A halt that survives a reboot is only worth anything if a reboot cannot clear it,
+/// and a halt a human cannot clear is a rig he no longer owns. Both are true at once
+/// only if the client can tell the two starts apart, so the caller says which it is:
+///
+/// * [`StartCause::User`] — a person acted (the GUI's Start button, a human typing
+///   `alice-miner start`). It clears the halt, its evidence and its ladder outright:
+///   the user has dealt with it, or has decided to burn the power anyway, and either
+///   way that is his call to make.
+/// * [`StartCause::Automatic`] — nobody acted; the OS service manager relaunched us
+///   (launchd `KeepAlive`, systemd `Restart=always`, a logon task, a restart after a
+///   self-update). This is the start that used to silently resume burning power, and
+///   it now HONORS the persisted halt: it waits out the remaining cooldown and lets
+///   the bounded re-probe ladder decide when to spend the next window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartCause {
+    User,
+    Automatic,
+}
+
+/// The process-wide default [`StartCause`], as an atomic so any thread may read it.
+/// `0` = [`StartCause::User`] — a plain binary invocation is a person until the
+/// front-end says otherwise, which is the safe default for the "never lock a user out
+/// of his own rig" half of the trade.
+static PROCESS_START_CAUSE: AtomicU8 = AtomicU8::new(0);
+
+/// Declare, once at process start, that THIS PROCESS was launched by the OS service
+/// manager rather than by a person — i.e. that its starts are
+/// [`StartCause::Automatic`].
+///
+/// The CLI calls this when it is invoked with `--from-service`, which is the exact
+/// argv the launchd plist / systemd unit / logon task run and which a human never
+/// types. It is process-level because the fact is process-level: nothing that happens
+/// later can turn a KeepAlive relaunch into somebody pressing a button.
+pub fn set_process_start_cause(cause: StartCause) {
+    PROCESS_START_CAUSE.store(
+        match cause {
+            StartCause::User => 0,
+            StartCause::Automatic => 1,
+        },
+        AtomicOrdering::SeqCst,
+    );
+}
+
+/// The cause [`LaneSupervisor::start`] / [`LaneSupervisor::start_simple`] assume.
+pub fn process_start_cause() -> StartCause {
+    match PROCESS_START_CAUSE.load(AtomicOrdering::SeqCst) {
+        0 => StartCause::User,
+        _ => StartCause::Automatic,
+    }
+}
+
+/// What kind of (re)launch [`LaneSupervisor::spawn_run`] is performing. Each answers
+/// one question: does the user's session start over, and does the acceptance
+/// judgement start over?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunKind {
+    /// A user-initiated start. Zeroes the session counters and every judgement.
+    Fresh,
+    /// A Layer-B failover or an automatic crash/stall restart: the rig kept mining and
+    /// only the engine process is new, so the session totals AND the acceptance
+    /// evidence carry over (see [`AcceptanceMonitor::on_failover`]).
+    Failover,
+    /// An acceptance-halt RE-PROBE: one deliberate window of electricity spent asking
+    /// whether the pool has started accepting again. The acceptance judgement starts
+    /// over (otherwise the terminal `Collapsed` verdict would re-halt before a single
+    /// share was measured) but the halt's LADDER does not — only a user Start or a
+    /// measured recovery may reset that.
+    Probe,
+}
+
+impl RunKind {
+    /// Whether the "lane is already running" guard applies. Only a fresh start can
+    /// collide with a live child; the other two are relaunches we ourselves sequenced
+    /// after a teardown.
+    fn guards_already_running(self) -> bool {
+        matches!(self, RunKind::Fresh)
+    }
+    /// Whether this run starts the user's session counters (and the best-hashrate
+    /// mark) from zero.
+    fn resets_counters(self) -> bool {
+        matches!(self, RunKind::Fresh | RunKind::Probe)
+    }
+}
 
 /// Structured arguments for a machine-keyed lane status ([`LaneStats::message_key`]
 /// / [`crate::engine::Snapshot::message_key`]). Carried ALONGSIDE the human
@@ -373,6 +497,11 @@ struct Inner {
     best_hashrate_hs: f64,
     /// The accepted count at the last progress mark (a rise counts as progress).
     progress_accepted: u64,
+    /// The SUBMITTED count (accepted + rejected) at the last progress mark. A rise in
+    /// either counter is Layer-B progress, because both require a reply from the pool
+    /// — see [`note_submission_progress`] for why counting only ACCEPTS made Layer B
+    /// fight the acceptance guard.
+    progress_submissions: u64,
     /// Number of Layer-B endpoint advances this run.
     failovers: u64,
     /// The no-progress window before the watchdog rotates endpoints. Defaults to
@@ -417,7 +546,34 @@ struct Inner {
     /// suppresses failover, the crash ladder and the stall ladder, because all three
     /// would do exactly what the 2026-08-11 incident did — burn three days of power
     /// re-connecting to a pool that rejects every share.
+    ///
+    /// It is NOT terminal, and it is NOT confined to this process. See
+    /// [`Self::halt_probes`] / [`Self::halt_record`].
     halted: bool,
+    /// How many bounded automatic RE-PROBES have been launched since the last clean
+    /// start. The rung of [`acceptance::reprobe_delay`]. Reset ONLY by a user Start or
+    /// by a measured recovery (a completed healthy period) — never by a restart, and
+    /// never by the clock.
+    halt_probes: u32,
+    /// The persisted halt (evidence + ladder position) mirrored in memory, so the
+    /// countdown status can be re-published every second without touching the disk.
+    /// `Some` exactly while [`Self::halted`].
+    halt_record: Option<HaltRecord>,
+    /// When the pending automatic re-probe fires. A MONOTONIC deadline: the wall-clock
+    /// arithmetic happens once, in [`HaltRecord::resume`], and is never re-consulted
+    /// while we wait, so a clock step mid-wait cannot stretch or collapse it.
+    halt_probe_at: Option<Instant>,
+    /// Override for the IN-PROCESS re-probe countdown. `None` ⇒ walk the real
+    /// [`acceptance::reprobe_delay`] ladder (production). `Some(d)` ⇒ a fixed, tiny
+    /// delay so a test can watch a halt lift itself without waiting out 30 minutes.
+    /// The PERSISTED deadlines always use the real ladder, so what a test checks on
+    /// disk is what production writes.
+    reprobe_override: Option<Duration>,
+    /// Set when a measured recovery (or a user Start) means the on-disk halt record
+    /// should be deleted. Taken by the log-pump task, which does the unlink AFTER
+    /// releasing the lock (disk I/O off the stats hot-path — same pattern as
+    /// [`Self::pending_good_region`]).
+    pending_halt_clear: bool,
 }
 
 /// Fold a new reading of a CUMULATIVE counter (accepted / rejected shares) coming
@@ -550,6 +706,7 @@ impl LaneSupervisor {
                 last_progress_at: None,
                 best_hashrate_hs: 0.0,
                 progress_accepted: 0,
+                progress_submissions: 0,
                 failovers: 0,
                 no_progress_window: NO_PROGRESS_WINDOW,
                 failover_backoff_override: None,
@@ -563,6 +720,11 @@ impl LaneSupervisor {
                 // lane→format mapping, and alpha-miner reports submissions, not accepts).
                 acceptance: AcceptanceMonitor::new(parser),
                 halted: false,
+                halt_probes: 0,
+                halt_record: None,
+                halt_probe_at: None,
+                reprobe_override: None,
+                pending_halt_clear: false,
             })),
         }
     }
@@ -585,6 +747,21 @@ impl LaneSupervisor {
     /// Whether the lane has been halted by the acceptance guard.
     pub fn is_halted(&self) -> bool {
         self.inner.lock().expect("mutex").halted
+    }
+
+    /// How many bounded automatic re-probes this halt has spent (0 = none yet, or no
+    /// halt at all). The rung of [`acceptance::reprobe_delay`].
+    pub fn halt_probes(&self) -> u32 {
+        self.inner.lock().expect("mutex").halt_probes
+    }
+
+    /// Seconds until the pending automatic acceptance re-probe, when one is armed.
+    /// `None` when the lane is not halted (or the halt's re-probe was cancelled by a
+    /// user Stop).
+    pub fn reprobe_in_s(&self) -> Option<u64> {
+        let g = self.inner.lock().expect("mutex");
+        g.halt_probe_at
+            .map(|t| t.saturating_duration_since(Instant::now()).as_secs())
     }
 
     /// Test/operator hook: shorten the no-progress window + fix the per-failover
@@ -611,6 +788,15 @@ impl LaneSupervisor {
     #[doc(hidden)]
     pub fn set_retry_timing(&self, delay: Duration) {
         self.inner.lock().expect("mutex").retry_backoff_override = Some(delay);
+    }
+
+    /// Test hook: fix the IN-PROCESS acceptance re-probe countdown to `delay` instead
+    /// of the real 30 min → 6 h ladder, so the self-recovery path can be watched in
+    /// milliseconds. The ladder POSITION and every persisted deadline still use the
+    /// production values, so what a test asserts on disk is what ships.
+    #[doc(hidden)]
+    pub fn set_reprobe_timing(&self, delay: Duration) {
+        self.inner.lock().expect("mutex").reprobe_override = Some(delay);
     }
 
     pub fn lane(&self) -> Lane {
@@ -717,17 +903,20 @@ impl LaneSupervisor {
         args: Vec<String>,
         rebuild: RebuildFn,
     ) -> Result<(), String> {
-        // Reset the failover cursor + budget on a user-initiated start.
-        {
-            let mut g = self.inner.lock().expect("mutex");
-            g.endpoint_plan.reset();
-            g.restart_policy.reset();
-            g.retry_ladder.reset();
-            g.crashes = 0;
-            g.rebuild = Some(rebuild);
-            g.failovers = 0;
-        }
-        self.spawn_run(program, args, /*is_failover=*/ false)
+        self.start_with_cause(program, args, rebuild, process_start_cause())
+    }
+
+    /// [`Self::start`] with an EXPLICIT [`StartCause`] instead of the process default.
+    /// A `User` start clears any persisted acceptance halt; an `Automatic` one honors
+    /// it (see [`Self::adopt_persisted_halt`]).
+    pub fn start_with_cause(
+        &self,
+        program: std::path::PathBuf,
+        args: Vec<String>,
+        rebuild: RebuildFn,
+        cause: StartCause,
+    ) -> Result<(), String> {
+        self.start_inner(program, args, Some(rebuild), cause)
     }
 
     /// Backwards-compatible start with NO failover rebuild (single-endpoint, the
@@ -739,16 +928,328 @@ impl LaneSupervisor {
         program: std::path::PathBuf,
         args: Vec<String>,
     ) -> Result<(), String> {
+        self.start_inner(program, args, None, process_start_cause())
+    }
+
+    /// [`Self::start_simple`] with an EXPLICIT [`StartCause`].
+    pub fn start_simple_with_cause(
+        &self,
+        program: std::path::PathBuf,
+        args: Vec<String>,
+        cause: StartCause,
+    ) -> Result<(), String> {
+        self.start_inner(program, args, None, cause)
+    }
+
+    /// The one start path. Resets the per-run failover budget, then either clears the
+    /// persisted acceptance halt (a person acted) or honors it (nobody did).
+    fn start_inner(
+        &self,
+        program: std::path::PathBuf,
+        args: Vec<String>,
+        rebuild: Option<RebuildFn>,
+        cause: StartCause,
+    ) -> Result<(), String> {
+        // Reset the failover cursor + budget on a user-initiated start.
         {
             let mut g = self.inner.lock().expect("mutex");
             g.endpoint_plan.reset();
             g.restart_policy.reset();
             g.retry_ladder.reset();
             g.crashes = 0;
-            g.rebuild = None;
+            g.rebuild = rebuild;
             g.failovers = 0;
         }
-        self.spawn_run(program, args, false)
+        match cause {
+            // The user has dealt with it (or has decided to pay for the power anyway).
+            // Either way it is his rig: everything goes, including the ladder.
+            StartCause::User => self.clear_halt_state(),
+            // Nobody acted — a service manager relaunched us. Honor the halt.
+            StartCause::Automatic => match self.adopt_persisted_halt(&program, &args) {
+                // Still cooling down: the engine is NOT spawned. The lane publishes the
+                // halt with a live countdown and the armed re-probe brings it back.
+                HaltGate::Waiting => return Ok(()),
+                // The cooldown elapsed while we were off — spend one window.
+                HaltGate::ProbeNow => return self.launch_reprobe_now(program, args),
+                HaltGate::None => {}
+            },
+        }
+        self.spawn_run(program, args, RunKind::Fresh)
+    }
+
+    /// Forget the acceptance halt entirely — in memory AND on disk. A user Start is
+    /// the only caller: it is the one action that means "I know, I've dealt with it".
+    fn clear_halt_state(&self) {
+        {
+            let mut g = self.inner.lock().expect("mutex");
+            g.halted = false;
+            g.halt_probes = 0;
+            g.halt_record = None;
+            g.halt_probe_at = None;
+            g.pending_halt_clear = false;
+            // Any pending re-probe countdown is bound to the retry token; bumping it
+            // makes that task a no-op the moment it next looks.
+            g.retry_token = g.retry_token.wrapping_add(1);
+        }
+        acceptance::clear_halt_record(self.lane);
+    }
+
+    /// Read this lane's persisted halt and decide what an AUTOMATIC start may do.
+    ///
+    /// When the cooldown has not elapsed the lane adopts the halt without spawning
+    /// anything: it republishes the original evidence (so the user is told why his rig
+    /// is idle, in his numbers, months after the fact if need be), remembers the
+    /// launch plan so the re-probe can use it, and arms the countdown. Nothing about
+    /// this path burns power.
+    fn adopt_persisted_halt(&self, program: &std::path::Path, args: &[String]) -> HaltGate {
+        let Some(rec) = acceptance::load_halt_record(self.lane) else {
+            return HaltGate::None;
+        };
+        let resume = rec.resume(acceptance::now_unix());
+        let wait = match resume {
+            HaltResume::ProbeNow => {
+                // Adopt the ladder position before the caller launches the probe, so
+                // the rung the record earned is the rung we spend next.
+                let mut g = self.inner.lock().expect("mutex");
+                g.halted = true;
+                g.halt_probes = rec.probes;
+                g.halt_record = Some(rec);
+                return HaltGate::ProbeNow;
+            }
+            HaltResume::Wait(d) => d,
+        };
+
+        let (gen, token) = {
+            let mut g = self.inner.lock().expect("mutex");
+            g.halted = true;
+            g.halt_probes = rec.probes;
+            g.halt_probe_at = Some(Instant::now() + wait);
+            // The re-probe relaunches from these, exactly like an automatic retry does.
+            g.last_launch = Some((program.to_path_buf(), args.to_vec()));
+            // No child, but a generation the countdown task can bind to (and which a
+            // later user Start supersedes).
+            g.generation += 1;
+            g.retry_token = g.retry_token.wrapping_add(1);
+            g.retry_at = None;
+            g.stop_requested = false;
+            g.forced_error = false;
+            g.pid = None;
+            g.started_at = None;
+            // `Error`, not `Stopped`: a lane that is refusing to mine for a reason must
+            // never render as an ordinary idle lane — that silence is the whole bug.
+            g.state = ProcState::Error;
+            let collapse = rec.collapse();
+            let attribution = rec.attribution();
+            g.halt_record = Some(rec);
+            set_halt_status_locked(&mut g, &collapse, attribution, Some(wait));
+            (g.generation, g.retry_token)
+        };
+        self.spawn_halt_probe_task(gen, token, wait);
+        HaltGate::Waiting
+    }
+
+    /// Spend one window right now: the persisted cooldown is already over (the machine
+    /// was off longer than the rung, or the clock says so). Charges the ladder BEFORE
+    /// launching, so a machine that dies mid-probe resumes on the next rung instead of
+    /// probing again the moment it boots.
+    fn launch_reprobe_now(
+        &self,
+        program: std::path::PathBuf,
+        args: Vec<String>,
+    ) -> Result<(), String> {
+        let rec = self.charge_reprobe();
+        self.spawn_run(program, args, RunKind::Probe)?;
+        if let Some(rec) = rec {
+            self.publish_reprobe_status(&rec);
+        }
+        Ok(())
+    }
+
+    /// Advance the ladder by one rung and persist it. Returns the updated record.
+    fn charge_reprobe(&self) -> Option<HaltRecord> {
+        let rec = {
+            let mut g = self.inner.lock().expect("mutex");
+            g.halt_probes = g.halt_probes.saturating_add(1);
+            let probes = g.halt_probes;
+            if let Some(rec) = g.halt_record.as_mut() {
+                rec.probes = probes;
+                rec.next_probe_at = acceptance::now_unix()
+                    .saturating_add(acceptance::reprobe_delay(probes).as_secs());
+            }
+            g.halt_probe_at = None;
+            g.halted = false; // the gates must let this one child through
+            g.halt_record.clone()
+        };
+        if let Some(rec) = &rec {
+            if let Err(e) = acceptance::save_halt_record(rec) {
+                // A rig with an unwritable home still gets the in-memory ladder; it
+                // only loses the across-reboot half, which is worth one window, not a
+                // refusal to mine.
+                log_verbose("halt record not persisted", &e);
+            }
+        }
+        rec
+    }
+
+    /// Say, in the status line, that this run is a deliberate re-check rather than
+    /// ordinary mining — so a user watching a rig that "stopped" and then started
+    /// again is not left guessing which of the two the client believes.
+    fn publish_reprobe_status(&self, rec: &HaltRecord) {
+        let mut g = self.inner.lock().expect("mutex");
+        let probes = rec.probes;
+        let endpoint = g.endpoint_plan.current().host_port();
+        let region = short_region_label(g.endpoint_plan.current());
+        g.set_status(
+            reprobe_status_text(probes),
+            "acceptance_reprobe",
+            StatusArgs {
+                endpoint: Some(endpoint),
+                region: Some(region),
+                attempt: Some(probes),
+                shares_accepted: Some(rec.run_accepted),
+                shares_rejected: Some(rec.run_rejected),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Write the current halt record to disk (best-effort). Called off-lock, so an
+    /// unwritable home never stalls the stats path or the teardown.
+    fn persist_halt(&self) {
+        let rec = self.inner.lock().expect("mutex").halt_record.clone();
+        if let Some(rec) = rec {
+            if let Err(e) = acceptance::save_halt_record(&rec) {
+                log_verbose("halt record not persisted", &e);
+            }
+        }
+    }
+
+    /// Wait out a halt cooldown (monotonic, with a live countdown), then re-probe.
+    fn spawn_halt_probe_task(&self, gen: u64, token: u64, delay: Duration) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.probe_after(gen, token, delay).await;
+        });
+    }
+
+    /// The countdown half of the re-probe. Bound to `(gen, token)` like every other
+    /// automatic path, so a user Start or Stop cancels it the moment it next looks.
+    async fn probe_after(&self, gen: u64, token: u64, delay: Duration) {
+        let deadline = Instant::now() + delay;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            {
+                let mut g = self.inner.lock().expect("mutex");
+                if g.generation != gen || g.retry_token != token || !g.halted {
+                    return; // superseded by a user Start / Stop, or already cleared
+                }
+                if g.halt_probe_at.is_none() {
+                    return; // a user Stop cancelled the re-probe but kept the halt
+                }
+                g.halt_probe_at = Some(deadline);
+                if let Some(rec) = g.halt_record.clone() {
+                    let collapse = rec.collapse();
+                    let attribution = rec.attribution();
+                    set_halt_status_locked(&mut g, &collapse, attribution, Some(remaining));
+                }
+            }
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+        }
+        self.run_reprobe(gen, token).await;
+    }
+
+    /// Launch the re-probe the countdown was waiting for: one window of electricity
+    /// spent asking whether the pool has started accepting again.
+    async fn run_reprobe(&self, gen: u64, token: u64) {
+        // Confirm we still own this halt, and grab the launch plan the same way an
+        // automatic retry does (a rebuild when we have one — a GPU-PRL argv carries a
+        // region-bound PoP token that must be re-minted after a long wait).
+        let (plan, unconfirmed) = {
+            let g = self.inner.lock().expect("mutex");
+            if g.generation != gen || g.retry_token != token || !g.halted {
+                return;
+            }
+            let plan = match g.rebuild.clone() {
+                Some(rebuild) => Ok((rebuild, g.endpoint_plan.ordered_from_cursor())),
+                None => Err(g.last_launch.clone()),
+            };
+            // A pid still recorded means the halt's teardown returned BOUNDED with the
+            // engine not yet reaped (a wedged child that outlasted SIGTERM+grace).
+            (plan, g.pid)
+        };
+        // Never put a second engine on the same GPU — the same contract the crash
+        // ladder honors. A halt teardown is bounded, so this is not impossible; and
+        // deferring costs one more rung, which is far cheaper than two engines.
+        if let Some(pid) = unconfirmed {
+            if !await_child_gone(pid).await {
+                log_verbose("halt re-probe deferred", &format!("engine pid {pid} still alive"));
+                self.charge_reprobe();
+                self.rearm_halt_probe(Some(gen));
+                return;
+            }
+        }
+        // Charge the ladder BEFORE the launch: if the rebuild hangs, the box reboots
+        // mid-probe, or the engine dies immediately, the next start must find the NEXT
+        // rung on disk rather than a deadline that has already passed.
+        let rec = self.charge_reprobe();
+        let launch = match plan {
+            Ok((rebuild, order)) => match rebuild(&order) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    log_verbose("halt re-probe rebuild failed", &e);
+                    None
+                }
+            },
+            Err(last) => last,
+        };
+        let Some((program, args)) = launch else {
+            // The rebuild failed: no child was spawned, so the generation still ours.
+            self.rearm_halt_probe(Some(gen));
+            return;
+        };
+        if let Err(e) = self.spawn_run(program, args, RunKind::Probe) {
+            log_verbose("halt re-probe spawn failed", &e);
+            // `spawn_run` bumped the generation on its way out, so bind to the CURRENT
+            // one — exactly as `schedule_retry(None, …)` does after the same failure.
+            self.rearm_halt_probe(None);
+            return;
+        }
+        if let Some(rec) = &rec {
+            self.publish_reprobe_status(rec);
+        }
+    }
+
+    /// A re-probe that could not even be launched must not silently end the halt: put
+    /// the lane back into its halted, waiting state on the rung already charged.
+    ///
+    /// `gen` is the generation the caller believes it owns; `None` binds to whatever
+    /// the current one is (used after `spawn_run` itself failed and already bumped it).
+    fn rearm_halt_probe(&self, gen: Option<u64>) {
+        let armed = {
+            let mut g = self.inner.lock().expect("mutex");
+            match gen {
+                Some(want) if want != g.generation => return, // superseded
+                _ => {}
+            }
+            if g.state.is_active() {
+                return; // a user Start raced in and won; it owns the lane now
+            }
+            g.halted = true;
+            g.state = ProcState::Error;
+            let wait = reprobe_wait(&g);
+            g.halt_probe_at = Some(Instant::now() + wait);
+            g.retry_token = g.retry_token.wrapping_add(1);
+            if let Some(rec) = g.halt_record.clone() {
+                let collapse = rec.collapse();
+                let attribution = rec.attribution();
+                set_halt_status_locked(&mut g, &collapse, attribution, Some(wait));
+            }
+            (g.generation, g.retry_token, wait)
+        };
+        self.spawn_halt_probe_task(armed.0, armed.1, armed.2);
     }
 
     /// Spawn (or re-spawn, on failover) the child with the given launch plan and
@@ -759,11 +1260,11 @@ impl LaneSupervisor {
         &self,
         program: std::path::PathBuf,
         args: Vec<String>,
-        is_failover: bool,
+        kind: RunKind,
     ) -> Result<(), String> {
         let gen = {
             let mut g = self.inner.lock().expect("mutex");
-            if !is_failover
+            if kind.guards_already_running()
                 && matches!(
                     g.state,
                     ProcState::Running | ProcState::Starting | ProcState::Stopping
@@ -791,20 +1292,29 @@ impl LaneSupervisor {
             g.telem_power_w = None;
             g.telem_util_pct = None;
             g.telem_fan_pct = None;
-            // On a fresh start, zero the share counters; on a failover relaunch,
-            // KEEP the cumulative accepted/rejected (the user's session totals
-            // shouldn't reset just because we rotated endpoints) but re-arm the
+            // On a fresh start (or a halt RE-PROBE, which is a deliberate fresh
+            // measurement), zero the share counters; on a failover / automatic-restart
+            // relaunch, KEEP the cumulative accepted/rejected (the user's session
+            // totals shouldn't reset just because we rotated endpoints) but re-arm the
             // progress mark so the new child gets a full window to make progress.
-            if !is_failover {
+            if kind.resets_counters() {
                 g.accepted = 0;
                 g.rejected = 0;
                 g.best_hashrate_hs = 0.0;
                 // A fresh start is the user's explicit act (possibly after updating),
                 // so it also clears an acceptance halt and every judgement behind it —
                 // the share counters just went to zero, so keeping the old verdict
-                // would be judging this run on the last one's evidence.
+                // would be judging this run on the last one's evidence. A re-probe
+                // clears the same judgement for the same reason; what it deliberately
+                // does NOT clear is `halt_probes` / the persisted record, so a second
+                // collapse escalates the ladder instead of restarting it.
                 g.acceptance.on_run_start(Instant::now());
                 g.halted = false;
+                if kind == RunKind::Fresh {
+                    g.halt_probes = 0;
+                    g.halt_record = None;
+                    g.halt_probe_at = None;
+                }
             } else {
                 // A failover deliberately carries the evidence over — see
                 // `AcceptanceMonitor::on_failover` for why resetting here would
@@ -816,6 +1326,7 @@ impl LaneSupervisor {
             g.generic_accepted_pending = None;
             g.generic_rejected_pending = None;
             g.progress_accepted = g.accepted;
+            g.progress_submissions = g.accepted.saturating_add(g.rejected);
             g.last_line.clear();
             g.last_exit_code = None;
             g.started_at = Some(std::time::Instant::now());
@@ -880,23 +1391,32 @@ impl LaneSupervisor {
         // per-lane: a custom miner picks the parser its preset implies).
         let inner_for_logs = self.inner.clone();
         let parser = self.parser;
+        let lane_for_logs = self.lane;
         tokio::spawn(async move {
             while let Some(line) = log_rx.recv().await {
                 // Parse under the lock, then persist any new last-good region AFTER
                 // releasing it (disk I/O off the stats hot-path).
-                let persist_region = {
+                let (persist_region, clear_halt) = {
                     let mut g = inner_for_logs.lock().expect("mutex");
                     if g.generation != gen {
                         break; // superseded by a newer run
                     }
                     apply_log_line(&mut g, parser, &line.text);
-                    g.pending_good_region.take()
+                    let clear = g.pending_halt_clear;
+                    g.pending_halt_clear = false;
+                    (g.pending_good_region.take(), clear)
                 };
                 if let Some(tag) = persist_region {
                     // Best-effort: remember the region that just landed an accepted
                     // share so the NEXT (unlocked) start resumes on it. Ignore errors
                     // (a read-only home is not worth failing a mining run over).
                     let _ = crate::settings::save_last_good_region(&tag);
+                }
+                if clear_halt {
+                    // The lane MEASURED a healthy period — the pool is accepting again.
+                    // That is the only evidence that retires a persisted halt (and its
+                    // ladder); everything else is a guess.
+                    acceptance::clear_halt_record(lane_for_logs);
                 }
             }
         });
@@ -973,6 +1493,16 @@ impl LaneSupervisor {
                             } else {
                                 ProcState::Stopped
                             };
+                        } else if g.halted {
+                            // The engine died on its own while the lane was halted (a
+                            // race: it exited between the collapse verdict and our stop
+                            // request). Land in `Error` and keep the halt's explanation
+                            // — arming the crash ladder here would restart straight back
+                            // into a pool that accepts nothing, which is the loop this
+                            // whole layer exists to break. The bounded re-probe, already
+                            // armed, is the ONLY thing that may bring the lane back.
+                            g.state = ProcState::Error;
+                            g.crashes += 1;
                         } else {
                             // ── BUG#4 ──────────────────────────────────────────────
                             // The engine died on its own. This used to be a TERMINAL
@@ -1117,11 +1647,30 @@ impl LaneSupervisor {
                     g.stop_requested = true; // let supervise_until_exit reap the child
                     g.forced_error = true; // land in Error, keep the explanation
                     g.state = ProcState::Stopping; // transitional; loop → Error
+                    // The bounded re-probe: the halt lifts itself after this long, so a
+                    // ten-minute upstream wobble costs the fleet one cooldown plus one
+                    // window, not "every rig needs a human". The rung is `halt_probes`,
+                    // which a restart carries over and only a user Start (or a measured
+                    // recovery) resets.
+                    let wait = reprobe_wait(&g);
+                    g.halt_probe_at = Some(Instant::now() + wait);
+                    let record = HaltRecord::new(
+                        self.lane,
+                        &collapse,
+                        Attribution::Unknown,
+                        g.halt_probes,
+                        acceptance::now_unix(),
+                    );
+                    g.halt_record = Some(record);
                     // Publish an immediate, attribution-free status so the lane is
                     // never a silent stop while we go ask the network whose fault it
                     // is. The wording is upgraded once that answer lands (or doesn't).
-                    set_halt_status_locked(&mut g, &collapse, Attribution::Unknown);
-                    WatchAction::Halt { collapse }
+                    set_halt_status_locked(&mut g, &collapse, Attribution::Unknown, Some(wait));
+                    WatchAction::Halt {
+                        collapse,
+                        token: g.retry_token,
+                        wait,
+                    }
                 } else {
                     let window = g.no_progress_window;
                     let stalled = g
@@ -1189,12 +1738,20 @@ impl LaneSupervisor {
             };
 
             match action {
-                WatchAction::Halt { collapse } => {
+                WatchAction::Halt { collapse, token, wait } => {
                     // Stop the engine first — every second we spend deciding whose
                     // fault it is costs the user electricity for shares nobody will
                     // accept. The status was already published under the decision lock,
                     // so the lane is explained before it is even torn down.
                     self.teardown_current_child(gen).await;
+                    // Persist the halt + its evidence BEFORE the network round-trip, so
+                    // a power cut in the next ten seconds cannot lose it. Whatever
+                    // happens next only ever REFINES this record's wording.
+                    self.persist_halt();
+                    // The countdown that lifts the halt by itself. Armed before the
+                    // attribution lookup for the same reason: nothing about the lane's
+                    // recovery may depend on a network call succeeding.
+                    self.spawn_halt_probe_task(gen, token, wait);
                     // Only NOW do we ask the network whose problem this is. It changes
                     // the WORDING, never the halt: a slow, broken or hostile answer
                     // (or none at all) leaves the honest "we can't tell you yet" text
@@ -1205,9 +1762,28 @@ impl LaneSupervisor {
                     let attribution = tokio::task::spawn_blocking(move || fetch_attribution(lane))
                         .await
                         .unwrap_or(Attribution::Unknown);
-                    let mut g = self.inner.lock().expect("mutex");
-                    if g.generation == gen && g.halted {
-                        set_halt_status_locked(&mut g, &collapse, attribution);
+                    let refined = {
+                        let mut g = self.inner.lock().expect("mutex");
+                        if g.generation != gen || !g.halted {
+                            return;
+                        }
+                        let remaining = g
+                            .halt_probe_at
+                            .map(|t| t.saturating_duration_since(Instant::now()));
+                        set_halt_status_locked(&mut g, &collapse, attribution, remaining);
+                        match g.halt_record.as_mut() {
+                            Some(rec) if rec.attribution() != attribution => {
+                                rec.attribution = attribution.key().to_string();
+                                Some(rec.clone())
+                            }
+                            _ => None,
+                        }
+                    };
+                    // Only rewrite the file if the answer actually changed the story.
+                    if let Some(rec) = refined {
+                        if let Err(e) = acceptance::save_halt_record(&rec) {
+                            log_verbose("halt record not persisted", &e);
+                        }
                     }
                     return;
                 }
@@ -1295,7 +1871,7 @@ impl LaneSupervisor {
                         };
 
                         match rebuild(&order) {
-                            Ok((program, args)) => match self.spawn_run(program, args, true) {
+                            Ok((program, args)) => match self.spawn_run(program, args, RunKind::Failover) {
                                 Ok(()) => {
                                     // `spawn_run` cleared `message` + bumped the generation
                                     // (the NEW child's watchdog now owns the lane). Restore
@@ -1477,6 +2053,12 @@ impl LaneSupervisor {
     /// later by a timer nobody could see.
     pub fn request_stop(&self) {
         let mut g = self.inner.lock().expect("mutex");
+        // A Stop also cancels a pending acceptance RE-PROBE. The halt itself stays
+        // (in memory and on disk — the pool has not been shown to be fixed), but the
+        // client must not resurrect the engine hours after the user said stop: an
+        // automatic relaunch nobody asked for is exactly what makes a timer nobody can
+        // see feel like a betrayal.
+        let had_probe = g.halt_probe_at.take().is_some();
         if matches!(g.state, ProcState::Running | ProcState::Starting) {
             g.stop_requested = true;
             g.state = ProcState::Stopping;
@@ -1490,6 +2072,18 @@ impl LaneSupervisor {
             g.forced_error = false;
             g.state = ProcState::Stopped;
             g.set_freeform(None);
+        } else if had_probe {
+            // A halted lane waiting to re-probe: keep the halt and its explanation
+            // (clearing it would erase the reason the rig is idle) and only take the
+            // countdown away.
+            g.retry_token = g.retry_token.wrapping_add(1);
+            g.stop_requested = true;
+            let record = g.halt_record.clone();
+            if let Some(rec) = record {
+                let collapse = rec.collapse();
+                let attribution = rec.attribution();
+                set_halt_status_locked(&mut g, &collapse, attribution, None);
+            }
         }
     }
 
@@ -1645,7 +2239,7 @@ impl LaneSupervisor {
         // `is_failover = true`: keep the user's cumulative session shares across an
         // automatic restart (the rig kept mining; only the engine process is new) and
         // skip the "already running" guard — we know it is not.
-        if let Err(e) = self.spawn_run(program, args, true) {
+        if let Err(e) = self.spawn_run(program, args, RunKind::Failover) {
             log_verbose("retry spawn failed", &e);
             // `spawn_run` bumped the generation on its way out, so bind to the current
             // one and arm the next rung. Still never terminal.
@@ -1736,12 +2330,22 @@ async fn await_child_gone(pid: u32) -> bool {
 /// language) and the [`StatusArgs`] carrying the raw numbers — the localizable
 /// pieces, never a pre-baked foreign-language sentence. The full paragraph the user
 /// reads lives in [`status_tooltip`] / [`acceptance::halt_explanation`].
-fn set_halt_status_locked(g: &mut Inner, c: &Collapse, attribution: Attribution) {
+/// `reprobe_in` is how long until the bounded automatic re-check, when one is armed —
+/// carried in the existing `retry_in_s` arg so both front-ends render the countdown
+/// with no new field, and `None` when a user Stop cancelled it (the halt then really
+/// is waiting for a person).
+fn set_halt_status_locked(
+    g: &mut Inner,
+    c: &Collapse,
+    attribution: Attribution,
+    reprobe_in: Option<Duration>,
+) {
     let key = match attribution {
         Attribution::NetworkWide => "acceptance_halt_network",
         Attribution::LocalOnly => "acceptance_halt_local",
         Attribution::Unknown => "acceptance_halt_unknown",
     };
+    let probes = g.halt_probes;
     g.set_status(
         acceptance::halt_status_line(c),
         key,
@@ -1751,9 +2355,58 @@ fn set_halt_status_locked(g: &mut Inner, c: &Collapse, attribution: Attribution)
             shares_accepted: Some(c.run_accepted),
             shares_rejected: Some(c.run_rejected),
             accept_pct: Some(c.period.accept_pct()),
+            retry_in_s: reprobe_in.map(|d| d.as_secs()),
+            attempt: (probes > 0).then_some(probes),
             ..Default::default()
         },
     );
+}
+
+/// How long until this lane's next automatic re-probe: the production ladder rung for
+/// the re-probes already spent, unless a test compressed it.
+fn reprobe_wait(g: &Inner) -> Duration {
+    g.reprobe_override
+        .unwrap_or_else(|| acceptance::reprobe_delay(g.halt_probes))
+}
+
+/// What an AUTOMATIC start found on disk (see [`LaneSupervisor::adopt_persisted_halt`]).
+enum HaltGate {
+    /// No persisted halt (or one this build cannot read) — start normally.
+    None,
+    /// A halt whose cooldown has NOT elapsed. The engine is not spawned; the lane
+    /// waits, visibly, and the armed re-probe brings it back.
+    Waiting,
+    /// A halt whose cooldown already elapsed while the machine was off — spend one
+    /// window now rather than sit out a wait that is over.
+    ProbeNow,
+}
+
+/// The status line for a run that is a deliberate re-check of a halted lane.
+fn reprobe_status_text(attempt: u32) -> String {
+    crate::tr!(
+        format!("Re-checking whether the pool accepts shares again (attempt {attempt})"),
+        format!("正在重新检查矿池是否恢复接受份额(第 {attempt} 次)")
+    )
+}
+
+/// A wait rendered for a human: seconds, minutes, or hours-and-minutes. Distinct from
+/// [`human_delay`] (which tops out at the 30-minute retry ladder and would render a
+/// six-hour halt cooldown as "360m").
+fn human_wait(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        return crate::tr!(format!("{s}s"), format!("{s} 秒"));
+    }
+    let m = s / 60;
+    if m < 60 {
+        return crate::tr!(format!("{m}m"), format!("{m} 分钟"));
+    }
+    let (h, rm) = (m / 60, m % 60);
+    if rm == 0 {
+        crate::tr!(format!("{h}h"), format!("{h} 小时"))
+    } else {
+        crate::tr!(format!("{h}h {rm}m"), format!("{h} 小时 {rm} 分钟"))
+    }
 }
 
 /// Ask the public read-API what the WHOLE NETWORK's acceptance rate is for `lane`,
@@ -1833,7 +2486,14 @@ enum WatchAction {
     /// and stay stopped. Outranks every other action; see the watchdog's PRIORITY 1
     /// comment for why failing over or restarting into a rejection storm is strictly
     /// worse than doing nothing.
-    Halt { collapse: Collapse },
+    Halt {
+        collapse: Collapse,
+        /// The retry token the halt claimed, so the re-probe countdown binds to it and
+        /// a user Start / Stop cancels it exactly like any other automatic relaunch.
+        token: u64,
+        /// How long until the bounded automatic re-probe.
+        wait: Duration,
+    },
     /// The fast failover budget is spent. The child is torn down and the lane hands
     /// over to the escalating retry ladder — it does NOT stop for good (BUG#4). The
     /// retry is ARMED under the decision lock (so `Error` and "retrying in N" become
@@ -2298,7 +2958,7 @@ pub fn status_short(key: &str, args: &StatusArgs) -> String {
             let accepted = args.shares_accepted.unwrap_or(0);
             let rejected = args.shares_rejected.unwrap_or(0);
             let submitted = accepted.saturating_add(rejected);
-            if accepted == 0 && submitted > 0 {
+            let mut s = if accepted == 0 && submitted > 0 {
                 crate::tr!(
                     format!("Stopped · {submitted} shares submitted, 0 accepted"),
                     format!("已停止 · 已提交 {submitted} 份额,0 个被接受")
@@ -2309,7 +2969,25 @@ pub fn status_short(key: &str, args: &StatusArgs) -> String {
                     format!("Stopped · only {pct:.0}% of shares accepted"),
                     format!("已停止 · 仅 {pct:.0}% 的份额被接受")
                 )
+            };
+            // F5: the halt lifts itself. Saying so on the ONE line the user actually
+            // reads is what stops a fleet-wide halt from feeling like a dead rig.
+            if let Some(secs) = args.retry_in_s {
+                let when = human_wait(Duration::from_secs(secs));
+                s.push_str(&crate::tr!(
+                    format!(" · rechecking in {when}"),
+                    format!(" · {when}后重新检查")
+                ));
             }
+            s
+        }
+        // A run that IS the re-check.
+        "acceptance_reprobe" => {
+            let n = args.attempt.unwrap_or(1);
+            crate::tr!(
+                format!("Rechecking the pool · attempt {n}"),
+                format!("正在重新检查矿池 · 第 {n} 次")
+            )
         }
         "budget_exhausted" => crate::tr!(
             "No progress · stopped to avoid a restart storm".to_string(),
@@ -2401,7 +3079,43 @@ pub fn status_tooltip(key: &str, args: &StatusArgs) -> Option<String> {
                 run_rejected: rejected,
                 shutout: accepted == 0,
             };
-            Some(acceptance::halt_explanation(&collapse, attribution))
+            let mut s = acceptance::halt_explanation(&collapse, attribution);
+            // F5: the halt is not a dead end and the user must not have to know that
+            // from a changelog. Either it re-checks by itself (say when), or a Stop
+            // cancelled that (say the rig is waiting for him) — never silence.
+            s.push('\n');
+            s.push_str(&match args.retry_in_s {
+                Some(secs) => {
+                    let when = human_wait(Duration::from_secs(secs));
+                    crate::tr!(
+                        format!(
+                            "You do not have to do anything: the miner rechecks the pool by itself in {when}, and each recheck costs one short measuring run. Press Start to try again immediately."
+                        ),
+                        format!(
+                            "你不需要做任何事:矿工会在 {when}后自动重新检查矿池,每次重新检查只花一小段测量时间。如果想立刻重试,请点击启动。"
+                        )
+                    )
+                }
+                None => crate::tr!(
+                    "The automatic recheck was cancelled by Stop, so this lane stays stopped until you press Start.".to_string(),
+                    "自动重新检查已被“停止”取消,该通道会保持停止,直到你点击启动。".to_string()
+                ),
+            });
+            Some(s)
+        }
+        "acceptance_reprobe" => {
+            let n = args.attempt.unwrap_or(1);
+            let accepted = args.shares_accepted.unwrap_or(0);
+            let rejected = args.shares_rejected.unwrap_or(0);
+            let submitted = accepted.saturating_add(rejected);
+            Some(crate::tr!(
+                format!(
+                    "Mining was stopped earlier because only {accepted} of {submitted} submitted shares were accepted. This is automatic recheck {n}: the miner runs one short measuring window to see whether the pool accepts shares again, and stops again by itself if it does not."
+                ),
+                format!(
+                    "之前因为提交的 {submitted} 个份额中只有 {accepted} 个被接受而停止挖矿。这是第 {n} 次自动重新检查:矿工会运行一小段测量时间,看矿池是否恢复接受份额;如果仍然不接受,会再次自动停止。"
+                )
+            ))
         }
         // ── BUG#4: the full story behind a pending automatic restart ────────────
         "engine_crashed_retrying" => {
@@ -2659,7 +3373,20 @@ fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
     // (a few integer compares; at most one division per completed period) — it runs
     // under the same lock as the stats hot path.
     let (a, r) = (g.accepted, g.rejected);
-    g.acceptance.observe(Instant::now(), a, r);
+    let verdict = g.acceptance.observe(Instant::now(), a, r);
+    // Layer B's progress mark, taken here rather than inside each parser arm: a
+    // SUBMISSION (accepted or rejected) is the liveness fact, and it is only knowable
+    // once both counters have been folded. See `note_submission_progress`.
+    note_submission_progress(g);
+    // F5: a MEASURED healthy period is the only thing that retires a halt and its
+    // re-probe ladder. Nothing else — not an uptime, not a reconnect, not a restart —
+    // is evidence that the pool started accepting again.
+    if g.halt_probes > 0 && matches!(verdict, LaneVerdict::Healthy(_)) {
+        g.halt_probes = 0;
+        g.halt_record = None;
+        g.halt_probe_at = None;
+        g.pending_halt_clear = true;
+    }
     g.last_line = line;
 }
 
@@ -2919,13 +3646,40 @@ fn note_hashrate_progress(g: &mut Inner, hr: f64) {
     }
 }
 
-/// A rise in accepted shares counts as progress (the strongest signal — the lane
-/// is doing real, credited work). A rise ALSO marks the CURRENT endpoint's region as
-/// "last-good": if the active host maps to a region tag (us/asia) that differs
-/// from the one already persisted this run, stage it in `pending_good_region` for the
-/// log-pump task to write to `settings.last_good_region` off-lock. Lane-agnostic —
-/// keyed purely by the endpoint host, so the XMR/RVN relay (`hk.aliceprotocol.org`,
-/// not a region relay) never records anything.
+/// A rise in SUBMITTED shares (accepted **or** rejected) counts as Layer-B progress.
+///
+/// Layer B asks one question — "is this lane still moving?" — and until the
+/// acceptance layer existed it had to answer it from accepted shares alone, because
+/// nothing else was watching rejections. That made it answer a question it could not
+/// see: during the 2026-08-11 rejection storm the lane was submitting constantly,
+/// Layer B saw no ACCEPTS, called it a stall, and rotated regions 69 times — every
+/// rotation costing a ~15 s engine re-init and a PoP re-mint, and every region
+/// rejecting the identical share.
+///
+/// Both counters require a reply FROM THE POOL (every parser reads the engine's own
+/// accepted/rejected tallies, which only move when the pool answers a submit), so a
+/// rejected share is real evidence that the lane is alive and talking. A lane that
+/// hashes into the void — connected, submitting, and never answered — moves NEITHER
+/// counter and still trips the watchdog, which is the case this window exists for.
+/// Whether the answers are any GOOD is now [`crate::acceptance`]'s question, and it
+/// is the layer that can actually see it.
+fn note_submission_progress(g: &mut Inner) {
+    let submitted = g.accepted.saturating_add(g.rejected);
+    if submitted > g.progress_submissions {
+        g.progress_submissions = submitted;
+        g.last_progress_at = Some(Instant::now());
+    }
+}
+
+/// A rise in ACCEPTED shares is progress too (the strongest signal — the lane is
+/// doing real, credited work), and it is the only signal allowed to mark the CURRENT
+/// endpoint's region as "last-good": a REJECTED share proves the region answers, not
+/// that mining there earns anything, so it must never nominate a region to resume on.
+/// If the active host maps to a region tag (us/asia) that differs from the one already
+/// persisted this run, stage it in `pending_good_region` for the log-pump task to
+/// write to `settings.last_good_region` off-lock. Lane-agnostic — keyed purely by the
+/// endpoint host, so the XMR/RVN relay (`hk.aliceprotocol.org`, not a region relay)
+/// never records anything.
 fn note_accepted_progress(g: &mut Inner, accepted: u64) {
     if accepted > g.progress_accepted {
         g.progress_accepted = accepted;
@@ -3126,10 +3880,78 @@ mod tests {
 
     /// Push one already-sanitised engine line through the SAME entry point the live
     /// log pump uses (`apply_log_line`, under the same lock), so these tests exercise
-    /// the real path rather than poking the monitor directly.
+    /// the real path rather than poking the monitor directly — including the pump's
+    /// post-lock step (the deferred disk work it stages).
     fn feed(s: &LaneSupervisor, line: &str) {
-        let mut g = s.inner.lock().unwrap();
-        apply_log_line(&mut g, ParserKind::Xmr, line);
+        let clear = {
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Xmr, line);
+            let c = g.pending_halt_clear;
+            g.pending_halt_clear = false;
+            c
+        };
+        if clear {
+            acceptance::clear_halt_record(s.lane);
+        }
+    }
+
+    /// [`spawn_env_guard`] plus a PRIVATE `$ALICE_IDENTITY_DIR`, so a persisted halt
+    /// record written by a test lands in a temp directory and never in the developer's
+    /// real `~/.alice` (and two tests can never read each other's halt).
+    struct TempHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        dir: std::path::PathBuf,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("ALICE_IDENTITY_DIR", v),
+                None => std::env::remove_var("ALICE_IDENTITY_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn temp_home() -> TempHome {
+        let lock = crate::IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "alice-halt-sup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var_os("ALICE_IDENTITY_DIR");
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+        TempHome { _lock: lock, dir, prev }
+    }
+
+    /// Drive a lane into an acceptance halt: past warm-up, then a full window of
+    /// nothing but rejections. Returns once the halt is visible.
+    async fn drive_to_halt(s: &LaneSupervisor) {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        feed(s, "net      rejected (0/0) diff 100 (10 ms)");
+        for i in 1..=25u64 {
+            feed(s, &format!("net      rejected (0/{i}) diff 100 (10 ms)"));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(wait_for(s, 12, |st| st.halted).await, "must halt: {:?}", s.stats());
+    }
+
+    /// Wait (bounded) for the halt record to reach the disk — it is written after the
+    /// child teardown, so `halted` becomes true slightly before the file exists.
+    async fn wait_for_halt_record(lane: Lane) -> acceptance::HaltRecord {
+        for _ in 0..100 {
+            if let Some(rec) = acceptance::load_halt_record(lane) {
+                return rec;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("a halt must reach the disk");
     }
 
     /// Wait (bounded) for `pred` to hold of the lane's stats.
@@ -4459,6 +5281,11 @@ mod tests {
             "all_regions_retrying",
             "relaunch_retrying",
             "engine_still_alive_retrying",
+            // LAYER 3 / F5: the halt, and the run that re-checks it.
+            "acceptance_halt_network",
+            "acceptance_halt_local",
+            "acceptance_halt_unknown",
+            "acceptance_reprobe",
         ];
         crate::i18n::set_lang(crate::i18n::Lang::En);
         for k in keys {
@@ -4960,7 +5787,7 @@ mod tests {
     /// Now it stops, and it says why.
     #[test]
     fn all_shares_rejected_halts_the_lane_and_explains_it() {
-        let _env = spawn_env_guard();
+        let _env = temp_home();
         let _lock = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
         let rt = rt();
@@ -5020,9 +5847,26 @@ mod tests {
             let st = s.stats();
             assert!(st.halted, "the halt must not decay");
             assert!(!st.running, "nothing may restart a halted lane");
-            assert_eq!(st.retry_in_s, None, "no automatic retry may be armed");
+            assert_eq!(st.retry_in_s, None, "no CRASH-ladder retry may be armed");
             assert_eq!(st.crashes, before);
             assert_eq!(s.failovers(), 0, "a halt must never rotate regions");
+            // F5: the ONE thing that will bring it back is the bounded re-probe, and it
+            // is half an hour away — not the seconds-scale crash ladder. It is visible
+            // in the status the user reads, so the rig is never a mystery.
+            let probe = s.reprobe_in_s().expect("a halt must schedule its own re-check");
+            assert!(
+                (1_700..=1_800).contains(&probe),
+                "the first re-probe is the 30-minute rung, got {probe}s"
+            );
+            let args = s.stats().message_args.expect("args");
+            let shown = args.retry_in_s.expect("the countdown must be in the status args");
+            assert!((1_700..=1_800).contains(&shown), "status carries the countdown: {shown}s");
+            let line = status_short(&key, &args);
+            assert!(line.contains("29m") || line.contains("30m"), "countdown on the line: {line}");
+            assert!(
+                status_tooltip(&key, &args).unwrap().contains("rechecks the pool by itself"),
+                "the halt must say it lifts itself"
+            );
 
             s.request_stop();
         });
@@ -5033,7 +5877,7 @@ mod tests {
     /// samples would be a worse bug than the one this layer fixes.
     #[test]
     fn a_trickle_of_rejects_below_the_sample_floor_never_halts() {
-        let _env = spawn_env_guard();
+        let _env = temp_home();
         let rt = rt();
         rt.block_on(async {
             let s = LaneSupervisor::new(Lane::Xmr);
@@ -5068,7 +5912,7 @@ mod tests {
     /// run that is healthy thereafter is never touched.
     #[test]
     fn a_cold_start_reject_burst_never_halts_a_healthy_run() {
-        let _env = spawn_env_guard();
+        let _env = temp_home();
         let rt = rt();
         rt.block_on(async {
             let s = LaneSupervisor::new(Lane::Xmr);
@@ -5118,7 +5962,7 @@ mod tests {
     /// everything is precisely the loop that burned three days.
     #[test]
     fn a_halted_lane_is_never_restarted_by_the_crash_ladder() {
-        let _env = spawn_env_guard();
+        let _env = temp_home();
         let rt = rt();
         rt.block_on(async {
             let s = LaneSupervisor::new(Lane::Xmr);
@@ -5160,7 +6004,7 @@ mod tests {
     /// protects the user; it does not lock him out of his own rig.
     #[test]
     fn a_user_start_clears_the_halt_and_the_verdict() {
-        let _env = spawn_env_guard();
+        let _env = temp_home();
         let rt = rt();
         rt.block_on(async {
             let s = LaneSupervisor::new(Lane::Xmr);
@@ -5247,6 +6091,479 @@ mod tests {
             assert!(!status_is_retrying(key), "a halt must never render as 'retrying'");
         }
         crate::i18n::set_lang(crate::i18n::Lang::En);
+    }
+
+    // ── F5: the halt survives the process, and lifts itself on a bounded ladder ──
+
+    /// A RESTART IS NOT AN ESCAPE HATCH. The original halt lived only in memory, so a
+    /// reboot / service restart / restart-after-update silently cleared it and burned
+    /// another full window — and headless rigs, the ones that burned three days, are
+    /// exactly the population a supervisor restarts most often.
+    ///
+    /// Simulated here the only honest way: one supervisor halts and is dropped (the
+    /// process dies), and a SECOND one — started the way launchd/systemd starts us —
+    /// picks the halt up off the disk and refuses to spawn the engine at all.
+    #[test]
+    fn a_persisted_halt_survives_a_restart_and_spawns_nothing() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let first = LaneSupervisor::new(Lane::Xmr);
+            first.set_acceptance_config(fast_acceptance());
+            let (program, args) = idle_child();
+            first.start_simple(program.clone(), args.clone()).expect("start");
+            assert!(wait_for(&first, 5, |st| st.state == ProcState::Running).await);
+            drive_to_halt(&first).await;
+
+            // The halt reached the disk, WITH the evidence.
+            let rec = wait_for_halt_record(Lane::Xmr).await;
+            assert!(rec.shutout, "the record must carry why: {rec:?}");
+            assert_eq!(rec.run_accepted, 0);
+            assert!(rec.run_rejected >= 20, "and the numbers: {rec:?}");
+            assert!(rec.halted_at > 0, "and when: {rec:?}");
+            assert_eq!(rec.probes, 0, "no re-probe spent yet");
+            assert!(rec.next_probe_at > rec.halted_at, "and when it will re-check itself");
+
+            // The process dies.
+            first.request_stop();
+            drop(first);
+
+            // A service manager brings us back. NOTHING may start mining.
+            let second = LaneSupervisor::new(Lane::Xmr);
+            second
+                .start_simple_with_cause(program, args, StartCause::Automatic)
+                .expect("an automatic start must not error, it must decline to mine");
+            let st = second.stats();
+            assert!(st.halted, "the halt must survive the process: {st:?}");
+            assert!(!st.running, "a restart must NOT resume burning power: {st:?}");
+            assert_eq!(st.state, ProcState::Error, "and must not look like an idle lane");
+            assert_eq!(second.pid(), None, "no engine child may exist");
+            // It explains itself from the record — the numbers from the PREVIOUS process.
+            let key = st.message_key.clone().expect("key");
+            assert!(key.starts_with("acceptance_halt_"), "got {key}");
+            let a = st.message_args.clone().expect("args");
+            assert_eq!(a.shares_accepted, Some(0));
+            assert_eq!(a.shares_rejected, rec.run_rejected.into());
+            // And it is still on the first rung, counting down.
+            assert_eq!(second.halt_probes(), 0);
+            let left = second.reprobe_in_s().expect("the countdown carries over");
+            assert!(left <= 1_800 && left > 1_700, "resumed mid-cooldown, got {left}s");
+
+            second.request_stop();
+        });
+    }
+
+    /// THE HALT LIFTS ITSELF. A ten-minute upstream wobble — including one of our own
+    /// relay deployments — used to stop the entire fleet until a human pressed Start on
+    /// every rig: "78 hours of wasted power" traded for "network hashrate at zero,
+    /// indefinitely". Now the halt re-probes on a bounded ladder, and a re-collapse
+    /// climbs that ladder instead of looping on the first rung.
+    #[test]
+    fn a_halt_reprobes_by_itself_and_a_second_collapse_climbs_the_ladder() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            // The real ladder is 30 min; compress only the WAIT (the persisted rungs
+            // below are still the production ones).
+            s.set_reprobe_timing(Duration::from_millis(300));
+            let (program, args) = idle_child();
+            s.start_simple(program, args).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+            drive_to_halt(&s).await;
+            let first = wait_for_halt_record(Lane::Xmr).await;
+            assert_eq!(first.probes, 0, "the halt starts on rung 0");
+            assert_eq!(
+                first.next_probe_at - first.halted_at,
+                1_800,
+                "and the PERSISTED rung is the production 30 minutes, not the test's"
+            );
+
+            // Nobody touches anything: the lane comes back on its own.
+            assert!(
+                wait_for(&s, 10, |st| st.state == ProcState::Running).await,
+                "the halt must lift itself: {:?}",
+                s.stats()
+            );
+            assert!(!s.stats().halted, "the re-probe run is measuring, not halted");
+            assert_eq!(s.halt_probes(), 1, "one window charged to the ladder");
+            assert_eq!(
+                s.stats().message_key.as_deref(),
+                Some("acceptance_reprobe"),
+                "and it says it is a re-check"
+            );
+
+            // The pool is still rejecting everything → it halts again, one rung up.
+            drive_to_halt(&s).await;
+            let second = wait_for_halt_record(Lane::Xmr).await;
+            assert_eq!(second.probes, 1, "the ladder climbed, it did not restart");
+            assert_eq!(acceptance::reprobe_delay(second.probes), Duration::from_secs(3_600));
+            // Measured against NOW, not against `halted_at`: the record is rewritten
+            // both when the rung is charged and when the lane re-halts, so only the
+            // deadline's distance from the present is a stable fact.
+            let ahead = second.next_probe_at.saturating_sub(acceptance::now_unix());
+            assert!(
+                (3_500..=3_600).contains(&ahead),
+                "the second wait is the 1-hour rung, got {ahead}s"
+            );
+            assert!(second.halted_at >= first.halted_at, "and it is the NEW halt's evidence");
+
+            s.request_stop();
+        });
+    }
+
+    /// A STALE halt whose cooldown already elapsed while the machine was off must not
+    /// make the miner sit out a wait that is over: it spends one window immediately,
+    /// says that is what it is doing, and CHARGES THE LADDER before launching — so a
+    /// box that dies mid-probe resumes on the next rung instead of probing on every
+    /// boot.
+    #[test]
+    fn a_stale_halt_whose_cooldown_elapsed_probes_at_once_and_charges_the_ladder() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            // A halt recorded a week ago, on the 30-minute rung.
+            let week_ago = acceptance::now_unix().saturating_sub(7 * 86_400);
+            let rec = acceptance::HaltRecord::new(
+                Lane::Xmr,
+                &Collapse {
+                    period: crate::acceptance::PeriodStat {
+                        accepted: 0,
+                        rejected: 40,
+                        elapsed: Duration::from_secs(900),
+                    },
+                    run_accepted: 0,
+                    run_rejected: 40,
+                    shutout: true,
+                },
+                Attribution::NetworkWide,
+                0,
+                week_ago,
+            );
+            acceptance::save_halt_record(&rec).expect("seed");
+
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            let (program, args) = idle_child();
+            s.start_simple_with_cause(program, args, StartCause::Automatic).expect("start");
+            assert!(
+                wait_for(&s, 5, |st| st.state == ProcState::Running).await,
+                "an elapsed cooldown must actually re-probe: {:?}",
+                s.stats()
+            );
+            let st = s.stats();
+            assert!(!st.halted, "the probe run is not halted while it measures");
+            assert_eq!(
+                st.message_key.as_deref(),
+                Some("acceptance_reprobe"),
+                "a re-check must say it is a re-check, not pretend to be a normal start"
+            );
+            let a = st.message_args.clone().expect("args");
+            assert_eq!(a.attempt, Some(1), "re-probe number 1");
+
+            // The ladder was charged BEFORE the launch, and persisted.
+            assert_eq!(s.halt_probes(), 1);
+            let after = acceptance::load_halt_record(Lane::Xmr).expect("still recorded");
+            assert_eq!(after.probes, 1, "the rung is spent even if this run never finishes");
+            let now = acceptance::now_unix();
+            assert!(
+                after.next_probe_at > now + 3_000 && after.next_probe_at <= now + 3_600,
+                "the NEXT rung is an hour out, got {}s",
+                after.next_probe_at.saturating_sub(now)
+            );
+            // The evidence from the original halt is preserved for the user.
+            assert_eq!(after.run_rejected, 40);
+
+            s.request_stop();
+        });
+    }
+
+    /// THE LADDER ITSELF, across restarts: rung 3 (4 h) has been spent, so the next
+    /// automatic re-probe is charged to rung 4 — which is the 6-hour CAP, not 8 hours.
+    #[test]
+    fn the_reprobe_ladder_escalates_across_restarts_and_stops_at_the_cap() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let elapsed_long_ago = acceptance::now_unix().saturating_sub(30 * 86_400);
+            let mut rec = acceptance::HaltRecord::new(
+                Lane::Xmr,
+                &Collapse {
+                    period: crate::acceptance::PeriodStat {
+                        accepted: 0,
+                        rejected: 25,
+                        elapsed: Duration::from_secs(900),
+                    },
+                    run_accepted: 0,
+                    run_rejected: 25,
+                    shutout: true,
+                },
+                Attribution::Unknown,
+                3, // three re-probes already spent
+                elapsed_long_ago,
+            );
+            rec.next_probe_at = elapsed_long_ago; // long overdue
+            acceptance::save_halt_record(&rec).expect("seed");
+
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            let (program, args) = idle_child();
+            s.start_simple_with_cause(program, args, StartCause::Automatic).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+
+            assert_eq!(s.halt_probes(), 4, "the ladder advanced, it did not restart");
+            let after = acceptance::load_halt_record(Lane::Xmr).expect("recorded");
+            assert_eq!(after.probes, 4);
+            let wait = after.next_probe_at.saturating_sub(acceptance::now_unix());
+            assert!(
+                wait > 6 * 3600 - 120 && wait <= 6 * 3600,
+                "rung 4 is the 6h CAP (not 8h), got {wait}s"
+            );
+            assert_eq!(acceptance::reprobe_delay(after.probes), acceptance::REPROBE_CAP);
+
+            s.request_stop();
+        });
+    }
+
+    /// A CLOCK THAT MOVED BACKWARDS (a dead RTC battery, an NTP step, a dual-boot BIOS
+    /// clock) leaves the persisted deadline sitting years in the "future". That must
+    /// never strand a rig halted forever: the wait is clamped to the rung it was
+    /// entitled to, and the ladder is NOT reset to zero either.
+    #[test]
+    fn a_backwards_clock_neither_strands_the_lane_nor_rewinds_the_ladder() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            // Written by a machine whose clock was ~10 years ahead of this one.
+            let future = acceptance::now_unix().saturating_add(10 * 365 * 86_400);
+            let rec = acceptance::HaltRecord::new(
+                Lane::Xmr,
+                &Collapse {
+                    period: crate::acceptance::PeriodStat {
+                        accepted: 1,
+                        rejected: 60,
+                        elapsed: Duration::from_secs(900),
+                    },
+                    run_accepted: 1,
+                    run_rejected: 60,
+                    shutout: false,
+                },
+                Attribution::LocalOnly,
+                2, // the 2-hour rung
+                future,
+            );
+            acceptance::save_halt_record(&rec).expect("seed");
+
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            let (program, args) = idle_child();
+            s.start_simple_with_cause(program, args, StartCause::Automatic).expect("start");
+
+            let st = s.stats();
+            assert!(st.halted, "the halt is still honored");
+            assert!(!st.running, "and nothing is burning power");
+            let left = s.reprobe_in_s().expect("a re-probe must still be scheduled");
+            assert!(
+                left <= 2 * 3600 && left > 2 * 3600 - 60,
+                "the wait must be clamped to the 2h rung, not ten years: {left}s"
+            );
+            assert_eq!(s.halt_probes(), 2, "and the ladder must not rewind to rung 0");
+
+            s.request_stop();
+        });
+    }
+
+    /// A USER START BEATS EVERYTHING. Even mid-cooldown, with a halt on disk, pressing
+    /// Start mines now and forgets the halt entirely — evidence, ladder and file. The
+    /// guard protects the user; it must never lock him out of his own rig.
+    #[test]
+    fn a_user_start_overrides_a_persisted_halt_and_deletes_it() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let rec = acceptance::HaltRecord::new(
+                Lane::Xmr,
+                &Collapse {
+                    period: crate::acceptance::PeriodStat {
+                        accepted: 0,
+                        rejected: 72,
+                        elapsed: Duration::from_secs(900),
+                    },
+                    run_accepted: 0,
+                    run_rejected: 72,
+                    shutout: true,
+                },
+                Attribution::NetworkWide,
+                4, // deep in the ladder: a 6-hour wait
+                acceptance::now_unix(),
+            );
+            acceptance::save_halt_record(&rec).expect("seed");
+
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            let (program, args) = idle_child();
+            // The default process cause is a person, which is what a Start button is.
+            s.start_simple(program, args).expect("the user may always start");
+            assert!(
+                wait_for(&s, 5, |st| st.state == ProcState::Running).await,
+                "a user Start must mine NOW, not in six hours: {:?}",
+                s.stats()
+            );
+            let st = s.stats();
+            assert!(!st.halted);
+            assert_eq!(st.acceptance, "warmup", "and the evidence behind it is gone");
+            assert_eq!(s.halt_probes(), 0, "the ladder resets — the user took ownership");
+            assert_eq!(s.reprobe_in_s(), None, "no cooldown may outlive a user Start");
+            assert_eq!(
+                acceptance::load_halt_record(Lane::Xmr),
+                None,
+                "and the record is gone from disk, so the NEXT reboot mines too"
+            );
+            s.request_stop();
+        });
+    }
+
+    /// A user STOP is not a user Start: it cancels the automatic re-probe (nothing may
+    /// resurrect the engine hours after he said stop) but KEEPS the halt and its
+    /// explanation, so the rig still says why it is idle.
+    #[test]
+    fn a_user_stop_cancels_the_reprobe_but_keeps_the_halt() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            let (program, args) = idle_child();
+            s.start_simple(program, args).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+            drive_to_halt(&s).await;
+            wait_for_halt_record(Lane::Xmr).await;
+            assert!(s.reprobe_in_s().is_some(), "a re-probe is armed");
+            assert!(wait_for(&s, 8, |st| !st.running).await, "the engine is stopped");
+
+            s.request_stop();
+            assert_eq!(s.reprobe_in_s(), None, "Stop must cancel the automatic re-check");
+            let st = s.stats();
+            assert!(st.halted, "but the halt itself stays");
+            let key = st.message_key.clone().expect("key");
+            assert!(key.starts_with("acceptance_halt_"), "and it still explains itself: {key}");
+            let args = st.message_args.clone().expect("args");
+            assert_eq!(args.retry_in_s, None, "with no countdown claimed");
+            let tip = status_tooltip(&key, &args).expect("tooltip");
+            assert!(tip.contains("cancelled by Stop"), "and says so: {tip}");
+            assert!(
+                acceptance::load_halt_record(Lane::Xmr).is_some(),
+                "a Stop must not erase the halt: the next automatic start still honors it"
+            );
+
+            // Give any stray countdown task a chance to misbehave.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(!s.stats().running, "nothing may relaunch after a Stop");
+        });
+    }
+
+    /// A MEASURED recovery — a completed healthy period, the only real evidence that
+    /// the pool is accepting again — retires the halt AND its ladder, in memory and on
+    /// disk. Nothing weaker (an uptime, a reconnect, a restart) may do it.
+    #[test]
+    fn a_measured_healthy_period_retires_the_halt_and_its_ladder() {
+        let _env = temp_home();
+        let s = LaneSupervisor::new(Lane::Xmr);
+        s.set_acceptance_config(fast_acceptance());
+        // Stand where a re-probe run stands: two rungs spent, a record on disk.
+        let rec = acceptance::HaltRecord::new(
+            Lane::Xmr,
+            &Collapse {
+                period: crate::acceptance::PeriodStat {
+                    accepted: 0,
+                    rejected: 30,
+                    elapsed: Duration::from_secs(900),
+                },
+                run_accepted: 0,
+                run_rejected: 30,
+                shutout: true,
+            },
+            Attribution::NetworkWide,
+            2,
+            acceptance::now_unix(),
+        );
+        acceptance::save_halt_record(&rec).expect("seed");
+        {
+            let mut g = s.inner.lock().unwrap();
+            g.halt_probes = 2;
+            g.halt_record = Some(rec);
+            g.acceptance.on_run_start(Instant::now());
+        }
+        // The pool starts accepting: past warm-up, then a full healthy window.
+        std::thread::sleep(Duration::from_millis(40));
+        feed(&s, "net      accepted (0/0) diff 100 (10 ms)");
+        for i in 1..=40u64 {
+            feed(&s, &format!("net      accepted ({i}/0) diff 100 (10 ms)"));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(s.stats().acceptance, "healthy", "the recovery must be MEASURED");
+        assert_eq!(s.halt_probes(), 0, "a recovery retires the ladder");
+        assert_eq!(
+            acceptance::load_halt_record(Lane::Xmr),
+            None,
+            "and the record, so the next reboot starts clean"
+        );
+    }
+
+    /// Layer B's progress mark counts SUBMISSIONS, not accepts.
+    ///
+    /// Both counters only move when the pool ANSWERS a submit, so a rejected share is
+    /// real evidence the lane is alive — and treating it as a stall is what rotated
+    /// the incident's rig through 69 regions, each of which rejected the identical
+    /// share. A lane that hashes into the void moves NEITHER counter and is still
+    /// caught, which is what the window is actually for.
+    #[test]
+    fn a_rejected_share_is_layer_b_progress_but_silence_is_not() {
+        let s = LaneSupervisor::new(Lane::Xmr);
+        {
+            let mut g = s.inner.lock().unwrap();
+            g.last_progress_at = Some(Instant::now() - Duration::from_secs(3_600));
+            g.progress_accepted = 0;
+            g.progress_submissions = 0;
+        }
+        let stale = |g: &Inner| {
+            g.last_progress_at
+                .map(|t| t.elapsed() >= Duration::from_secs(600))
+                .unwrap_or(true)
+        };
+        // Engine chatter that moves no counter is NOT progress — a void lane still trips.
+        {
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Xmr, "net      new job from pool diff 100");
+            assert!(stale(&g), "a job with no share answer must not count as progress");
+        }
+        // A REJECTED share is.
+        {
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Xmr, "net      rejected (0/1) diff 100 (10 ms)");
+            assert!(!stale(&g), "a pool answering 'rejected' proves the lane is alive");
+            assert_eq!(g.progress_submissions, 1);
+        }
+        // A repeat of the SAME totals is not new progress.
+        {
+            let mut g = s.inner.lock().unwrap();
+            g.last_progress_at = Some(Instant::now() - Duration::from_secs(3_600));
+            apply_log_line(&mut g, ParserKind::Xmr, "net      rejected (0/1) diff 100 (10 ms)");
+            assert!(stale(&g), "no NEW submission = no new progress");
+        }
+    }
+
+    /// The process-level start cause is a plain flag with a safe default: a binary that
+    /// never declares itself a service treats every start as a person's.
+    #[test]
+    fn the_process_start_cause_defaults_to_a_person() {
+        let before = process_start_cause();
+        set_process_start_cause(StartCause::Automatic);
+        assert_eq!(process_start_cause(), StartCause::Automatic);
+        set_process_start_cause(StartCause::User);
+        assert_eq!(process_start_cause(), StartCause::User, "the default a fresh process has");
+        set_process_start_cause(before);
     }
 
     /// The halt status re-localizes from its machine key + args, so a `zh` GUI paired
