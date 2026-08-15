@@ -1403,8 +1403,10 @@ fn render_auto_update_mode(ui: &mut egui::Ui) {
 
 fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
     // The release channel link (PUBLIC apex; never an internal/core host). Shown
-    // as the fallback for platforms without an in-app artifact.
-    const RELEASES_PAGE: &str = "https://github.com/V-SK/alice-miner/releases/latest";
+    // as the fallback for platforms without an in-app artifact. One definition,
+    // in `alice-release`, so this and the updater's own "fetch it yourself"
+    // messages can never drift onto different addresses.
+    const RELEASES_PAGE: &str = alice_miner_core::alice_release::RELEASES_PAGE_URL;
 
     panel(ui, tr!("Software update", "软件更新"), Icon::Globe, |ui| {
         // A one-time "updated to vX" confirmation, if the health gate committed a
@@ -1513,33 +1515,69 @@ fn render_update_panel(ui: &mut egui::Ui, app: &mut MinerApp) {
                     });
                 });
             }
-            UpdateUi::Available { version, notes, .. } => {
-                let hint = if notes.trim().is_empty() {
+            UpdateUi::Available { version, notes, visibility, risk, .. } => {
+                let mut hint = if notes.trim().is_empty() {
                     tr!("Version {v} is available.", "有可用版本 {v}。").replace("{v}", &version)
                 } else {
                     tr!("Version {v} is available — {notes}", "有可用版本 {v} —— {notes}")
                         .replace("{v}", &version)
                         .replace("{notes}", &notes)
                 };
+                // The same fact the automatic updater decides on, put in front of
+                // the person deciding instead. Installing a version that appeared
+                // twenty minutes ago is a legitimate thing to do by hand — it is
+                // just not a thing to do without knowing that is what it is.
+                if let Some(v) = &visibility {
+                    hint.push(' ');
+                    hint.push_str(v);
+                }
                 let mut do_apply = false;
                 srow(ui, tr!("Update available", "有可用更新"), &hint, |ui| {
+                    // With a concern raised, the ordinary affordance is replaced
+                    // by an explicit one. This is not the "Update now" button
+                    // wearing a warning; it is a different question.
+                    let label = if risk.is_some() {
+                        tr!("Install anyway", "仍然安装")
+                    } else {
+                        tr!("Update now", "立即更新")
+                    };
+                    let fill = if risk.is_some() { THEME.warn } else { THEME.brand };
                     let btn = egui::Button::new(
-                        RichText::new(tr!("Update now", "立即更新"))
+                        RichText::new(label)
                             .size(12.5)
                             .strong()
                             .color(THEME.ink_on_brand),
                     )
-                    .fill(THEME.brand)
-                    .stroke(egui::Stroke::new(1.0_f32, THEME.brand))
+                    .fill(fill)
+                    .stroke(egui::Stroke::new(1.0_f32, fill))
                     .corner_radius(9)
                     .min_size(egui::vec2(0.0, 32.0));
                     if ui.add(btn).clicked() {
                         do_apply = true;
                     }
                 });
+                if let Some(r) = &risk {
+                    srow(ui, tr!("Before you do", "安装前请注意"), r, |ui| {
+                        ui.label(RichText::new(tr!("check first", "请先确认")).size(12.0).color(THEME.warn));
+                    });
+                }
                 if do_apply {
                     app.updater.apply();
                 }
+            }
+            UpdateUi::Refused { version, message } => {
+                // No button. A refusal is not a confirmation dialog with the
+                // buttons rearranged — there is nothing here to click past.
+                srow(
+                    ui,
+                    tr!("Update refused", "已拒绝更新"),
+                    &message,
+                    |ui| {
+                        ui.label(
+                            widgets::mono(format!("v{version}"), 12.5, THEME.err),
+                        );
+                    },
+                );
             }
             UpdateUi::AvailableNoArtifact { version, .. } => {
                 srow(

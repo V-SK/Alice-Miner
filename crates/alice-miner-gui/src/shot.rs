@@ -1053,6 +1053,14 @@ fn pose_settings_update(app: &mut MinerApp) {
         current: release::current_version().to_string(),
         version: "1.1.0".to_string(),
         notes: "stability + speed.".to_string(),
+        // The posed capture shows the ordinary offer: a version this machine has
+        // had in view for longer than the soak floor, with nothing the shared
+        // guardrails object to. No disk is read in shot mode.
+        visibility: Some(
+            "This machine has been able to see v1.1.0 for 3 days — past the day the automatic updater waits."
+                .to_string(),
+        ),
+        risk: None,
         manifest: Box::new(manifest),
         artifact,
     };

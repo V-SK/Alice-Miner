@@ -3972,7 +3972,11 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
 
     /// Process env (`HOME` / the payout override) is global; serialize the PRL
     /// payout tests through this lock so parallel test threads can't race.
-    static PRL_PAYOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ///
+    /// It is the CRATE-WIDE env lock, not a private one: the updater's tests
+    /// move `$ALICE_IDENTITY_DIR` too, and two modules serialising against two
+    /// different mutexes serialise against nothing.
+    use crate::ENV_TEST_LOCK as PRL_PAYOUT_ENV_LOCK;
 
     /// `save_prl_payout` FULL-validates (shape + bech32m checksum, AM-SEC-008): a typo
     /// shows the inline error and is NEVER written; a valid address is only PARKED for

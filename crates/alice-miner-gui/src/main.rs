@@ -25,6 +25,16 @@ mod update;
 #[cfg(test)]
 pub(crate) static LANG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Process-environment test serialization lock. `$HOME` and
+/// `$ALICE_IDENTITY_DIR` are process globals, and a test that points them at a
+/// temp dir is briefly changing where EVERY other thread in this binary reads
+/// and writes. It has to be ONE lock for the whole crate, not one per module:
+/// two modules each serialising against their own mutex serialise against
+/// nothing, and the failure mode is a test writing into the developer's real
+/// `~/.alice`. Test-only.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
