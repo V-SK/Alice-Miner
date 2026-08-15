@@ -1251,9 +1251,10 @@ mod tests {
     /// install again until someone looks at the clock.
     #[test]
     fn a_clock_disagreement_never_reads_like_an_ordinary_soak() {
-        let _g = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // No lock: the language is thread-scoped now, so switching it here cannot
+        // disturb a reader on another test thread. (This test was written against
+        // the old process-global lock, which was removed in the same release —
+        // and removing it is what broke the AB-BA deadlock with the identity lock.)
         let decade = 10 * 365 * 24 * 3600;
         for (lang, reassurance, clock, security) in [
             (
