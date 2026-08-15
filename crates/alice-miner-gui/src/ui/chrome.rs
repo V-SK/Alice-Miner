@@ -140,9 +140,12 @@ fn titlebar(ui_root: &mut egui::Ui, app: &mut MinerApp) {
 
                 // Right-aligned: lang chip, then the global status pill.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let lang = if app.lang_zh { "中" } else { "EN" };
+                    let zh = app.lang_zh();
+                    let lang = if zh { "中" } else { "EN" };
                     if lang_chip(ui, lang).clicked() {
-                        app.lang_zh = !app.lang_zh;
+                        // Applies to the whole process AND persists — the chip is a
+                        // preference, not a per-session mood.
+                        app.set_lang_zh(!zh);
                     }
                     ui.add_space(8.0);
                     let (tone, label, blink) = status_for(app);
@@ -153,8 +156,8 @@ fn titlebar(ui_root: &mut egui::Ui, app: &mut MinerApp) {
 }
 
 /// Map the engine state to the titlebar pill (tone, label, blink). The label follows
-/// the user's EN/中 toggle via the shared `tr!` i18n (synced from `app.lang_zh` each
-/// frame in `MinerApp::ui`).
+/// the user's EN/中 choice via the shared `tr!` i18n — the process language `main`
+/// resolves at startup and the chip above writes through `MinerApp::set_lang_zh`.
 fn status_for(app: &MinerApp) -> (Tone, String, bool) {
     use alice_miner_core::tr;
     match app.state() {

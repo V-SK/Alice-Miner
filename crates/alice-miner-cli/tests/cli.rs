@@ -985,3 +985,176 @@ fn auto_update_mode_works_offline() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The startup messages a 中文 user actually reads (R5)
+//
+// Every one of these strings is written correctly at its call site: two inline
+// variants, `tr!` picking between them. What decides which one a miner reads is
+// WHEN the line is formatted — and the self-update health gates format theirs
+// before the command line is even parsed. While the language was resolved after
+// the parse, the 中文 half of the post-update line and of BOTH auto-rollback
+// warnings was unreachable in production: the code was there, the tests that
+// covered it pinned the language by hand, and the shipped binary could never
+// take that branch.
+//
+// So these tests do it the only way that can answer the question: seed the real
+// state files, run the REAL binary, and read what a 中文 user would have read.
+// The existing rollback test above deliberately accepts either language
+// (`"rolled back" || "回滚"`) — which is exactly how this survived.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The self-check hook: with this set the binary reports, on stderr, whether any
+/// user-facing text was selected before the UI language was resolved. Mirrors
+/// `main.rs`'s `ENV_LANG_SELFCHECK` (this test drives the BUILT binary, so it
+/// cannot reach that `const`).
+const ENV_LANG_SELFCHECK: &str = "ALICE_MINER_LANG_SELFCHECK";
+
+/// Save a 中文 preference into the sandbox's `~/.alice`, exactly as
+/// `alice-miner lang zh` would.
+fn save_lang_pref_zh(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("dot-alice").join("settings.json"),
+        br#"{"schema": 1, "lang": "zh"}"#,
+    )
+    .unwrap();
+}
+
+/// Run the staged copy like `run_staged`, but with the language self-check on.
+fn run_staged_checked(
+    app: &std::path::Path,
+    dir: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    let mut cmd = Command::new(app);
+    cmd.args(args)
+        .env("ALICE_IDENTITY_DIR", dir.join("dot-alice"))
+        .env("ALICE_WALLET_DATA_ROOT", dir.join("wallet"))
+        .env(ENV_NO_UPDATE_CHECK, "1")
+        .env("ALICE_MINER_AUTO_UPDATE", "off")
+        .env(ENV_LANG_SELFCHECK, "1");
+    cmd.output().expect("run the staged binary")
+}
+
+/// The auto-rollback warning is the highest-stakes line this client can print —
+/// "your client was rolled back and this process is still the failed build" — and
+/// it is produced BEFORE the command line is parsed, so it is the message most
+/// exposed to a late language resolution.
+///
+/// Same process, same run: stdout proves the 中文 preference was found and
+/// honoured, stderr must therefore carry the 中文 warning.
+#[test]
+fn the_auto_rollback_warning_speaks_the_users_language() {
+    let dir = sandbox("rollback-zh");
+    let (app, _lkg) = staged_app(&dir);
+    save_lang_pref_zh(&dir);
+    // launches=1, started_ok=false ⇒ "we have been here before and it died".
+    arm_probation(&app, 1, false);
+
+    let out = run_staged_checked(&app, &dir, &["lang"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Precondition, in this very run: the saved preference WAS found.
+    assert!(
+        stdout.contains("当前语言: zh"),
+        "precondition — the run must resolve to 中文: {stdout}"
+    );
+    // Precondition: the rollback really happened (or there is no warning to judge).
+    assert_eq!(
+        std::fs::read(&app).unwrap(),
+        b"LKG-SENTINEL",
+        "precondition — the failed build must have been rolled back"
+    );
+    assert!(
+        stderr.contains("已被自动回滚"),
+        "the rollback warning must be in the language the user chose: {stderr}"
+    );
+    assert!(
+        !stderr.contains("was rolled back automatically"),
+        "and not in English alongside it: {stderr}"
+    );
+    assert!(
+        stderr.contains("lang-selfcheck: ok"),
+        "no user-facing text may be selected before the language is resolved: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The common case, and the one that hits every 中文 user who ever self-updates:
+/// the ordinary post-update line. It is printed by the MANUAL health gate, which
+/// commits right after the parse and still ahead of the old resolution point.
+#[test]
+fn the_post_update_line_speaks_the_users_language() {
+    let dir = sandbox("updated-zh");
+    let (app, _lkg) = staged_app(&dir);
+    save_lang_pref_zh(&dir);
+    // The manual gate's marker: a freshly-installed build awaiting its first-run
+    // health proof (attempt 0 ⇒ this run IS that first run).
+    let marker = app.with_file_name(format!(
+        "{}.pending-health",
+        app.file_name().unwrap().to_string_lossy()
+    ));
+    let body = serde_json::json!({ "installed_version": THIS_VERSION, "attempt": 0 });
+    std::fs::write(&marker, serde_json::to_vec(&body).unwrap()).unwrap();
+
+    let out = run_staged_checked(&app, &dir, &["lang"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        stdout.contains("当前语言: zh"),
+        "precondition — the run must resolve to 中文: {stdout}"
+    );
+    assert!(
+        !marker.exists(),
+        "precondition — the health gate must have committed this run"
+    );
+    assert!(
+        stderr.contains("已更新到 v"),
+        "the post-update line must be in the language the user chose: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Updated to v"),
+        "and not in English alongside it: {stderr}"
+    );
+    assert!(
+        stderr.contains("lang-selfcheck: ok"),
+        "no user-facing text may be selected before the language is resolved: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same warning on the path that exits through clap — `--help`, `--version`,
+/// a usage error. That path leaves `main` early, ABOVE the normal exit, and it is
+/// exactly the path a puzzled miner takes after an unexpected rollback.
+#[test]
+fn the_rollback_warning_speaks_the_users_language_on_the_clap_exit_path() {
+    let dir = sandbox("rollback-help-zh");
+    let (app, _lkg) = staged_app(&dir);
+    save_lang_pref_zh(&dir);
+    arm_probation(&app, 1, false);
+
+    let out = run_staged_checked(&app, &dir, &["--help"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(out.status.success(), "--help still exits 0: {stderr}");
+    assert_eq!(
+        std::fs::read(&app).unwrap(),
+        b"LKG-SENTINEL",
+        "precondition — the failed build must have been rolled back"
+    );
+    assert!(
+        stderr.contains("已被自动回滚"),
+        "the rollback warning must be in the language the user chose: {stderr}"
+    );
+    assert!(
+        !stderr.contains("was rolled back automatically"),
+        "and not in English alongside it: {stderr}"
+    );
+    assert!(
+        stderr.contains("lang-selfcheck: ok"),
+        "the self-check must cover the clap-exit path too: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

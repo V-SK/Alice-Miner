@@ -9,11 +9,32 @@
 //!     local + merge-conflict-free. `tr!` expands to the `&'static str` for the
 //!     current global language, so it drops straight into `println!`/`format!`.
 //!
-//! The GUI crate ALSO drives this: `alice-miner-gui`'s `MinerApp::ui` mirrors its
-//! `app.lang_zh` toggle into [`set_process_lang`] each frame, so the desktop titlebar
-//! pill + Settings labels localize through the SAME `tr!` mechanism (no second i18n
-//! system). The GUI's bilingual-inline `ui/strings.rs` constants (which embed both
-//! languages in one string) are unaffected.
+//! [`init_startup_lang`] is how a front-end keeps the first half of that bargain, and
+//! it is deliberately shaped so there is only ONE right place to call it: the first
+//! statement of `main`, before the process can produce any user-facing text at all.
+//! Both front-ends do exactly that. It needs no parsed command line (it scans argv for
+//! `--lang` itself) and never prompts, so nothing has to run ahead of it. The CLI then
+//! re-resolves post-parse — same precedence, plus clap's validated flag, the
+//! interactive first-run prompt and persistence — which can only ever CONFIRM or
+//! REFINE the early answer.
+//!
+//! The GUI crate reads this same global as its ONE language state: `MinerApp::lang_zh`
+//! is a view of [`lang`] rather than a field, and the EN/中 chip writes through
+//! `MinerApp::set_lang_zh` (which sets the process language AND persists the choice).
+//! The desktop titlebar pill + Settings labels therefore localize through the SAME
+//! `tr!` mechanism as the CLI (no second i18n system, and no per-frame global write).
+//! The GUI's bilingual-inline `ui/strings.rs` constants (which embed both languages in
+//! one string) are unaffected.
+//!
+//! ## The ordering bug this module now audits
+//!
+//! Text formatted before the front-end resolves the language is silently English,
+//! whatever the user picked — and the code reads correctly at every individual call
+//! site, because each one uses `tr!` properly. The only thing wrong is WHEN it ran.
+//! [`lang`] therefore records whether anything read the process language before
+//! [`set_process_lang`] ever ran; [`text_selected_before_language_resolved`] reports
+//! it, and the CLI surfaces that under `ALICE_MINER_LANG_SELFCHECK` so a test can put
+//! the question to the REAL binary instead of to a reviewer's memory.
 //!
 //! ## Two setters, and why
 //!
@@ -37,7 +58,7 @@
 
 use std::cell::Cell;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// The two languages the CLI speaks. `Default` is [`Lang::En`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -126,15 +147,22 @@ thread_local! {
 }
 
 /// Set the PROCESS-WIDE language — **the production setter**. The front-end calls this
-/// ONCE, early in `main`, after resolving the preference; the GUI additionally mirrors
-/// its EN/中 toggle into it each frame. Visible to EVERY thread, which is required:
-/// `supervise`'s failover status text is built on the engine worker thread, not main.
+/// ONCE at startup, via [`init_startup_lang`], as the first statement of `main`; after
+/// that only an explicit user action moves it (the CLI's `lang` subcommand and
+/// `--lang`, the GUI's EN/中 chip), and each of those persists the choice too. Visible
+/// to EVERY thread, which is required: `supervise`'s failover status text is built on
+/// the engine worker thread, not main.
+///
+/// It also latches "the language has been resolved" for
+/// [`text_selected_before_language_resolved`], so call it only when that is true —
+/// which is another way of saying: resolve, then set, then print.
 ///
 /// TESTS SHOULD NOT CALL THIS. A test that moves the process-wide language changes the
 /// answer for every other test running at that moment — use [`set_lang`], which is
 /// scoped to the calling thread.
 pub fn set_process_lang(lang: Lang) {
     CURRENT.store(lang.to_u8(), Ordering::Relaxed);
+    AUDIT.mark_resolved();
 }
 
 /// Set the language for the CALLING THREAD ONLY, leaving every other thread on the
@@ -165,8 +193,182 @@ pub fn clear_lang_override() {
 pub fn lang() -> Lang {
     match THREAD_LANG.try_with(Cell::get) {
         Ok(Some(l)) => l,
-        _ => Lang::from_u8(CURRENT.load(Ordering::Relaxed)),
+        _ => {
+            // Only a read that actually FALLS THROUGH to the process value can be
+            // "text selected before the language was resolved" — a thread with its
+            // own override (i.e. a test) answered its own question.
+            AUDIT.note_read();
+            Lang::from_u8(CURRENT.load(Ordering::Relaxed))
+        }
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Resolution audit — "was any text selected before the language was resolved?"
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Two facts about this process: whether the front-end has resolved the language
+/// yet, and whether anything read the process language BEFORE it did.
+///
+/// Its own type (rather than two loose statics) so the state machine can be tested
+/// on a fresh instance — the process-wide one is a global whose history depends on
+/// whichever test in the binary touched it first, and a test of "starts unresolved"
+/// written against THAT would pass or fail depending on test order.
+struct ResolveAudit {
+    resolved: AtomicBool,
+    read_early: AtomicBool,
+}
+
+impl ResolveAudit {
+    const fn new() -> Self {
+        Self {
+            resolved: AtomicBool::new(false),
+            read_early: AtomicBool::new(false),
+        }
+    }
+
+    /// The front-end resolved the language. Latches: a later re-resolution (the
+    /// CLI's post-parse pass, the GUI's EN/中 chip) is not a new startup.
+    fn mark_resolved(&self) {
+        self.resolved.store(true, Ordering::Relaxed);
+    }
+
+    /// Somebody asked for the process language. Before [`Self::mark_resolved`],
+    /// that answer was the English DEFAULT rather than the user's choice — latch it.
+    fn note_read(&self) {
+        if !self.resolved.load(Ordering::Relaxed) {
+            self.read_early.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn resolved(&self) -> bool {
+        self.resolved.load(Ordering::Relaxed)
+    }
+
+    fn read_before_resolve(&self) -> bool {
+        self.read_early.load(Ordering::Relaxed)
+    }
+}
+
+static AUDIT: ResolveAudit = ResolveAudit::new();
+
+/// Whether [`set_process_lang`] has run at all in this process.
+pub fn process_lang_resolved() -> bool {
+    AUDIT.resolved()
+}
+
+/// Whether any `tr!` / [`lang`] read reached the process language BEFORE the
+/// front-end resolved it — i.e. whether this run produced user-facing text in the
+/// English default while the user may have chosen 中文.
+///
+/// `false` is the contract; `true` is a bug in the front-end's startup ORDER, not
+/// at the call site that formatted the text. The CLI prints this under
+/// `ALICE_MINER_LANG_SELFCHECK` so a test can ask the real binary.
+pub fn text_selected_before_language_resolved() -> bool {
+    AUDIT.read_before_resolve()
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Startup resolution — the one place a front-end turns a preference into the
+// process language
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The env vars that can carry a locale, in the precedence we read them.
+const LOCALE_ENV_VARS: [&str; 3] = ["LC_ALL", "LANG", "LANGUAGE"];
+
+/// Read a language preference from the `LC_ALL` / `LANG` / `LANGUAGE` env vars, in
+/// that precedence. Returns the FIRST that parses to a known language; `None` if
+/// none are set or none parse (the caller then defaults to English). A `C` /
+/// `POSIX` locale parses to nothing → `None` → English.
+pub fn lang_from_env() -> Option<Lang> {
+    for var in LOCALE_ENV_VARS {
+        if let Ok(val) = std::env::var(var) {
+            if let Ok(lang) = val.parse::<Lang>() {
+                return Some(lang);
+            }
+        }
+    }
+    None
+}
+
+/// Find a `--lang` / `--language` VALUE in a raw argument list, in both the
+/// `--lang zh` and `--lang=zh` spellings (the CLI declares the flag global, so it
+/// can sit anywhere on the line).
+///
+/// This exists so the language can be resolved BEFORE the command line is parsed —
+/// argument parsing is itself a step that can produce user-facing output (clap's
+/// `--help` / usage error), and the startup health gates run ahead of it on purpose.
+/// The value is returned RAW and unvalidated: the front-end's post-parse resolution
+/// owns the "unknown language" warning, and warning from here too would print it
+/// twice.
+///
+/// Stops at a bare `--`: everything after it is a subcommand's data, not our flags.
+pub fn lang_flag_in_args<I, S>(args: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        let arg = arg.as_ref();
+        if arg == "--" {
+            return None;
+        }
+        for name in ["--lang", "--language"] {
+            if arg == name {
+                return iter.next().map(|v| v.as_ref().to_string());
+            }
+            if let Some(v) = arg.strip_prefix(name).and_then(|r| r.strip_prefix('=')) {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the startup language from the sources EVERY front-end shares, in the
+/// documented precedence, with NO prompting, NO persistence and no output:
+///
+///   (a) an explicit flag value, when it parses (an unparseable one falls through);
+///   (b) the persisted `~/.alice/settings.json` preference;
+///   (c) the `LC_ALL` / `LANG` / `LANGUAGE` environment;
+///   (d) English.
+///
+/// The CLI's post-parse `resolve_language` is this same order with the interactive
+/// first-run prompt inserted between (b) and (c) — the one step that cannot run
+/// before the command line is known (it must not fire for `service` / `--json` /
+/// non-TTY runs), and the only reason a front-end resolves twice.
+pub fn resolve_startup_lang(flag: Option<&str>) -> Lang {
+    if let Some(lang) = flag.and_then(|f| f.parse::<Lang>().ok()) {
+        return lang;
+    }
+    if let Some(lang) = crate::settings::load().parsed_lang() {
+        return lang;
+    }
+    lang_from_env().unwrap_or(Lang::En)
+}
+
+/// Resolve the startup language from argv + settings + env and install it
+/// process-wide. **Call this as the FIRST statement of `main`, in every front-end.**
+///
+/// Everything a miner reads is bilingual, so anything that runs before this line
+/// prints in English no matter what the user chose — and the startup self-update
+/// health gates, which run before the command line is even parsed, produce exactly
+/// such text (a post-update line, and the auto-rollback warning: the highest-stakes
+/// message this client can emit). Hence the shape of this function: it takes no
+/// arguments, needs no parse, never prompts and never blocks, so there is nothing
+/// that legitimately has to happen first.
+///
+/// Returns the language it installed.
+pub fn init_startup_lang() -> Lang {
+    let flag = lang_flag_in_args(
+        std::env::args_os()
+            .skip(1)
+            .map(|a| a.to_string_lossy().into_owned()),
+    );
+    let lang = resolve_startup_lang(flag.as_deref());
+    set_process_lang(lang);
+    lang
 }
 
 /// Return the variant matching the current global language. The function form of
@@ -315,6 +517,121 @@ mod tests {
 
         clear_lang_override();
         assert_eq!(lang(), Lang::En, "clearing returns this thread to the process language");
+    }
+
+    // ── startup resolution (the contract the front-ends have to keep) ───────
+
+    /// Run `f` with `$ALICE_IDENTITY_DIR` pointed at a throwaway dir and the three
+    /// locale env vars CLEARED (whatever the developer's shell has set), restoring
+    /// both afterwards. Serialized on the crate-wide env lock, because every one of
+    /// those is a process global.
+    fn with_isolated_lang_env<F: FnOnce()>(f: F) {
+        let _g = crate::IDENTITY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "alice-i18n-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved: Vec<(&str, Option<String>)> = LOCALE_ENV_VARS
+            .iter()
+            .map(|v| (*v, std::env::var(v).ok()))
+            .collect();
+        for (v, _) in &saved {
+            std::env::remove_var(v);
+        }
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+
+        f();
+
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        for (v, old) in saved {
+            match old {
+                Some(val) => std::env::set_var(v, val),
+                None => std::env::remove_var(v),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The audit's whole point is the ORDER of two events, so test it on a fresh
+    /// instance: the process-wide one has already seen both by the time any test
+    /// runs, and asserting against that would pass or fail by test order.
+    #[test]
+    fn resolve_audit_latches_only_a_read_that_preceded_resolution() {
+        // Read first → the read got the English default, and that stays on record
+        // even once the front-end resolves.
+        let early = ResolveAudit::new();
+        assert!(!early.resolved());
+        assert!(!early.read_before_resolve());
+        early.note_read();
+        assert!(early.read_before_resolve(), "a read before resolution is recorded");
+        early.mark_resolved();
+        assert!(early.resolved());
+        assert!(early.read_before_resolve(), "and it is not erased by resolving later");
+
+        // Resolve first (the contract) → any number of later reads are clean.
+        let ordered = ResolveAudit::new();
+        ordered.mark_resolved();
+        for _ in 0..3 {
+            ordered.note_read();
+        }
+        assert!(ordered.resolved());
+        assert!(
+            !ordered.read_before_resolve(),
+            "reads after resolution are what production is supposed to look like"
+        );
+    }
+
+    /// `--lang` is a GLOBAL clap flag, so the pre-parse scan has to find it in both
+    /// spellings and anywhere on the line — including after the subcommand.
+    #[test]
+    fn lang_flag_in_args_finds_every_spelling() {
+        let f = |args: &[&str]| lang_flag_in_args(args.iter().copied());
+        assert_eq!(f(&["--lang", "zh"]).as_deref(), Some("zh"));
+        assert_eq!(f(&["--lang=zh"]).as_deref(), Some("zh"));
+        assert_eq!(f(&["--language", "zh"]).as_deref(), Some("zh"));
+        assert_eq!(f(&["--language=zh"]).as_deref(), Some("zh"));
+        // Global flag: after the subcommand is a legal place for it.
+        assert_eq!(f(&["start", "--lane", "xmr", "--lang", "zh"]).as_deref(), Some("zh"));
+        // Nothing to find.
+        assert_eq!(f(&["start", "--lane", "xmr"]), None);
+        // A dangling `--lang` (clap will reject it) yields no value, not a panic.
+        assert_eq!(f(&["start", "--lang"]), None);
+        // Past a bare `--` it is a subcommand's data, not our flag.
+        assert_eq!(f(&["ai", "--", "--lang", "zh"]), None);
+        // The value is returned RAW — validating it is the front-end's job (it owns
+        // the one "unknown language" warning).
+        assert_eq!(f(&["--lang", "martian"]).as_deref(), Some("martian"));
+    }
+
+    /// The shared precedence, end to end: flag → saved settings → env → English.
+    #[test]
+    fn resolve_startup_lang_follows_the_documented_precedence() {
+        with_isolated_lang_env(|| {
+            // (d) nothing anywhere → English.
+            assert_eq!(resolve_startup_lang(None), Lang::En);
+
+            // (c) env only.
+            std::env::set_var("LANG", "zh_CN.UTF-8");
+            assert_eq!(resolve_startup_lang(None), Lang::Zh);
+
+            // (b) a saved preference beats the env.
+            std::env::set_var("LANG", "en_US.UTF-8");
+            crate::settings::save_lang(Lang::Zh).expect("save");
+            assert_eq!(resolve_startup_lang(None), Lang::Zh);
+
+            // (a) an explicit flag beats the saved preference.
+            assert_eq!(resolve_startup_lang(Some("en")), Lang::En);
+            // An UNPARSEABLE flag falls through to the next source rather than
+            // silently meaning English.
+            assert_eq!(resolve_startup_lang(Some("martian")), Lang::Zh);
+        });
     }
 
     #[test]

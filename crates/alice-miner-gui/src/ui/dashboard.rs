@@ -1179,7 +1179,8 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                     },
                 );
                 app.reduce_motion = rm;
-                let mut zh = app.lang_zh;
+                let was_zh = app.lang_zh();
+                let mut zh = was_zh;
                 srow(ui, "Language · 语言", tr!("Interface language. Numbers stay mono in both.", "界面语言。两种语言下数字都保持等宽显示。"), |ui| {
                     ui.horizontal(|ui| {
                         if lang_seg(ui, "EN", !zh).clicked() {
@@ -1191,7 +1192,11 @@ pub fn render_settings(ui: &mut egui::Ui, app: &mut MinerApp) {
                         }
                     });
                 });
-                app.lang_zh = zh;
+                // Only on a real change: `set_lang_zh` persists, and a settings write
+                // per frame would be absurd.
+                if zh != was_zh {
+                    app.set_lang_zh(zh);
+                }
             });
 
             // Identity panel — the active reward address (with a copy affordance +

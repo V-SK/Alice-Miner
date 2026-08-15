@@ -1040,6 +1040,25 @@ fn main() {
     // `alice_miner_core::console::init_utf8_console` for the full root-cause note.
     alice_miner_core::console::init_utf8_console();
 
+    // SECOND, and before anything that can produce a user-facing STRING: resolve the
+    // UI language. Everything this client says is bilingual, and `tr!` picks its
+    // variant when the text is FORMATTED — so a line built above this one is English
+    // whatever the user chose, at every call site, however correctly each one is
+    // written. Every message that used to be built up here belongs to the self-update
+    // health gates — the ordinary post-update line, which every 中文 user who ever
+    // self-updates reads, and the rollback warnings, the highest-stakes thing this
+    // client can say — and those gates have to stay where they are for reasons of
+    // their own (they must resolve before anything can fail, and before the parse).
+    // So the language moves ABOVE THEM instead of the messages moving below.
+    //
+    // Deliberately parse-free: `init_startup_lang` scans argv for `--lang` itself and
+    // never prompts, so nothing legitimately has to run before it and there is no
+    // window left for the next startup message to be written into. `resolve_language`
+    // below re-resolves once the command line is known (same precedence, plus clap's
+    // validated flag, the interactive first-run prompt and persistence) and can only
+    // confirm or refine this answer.
+    alice_miner_core::i18n::init_startup_lang();
+
     // Start the engine-pin refresher with the PROCESS (F15), not with the first
     // lane that resolves an engine. A client the acceptance guard has halted never
     // starts an engine again, so a pin-refresh gated on that could never deliver
@@ -1085,11 +1104,16 @@ fn main() {
         Ok(c) => c,
         // `exit` prints to the right stream (stdout for --help/--version, stderr for
         // an error) with clap's own exit code — identical to what `parse()` did.
-        Err(e) => e.exit(),
+        Err(e) => {
+            lang_selfcheck();
+            e.exit()
+        }
     };
     let no_color = cli.no_color;
-    // Resolve + set the process-global UI language ONCE, before any user-facing
-    // output. Order: --lang flag → saved settings → interactive first-run prompt →
+    // Re-resolve the language now that the command line is known: same precedence as
+    // the pre-parse pass at the top of `main`, plus clap's validated `--lang`, the
+    // interactive first-run prompt (which needs the subcommand to know it is safe) and
+    // persistence. Order: --lang flag → saved settings → interactive first-run prompt →
     // LANG/LC_ALL/LANGUAGE env → English. See `resolve_language`.
     resolve_language(cli.lang.as_deref(), cli.command.as_ref());
     // A command the user actually asked for is about to run: THIS is the start the
@@ -1122,11 +1146,41 @@ fn main() {
         // (piped / non-TTY) print help. Never a surprise prompt for a script.
         None => cmd_no_subcommand(no_color),
     };
+    lang_selfcheck();
     std::process::exit(code);
 }
 
-/// Resolve the process-global UI language ONCE, before any user-facing output, and
-/// install it via [`i18n::set_lang`]. Resolution order (first hit wins):
+/// The env var that turns on the startup-order self-check below. Diagnostic only.
+const ENV_LANG_SELFCHECK: &str = "ALICE_MINER_LANG_SELFCHECK";
+
+/// Report, on stderr and only when `$ALICE_MINER_LANG_SELFCHECK` is set, whether this
+/// run selected any user-facing text BEFORE the language was resolved.
+///
+/// This exists because the bug it guards is invisible at every call site: each `tr!`
+/// is written correctly, and the only thing wrong is that it ran too early — which no
+/// unit test of a message can see, and which a reviewer can only catch by reading
+/// `main` top to bottom. Under the env var the REAL binary answers the question
+/// itself, so the regression test is an observation rather than an argument.
+///
+/// Prints an explicit `ok` as well as the failure, so a test can tell "the contract
+/// holds" apart from "the hook never ran".
+fn lang_selfcheck() {
+    if std::env::var_os(ENV_LANG_SELFCHECK).is_none() {
+        return;
+    }
+    if alice_miner_core::i18n::text_selected_before_language_resolved() {
+        eprintln!(
+            "lang-selfcheck: FAIL — user-facing text was selected before the UI language was \
+             resolved; a 中文 user read it in English. Move the producer below \
+             `i18n::init_startup_lang()` in main()."
+        );
+    } else {
+        eprintln!("lang-selfcheck: ok");
+    }
+}
+
+/// Resolve the process-global UI language and install it via [`i18n::set_process_lang`].
+/// Resolution order (first hit wins):
 ///
 ///   (a) the `--lang <en|zh>` flag — always honored, and PERSISTED when explicitly
 ///       passed so a later bare run keeps it.
@@ -1137,6 +1191,13 @@ fn main() {
 ///       never asked again.
 ///   (d) the `LANG` / `LC_ALL` / `LANGUAGE` env (zh* ⇒ 中文).
 ///   (e) English (the default).
+///
+/// This is the SECOND pass. `main` resolves (a)/(b)/(d)/(e) before it does anything
+/// else at all — see `i18n::init_startup_lang` — because the startup health gates
+/// produce text before the command line is parsed, and text is bound to a language
+/// when it is FORMATTED. This pass adds the three things that genuinely need the
+/// parse: clap's validated flag value, persistence of an explicit choice, and (c),
+/// the first-run prompt, which must not fire for a service / `--json` / non-TTY run.
 ///
 /// The prompt NEVER blocks a scripted or service run: a non-TTY stdin/stdout, a
 /// `--json` output mode, the `service`/`fleet`/`stop` paths, and an explicit
@@ -1151,8 +1212,11 @@ fn resolve_language(flag: Option<&str>, command: Option<&Command>) {
                 return;
             }
             Err(e) => {
-                // Bad value: warn (in English — lang isn't resolved yet) and fall
-                // through to the remaining sources rather than aborting.
+                // Bad value: warn and fall through to the remaining sources rather
+                // than aborting. English on purpose: the message quotes the value the
+                // user typed and names the flag, so it is about the command line
+                // rather than about mining. (The pre-parse pass deliberately does NOT
+                // warn about the same value — one bad flag, one warning.)
                 eprintln!("warning: {e}; ignoring --lang");
             }
         }
@@ -1177,8 +1241,8 @@ fn resolve_language(flag: Option<&str>, command: Option<&Command>) {
         }
     }
 
-    // (d) environment locale.
-    if let Some(lang) = lang_from_env() {
+    // (d) environment locale (the same reader the pre-parse pass and the GUI use).
+    if let Some(lang) = i18n::lang_from_env() {
         i18n::set_process_lang(lang);
         return;
     }
@@ -1242,20 +1306,10 @@ fn prompt_for_language() -> Option<Lang> {
     }
 }
 
-/// Read a language preference from the `LANG` / `LC_ALL` / `LANGUAGE` env vars, in
-/// that precedence. Returns the FIRST that parses to a known language; `None` if
-/// none are set or none parse (the caller then defaults to English). A `C` /
-/// `POSIX` locale parses to nothing → `None` → English.
-fn lang_from_env() -> Option<Lang> {
-    for var in ["LC_ALL", "LANG", "LANGUAGE"] {
-        if let Ok(val) = std::env::var(var) {
-            if let Ok(lang) = val.parse::<Lang>() {
-                return Some(lang);
-            }
-        }
-    }
-    None
-}
+// NOTE: `lang_from_env` used to live here. It moved to
+// `alice_miner_core::i18n::lang_from_env`, because the pre-parse pass at the top of
+// `main` and the GUI need the identical reader — a second copy is how the two
+// front-ends' precedence quietly drifts apart.
 
 /// `lang`: set or show the persisted UI language. With an argument, parse + persist
 /// it (and apply it to this run's remaining output); with none, print the current
