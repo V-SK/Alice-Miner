@@ -460,6 +460,77 @@ impl Manifest {
     pub fn is_security(&self) -> bool {
         self.security.unwrap_or(false)
     }
+
+    /// The `released` field as seconds since the epoch, when it is a timestamp
+    /// we can read at all. `None` for anything we cannot parse with certainty.
+    ///
+    /// There is exactly ONE legitimate use for this value and it is worth naming
+    /// here rather than in the caller: it is a FLOOR on the soak anchor (see
+    /// [`auto::soak_anchor`]), never the anchor itself. A machine cannot have
+    /// seen a version before the publisher released it, so a local first-sighting
+    /// timestamp that predates `released` is a broken clock rather than evidence
+    /// of a long soak. Used that way the field can only ever push an automatic
+    /// install LATER, which is the only direction a manifest field is allowed to
+    /// move anything.
+    pub fn released_unix(&self) -> Option<u64> {
+        parse_rfc3339_utc(&self.released)
+    }
+}
+
+/// Parse the narrow RFC3339 subset the release pipeline emits —
+/// `YYYY-MM-DDTHH:MM:SSZ`, or a bare `YYYY-MM-DD` — into seconds since the epoch.
+///
+/// Deliberately strict: an offset other than `Z`, a fractional second, prose or
+/// an empty string all yield `None`. The consumer treats `None` as "no floor",
+/// i.e. exactly the behaviour that existed before this function, so being unable
+/// to read the field can never be worse than not looking at it.
+fn parse_rfc3339_utc(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (date, time) = match s.split_once('T') {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let mut dp = date.split('-');
+    let y: i64 = dp.next()?.parse().ok()?;
+    let mo: u32 = dp.next()?.parse().ok()?;
+    let d: u32 = dp.next()?.parse().ok()?;
+    if dp.next().is_some() || !(1970..=9999).contains(&y) || !(1..=12).contains(&mo) {
+        return None;
+    }
+    if !(1..=31).contains(&d) {
+        return None;
+    }
+    let (h, mi, sec) = match time {
+        None => (0u64, 0u64, 0u64),
+        Some(t) => {
+            let t = t.strip_suffix('Z').or_else(|| t.strip_suffix('z'))?;
+            let mut tp = t.split(':');
+            let h: u64 = tp.next()?.parse().ok()?;
+            let mi: u64 = tp.next()?.parse().ok()?;
+            let sec: u64 = tp.next()?.parse().ok()?;
+            if tp.next().is_some() || h > 23 || mi > 59 || sec > 60 {
+                return None;
+            }
+            (h, mi, sec)
+        }
+    };
+    let days = days_from_civil(y, mo, d);
+    if days < 0 {
+        return None;
+    }
+    Some((days as u64) * 86_400 + h * 3600 + mi * 60 + sec)
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian date (Howard Hinnant's
+/// `days_from_civil`). Pure integer arithmetic — no dependency, no clock.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64; // March-based month
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Outcome of an update check, surfaced to the GUI for a user decision.
@@ -2141,6 +2212,41 @@ mod tests {
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    /// `released` is only ever used as a floor under the soak anchor, so the
+    /// parser has exactly two jobs: read what our pipeline emits, and say `None`
+    /// rather than guess at anything else (a guess low would weaken the floor).
+    #[test]
+    fn released_parses_the_shape_we_publish_and_refuses_to_guess() {
+        assert_eq!(parse_rfc3339_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339_utc("1970-01-02T00:00:00Z"), Some(86_400));
+        assert_eq!(parse_rfc3339_utc("2001-09-09T01:46:40Z"), Some(1_000_000_000));
+        // The real shape, cross-checked against a value computed elsewhere.
+        assert_eq!(parse_rfc3339_utc("2026-08-14T00:00:00Z"), Some(1_786_665_600));
+        // A leap day, so the civil-date arithmetic is not merely 365-day maths.
+        assert_eq!(parse_rfc3339_utc("2024-02-29T00:00:00Z"), Some(1_709_164_800));
+        // Date-only is accepted (midnight UTC); surrounding whitespace is not
+        // worth failing over.
+        assert_eq!(parse_rfc3339_utc(" 2026-08-14 "), Some(1_786_665_600));
+
+        for bad in [
+            "",
+            "soon",
+            "2026-08-14T00:00:00+08:00", // an offset we would have to trust
+            "2026-08-14T00:00:00",       // no zone at all
+            "2026-13-01T00:00:00Z",      // not a month
+            "2026-08-14T24:00:00Z",      // not an hour
+            "1969-12-31T00:00:00Z",      // before the epoch
+        ] {
+            assert_eq!(parse_rfc3339_utc(bad), None, "must not guess at {bad:?}");
+        }
+
+        let mut m = sample_manifest();
+        m.released = "2026-08-14T00:00:00Z".to_string();
+        assert_eq!(m.released_unix(), Some(1_786_665_600));
+        m.released = "not a date".to_string();
+        assert_eq!(m.released_unix(), None);
     }
 
     #[test]

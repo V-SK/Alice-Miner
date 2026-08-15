@@ -163,8 +163,14 @@ pub fn tick(quiet_holds: bool) -> Outcome {
         mode: m,
         rollout_id: &auto::rollout_id(&dir),
         now_unix: now_unix(),
-        first_seen_unix: seen.as_ref().map(|s| s.first_seen_unix).unwrap_or_else(now_unix),
-        seen_sha256: seen.as_ref().map(|s| s.sha256.as_str()),
+        first_seen_unix: seen
+            .as_ref()
+            .map(|s| s.seen.first_seen_unix)
+            .unwrap_or_else(now_unix),
+        seen_sha256: seen.as_ref().map(|s| s.seen.sha256.as_str()),
+        // Nothing to record (no package for this platform) is not a failure to
+        // record; that path holds on `NoArtifact` long before this matters.
+        sighting_on_record: seen.as_ref().map(|s| s.on_record).unwrap_or(true),
         pinned: &pins,
         lkg_present: app_path
             .as_deref()
@@ -216,7 +222,7 @@ pub fn tick(quiet_holds: bool) -> Outcome {
                 );
             }
             Outcome::CurrentRevoked {
-                message: describe_revoked(&current, &newer, reverted, rollback_available),
+                message: describe_revoked(&current, &newer, reverted, rollback_available, may_act),
             }
         }
 
@@ -247,7 +253,7 @@ pub fn tick(quiet_holds: bool) -> Outcome {
             // The build we are about to replace: was it earning? This is the only
             // thing that lets the probation tell "the new client broke" apart from
             // "the pool is down", so it is read BEFORE the swap.
-            let previous_productive = auto::was_recently_productive(&dir);
+            let baseline = earning_baseline(&dir);
             auto::log_event(
                 &dir,
                 "installing",
@@ -255,10 +261,11 @@ pub fn tick(quiet_holds: bool) -> Outcome {
                     "version": version,
                     "security": security,
                     "sha256": artifact.sha256,
-                    "previous_productive": previous_productive,
+                    "previous_productive": baseline == auto::EarningBaseline::Earning,
+                    "baseline": format!("{baseline:?}"),
                 }),
             );
-            match install(&artifact, &version, current, previous_productive) {
+            match install(&artifact, &version, current, baseline) {
                 Ok(()) => Outcome::Installed {
                     version: version.clone(),
                     message: tr!(
@@ -295,13 +302,47 @@ fn install(
     artifact: &release::Artifact,
     version: &str,
     previous: &str,
-    previous_productive: bool,
+    baseline: auto::EarningBaseline,
 ) -> Result<(), String> {
     let bytes = release::download_and_verify(artifact).map_err(|e| e.to_string())?;
     let applied = release::apply_update(artifact, &bytes).map_err(|e| e.to_string())?;
-    auto::arm(&applied.app_path, version, previous, previous_productive)
-        .map_err(|e| e.to_string())?;
+    auto::arm(&applied.app_path, version, previous, baseline).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// What this machine knows about whether the OUTGOING build was earning.
+///
+/// The productive stamp alone cannot answer this, and the way it fails is the
+/// specific one this release exists for. The acceptance guard (layer 3) halts a
+/// lane during an upstream collapse and the stamp then freezes by design — the
+/// August 2026 fork froze it for 78 hours, past the 72-hour
+/// [`auto::PRODUCTIVE_WINDOW`]. A stale stamp during a halt does NOT mean "this
+/// machine was not earning"; it means "this machine was not allowed to try".
+///
+/// So the halt is read here, from the record layer 3 persists precisely so that
+/// it survives a restart. Nothing in the acceptance layer is touched or changed:
+/// this is a read of a public, on-disk fact, at the one moment the arming path
+/// needs it.
+fn earning_baseline(dir: &std::path::Path) -> auto::EarningBaseline {
+    if auto::was_recently_productive(dir) {
+        return auto::EarningBaseline::Earning;
+    }
+    if any_lane_halted() {
+        return auto::EarningBaseline::Unknown;
+    }
+    auto::EarningBaseline::NotEarning
+}
+
+/// Whether the acceptance guard is holding ANY lane on this machine right now.
+///
+/// One halted lane is enough: it is the lane whose accepted shares would have
+/// refreshed the stamp, and we would rather defer a verdict we cannot reach than
+/// commit a build that has never mined.
+fn any_lane_halted() -> bool {
+    use crate::lane::Lane;
+    [Lane::Xmr, Lane::GpuPrl, Lane::GpuAlpha, Lane::GpuRvn]
+        .into_iter()
+        .any(|l| crate::acceptance::load_halt_record(l).is_some())
 }
 
 /// The whole withdrawal notice: what is wrong, what (if anything) there is to
@@ -315,30 +356,45 @@ fn describe_revoked(
     newer: &Option<auto::NewerRelease>,
     reverted: bool,
     rollback_available: bool,
+    may_act: bool,
 ) -> String {
     let tail = if reverted {
         tr!(
             "The previous version has been restored on disk — restart alice-miner to run it. This process is still the withdrawn build.",
             "上一个版本已恢复到磁盘 —— 请重启 alice-miner 以运行它。当前进程仍是被撤回的版本。"
-        )
-    } else if rollback_available {
+        ).to_string()
+    } else if rollback_available && may_act {
+        // We were allowed to act, a copy was there, and the restore still did
+        // not happen. Saying "nothing was changed because of a setting" here
+        // would blame a setting for a failure — the same class of half-truth the
+        // rollback notices are careful to avoid.
         tr!(
-            "A previous version is still on this machine, but this machine is set not to install anything on its own, so nothing was changed.",
-            "本机仍保留上一个版本,但本机设置为不自动安装任何东西,因此未做任何更改。"
-        )
+            "A previous version is on this machine but it could NOT be restored automatically. Reinstall the previous release yourself from {url}.",
+            "本机保留有上一个版本,但无法自动恢复。请自行从 {url} 重新安装上一个版本。"
+        ).replace("{url}", release::RELEASES_PAGE_URL)
+    } else if rollback_available {
+        // The load-bearing correction: this client is HOLDING the copy it would
+        // put back, and the only thing stopping it is a setting the reader can
+        // change. Telling them to go and reinstall by hand — as the "nowhere
+        // forward to go" clause used to — sends someone running a build we have
+        // just called dangerous off to do manually what one command would do.
+        tr!(
+            "A previous version is still on this machine and this client can restore it, but this machine is set not to install anything on its own, so nothing was changed. Allow it with `alice-miner update --auto security-only` and it will roll back on the next check.",
+            "本机仍保留上一个版本,客户端也能把它装回去,但本机设置为不自动安装任何东西,因此未做任何更改。可运行 `alice-miner update --auto security-only` 允许它,下次检查时便会自动回滚。"
+        ).to_string()
     } else {
         tr!(
             "There is no previous version on this machine to fall back to.",
             "本机没有可回退的旧版本。"
-        )
+        ).to_string()
     };
     [
         tr!(
             format!("⚠ WARNING: v{current} has been WITHDRAWN by the publisher — do not keep running it."),
             format!("⚠ 警告:v{current} 已被发布方撤回 —— 请不要继续运行它。")
         ),
-        describe_forward(newer, reverted),
-        tail.to_string(),
+        describe_forward(newer, reverted, rollback_available),
+        tail,
     ]
     .iter()
     .filter(|s| !s.is_empty())
@@ -357,7 +413,11 @@ fn describe_revoked(
 /// the attack: it collapses the soak window from a day to however long it takes
 /// someone to read a line of text, on a version they have no reason to distrust
 /// because we just told them to take it. So this says what is true and stops.
-fn describe_forward(newer: &Option<auto::NewerRelease>, reverted: bool) -> String {
+fn describe_forward(
+    newer: &Option<auto::NewerRelease>,
+    reverted: bool,
+    rollback_available: bool,
+) -> String {
     match newer {
         // F2b — the ordinary case: we shipped it, it is bad, we pulled it. The
         // withdrawn build IS the newest published version, so there is nowhere
@@ -367,6 +427,18 @@ fn describe_forward(newer: &Option<auto::NewerRelease>, reverted: bool) -> Strin
             // at the releases page on top of that would be noise.
             String::new()
         }
+        // Nowhere forward, but a last-known-good copy IS here. What to do about
+        // it is entirely the tail's business (it knows whether the client is
+        // allowed to use that copy, and whether it tried and failed), so this
+        // clause states the one fact it owns and stops. It must NOT say "this
+        // client cannot put it back for you": in this branch the client is
+        // holding the copy, and that sentence would be false as well as
+        // discouraging.
+        None if rollback_available => tr!(
+            "There is no newer version to move to — the withdrawn build is the newest one published.",
+            "没有可以升级过去的更新版本 —— 被撤回的就是当前最新发布版本。"
+        )
+        .to_string(),
         None => tr!(
             format!("There is no newer version to move to — the withdrawn build is the newest one published. Leaving it means reinstalling the previous release yourself from {url}; this client cannot put it back for you from here.", url = release::RELEASES_PAGE_URL),
             format!("没有可以升级过去的更新版本 —— 被撤回的就是当前最新发布版本。要离开它,需要你自己从 {url} 重新安装上一个版本;客户端无法在这里替你装回去。", url = release::RELEASES_PAGE_URL)
@@ -458,6 +530,10 @@ fn describe_hold(version: &str, hold: &Hold) -> String {
             format!("v{version} is available but ships no package for this platform — download it manually from the releases page."),
             format!("有新版本 v{version},但没有适用于本平台的安装包 —— 请从发布页手动下载。")
         ),
+        Hold::LedgerUnwritable => tr!(
+            format!("v{version} is available but was NOT installed automatically: this machine could not write its update ledger, so it cannot remember which package a version number arrived with — the check that catches a version being re-published with different bytes. Fix the permissions on the alice-miner data directory (or free some disk) and it will resume on its own. `alice-miner update` still works and will say the same thing before it installs anything."),
+            format!("有新版本 v{version},但未自动安装:本机无法写入更新台账,也就记不住某个版本号当初对应的安装包 —— 那正是用来发现「同一版本号换了字节」的检查。请修复 alice-miner 数据目录的权限(或清出磁盘空间),之后会自动恢复。`alice-miner update` 仍可使用,并会在安装前给出同样的提示。")
+        ),
         Hold::HashConflict { seen_sha256, now_sha256 } => {
             let seen = short(seen_sha256);
             let now = short(now_sha256);
@@ -533,6 +609,7 @@ pub struct ManualCheck {
 pub fn manual_check(
     manifest: &release::Manifest,
     artifact: Option<&release::Artifact>,
+    current: &str,
 ) -> ManualCheck {
     let dir = state_dir();
     // The ledger is keyed by (version, platform artifact hash). With no artifact
@@ -541,14 +618,21 @@ pub fn manual_check(
     let seen = artifact.map(|a| auto::note_seen(&dir, &manifest.version, &a.sha256));
     let visible_for_s = seen
         .as_ref()
-        .map(|s| auto::visible_for(now_unix(), s.first_seen_unix))
+        .map(|s| {
+            auto::visible_for(
+                now_unix(),
+                auto::soak_anchor(s.seen.first_seen_unix, manifest.released_unix()),
+            )
+        })
         .unwrap_or(0);
     let inside_soak = auto::inside_soak(visible_for_s);
     let pins = auto::pins(&dir);
     let verdict = auto::decide_manual(&auto::ManualInput {
         manifest,
+        current,
         artifact_sha256: artifact.map(|a| a.sha256.as_str()),
-        seen_sha256: seen.as_ref().map(|s| s.sha256.as_str()),
+        seen_sha256: seen.as_ref().map(|s| s.seen.sha256.as_str()),
+        sighting_on_record: seen.as_ref().map(|s| s.on_record).unwrap_or(true),
         pinned: &pins,
     });
 
@@ -577,6 +661,19 @@ pub fn manual_check(
                 ),
             }
         }
+        auto::ManualVerdict::Refuse(auto::ManualRefusal::NotNewer { offered, current }) => {
+            auto::log_event(
+                &dir,
+                "manual-downgrade-refused",
+                serde_json::json!({ "offered": offered, "current": current }),
+            );
+            ManualOutcome::Refuse {
+                message: tr!(
+                    format!("REFUSED to install v{offered}: it is not newer than the v{current} this machine is already running, and `update` never means going backwards. Nothing was downloaded. If a manifest is offering an older build as a required upgrade, that is either a mistake on our side or someone else signing with our key — report it. A downgrade you genuinely want is a manual install from the releases page, not an update."),
+                    format!("已拒绝安装 v{offered}:它并不比本机正在运行的 v{current} 更新,而 `update` 从来不是往回退。没有下载任何内容。如果清单把一个更旧的版本当作必须升级的目标,要么是我方出错,要么是别人拿着我们的密钥在签名 —— 请上报。若你确实想降级,请到发布页手动安装,而不是走更新。")
+                ),
+            }
+        }
         auto::ManualVerdict::Refuse(auto::ManualRefusal::Revoked) => ManualOutcome::Refuse {
             message: tr!(
                 format!("v{version} has been WITHDRAWN by the publisher and will not be installed."),
@@ -589,6 +686,20 @@ pub fn manual_check(
                 format!("本机曾安装过 v{version} 并自动回滚,原因是它要么无法启动,要么在本机不再有被接受的份额。")
             ),
         },
+        auto::ManualVerdict::ConfirmFirst(auto::ManualConcern::UnrecordedSighting) => {
+            auto::log_event(
+                &dir,
+                "ledger-unwritable",
+                serde_json::json!({ "version": version }),
+            );
+            ManualOutcome::Confirm {
+                message: tr!(
+                    "this machine could not write its update ledger, so it cannot remember which package this version number arrived with. The check that catches the same version being re-published with different bytes is not running here, and will not run on the next install either. Fixing the permissions on the alice-miner data directory (or freeing disk space) restores it.",
+                    "本机无法写入更新台账,因而记不住这个版本号当初对应的是哪个安装包。用于发现「同一版本号被换成不同字节」的检查在本机没有生效,下次安装时同样不会生效。修复 alice-miner 数据目录的权限(或清出磁盘空间)即可恢复。"
+                )
+                .to_string(),
+            }
+        }
     };
 
     let visibility = seen.as_ref().map(|_| {
@@ -925,6 +1036,7 @@ mod tests {
                 seen_sha256: "aa".repeat(32),
                 now_sha256: "bb".repeat(32),
             },
+            Hold::LedgerUnwritable,
         ];
         for h in holds {
             let s = describe_hold("0.6.8", &h);
@@ -1146,6 +1258,7 @@ mod tests {
             Hold::Soaking { ready_in_s: 3600 },
             Hold::Rollout { bucket: 42, pct: 10 },
             Hold::Pinned,
+            Hold::LedgerUnwritable,
         ];
         let preference = [Hold::ModeOff, Hold::NotifyOnly, Hold::NotSecurity];
 
@@ -1197,7 +1310,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
             crate::i18n::set_lang(lang);
-            let s = describe_forward(&Some(newer("9.9.9", 2 * 3600)), false);
+            let s = describe_forward(&Some(newer("9.9.9", 2 * 3600)), false, false);
             assert!(
                 !reads_as_an_instruction(&s),
                 "a withdrawal must never double as an install instruction ({lang:?}): {s}"
@@ -1224,7 +1337,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
-        let s = describe_forward(&Some(newer("9.9.9", 5 * 24 * 3600)), false);
+        let s = describe_forward(&Some(newer("9.9.9", 5 * 24 * 3600)), false, false);
         assert!(!reads_as_an_instruction(&s), "{s}");
         assert!(s.contains("5 days"), "{s}");
         assert!(!s.contains("NOT advised"), "no scolding past the floor: {s}");
@@ -1241,7 +1354,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
             crate::i18n::set_lang(lang);
-            let s = describe_forward(&None, false);
+            let s = describe_forward(&None, false, /* rollback_available */ false);
             assert!(!reads_as_an_instruction(&s), "({lang:?}): {s}");
             assert!(
                 s.contains(release::RELEASES_PAGE_URL),
@@ -1255,7 +1368,7 @@ mod tests {
         // …unless we already put the previous build back, in which case the tail
         // covers it and a releases-page link would be noise.
         crate::i18n::set_lang(crate::i18n::Lang::En);
-        assert_eq!(describe_forward(&None, true), "");
+        assert_eq!(describe_forward(&None, true, true), "");
     }
 
     /// The whole notice, as the miner actually reads it. The clause tests above
@@ -1269,13 +1382,17 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
             crate::i18n::set_lang(lang);
-            for (newer, reverted, lkg) in [
-                (Some(newer("9.9.9", 2 * 3600)), false, false),
-                (Some(newer("9.9.9", 9 * 24 * 3600)), false, true),
-                (None, false, false),
-                (None, true, true),
+            for (newer, reverted, lkg, may_act) in [
+                (Some(newer("9.9.9", 2 * 3600)), false, false, false),
+                (Some(newer("9.9.9", 9 * 24 * 3600)), false, true, false),
+                (None, false, false, false),
+                (None, true, true, true),
+                // The two branches F3 is about: a last-known-good copy is here
+                // and we either were not allowed to use it, or tried and failed.
+                (None, false, true, false),
+                (None, false, true, true),
             ] {
-                let s = describe_revoked("0.6.9", &newer, reverted, lkg);
+                let s = describe_revoked("0.6.9", &newer, reverted, lkg, may_act);
                 assert!(
                     !reads_as_an_instruction(&s),
                     "({lang:?}) the notice must never become an install instruction: {s}"
@@ -1287,6 +1404,72 @@ mod tests {
                 );
                 assert!(!s.contains("  "), "({lang:?}) a skipped clause left a hole: {s}");
             }
+        }
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+    }
+
+    /// The ordinary "we shipped it, it is bad, we pulled it" withdrawal, on a
+    /// machine set to `off`/`notify` that IS holding a last-known-good copy.
+    ///
+    /// The notice used to say both "this client cannot put it back for you from
+    /// here" and "a previous version is still on this machine". The middle
+    /// clause was false in this branch — the client is holding the copy and
+    /// declined to use it on policy grounds — so we sent a miner running a build
+    /// we had just called dangerous off to reinstall by hand, when flipping one
+    /// setting would have done it.
+    #[test]
+    fn a_withdrawal_with_a_rollback_copy_in_hand_does_not_send_the_user_away() {
+        let _g = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
+            crate::i18n::set_lang(lang);
+            let s = describe_revoked(
+                "0.6.9",
+                &None,
+                /* reverted */ false,
+                /* rollback_available */ true,
+                /* may_act */ false,
+            );
+            assert!(
+                !s.contains("cannot put it back") && !s.contains("无法在这里替你装回去"),
+                "the client IS holding the copy — saying otherwise is false ({lang:?}): {s}"
+            );
+            assert!(
+                !s.contains(release::RELEASES_PAGE_URL),
+                "do not send them to reinstall by hand when a setting would do it ({lang:?}): {s}"
+            );
+            assert!(
+                s.contains("--auto security-only"),
+                "it must name the one thing that actually recovers this machine ({lang:?}): {s}"
+            );
+            assert!(!reads_as_an_instruction(&s), "({lang:?}): {s}");
+
+            // The control, and the branch that keeps the old wording: no copy on
+            // disk, so reinstalling by hand really is the only way out.
+            let none = describe_revoked("0.6.9", &None, false, false, false);
+            assert!(
+                none.contains(release::RELEASES_PAGE_URL)
+                    && (none.contains("cannot") || none.contains("无法")),
+                "({lang:?}): {none}"
+            );
+            assert!(
+                !none.contains("--auto security-only"),
+                "there is nothing for a setting to unlock here ({lang:?}): {none}"
+            );
+
+            // And the third case, which the old shape could not express at all:
+            // we WERE allowed to act, there WAS a copy, and the restore failed.
+            // Blaming a setting there would be a different false statement.
+            let failed = describe_revoked("0.6.9", &None, false, true, /* may_act */ true);
+            assert!(
+                !failed.contains("--auto security-only"),
+                "a failed restore is not a settings problem ({lang:?}): {failed}"
+            );
+            assert!(
+                failed.contains("could NOT be restored") || failed.contains("无法自动恢复"),
+                "({lang:?}): {failed}"
+            );
         }
         crate::i18n::set_lang(crate::i18n::Lang::En);
     }
@@ -1358,7 +1541,7 @@ mod tests {
         crate::i18n::set_lang(crate::i18n::Lang::En);
         with_state_dir("seen", |dir| {
             let m = test_manifest("9.9.9");
-            let check = manual_check(&m, Some(&m.artifacts[0]));
+            let check = manual_check(&m, Some(&m.artifacts[0]), "0.6.7");
             assert_eq!(check.outcome, ManualOutcome::Proceed);
             assert!(
                 dir.join("update-seen.json").exists(),
@@ -1373,7 +1556,7 @@ mod tests {
             );
             // The recorded hash is the one we were offered.
             let seen = auto::note_seen(dir, "9.9.9", "ff".repeat(32).as_str());
-            assert_eq!(seen.sha256, "aa".repeat(32), "first bytes win");
+            assert_eq!(seen.seen.sha256, "aa".repeat(32), "first bytes win");
         });
     }
 
@@ -1391,7 +1574,7 @@ mod tests {
             auto::note_seen(dir, "9.9.9", "bb".repeat(32).as_str());
             // The server now offers "aa…" under the same number.
             let m = test_manifest("9.9.9");
-            let check = manual_check(&m, Some(&m.artifacts[0]));
+            let check = manual_check(&m, Some(&m.artifacts[0]), "0.6.7");
             match check.outcome {
                 ManualOutcome::Refuse { message } => {
                     assert!(message.contains("REFUSED"), "{message}");
@@ -1418,7 +1601,7 @@ mod tests {
         with_state_dir("pinned", |dir| {
             auto::pin(dir, "9.9.9");
             let m = test_manifest("9.9.9");
-            match manual_check(&m, Some(&m.artifacts[0])).outcome {
+            match manual_check(&m, Some(&m.artifacts[0]), "0.6.7").outcome {
                 ManualOutcome::Confirm { message } => {
                     assert!(message.contains("9.9.9"), "{message}");
                     assert!(message.contains("rolled it back"), "{message}");
@@ -1428,6 +1611,128 @@ mod tests {
         });
     }
 
+    /// The manual driver refuses a build that is not newer than the running
+    /// one, in the shape both front-ends actually call.
+    #[test]
+    fn the_manual_path_refuses_a_downgrade() {
+        let _l = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        with_state_dir("downgrade", |dir| {
+            // A perfectly ordinary, correctly-signed manifest — the only thing
+            // wrong with it is the direction.
+            let m = test_manifest("0.6.4");
+            match manual_check(&m, Some(&m.artifacts[0]), "0.6.8").outcome {
+                ManualOutcome::Refuse { message } => {
+                    assert!(message.contains("REFUSED"), "{message}");
+                    assert!(message.contains("0.6.4") && message.contains("0.6.8"), "{message}");
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+            let hist = std::fs::read_to_string(dir.join("update-history.jsonl")).unwrap_or_default();
+            assert!(hist.contains("manual-downgrade-refused"), "history: {hist}");
+
+            // The control: the same driver, the same machine, one version later.
+            let up = test_manifest("0.6.9");
+            assert_eq!(
+                manual_check(&up, Some(&up.artifacts[0]), "0.6.8").outcome,
+                ManualOutcome::Proceed
+            );
+        });
+    }
+
+    /// The cross-layer half of the arming fix: layer 3 persists its halt so it
+    /// survives a restart, and the arming path reads it. Without that read, a
+    /// build installed during a multi-day outage arms with no baseline and
+    /// commits — dropping last-known-good — on the first command the user types.
+    #[test]
+    fn a_halted_lane_makes_the_earning_baseline_unknown_rather_than_absent() {
+        with_state_dir("baseline", |_dir| {
+            let dir = state_dir();
+            // Nothing earning, nothing halted: a genuinely idle rig.
+            assert_eq!(earning_baseline(&dir), auto::EarningBaseline::NotEarning);
+
+            // Layer 3 halts the lane. The productive stamp is now frozen by
+            // design — and it is still stale, because the outage outlasted the
+            // 72-hour window (August 2026 ran 78).
+            let rec = crate::acceptance::HaltRecord {
+                schema: crate::acceptance::HALT_SCHEMA,
+                lane: crate::acceptance::lane_wire_name(crate::lane::Lane::GpuPrl).to_string(),
+                halted_at: crate::acceptance::now_unix(),
+                next_probe_at: crate::acceptance::now_unix() + 1800,
+                probes: 3,
+                run_accepted: 0,
+                run_rejected: 7_743,
+                period_accepted: 0,
+                period_rejected: 500,
+                period_elapsed_s: 900,
+                shutout: true,
+                attribution: "upstream".to_string(),
+                version: "0.6.8".to_string(),
+            };
+            crate::acceptance::save_halt_record(&rec).expect("seed the halt");
+            assert_eq!(
+                earning_baseline(&dir),
+                auto::EarningBaseline::Unknown,
+                "a stale stamp behind a halt is 'we could not tell', not 'it was not earning'"
+            );
+
+            // A fresh accepted share still outranks everything: if the machine
+            // IS earning we have a real baseline and the mining gate arms.
+            auto::mark_productive(&dir);
+            assert_eq!(earning_baseline(&dir), auto::EarningBaseline::Earning);
+
+            crate::acceptance::clear_halt_record(crate::lane::Lane::GpuPrl);
+        });
+    }
+
+    /// A state directory that cannot be written disarms the hash-conflict
+    /// refusal permanently — the sighting handed back is built from the manifest
+    /// and therefore agrees with it, every run, forever. The manual path must
+    /// say so rather than proceed as if the check had passed.
+    #[test]
+    fn the_manual_path_says_when_it_could_not_record_what_it_was_offered() {
+        let _l = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let _g = crate::IDENTITY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // `$ALICE_IDENTITY_DIR` pointed at a regular FILE: `create_dir_all`
+        // fails on every platform, which is what an unwritable state dir does.
+        let base = std::env::temp_dir().join(format!(
+            "alice-noledger-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::create_dir_all(&base);
+        let not_a_dir = base.join("state");
+        std::fs::write(&not_a_dir, b"not a directory").unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &not_a_dir);
+
+        let m = test_manifest("9.9.9");
+        let outcome = manual_check(&m, Some(&m.artifacts[0]), "0.6.7").outcome;
+
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&base);
+
+        match outcome {
+            ManualOutcome::Confirm { message } => {
+                assert!(
+                    message.contains("could not write its update ledger"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("re-published") || message.contains("different bytes"),
+                    "it must name the check that is missing, not just the file: {message}"
+                );
+            }
+            other => panic!("expected a second question, got {other:?}"),
+        }
+    }
+
     /// With no package for this platform there is nothing to compare, and the
     /// gate must not invent a conflict out of the absence — nor write a
     /// placeholder hash into an append-only ledger.
@@ -1435,10 +1740,11 @@ mod tests {
     fn the_manual_path_with_no_platform_package_records_nothing() {
         with_state_dir("noartifact", |dir| {
             let m = test_manifest("9.9.9");
-            let check = manual_check(&m, None);
+            let check = manual_check(&m, None, "0.6.7");
             assert_eq!(check.outcome, ManualOutcome::Proceed);
             assert_eq!(check.visibility, None);
             assert!(!dir.join("update-seen.json").exists());
         });
     }
 }
+
