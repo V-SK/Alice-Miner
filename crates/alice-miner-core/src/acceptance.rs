@@ -467,6 +467,12 @@ pub struct AcceptanceMonitor {
     verdict: LaneVerdict,
     /// Latest cumulative counters seen (for regression detection).
     last_seen: (u64, u64),
+    /// Whether the counter stream BROKE inside the period now open — i.e. a reading
+    /// came in below the last one, so the period's two ends were measured on
+    /// different scales. Set beside [`Self::rebaseline`], cleared with every fresh
+    /// period baseline. A broken period is not a measurement and is never judged;
+    /// see the `is_shutout` guard in [`Self::observe`].
+    period_broken: bool,
 }
 
 impl AcceptanceMonitor {
@@ -490,6 +496,7 @@ impl AcceptanceMonitor {
                 RejectVisibility::Unavailable => LaneVerdict::Unknown,
             },
             last_seen: (0, 0),
+            period_broken: false,
         }
     }
 
@@ -523,6 +530,7 @@ impl AcceptanceMonitor {
         self.period_baseline = None;
         self.strikes = 0;
         self.last_seen = (0, 0);
+        self.period_broken = false;
         self.verdict = match self.visibility {
             RejectVisibility::Observed => LaneVerdict::Warmup,
             RejectVisibility::Unavailable => LaneVerdict::Unknown,
@@ -576,6 +584,9 @@ impl AcceptanceMonitor {
         // delta — an under-count can only make us slower to halt, never quicker.
         if accepted < self.last_seen.0 || rejected < self.last_seen.1 {
             self.rebaseline(now, accepted, rejected);
+            // …and REMEMBER that it happened. Moving the floor keeps the arithmetic
+            // sane; it does not make the period measurable. See the guard below.
+            self.period_broken = true;
         }
         self.last_seen = (accepted, rejected);
 
@@ -597,6 +608,7 @@ impl AcceptanceMonitor {
             let base = Baseline { at: now, accepted, rejected };
             self.warm_baseline = Some(base);
             self.period_baseline = Some(base);
+            self.period_broken = false;
             self.verdict = LaneVerdict::Gathering;
             return self.verdict.clone();
         }
@@ -626,6 +638,42 @@ impl AcceptanceMonitor {
 
         // The period is complete. Judge it and open the next one.
         self.period_baseline = Some(Baseline { at: now, accepted, rejected });
+
+        // ── …unless the COUNTER STREAM broke inside it ────────────────────────
+        // A reading came in below the one before it, so this period's two ends were
+        // measured on different scales and the delta between them is not a count of
+        // anything. On a bring-your-own lane that is routine: `supervise::fold_generic`
+        // adopts a rise at once (the totals must not lag reality by a line) and heals
+        // it back down two readings later, so a mis-read line opens a period on a
+        // number the rig never reached. When the heal lands, `accepted` is BELOW the
+        // baseline, `saturating_sub` floors the accepted side at zero, and the rejected
+        // side still counts the whole window — a period that is a guaranteed
+        // `is_shutout`, and `is_shutout` halts on ONE window. That is how a rig with
+        // shares landing gets stopped for "0 accepted".
+        //
+        // The fix is the module's founding rule, not a threshold: a lane we cannot
+        // measure is never judged. So the broken period is DISCARDED — no rate is
+        // published (a fabricated 0% is exactly what we refuse to print), no strike is
+        // charged, and the strike memory is left alone so a bad window on either side
+        // of the break still counts. The clock is not rewound either: `rebaseline`
+        // deliberately keeps `at`, and the fresh period opens only once this one has
+        // run its full course, so a break cannot hold a window open. What a lane CAN
+        // do is evade judgement by breaking its counter inside every single window —
+        // and a stream that does that is genuinely unmeasurable, which is the honest
+        // answer rather than a halt on invented evidence.
+        //
+        // Scope, precisely: the flag is set by a MID-STREAM regression only. The
+        // incident's own shape cannot set it — an engine restart or a Layer-B failover
+        // no longer presents a regression here at all, because the supervisor adds each
+        // child's counters to what the run already earned
+        // (`supervise::adopt_child_accepted`), which is what [`Self::on_failover`]
+        // depends on. A bundled engine reaches this only by mis-reading one of its own
+        // lines into a lower cumulative value, and a period measured across THAT is no
+        // more trustworthy than a generic one.
+        if std::mem::take(&mut self.period_broken) {
+            self.verdict = LaneVerdict::Gathering;
+            return self.verdict.clone();
+        }
 
         if period.accept_pct() >= self.cfg.collapse_pct {
             self.strikes = 0;
@@ -665,6 +713,13 @@ impl AcceptanceMonitor {
     /// (the shares really were counted, we just lost the reading) and wrong for a new
     /// process (the shares were counted by somebody else). The supervisor keeps the
     /// restart path off this function entirely — see [`Self::on_failover`].
+    ///
+    /// What this is NOT: a defence against being judged across the break. Lowering a
+    /// baseline can only make a period's measured deltas LARGER, so it never causes a
+    /// halt and never prevents one — with this function neutered entirely, a period
+    /// that a glitch ran through still lands on `saturating_sub`'s floor and still
+    /// reads `0 accepted`. Refusing to judge such a period is a separate rule, and it
+    /// lives at [`Self::period_broken`].
     fn rebaseline(&mut self, now: Instant, accepted: u64, rejected: u64) {
         if let Some(b) = self.warm_baseline.as_mut() {
             b.accepted = b.accepted.min(accepted);
@@ -1409,6 +1464,92 @@ mod tests {
             }
         }
         assert!(v.is_collapsed(), "failover churn must not hide a total shutout: {v:?}");
+    }
+
+    /// R5: a period the COUNTER STREAM broke under is not a measurement, so it may not
+    /// produce a verdict — least of all the one-window "total shutout" halt.
+    ///
+    /// The shape is a bring-your-own miner on [`ParserKind::Generic`]. A mis-read line
+    /// implants a spike; the supervisor's belt (`supervise::fold_generic`) adopts the
+    /// rise at once, so the period that opens here opens on a number the rig never
+    /// reached. The rig is mining fine and its rejects tick along normally. Two later
+    /// readings corroborate the fall and the belt heals the total — and THAT
+    /// observation is the first one to satisfy both gates, so the period is judged with
+    /// its accepted side zeroed by the break and its rejected side counting the whole
+    /// window. `accepted == 0` ⇒ `is_shutout` ⇒ the lane is halted while it is
+    /// accepting. Judging across the break is exactly the fabricated verdict this
+    /// module's founding rule forbids.
+    #[test]
+    fn a_period_the_counter_broke_under_is_not_judged_as_a_shutout() {
+        let c = Clock::new();
+        let mut m = AcceptanceMonitor::with_config(ParserKind::Generic, cfg_fast());
+        m.on_run_start(c.at(0));
+        // First observation past warm-up lands on the mis-read spike, so the period
+        // baseline is a number the rig never reached.
+        assert_eq!(m.observe(c.at(60), 5_000, 3), LaneVerdict::Gathering);
+        // The rig keeps working. The belt holds the spike, so `accepted` is pinned
+        // while the real rejects tick along — 17 of them, one short of the sample.
+        let mut v = LaneVerdict::Gathering;
+        for r in 4..=20u64 {
+            v = m.observe(c.at(60 + (r - 3) * 5), 5_000, r);
+        }
+        assert_eq!(v, LaneVerdict::Gathering, "not enough sample yet: {v:?}");
+        // The heal: two corroborating readings walked the total back to the truth.
+        // This is the first observation to satisfy BOTH gates.
+        let v = m.observe(c.at(200), 46, 24);
+        assert!(
+            !v.is_collapsed(),
+            "a period the counter broke under must not halt an accepting rig: {v:?}"
+        );
+        // And the lane is not left holding a fabricated rate either.
+        assert_eq!(v.accept_pct(), None, "no rate may be published for a broken period: {v:?}");
+        // It recovers on its own evidence: the next CLEAN period is measured normally
+        // (20 accepted, 0 rejected, a full window) — the guard withholds one period,
+        // it does not switch the layer off.
+        let mut v = LaneVerdict::Gathering;
+        for i in 1..=20u64 {
+            v = m.observe(c.at(200 + i * 10), 46 + i, 24);
+        }
+        assert!(matches!(v, LaneVerdict::Healthy(_)), "a clean period must judge normally: {v:?}");
+    }
+
+    /// The other side of that rule: a break costs the lane ONE period, never the halt.
+    /// The strike memory survives it, so a bad window on either side of the break still
+    /// adds up to a collapse on the ordinary two-strike rule — the withheld period is
+    /// withheld, not forgiven.
+    #[test]
+    fn a_break_does_not_buy_a_collapsing_lane_a_fresh_start() {
+        let c = Clock::new();
+        let mut m = AcceptanceMonitor::with_config(ParserKind::Generic, cfg_fast());
+        m.on_run_start(c.at(0));
+        m.observe(c.at(60), 0, 0); // warm baseline @60 = (0, 0)
+        // Period 1: bad but not a shutout — 1 accepted / 19 rejected = 5% ⇒ STRIKE 1.
+        let mut v = LaneVerdict::Gathering;
+        for r in 1..=19u64 {
+            v = m.observe(c.at(60 + r * 10), 1, r);
+        }
+        assert!(matches!(v, LaneVerdict::Degrading(_)), "one bad window is a strike: {v:?}");
+
+        // Period 2 (baseline (1, 19) @250): the miner re-baselines its own counters
+        // mid-stream — the counter stream breaks under the open period.
+        m.observe(c.at(300), 0, 0);
+        let mut v = LaneVerdict::Gathering;
+        for r in 1..=20u64 {
+            v = m.observe(c.at(300 + r * 10), 0, r);
+        }
+        assert!(
+            !v.is_collapsed(),
+            "0 accepted across a BROKEN period is not a measured shutout: {v:?}"
+        );
+        assert_eq!(v.accept_pct(), None, "no rate may be published for it either: {v:?}");
+
+        // Period 3 is clean and just as bad as period 1 ⇒ STRIKE 2 ⇒ halt. If the
+        // break had reset the strike memory this would only be a `Degrading`.
+        let mut v = LaneVerdict::Gathering;
+        for r in 21..=39u64 {
+            v = m.observe(c.at(500 + r * 10), 1, r);
+        }
+        assert!(v.is_collapsed(), "the second bad window must still halt: {v:?}");
     }
 
     #[test]
