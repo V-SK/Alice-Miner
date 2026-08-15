@@ -34,8 +34,20 @@
 //!
 //! This layer adds no signing key, no auto-download, no new code path that a stolen
 //! release key could ride. Its network use is one *read-only, unauthenticated* GET
-//! whose only effect is choosing between two sentences (see [`Attribution`]) — a
-//! hostile answer can make the wording wrong, never the halt.
+//! (see [`fetch_attribution`]), and it has exactly two readers:
+//!
+//! * the halt message, where it only chooses between two sentences (see
+//!   [`Attribution`]) — a hostile answer can make the wording wrong, never the halt;
+//! * the auto-updater's health probation, where a `NetworkWide` answer makes it
+//!   ABSTAIN from judging the installed build ([`any_lane_collapsed_network_wide`]).
+//!
+//! State the second one's worst case plainly rather than implying it is free: an
+//! endpoint that always claims a network-wide collapse can *suppress* an automatic
+//! rollback, leaving a machine on a build that genuinely stopped earning. It cannot
+//! cause a rollback, cannot install anything, cannot halt a healthy lane and cannot
+//! un-halt a collapsed one. We take that trade deliberately: the failure it prevents
+//! (rolling back and permanently pinning an innocent client during an upstream
+//! outage, fleet-wide, unattended) is the one that actually happened.
 
 use std::time::{Duration, Instant};
 
@@ -607,6 +619,69 @@ pub fn lane_wire_name(lane: Lane) -> &'static str {
 /// The lane-health URL under a read-API `base` (the same apex the credit poller uses).
 pub fn lane_health_url(base: &str) -> String {
     format!("{}/read/lane-health", base.trim_end_matches('/'))
+}
+
+/// Fetch the raw lane-health body from the public read-API. Blocking, bounded,
+/// unauthenticated, read-only. `None` on any failure — there is no retry and no
+/// caching, because every caller treats "we could not ask" as "we do not know".
+fn fetch_lane_health_body() -> Option<String> {
+    let base = std::env::var(crate::dashboard::ENV_READ_API_URL)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::dashboard::READ_API_BASE_DEFAULT.to_string());
+    match crate::dashboard::http_get_read_api(&lane_health_url(&base)) {
+        Ok(body) => Some(body),
+        Err(e) => {
+            if std::env::var("ALICE_MINER_VERBOSE").map(|v| v == "1").unwrap_or(false) {
+                eprintln!("[verbose] lane-health lookup failed: {e}");
+            }
+            None
+        }
+    }
+}
+
+/// Ask the public read-API what the WHOLE NETWORK's acceptance rate is for `lane`,
+/// and turn it into an [`Attribution`].
+///
+/// Anything that goes wrong (no network, a non-2xx, an unparseable body, a lane the
+/// server didn't mention, a figure drawn from a single miner) resolves to
+/// [`Attribution::Unknown`]: we say we don't know rather than handing anyone a guess.
+/// A hostile endpoint can therefore only make our wording vaguer — it can neither
+/// halt a healthy miner nor un-halt a collapsed one.
+///
+/// Blocking. Call it off any hot path (the supervisor calls it once per halt, after
+/// the engine is already stopped; the updater calls it at most once per session, and
+/// only at the moment it would otherwise roll a build back).
+pub fn fetch_attribution(lane: Lane) -> Attribution {
+    match fetch_lane_health_body() {
+        Some(body) => match parse_lane_health(&body, lane) {
+            Some(h) => h.attribute(),
+            None => Attribution::Unknown,
+        },
+        None => Attribution::Unknown,
+    }
+}
+
+/// Whether ANY of `lanes` is being rejected NETWORK-WIDE right now — one HTTP GET
+/// for the whole set.
+///
+/// This is the cross-layer question the auto-updater's health probation asks before
+/// it blames the local build for a lack of accepted shares (F4). It is deliberately
+/// asymmetric: only a confident `NetworkWide` answer counts. "We could not reach the
+/// status service" and "the network is fine" both return `false`, because neither is
+/// grounds to suppress a genuine local-build failure.
+pub fn any_lane_collapsed_network_wide(lanes: &[Lane]) -> bool {
+    if lanes.is_empty() {
+        return false;
+    }
+    let Some(body) = fetch_lane_health_body() else {
+        return false;
+    };
+    lanes.iter().any(|l| {
+        parse_lane_health(&body, *l)
+            .map(|h| h.attribute() == Attribution::NetworkWide)
+            .unwrap_or(false)
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

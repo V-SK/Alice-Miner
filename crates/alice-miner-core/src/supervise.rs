@@ -1756,32 +1756,21 @@ fn set_halt_status_locked(g: &mut Inner, c: &Collapse, attribution: Attribution)
     );
 }
 
-/// Ask the public read-API what the WHOLE NETWORK's acceptance rate is for `lane`,
-/// and turn it into an [`Attribution`].
+/// Ask the public read-API what the WHOLE NETWORK's acceptance rate is for `lane`.
+///
+/// The call itself lives in [`acceptance::fetch_attribution`] because the halt is no
+/// longer its only reader: the auto-updater's health probation asks the same question
+/// before it blames a client build for a lack of accepted shares (F4), and two copies
+/// of "whose fault is this" is how the two layers would drift apart.
 ///
 /// Blocking, bounded, unauthenticated, read-only, and called exactly once per halt —
-/// after the engine is already stopped. Anything that goes wrong (no network, a
-/// non-2xx, an unparseable body, a lane the server didn't mention, a figure drawn
-/// from a single miner) resolves to [`Attribution::Unknown`], and the user is told we
-/// don't know rather than being handed a guess. It CANNOT halt a healthy lane and
-/// CANNOT un-halt a collapsed one; the worst a compromised endpoint achieves is
-/// pointing a stopped miner at the wrong suspect.
+/// after the engine is already stopped. Anything that goes wrong resolves to
+/// [`Attribution::Unknown`], and the user is told we don't know rather than being
+/// handed a guess. It CANNOT halt a healthy lane and CANNOT un-halt a collapsed one;
+/// the worst a compromised endpoint achieves is pointing a stopped miner at the wrong
+/// suspect.
 fn fetch_attribution(lane: Lane) -> Attribution {
-    let base = std::env::var(crate::dashboard::ENV_READ_API_URL)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| crate::dashboard::READ_API_BASE_DEFAULT.to_string());
-    let url = acceptance::lane_health_url(&base);
-    match crate::dashboard::http_get_read_api(&url) {
-        Ok(body) => match acceptance::parse_lane_health(&body, lane) {
-            Some(h) => h.attribute(),
-            None => Attribution::Unknown,
-        },
-        Err(e) => {
-            log_verbose("lane-health lookup failed", &e);
-            Attribution::Unknown
-        }
-    }
+    acceptance::fetch_attribution(lane)
 }
 
 /// Why an automatic restart is pending. Drives the status key + wording, and carries
@@ -5024,6 +5013,121 @@ mod tests {
             assert_eq!(st.crashes, before);
             assert_eq!(s.failovers(), 0, "a halt must never rotate regions");
 
+            s.request_stop();
+        });
+    }
+
+    /// **F4, end to end: a lane the acceptance guard halted must never produce a
+    /// `StoppedEarning` rollback.**
+    ///
+    /// Layers 2 and 3 were built separately and this is where they meet. Layer 3
+    /// halts on a rejection storm — and from that moment the accepted counter is
+    /// frozen at zero *by design*. Layer 2 watches the same counter to decide
+    /// whether the build it installed still earns, and its only guard was "this
+    /// machine landed a share in the last 72 h", which is true of every normally
+    /// mining rig. So layer 3 doing its job read, to layer 2, as "the new version
+    /// does not earn" — and would roll back and permanently pin an innocent
+    /// client during an upstream outage. Exactly the mistake this release exists
+    /// to stop.
+    ///
+    /// This drives a REAL halt through the real supervisor, reads the evidence the
+    /// front-ends read, and asserts the probation abstains.
+    #[test]
+    fn a_halted_lane_is_not_evidence_against_the_installed_build() {
+        use alice_release::auto::{
+            judge_session, Probation, SessionAction, SessionEvidence, SessionResult,
+        };
+        let _env = spawn_env_guard();
+        let rt = rt();
+        rt.block_on(async {
+            // F15, in the same breath: the engine-pin refresher is armed by process
+            // start, so it is already running on a client that is about to halt —
+            // and it keeps running afterwards, when no lane will start an engine
+            // ever again. That thread is the only way the fixed pin can reach this
+            // machine without a human pressing Start.
+            crate::engine_pins::start_background_refresh();
+            assert_eq!(crate::engine_pins::background_refresh_starts(), 1);
+
+            let s = LaneSupervisor::new(Lane::GpuPrl);
+            s.set_acceptance_config(fast_acceptance());
+            let (program, args) = idle_child();
+            s.start_simple(program, args).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await, "child up");
+
+            // The August shape: everything submitted is rejected.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            feed(&s, "net      rejected (0/0) diff 100 (10 ms)");
+            for i in 1..=25u64 {
+                feed(&s, &format!("net      rejected (0/{i}) diff 100 (10 ms)"));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(wait_for(&s, 12, |st| st.halted).await, "the lane must halt");
+            let st = s.stats();
+            assert_eq!(st.accepted, 0, "a halted lane's accepted counter is frozen at 0");
+
+            // What the front-ends now feed the updater, built from this lane.
+            let mut snap = crate::engine::Snapshot::idle();
+            snap.lane = Some(st.lane);
+            snap.shares_accepted = st.accepted;
+            snap.lanes = vec![crate::engine::LaneSnapshot {
+                lane: st.lane,
+                state: st.state.into(),
+                hashrate_hs: st.hashrate_hs,
+                hashrate_60s_hs: None,
+                hashrate_15m_hs: None,
+                shares_accepted: st.accepted,
+                shares_rejected: st.rejected,
+                uptime_s: st.uptime_s,
+                endpoint: st.endpoint.clone(),
+                failovers: st.failovers,
+                temp_c: None,
+                power_w: None,
+                util_pct: None,
+                fan_pct: None,
+                acceptance: st.acceptance.to_string(),
+                accept_pct: st.accept_pct,
+                halted: st.halted,
+            }];
+            let mining = crate::autoupdate::MiningEvidence::from_snapshot(&snap);
+            assert!(mining.halted, "the halt must reach layer 2");
+            assert!(!mining.counts_as_earning());
+
+            // A build that installed itself yesterday, on a machine that WAS
+            // earning, with one long empty session already on the record: the next
+            // report is the one that used to roll it back and pin it forever.
+            let on_trial = Probation {
+                version: "0.6.8".into(),
+                previous: "0.6.7".into(),
+                armed_at_unix: 0,
+                launches: 1,
+                started_ok: true,
+                previous_productive: true,
+                failed_sessions: alice_release::auto::FAILED_SESSIONS_TO_ROLLBACK - 1,
+            };
+            let ran = alice_release::auto::MIN_JUDGED_SESSION.as_secs();
+            assert_eq!(
+                judge_session(&on_trial, "0.6.8", &SessionResult::judgeable(ran, 0)),
+                SessionAction::RollBack,
+                "this is genuinely the tipping session — otherwise the test proves nothing"
+            );
+            assert_eq!(
+                judge_session(
+                    &on_trial,
+                    "0.6.8",
+                    &SessionResult {
+                        ran_secs: ran,
+                        accepted: mining.accepted,
+                        evidence: SessionEvidence::MiningHalted,
+                    }
+                ),
+                SessionAction::Abstain(SessionEvidence::MiningHalted),
+                "layer 3 halting must never be read as 'the new version does not earn'"
+            );
+
+            // Still halted, still no engine — and the refresher is still the one
+            // that was started with the process.
+            assert!(s.stats().halted);
+            assert_eq!(crate::engine_pins::background_refresh_starts(), 1);
             s.request_stop();
         });
     }

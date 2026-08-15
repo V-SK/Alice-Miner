@@ -529,6 +529,9 @@ pub struct AutoUpdater {
     rx: Receiver<String>,
     /// A check is in flight (never two at once).
     in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A session report is in flight on a worker thread (never two — two
+    /// concurrent reports could double-count a strike against the probation).
+    session_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_check: Instant,
     session_start: Instant,
     last_productive_mark: Option<Instant>,
@@ -550,6 +553,7 @@ impl AutoUpdater {
             tx,
             rx,
             in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_check: Instant::now(),
             session_start: Instant::now(),
             last_productive_mark: None,
@@ -558,6 +562,37 @@ impl AutoUpdater {
         };
         me.kick(false);
         me
+    }
+
+    /// Hand one session report to the probation, on the right thread.
+    ///
+    /// A report that could decide a ROLLBACK first asks the network whether the
+    /// whole lane is down (F4) — a bounded but blocking GET, which must never run
+    /// on this loop: it drives the terminal UI and the engine event pump. That
+    /// case (at most once per session) goes to a worker thread and its verdict
+    /// comes back through the same channel the update lines use. Every other
+    /// report — the per-tick ones — is local-only and stays inline.
+    fn report_session(
+        &mut self,
+        ran: Duration,
+        mining: alice_miner_core::autoupdate::MiningEvidence,
+    ) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        if !alice_miner_core::autoupdate::session_may_consult_the_network(ran, &mining) {
+            return alice_miner_core::autoupdate::note_session(ran, &mining);
+        }
+        if self.session_in_flight.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        let tx = self.tx.clone();
+        let flag = self.session_in_flight.clone();
+        std::thread::spawn(move || {
+            if let Some(msg) = alice_miner_core::autoupdate::note_session(ran, &mining) {
+                let _ = tx.send(msg);
+            }
+            flag.store(false, Ordering::SeqCst);
+        });
+        None
     }
 
     /// Spawn one background check cycle, unless one is already running.
@@ -584,11 +619,21 @@ impl AutoUpdater {
     /// Call once per engine snapshot. Handles the periodic re-check, the
     /// "this machine is earning" mark, and the mining half of the health
     /// probation. Returns any line the caller should print.
-    pub fn tick(&mut self, accepted: u64) -> Option<String> {
-        // 1. An accepted share is two things at once: proof that THIS build works
-        //    (which commits a probation), and the baseline a FUTURE update will be
-        //    judged against.
-        if accepted > 0 {
+    ///
+    /// Takes the whole snapshot rather than a bare share count, because the share
+    /// count alone is a lie the moment the acceptance guard halts a lane: it
+    /// freezes, and reading a frozen counter as "this build stopped earning" is
+    /// layer 2 rolling a client back over layer 3 doing its job (F4). The
+    /// derivation lives in `MiningEvidence` so the GUI reads it identically.
+    pub fn tick(&mut self, snap: Option<&alice_miner_core::engine::Snapshot>) -> Option<String> {
+        let mining = snap
+            .map(alice_miner_core::autoupdate::MiningEvidence::from_snapshot)
+            .unwrap_or_default();
+
+        // 1. An accepted share on a lane that is actually allowed to run is two
+        //    things at once: proof that THIS build works (which commits a
+        //    probation), and the baseline a FUTURE update will be judged against.
+        if mining.counts_as_earning() {
             let due = self
                 .last_productive_mark
                 .map(|t| t.elapsed() >= PRODUCTIVE_MARK_EVERY)
@@ -601,9 +646,11 @@ impl AutoUpdater {
 
         // 2. Feed the probation. An accepted share commits immediately; a long
         //    stretch with none counts against the build ONCE per session, and only
-        //    when the build we replaced had been earning here (that check lives in
+        //    when the build we replaced had been earning here AND the acceptance
+        //    guard has not disqualified the session (both of those checks live in
         //    the kernel, which is where the outage-versus-client distinction is
         //    made).
+        let accepted = mining.accepted;
         let ran = self.session_start.elapsed();
         let judge = accepted > 0
             || (!self.judged_this_session
@@ -612,7 +659,7 @@ impl AutoUpdater {
             if accepted == 0 {
                 self.judged_this_session = true;
             }
-            if let Some(msg) = alice_miner_core::autoupdate::note_session(ran, accepted) {
+            if let Some(msg) = self.report_session(ran, mining) {
                 return Some(msg);
             }
         }

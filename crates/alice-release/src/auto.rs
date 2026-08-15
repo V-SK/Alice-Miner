@@ -61,6 +61,29 @@
 //! trial for it — we commit and say so, rather than blaming the client for the
 //! network.
 //!
+//! ## Why "the previous build was earning" is NOT enough on its own (F4)
+//!
+//! That baseline says only "this machine landed a share in the last 72 h", which
+//! is true of every normally-mining machine. Replay August against it: a rig
+//! auto-updates on the 10th, the upstream fork lands on the 11th, two long
+//! sessions land nothing, and the client rolls back and permanently pins a
+//! completely innocent version — the exact mistake this release exists to stop.
+//!
+//! So the caller may also tell us that the session it is reporting is **not
+//! evidence**, via [`SessionEvidence`]:
+//!
+//!   * [`SessionEvidence::MiningHalted`] — the acceptance guard (layer 3) stopped
+//!     mining on purpose. Its zero-accepted is *ours*, not the build's. Layer 3
+//!     halting must never be read here as "the new version does not earn".
+//!   * [`SessionEvidence::NetworkWide`] — the network-wide lane health says every
+//!     miner on this lane is being rejected. Blaming the local build for a
+//!     network-wide failure is never correct.
+//!
+//! An abstained session is neither good nor bad evidence: it does not record a
+//! strike, and it does **not** commit the build either (the probation simply
+//! stays open — see [`SessionVerdict::Abstained`]). We deliberately do not let a
+//! session we refused to judge drop last-known-good.
+//!
 //! All state lives in a caller-supplied directory (`~/.alice` in the app) so this
 //! module stays testable and never guesses at a data dir. Nothing here is ever
 //! transmitted: the rollout id is a local random label, not a machine
@@ -108,6 +131,10 @@ pub const FAILED_SESSIONS_TO_ROLLBACK: u32 = 2;
 /// machine within this window before the swap. Older than that and we have no
 /// fresh baseline to judge the new build against, so the mining probation
 /// abstains instead of guessing.
+///
+/// Note what this gate is NOT: it is true of every normally-mining machine, so it
+/// cannot by itself tell "the new build broke earning" from "the pool started
+/// rejecting everyone". [`SessionEvidence`] is the input that can.
 pub const PRODUCTIVE_WINDOW: Duration = Duration::from_secs(72 * 60 * 60);
 
 /// A probation that never reaches a verdict is committed after this long. We do
@@ -762,11 +789,65 @@ pub fn confirm_start(state_dir: &Path, app_path: &Path, running_version: &str) -
     false
 }
 
+/// What the ACCEPTANCE guard (layer 3) has to say about the session being
+/// reported — i.e. whether this session is evidence about the build at all.
+///
+/// This is the cross-layer input F4 is about. Layer 3 can stop mining on purpose,
+/// and it can know that the whole network is being rejected; both of those make a
+/// zero-accepted session say nothing whatsoever about the client build, and both
+/// of them are invisible from inside this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionEvidence {
+    /// Nothing disqualifies this session: judge it on its shares.
+    #[default]
+    Judgeable,
+    /// The acceptance guard halted or stopped this machine's lane during the
+    /// session. Once it halts, `accepted` is necessarily frozen — reading that as
+    /// "the new version does not earn" is layer 2 mistaking layer 3's deliberate
+    /// stop for a client failure.
+    MiningHalted,
+    /// The network-wide lane health says every miner on this lane is being
+    /// rejected right now. The local build cannot be the cause.
+    NetworkWide,
+}
+
+impl SessionEvidence {
+    /// Whether this session must not be judged in either direction.
+    pub fn abstains(self) -> bool {
+        !matches!(self, SessionEvidence::Judgeable)
+    }
+
+    /// A stable machine key for the local history log.
+    pub fn key(self) -> &'static str {
+        match self {
+            SessionEvidence::Judgeable => "judgeable",
+            SessionEvidence::MiningHalted => "mining-halted",
+            SessionEvidence::NetworkWide => "network-wide",
+        }
+    }
+}
+
 /// The outcome of one mining session, fed to the probation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionResult {
     pub ran_secs: u64,
     pub accepted: u64,
+    /// What layer 3 says about this session. There is deliberately no `Default`
+    /// on this struct: a caller that has not thought about the acceptance guard
+    /// should fail to compile rather than silently report a halted lane as if it
+    /// were an honest zero.
+    pub evidence: SessionEvidence,
+}
+
+impl SessionResult {
+    /// A session the acceptance guard has no objection to.
+    pub fn judgeable(ran_secs: u64, accepted: u64) -> Self {
+        Self {
+            ran_secs,
+            accepted,
+            evidence: SessionEvidence::Judgeable,
+        }
+    }
 }
 
 /// What a finished (or long-running) mining session did to the probation.
@@ -774,6 +855,12 @@ pub struct SessionResult {
 pub enum SessionVerdict {
     /// Not on trial, or the session is too short / too ambiguous to judge.
     NoChange,
+    /// Layer 3 disqualified this session, so it counted for NOTHING: no strike,
+    /// and no commit either. The probation stays exactly as it was and the build
+    /// keeps its last-known-good copy until a session we CAN judge arrives (or
+    /// the probation expires). Distinct from [`Self::NoChange`] so an abstention
+    /// is visible rather than being indistinguishable from "nothing happened".
+    Abstained { reason: SessionEvidence },
     /// The build proved it still earns; probation over, last-known-good dropped.
     Committed { version: String },
     /// The build has now failed enough long sessions; rolled back and pinned.
@@ -784,6 +871,65 @@ pub enum SessionVerdict {
         /// Whether the previous build is actually back on disk.
         restored: bool,
     },
+}
+
+/// What reporting a session DOES to a probation record — the pure half of
+/// [`note_session`], so the decision can be tested without a filesystem and so
+/// [`session_would_roll_back`] cannot drift from what actually happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAction {
+    /// Say nothing: not on trial, no earning baseline, or too short to judge.
+    Ignore,
+    /// Not evidence in either direction (see [`SessionEvidence`]).
+    Abstain(SessionEvidence),
+    /// The build is earning: commit it and drop last-known-good.
+    Commit,
+    /// One more long, empty, JUDGEABLE session — recorded, below the threshold.
+    Strike,
+    /// Enough of them: roll back and pin.
+    RollBack,
+}
+
+/// The pure decision behind [`note_session`]. No clock, no disk, no network.
+///
+/// Order matters and is the whole of F4: the acceptance guard's word is checked
+/// BEFORE the share count, so a halted lane can neither strike the build (its
+/// zero is layer 3's doing) nor commit it (we did not watch it earn — we watched
+/// it not run).
+pub fn judge_session(p: &Probation, running_version: &str, result: &SessionResult) -> SessionAction {
+    if p.version != running_version || !p.previous_productive {
+        return SessionAction::Ignore;
+    }
+    if result.evidence.abstains() {
+        return SessionAction::Abstain(result.evidence);
+    }
+    if result.accepted > 0 {
+        return SessionAction::Commit;
+    }
+    if result.ran_secs < MIN_JUDGED_SESSION.as_secs() {
+        return SessionAction::Ignore;
+    }
+    if p.failed_sessions.saturating_add(1) >= FAILED_SESSIONS_TO_ROLLBACK {
+        SessionAction::RollBack
+    } else {
+        SessionAction::Strike
+    }
+}
+
+/// Whether reporting `result` RIGHT NOW would roll this build back and pin it.
+///
+/// Read-only: it changes nothing. It exists so the caller can spend a network
+/// call establishing whether the WHOLE NETWORK is being rejected at the one
+/// moment that matters — the moment before we would otherwise blame the local
+/// build — instead of on every tick of every session.
+pub fn session_would_roll_back(
+    app_path: &Path,
+    running_version: &str,
+    result: &SessionResult,
+) -> bool {
+    probation(app_path)
+        .map(|p| judge_session(&p, running_version, result) == SessionAction::RollBack)
+        .unwrap_or(false)
 }
 
 /// Report a mining session against the probation. Safe to call repeatedly with
@@ -800,39 +946,45 @@ pub fn note_session(
     let Some(mut p) = probation(app_path) else {
         return SessionVerdict::NoChange;
     };
-    if p.version != running_version || !p.previous_productive {
-        return SessionVerdict::NoChange;
-    }
 
-    if result.accepted > 0 {
-        clear_probation(app_path);
-        let _ = crate::commit_update(app_path);
-        log_event(
-            state_dir,
-            "committed",
-            serde_json::json!({ "version": p.version, "on": "accepted share" }),
-        );
-        return SessionVerdict::Committed { version: p.version };
-    }
+    match judge_session(&p, running_version, &result) {
+        SessionAction::Ignore => SessionVerdict::NoChange,
 
-    if result.ran_secs < MIN_JUDGED_SESSION.as_secs() {
-        return SessionVerdict::NoChange;
-    }
+        // Nothing is written: not the strike counter, not a commit, not a pin.
+        // The probation record survives untouched for a session we CAN judge.
+        SessionAction::Abstain(reason) => SessionVerdict::Abstained { reason },
 
-    p.failed_sessions = p.failed_sessions.saturating_add(1);
-    if p.failed_sessions < FAILED_SESSIONS_TO_ROLLBACK {
-        let _ = write_probation(app_path, &p);
-        return SessionVerdict::NoChange;
-    }
+        SessionAction::Commit => {
+            clear_probation(app_path);
+            let _ = crate::commit_update(app_path);
+            log_event(
+                state_dir,
+                "committed",
+                serde_json::json!({ "version": p.version, "on": "accepted share" }),
+            );
+            SessionVerdict::Committed { version: p.version }
+        }
 
-    let previous = p.previous.clone();
-    match do_rollback(state_dir, app_path, &p, RollbackReason::StoppedEarning) {
-        LaunchVerdict::RolledBack { failed_version, restored, .. } => SessionVerdict::RolledBack {
-            failed_version,
-            previous,
-            restored,
-        },
-        _ => SessionVerdict::NoChange,
+        SessionAction::Strike => {
+            p.failed_sessions = p.failed_sessions.saturating_add(1);
+            let _ = write_probation(app_path, &p);
+            SessionVerdict::NoChange
+        }
+
+        SessionAction::RollBack => {
+            // No need to persist the final strike: `do_rollback` clears the record.
+            let previous = p.previous.clone();
+            match do_rollback(state_dir, app_path, &p, RollbackReason::StoppedEarning) {
+                LaunchVerdict::RolledBack { failed_version, restored, .. } => {
+                    SessionVerdict::RolledBack {
+                        failed_version,
+                        previous,
+                        restored,
+                    }
+                }
+                _ => SessionVerdict::NoChange,
+            }
+        }
     }
 }
 
@@ -1221,7 +1373,7 @@ mod tests {
         assert!(!confirm_start(&d, &app, "0.6.8"));
         assert!(probation(&app).is_some());
 
-        let v = note_session(&d, &app, "0.6.8", SessionResult { ran_secs: 60, accepted: 1 });
+        let v = note_session(&d, &app, "0.6.8", SessionResult::judgeable(60, 1));
         assert_eq!(v, SessionVerdict::Committed { version: "0.6.8".into() });
         assert!(probation(&app).is_none());
         let mut lkg = app.as_os_str().to_os_string();
@@ -1238,8 +1390,8 @@ mod tests {
         register_launch(&d, &app, "0.6.8");
         confirm_start(&d, &app, "0.6.8");
 
-        let long = SessionResult { ran_secs: MIN_JUDGED_SESSION.as_secs(), accepted: 0 };
-        let short = SessionResult { ran_secs: 60, accepted: 0 };
+        let long = SessionResult::judgeable(MIN_JUDGED_SESSION.as_secs(), 0);
+        let short = SessionResult::judgeable(60, 0);
 
         // Short sessions never count against it.
         assert_eq!(note_session(&d, &app, "0.6.8", short), SessionVerdict::NoChange);
@@ -1275,10 +1427,223 @@ mod tests {
         assert!(probation(&app).is_none());
 
         // And later zero-share sessions cannot resurrect a verdict.
-        let long = SessionResult { ran_secs: 10 * 3600, accepted: 0 };
+        let long = SessionResult::judgeable(10 * 3600, 0);
         assert_eq!(note_session(&d, &app, "0.6.8", long), SessionVerdict::NoChange);
         assert_eq!(std::fs::read_to_string(&app).unwrap(), "NEW");
         assert!(pins(&d).is_empty());
+    }
+
+    // ── F4: layer 3 halting must not be read as "this build does not earn" ──
+
+    /// **The August timeline, replayed against the probation.** A rig auto-updates
+    /// on the 10th; the upstream fork lands on the 11th; the acceptance guard does
+    /// its job and halts the lane; the client then keeps feeding the frozen
+    /// zero-accepted counter into the probation.
+    ///
+    /// Without the evidence gate this is two long empty sessions and a rollback +
+    /// permanent pin of a completely innocent version. With it, the halted lane is
+    /// simply not evidence: nothing is written, nothing is pinned, and the binary
+    /// on disk is untouched.
+    #[test]
+    fn a_halted_lane_never_produces_a_stopped_earning_rollback() {
+        let d = tmp("halted");
+        let app = fake_app(&d, "NEW", "OLD");
+        arm(&app, "0.6.8", "0.6.7", /* previous_productive */ true).unwrap();
+        register_launch(&d, &app, "0.6.8");
+        confirm_start(&d, &app, "0.6.8");
+
+        let halted = SessionResult {
+            ran_secs: 20 * 3600,
+            accepted: 0,
+            evidence: SessionEvidence::MiningHalted,
+        };
+        // Ten of them — a halted rig reports every tick, forever.
+        for _ in 0..10 {
+            assert_eq!(
+                note_session(&d, &app, "0.6.8", halted),
+                SessionVerdict::Abstained { reason: SessionEvidence::MiningHalted },
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&app).unwrap(), "NEW", "no rollback");
+        assert!(pins(&d).is_empty(), "an innocent version must never be pinned");
+        let p = probation(&app).expect("the probation must survive an abstention");
+        assert_eq!(p.failed_sessions, 0, "an abstained session is not a strike");
+    }
+
+    /// The other half of "not evidence": an abstained session must not COMMIT the
+    /// build either. Committing drops last-known-good, so treating a halt as an
+    /// all-clear would quietly throw away the rollback copy on the strength of a
+    /// session in which the miner was deliberately not mining.
+    #[test]
+    fn an_abstained_session_does_not_silently_commit_the_build() {
+        let d = tmp("abstain-commit");
+        let app = fake_app(&d, "NEW", "OLD");
+        let mut lkg = app.as_os_str().to_os_string();
+        lkg.push(".lkg");
+        let lkg = PathBuf::from(lkg);
+        arm(&app, "0.6.8", "0.6.7", true).unwrap();
+        register_launch(&d, &app, "0.6.8");
+
+        for reason in [SessionEvidence::MiningHalted, SessionEvidence::NetworkWide] {
+            // Even WITH accepted shares on the clock: a session layer 3 disqualified
+            // is not evidence in either direction.
+            let v = note_session(
+                &d,
+                &app,
+                "0.6.8",
+                SessionResult { ran_secs: 3600, accepted: 42, evidence: reason },
+            );
+            assert_eq!(v, SessionVerdict::Abstained { reason });
+            assert!(probation(&app).is_some(), "{reason:?} must leave the trial open");
+            assert!(lkg.exists(), "{reason:?} must not drop last-known-good");
+        }
+        // …and a real, judgeable session still decides it.
+        assert_eq!(
+            note_session(&d, &app, "0.6.8", SessionResult::judgeable(60, 1)),
+            SessionVerdict::Committed { version: "0.6.8".into() }
+        );
+        assert!(!lkg.exists(), "a judgeable earning session commits normally");
+    }
+
+    /// A network-wide collapse must make the probation abstain — including on the
+    /// very session that would otherwise have tipped it into a rollback. Blaming
+    /// the local build for a failure every miner on the lane is having is never
+    /// correct.
+    #[test]
+    fn a_network_wide_collapse_makes_the_probation_abstain() {
+        let d = tmp("networkwide");
+        let app = fake_app(&d, "NEW", "OLD");
+        arm(&app, "0.6.8", "0.6.7", true).unwrap();
+        register_launch(&d, &app, "0.6.8");
+        confirm_start(&d, &app, "0.6.8");
+
+        // One honest strike first (nothing knew anything yet).
+        let long = SessionResult::judgeable(MIN_JUDGED_SESSION.as_secs(), 0);
+        assert_eq!(note_session(&d, &app, "0.6.8", long), SessionVerdict::NoChange);
+        assert_eq!(probation(&app).unwrap().failed_sessions, 1);
+
+        // The next one WOULD roll back — that is exactly when the caller asks the
+        // network, and the network says everybody is down.
+        assert!(
+            session_would_roll_back(&app, "0.6.8", &long),
+            "the guard is only useful if this is the tipping session"
+        );
+        let v = note_session(
+            &d,
+            &app,
+            "0.6.8",
+            SessionResult {
+                ran_secs: long.ran_secs,
+                accepted: 0,
+                evidence: SessionEvidence::NetworkWide,
+            },
+        );
+        assert_eq!(v, SessionVerdict::Abstained { reason: SessionEvidence::NetworkWide });
+        assert_eq!(std::fs::read_to_string(&app).unwrap(), "NEW", "no rollback");
+        assert!(pins(&d).is_empty());
+        assert_eq!(
+            probation(&app).unwrap().failed_sessions,
+            1,
+            "the abstained session must not have added a strike"
+        );
+    }
+
+    /// `session_would_roll_back` is the caller's "is it worth a network call"
+    /// probe, so it must agree with what `note_session` actually does — for every
+    /// shape, and without changing anything itself.
+    #[test]
+    fn would_roll_back_matches_what_note_session_does_and_writes_nothing() {
+        let d = tmp("would");
+        let app = fake_app(&d, "NEW", "OLD");
+        arm(&app, "0.6.8", "0.6.7", true).unwrap();
+        register_launch(&d, &app, "0.6.8");
+        let long = SessionResult::judgeable(MIN_JUDGED_SESSION.as_secs(), 0);
+
+        // Not on the tipping session yet, and asking does not move it there.
+        assert!(!session_would_roll_back(&app, "0.6.8", &long));
+        assert!(!session_would_roll_back(&app, "0.6.8", &long));
+        assert_eq!(probation(&app).unwrap().failed_sessions, 0, "probing wrote nothing");
+        // Nor for another version, a short session, or an abstaining one.
+        assert!(!session_would_roll_back(&app, "0.6.9", &long));
+        assert!(!session_would_roll_back(&app, "0.6.8", &SessionResult::judgeable(60, 0)));
+
+        assert_eq!(note_session(&d, &app, "0.6.8", long), SessionVerdict::NoChange);
+        assert!(session_would_roll_back(&app, "0.6.8", &long), "now it would");
+        for reason in [SessionEvidence::MiningHalted, SessionEvidence::NetworkWide] {
+            assert!(
+                !session_would_roll_back(
+                    &app,
+                    "0.6.8",
+                    &SessionResult { ran_secs: long.ran_secs, accepted: 0, evidence: reason }
+                ),
+                "{reason:?} can never roll back"
+            );
+        }
+        // …and it was telling the truth.
+        assert!(matches!(
+            note_session(&d, &app, "0.6.8", long),
+            SessionVerdict::RolledBack { .. }
+        ));
+    }
+
+    /// The pure decision table, straight from `judge_session` — no filesystem.
+    #[test]
+    fn judge_session_checks_layer_three_before_the_share_count() {
+        let base = Probation {
+            version: "0.6.8".into(),
+            previous: "0.6.7".into(),
+            armed_at_unix: 0,
+            launches: 1,
+            started_ok: true,
+            previous_productive: true,
+            failed_sessions: 0,
+        };
+        let long = MIN_JUDGED_SESSION.as_secs();
+
+        assert_eq!(
+            judge_session(&base, "0.6.8", &SessionResult::judgeable(long, 0)),
+            SessionAction::Strike
+        );
+        assert_eq!(
+            judge_session(&base, "0.6.8", &SessionResult::judgeable(60, 0)),
+            SessionAction::Ignore
+        );
+        assert_eq!(
+            judge_session(&base, "0.6.8", &SessionResult::judgeable(60, 1)),
+            SessionAction::Commit
+        );
+        let tipping = Probation { failed_sessions: FAILED_SESSIONS_TO_ROLLBACK - 1, ..base.clone() };
+        assert_eq!(
+            judge_session(&tipping, "0.6.8", &SessionResult::judgeable(long, 0)),
+            SessionAction::RollBack
+        );
+        // Layer 3 outranks BOTH the rollback and the commit.
+        for reason in [SessionEvidence::MiningHalted, SessionEvidence::NetworkWide] {
+            for accepted in [0, 99] {
+                assert_eq!(
+                    judge_session(
+                        &tipping,
+                        "0.6.8",
+                        &SessionResult { ran_secs: long, accepted, evidence: reason }
+                    ),
+                    SessionAction::Abstain(reason),
+                    "{reason:?} with accepted={accepted}"
+                );
+            }
+        }
+        // No earning baseline / another version: nothing to say, as before.
+        let no_baseline = Probation { previous_productive: false, ..base.clone() };
+        assert_eq!(
+            judge_session(&no_baseline, "0.6.8", &SessionResult::judgeable(long, 0)),
+            SessionAction::Ignore
+        );
+        assert_eq!(
+            judge_session(&base, "0.6.9", &SessionResult::judgeable(long, 0)),
+            SessionAction::Ignore
+        );
+        assert!(SessionEvidence::default() == SessionEvidence::Judgeable);
+        assert!(!SessionEvidence::Judgeable.abstains());
+        assert!(SessionEvidence::MiningHalted.abstains() && SessionEvidence::NetworkWide.abstains());
     }
 
     #[test]

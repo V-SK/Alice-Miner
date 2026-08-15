@@ -2228,8 +2228,7 @@ impl eframe::App for MinerApp {
         self.updater.note_mining(
             self.snapshot
                 .as_ref()
-                .filter(|s| matches!(s.state, alice_miner_core::EngineState::Running))
-                .map(|s| s.shares_accepted),
+                .filter(|s| matches!(s.state, alice_miner_core::EngineState::Running)),
         );
         // Source B: refresh the server-confirmed credit state from the poller
         // (v1: a pure no-op yielding `NotExposed`; the fast-follow drives a real
