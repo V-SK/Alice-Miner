@@ -610,8 +610,9 @@ fn lane_selector(ui: &mut egui::Ui, app: &mut MinerApp) {
         ui.spacing_mut().item_spacing.x = 7.0;
         for &lane in &lanes {
             let support = app.lane_support(lane);
+            let reason = app.lane_reason(lane);
             let is_sel = lane == selected;
-            let resp = lane_chip(ui, lane, support, is_sel, locked);
+            let resp = lane_chip(ui, lane, support, reason, is_sel, locked);
             if resp.clicked() && !locked && support.is_runnable() && !is_sel {
                 pick.set(Some(lane));
             }
@@ -890,6 +891,7 @@ fn lane_chip(
     ui: &mut egui::Ui,
     lane: Lane,
     support: LaneSupport,
+    reason: Option<&str>,
     selected: bool,
     locked: bool,
 ) -> egui::Response {
@@ -924,7 +926,7 @@ fn lane_chip(
             egui::Stroke::new(1.0_f32, THEME.line),
         ),
         LaneSupport::Unavailable => (
-            format!("{} · {}", lane_short(lane), unavailable_tail(lane)),
+            format!("{} · {}", lane_short(lane), unavailable_tail(lane, reason)),
             THEME.text4,
             None,
             egui::Stroke::new(1.0_f32, THEME.line),
@@ -976,7 +978,15 @@ fn lane_short(lane: Lane) -> &'static str {
 }
 
 /// The honest tail for an Unavailable lane (why it can't run here). Bilingual.
-fn unavailable_tail(lane: Lane) -> &'static str {
+fn unavailable_tail(lane: Lane, reason: Option<&str>) -> &'static str {
+    // An AMD RDNA2 box HAS a supported-vendor GPU — the lane is gone because
+    // SRBMiner removed RDNA2 pearlhash upstream in 3.5.0. Telling that owner
+    // "needs NVIDIA/AMD GPU" would be false and would send them hunting for a
+    // driver problem that does not exist, so the reason wins over the generic
+    // per-lane tail.
+    if reason == Some(alice_miner_core::detect::capability::PRL_REASON_AMD_RDNA2) {
+        return tr!("RDNA2 unsupported", "RDNA2 不受支持");
+    }
     match lane {
         // RVN unavailable means no NVIDIA (Apple/CPU-only) → XMR is the lane.
         Lane::GpuRvn => tr!("needs NVIDIA", "需要 NVIDIA"),

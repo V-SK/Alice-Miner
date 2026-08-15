@@ -338,6 +338,8 @@ fn demo_device() -> DeviceProfile {
         memory_gb: 32,
         display: "Apple M2 Max · 12 cores".into(),
         warnings: vec![],
+        // No AMD GPU in these posed captures (the CPU vendor is irrelevant here).
+        amd_gpu_pci_ids: Vec::new(),
     }
 }
 
@@ -360,6 +362,8 @@ fn demo_nvidia_device() -> DeviceProfile {
         memory_gb: 64,
         display: "AMD Ryzen 9 5950X · 16 cores".into(),
         warnings: vec![],
+        // No AMD GPU in these posed captures (the CPU vendor is irrelevant here).
+        amd_gpu_pci_ids: Vec::new(),
     }
 }
 
@@ -403,6 +407,8 @@ fn demo_multigpu_device() -> DeviceProfile {
         memory_gb: 128,
         display: "AMD Ryzen Threadripper 3970X · 32 cores".into(),
         warnings: vec![],
+        // No AMD GPU in these posed captures (the CPU vendor is irrelevant here).
+        amd_gpu_pci_ids: Vec::new(),
     }
 }
 

@@ -11,7 +11,7 @@
 //! presentation only; no mining logic.
 
 use alice_miner_core::detect::capability::ALL_LANES;
-use alice_miner_core::detect::GpuDevice;
+use alice_miner_core::detect::{AmdArch, GpuDevice};
 use alice_miner_core::engine::LaneSnapshot;
 use alice_miner_core::tr;
 use alice_miner_core::{
@@ -326,7 +326,7 @@ pub fn render_detect(cap: &CapabilityProfile) -> String {
     if !p.cpu_model.is_empty() {
         out.push_str(&format!("  cpu_model:     {}\n", p.cpu_model));
     }
-    out.push_str(&format!("  gpu:           {}\n", fmt_gpu(&p.gpu)));
+    out.push_str(&format!("  gpu:           {}\n", fmt_gpu(&p.gpu, p.amd_arch())));
     // Per-card enumeration (NVIDIA) so multi-GPU rigs can see each card + its
     // index — the token for `start --lane gpu --gpus 0,1,…`.
     out.push_str(&fmt_gpu_list(&p.gpu.gpus));
@@ -360,6 +360,15 @@ pub fn render_detect(cap: &CapabilityProfile) -> String {
             support.label(),
             marker
         ));
+    }
+    // The matrix's own operator notes — where the AMD RDNA2 verdict is spelled
+    // out. They were derived and then printed nowhere, so a lane could be
+    // Unavailable for a reason the miner never got to read.
+    if !cap.viability.notes.is_empty() {
+        out.push_str(tr!("Notes:\n", "注意:\n"));
+        for note in &cap.viability.notes {
+            out.push_str(&format!("  - {note}\n"));
+        }
     }
     out
 }
@@ -429,7 +438,7 @@ pub fn render_gpu_devices(devices: &[alice_miner_core::lane::gpu_prl::SrbGpuDevi
     s
 }
 
-fn fmt_gpu(gpu: &GpuInfo) -> String {
+fn fmt_gpu(gpu: &GpuInfo, arch: AmdArch) -> String {
     match gpu.vendor {
         GpuVendor::None => tr!("none (CPU-only)", "无 (仅 CPU)").to_string(),
         GpuVendor::Nvidia => {
@@ -439,7 +448,28 @@ fn fmt_gpu(gpu: &GpuInfo) -> String {
                 gpu.model.clone()
             }
         }
-        GpuVendor::Amd => format!("{} {}", gpu.model, tr!("(lane coming soon)", "(通道即将推出)")),
+        // AMD is no longer a single "coming soon" bucket: the GPU-PRL lane is real
+        // on RDNA3+, GONE on RDNA2 (SRBMiner dropped it upstream in 3.5.0), and
+        // unverified on a card we could not place. Say which.
+        GpuVendor::Amd => {
+            let vram = if gpu.vram_gb > 0 {
+                format!(" · {} GB VRAM", gpu.vram_gb)
+            } else {
+                String::new()
+            };
+            let tail = match arch {
+                AmdArch::Rdna3OrNewer => tr!("(RDNA3+ · GPU-PRL supported)", "(RDNA3+ · 支持 GPU-PRL)"),
+                AmdArch::Rdna2 => tr!(
+                    "(RDNA2 · GPU-PRL unavailable — SRBMiner dropped RDNA2 in 3.5.0)",
+                    "(RDNA2 · GPU-PRL 不可用 —— SRBMiner 自 3.5.0 起移除 RDNA2 支持)"
+                ),
+                AmdArch::Unknown => tr!(
+                    "(architecture unidentified · GPU-PRL not auto-selected)",
+                    "(架构无法识别 · 不会自动选择 GPU-PRL)"
+                ),
+            };
+            format!("{}{vram} {tail}", gpu.model)
+        }
         GpuVendor::Apple => format!("{} {}", gpu.model, tr!("(unified memory)", "(统一内存)")),
     }
 }
@@ -2153,6 +2183,54 @@ mod tests {
             let is_emoji = (0x1F300..=0x1FAFF).contains(&c) || (0x2600..=0x27BF).contains(&c);
             assert!(!is_emoji, "detect output contains an emoji: {ch:?}");
         }
+    }
+
+    /// `alice-miner detect` on an AMD **RDNA2** box must say the lane is not
+    /// supported AND why — the matrix's note used to be derived and then rendered
+    /// nowhere, so the honest explanation never reached a miner. Also checks the
+    /// `gpu:` summary line, which used to read "(lane coming soon)" for every AMD
+    /// card regardless of generation.
+    #[test]
+    fn detect_render_is_honest_about_an_rdna2_card() {
+        use alice_miner_core::detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
+        let mut profile = DeviceProfile {
+            os: OsFamily::Linux,
+            arch: "x86_64".into(),
+            apple_silicon: false,
+            logical_cores: 16,
+            cpu_model: "AMD Ryzen 9 5950X".into(),
+            gpu: GpuInfo {
+                vendor: GpuVendor::Amd,
+                model: "AMD Navi 21".into(),
+                vram_gb: 16,
+                gpus: Vec::new(),
+                max_compute_cap_x10: None,
+            },
+            memory_gb: 64,
+            display: "AMD Ryzen 9 5950X · 16 cores".into(),
+            warnings: vec![],
+            amd_gpu_pci_ids: vec![0x73BF], // RX 6800 XT
+        };
+        let cap = CapabilityProfile {
+            viability: alice_miner_core::detect::capability::derive_lane_viability(&profile),
+            profile: profile.clone(),
+        };
+        let s = render_detect(&cap);
+        assert!(s.contains("RDNA2"), "the gpu line names the architecture: {s}");
+        assert!(
+            s.contains("Notes:") && s.contains("3.5.0"),
+            "the note explains the upstream removal: {s}"
+        );
+        // ...and the RDNA3 card in the same family is NOT tarred with it.
+        profile.gpu.model = "AMD Navi 31".into();
+        profile.amd_gpu_pci_ids = vec![0x744C];
+        let cap = CapabilityProfile {
+            viability: alice_miner_core::detect::capability::derive_lane_viability(&profile),
+            profile,
+        };
+        let s = render_detect(&cap);
+        assert!(s.contains("RDNA3+"), "RDNA3 reads as supported: {s}");
+        assert!(!s.contains("RDNA2"), "no RDNA2 warning on an RDNA3 card: {s}");
     }
 
     /// Polish #13: the lane-matrix support column must line up across rows even for

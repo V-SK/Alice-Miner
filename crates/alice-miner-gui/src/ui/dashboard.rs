@@ -318,9 +318,29 @@ fn dashboard_inner(ui: &mut egui::Ui, app: &mut MinerApp) {
     } else {
         mining && app.active_lane() == Lane::GpuPrl
     };
+    let prl_reason = app.lane_reason(Lane::GpuPrl);
     let prl_role = match app.lane_support(Lane::GpuPrl) {
+        // An AMD card we could not place is runnable but unverified — say so
+        // rather than claiming "ready", which is what the old vendor-only rule
+        // told every AMD owner including the RDNA2 ones.
+        LaneSupport::Viable
+            if prl_reason
+                == Some(alice_miner_core::detect::capability::PRL_REASON_AMD_UNIDENTIFIED) =>
+        {
+            tr!("· GPU · AMD · support unverified", "· GPU · AMD · 支持情况未确认")
+        }
         LaneSupport::Viable => tr!("· GPU · NVIDIA/AMD · ready", "· GPU · NVIDIA/AMD · 就绪"),
         LaneSupport::ComingSoon => tr!("· GPU · coming soon", "· GPU · 即将推出"),
+        // SRBMiner removed RDNA2 pearlhash in 3.5.0: this owner HAS an AMD GPU,
+        // so "needs NVIDIA/AMD GPU" would be a lie.
+        LaneSupport::Unavailable
+            if prl_reason == Some(alice_miner_core::detect::capability::PRL_REASON_AMD_RDNA2) =>
+        {
+            tr!(
+                "· GPU · AMD RDNA2 · unsupported by SRBMiner 3.5+",
+                "· GPU · AMD RDNA2 · SRBMiner 3.5+ 不再支持"
+            )
+        }
         LaneSupport::Unavailable => tr!("· GPU · needs NVIDIA/AMD GPU", "· GPU · 需要 NVIDIA/AMD GPU"),
     };
     let (prl_hr, prl_sh) = lane_live_figures(app, dual, prl_ls, prl_active, (a, r));

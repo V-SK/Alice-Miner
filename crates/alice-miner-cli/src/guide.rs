@@ -186,6 +186,17 @@ fn render_human(cap: &CapabilityProfile) -> String {
         let _ = writeln!(out, "  {}: {list}", tr!("also runnable", "也可运行"));
     }
 
+    // (2b) The viability notes. These were computed by `derive_lane_viability` and
+    // then rendered NOWHERE — which is how an honest "this card cannot mine this
+    // lane" explanation could exist in the matrix and still never reach a miner.
+    // They carry the AMD RDNA2 verdict, so they are printed here.
+    if !cap.viability.notes.is_empty() {
+        let _ = writeln!(out);
+        for note in &cap.viability.notes {
+            let _ = writeln!(out, "  {} {note}", tr!("Note:", "注意:"));
+        }
+    }
+
     // (3a) Next step — the bundled official client.
     let _ = writeln!(out, "\n{}", tr!("Next step — mine with the official client:", "下一步 —— 使用官方客户端挖矿:"));
     let _ = writeln!(
@@ -316,6 +327,7 @@ mod tests {
             memory_gb: 32,
             display: "Test CPU · 8 cores".into(),
             warnings: vec![],
+            amd_gpu_pci_ids: Vec::new(),
         }
     }
 
@@ -354,12 +366,31 @@ mod tests {
         ))
     }
 
-    fn amd() -> CapabilityProfile {
-        cap_for(profile_with(
+    /// An AMD box carrying the given PCI device ids — the input that decides
+    /// whether GPU-PRL is offered at all (SRBMiner dropped RDNA2 in 3.5.0).
+    fn amd_with_ids(model: &str, ids: &[u16]) -> CapabilityProfile {
+        let mut p = profile_with(
             OsFamily::Linux,
             false,
-            GpuInfo { vendor: GpuVendor::Amd, model: "AMD GPU".into(), vram_gb: 0, gpus: Vec::new(), max_compute_cap_x10: None },
-        ))
+            GpuInfo { vendor: GpuVendor::Amd, model: model.into(), vram_gb: 0, gpus: Vec::new(), max_compute_cap_x10: None },
+        );
+        p.amd_gpu_pci_ids = ids.to_vec();
+        cap_for(p)
+    }
+
+    /// RX 6800 XT (Navi 21) — RDNA2, the generation upstream dropped.
+    fn amd_rdna2() -> CapabilityProfile {
+        amd_with_ids("AMD Navi 21", &[0x73BF])
+    }
+
+    /// RX 7900 XTX (Navi 31) — RDNA3, still supported.
+    fn amd_rdna3() -> CapabilityProfile {
+        amd_with_ids("AMD Navi 31", &[0x744C])
+    }
+
+    /// An AMD card we cannot place (RX 580 / Polaris 10).
+    fn amd_unidentified() -> CapabilityProfile {
+        amd_with_ids("AMD GPU [1002:67df]", &[0x67DF])
     }
 
     fn apple() -> CapabilityProfile {
@@ -379,14 +410,45 @@ mod tests {
     }
 
     /// THE RECOMMENDATION MATRIX: hardware → recommended lane (tracks the viability
-    /// matrix). Ampere/AMD → PRL; Volta → Alpha; Apple/CPU-only → XMR.
+    /// matrix). Ampere/AMD-RDNA3 → PRL; Volta → Alpha; Apple/CPU-only → XMR;
+    /// AMD RDNA2 and AMD-we-can't-identify → XMR, never PRL.
+    ///
+    /// ASSERTION CHANGED: this used to read `recommends(&amd()) == Lane::GpuPrl`
+    /// against a vendor-only "AMD GPU" profile — which is exactly the profile an
+    /// RX 6800 produced, so the test was pinning the bug. It is now split by
+    /// architecture.
     #[test]
     fn recommendation_matrix_tracks_hardware() {
         assert_eq!(recommends(&nvidia_ampere()), Lane::GpuPrl);
-        assert_eq!(recommends(&amd()), Lane::GpuPrl);
+        assert_eq!(recommends(&amd_rdna3()), Lane::GpuPrl);
+        // The RDNA2 card cannot run SRBMiner pearlhash at all → CPU lane.
+        assert_eq!(recommends(&amd_rdna2()), Lane::Xmr);
+        // An AMD card we could not identify is never chosen FOR the user.
+        assert_eq!(recommends(&amd_unidentified()), Lane::Xmr);
         assert_eq!(recommends(&nvidia_volta()), Lane::GpuAlpha);
         assert_eq!(recommends(&apple()), Lane::Xmr);
         assert_eq!(recommends(&cpu_only()), Lane::Xmr);
+    }
+
+    /// The advisor screen must SAY why, not just quietly point elsewhere: on an
+    /// RDNA2 box it names RDNA2 + the upstream removal, and on an unidentified
+    /// AMD box it warns that an RX 6xxx card will not mine. This is the "we would
+    /// rather say so than let you find out from a silent lane" promise, rendered.
+    #[test]
+    fn guide_explains_the_amd_verdict_instead_of_silently_recommending_xmr() {
+        let _g = LANG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        i18n::set_lang(Lang::En);
+        let rdna2 = render_human(&amd_rdna2());
+        assert!(rdna2.contains("RDNA2"), "names the architecture: {rdna2}");
+        assert!(rdna2.contains("3.5.0"), "names the upstream removal: {rdna2}");
+
+        let unknown = render_human(&amd_unidentified());
+        assert!(
+            unknown.contains("could not be identified"),
+            "says it could not identify the card: {unknown}"
+        );
+        assert!(unknown.contains("RX 6000-series"), "warns about RDNA2: {unknown}");
+        i18n::set_lang(Lang::En);
     }
 
     /// The bring-your-own surface is correct + PUBLIC-only per lane: pearlhash lanes
@@ -419,7 +481,15 @@ mod tests {
     #[test]
     fn guide_output_is_credit_only_and_leaks_no_secrets() {
         let _g = LANG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        for cap in [nvidia_ampere(), nvidia_volta(), amd(), apple(), cpu_only()] {
+        for cap in [
+            nvidia_ampere(),
+            nvidia_volta(),
+            amd_rdna3(),
+            amd_rdna2(),
+            amd_unidentified(),
+            apple(),
+            cpu_only(),
+        ] {
             for lang in [Lang::En, Lang::Zh] {
                 i18n::set_lang(lang);
                 let human = render_human(&cap).to_lowercase();

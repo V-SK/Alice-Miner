@@ -1021,6 +1021,15 @@ impl MinerApp {
         }
     }
 
+    /// The machine-readable reason the matrix recorded for a lane (e.g. why
+    /// GPU-PRL is unavailable). `None` before detection completes. The UI uses
+    /// this to say *why* a lane is off instead of guessing — an AMD RDNA2 box is
+    /// missing the lane because the engine dropped the architecture, not because
+    /// it is "missing a GPU", and telling it the second way is a lie.
+    pub fn lane_reason(&self, lane: Lane) -> Option<&str> {
+        self.viability.as_ref().and_then(|v| v.reason(lane))
+    }
+
     /// The ordered list of GPU lanes to OFFER in the Home lane selector, given the
     /// detected device. The two pearlhash lanes — [`Lane::GpuPrl`] (SRBMiner →
     /// herominers relay, CC≥7.5) and [`Lane::GpuAlpha`] (AlphaMiner → AlphaPool
@@ -2464,6 +2473,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             memory_gb: 64,
             display: "AMD Ryzen 9 5950X · 16 cores".into(),
             warnings: vec![],
+            amd_gpu_pci_ids: Vec::new(),
         });
         app.snapshot = None; // idle / not connected
 
@@ -2509,6 +2519,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             memory_gb: 32,
             display: "Apple M2 Max · 12 cores".into(),
             warnings: vec![],
+            amd_gpu_pci_ids: Vec::new(),
         });
         assert!(!app.dual_viable(), "Apple/CPU-only → dual disabled (one viable lane)");
 
@@ -2529,6 +2540,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             memory_gb: 64,
             display: "AMD Ryzen 9 5950X · 16 cores".into(),
             warnings: vec![],
+            amd_gpu_pci_ids: Vec::new(),
         });
         assert!(app.dual_viable(), "NVIDIA box → dual enabled (two viable lanes)");
     }
@@ -2555,11 +2567,13 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             memory_gb: 64,
             display: "Intel Xeon · 16 cores".into(),
             warnings: vec![],
+            amd_gpu_pci_ids: Vec::new(),
         }
     }
 
-    /// An AMD box: SRBMiner supports AMD (GPU-PRL runnable) but alpha-miner is
-    /// NVIDIA-CUDA only (GPU-Alpha Unavailable).
+    /// An AMD **RDNA3** box (RX 7900 XTX / Navi 31): the pinned SRBMiner still
+    /// supports this generation, so GPU-PRL is runnable — but alpha-miner is
+    /// NVIDIA-CUDA only, so GPU-Alpha stays Unavailable.
     fn amd_device() -> alice_miner_core::detect::DeviceProfile {
         use alice_miner_core::detect::{DeviceProfile, GpuInfo, GpuVendor, OsFamily};
         DeviceProfile {
@@ -2578,6 +2592,9 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             memory_gb: 64,
             display: "AMD Ryzen · 16 cores".into(),
             warnings: vec![],
+            // Navi 31 (0x744C) = the RX 7900 XTX named above: RDNA3, which the
+            // pinned SRBMiner still supports, so GPU-PRL stays viable here.
+            amd_gpu_pci_ids: vec![0x744C],
         }
     }
 
@@ -2593,6 +2610,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             memory_gb: 32,
             display: "Apple M2 Max · 12 cores".into(),
             warnings: vec![],
+            amd_gpu_pci_ids: Vec::new(),
         }
     }
 
@@ -2658,6 +2676,83 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             "no runnable GPU engine on Apple → none offered"
         );
         assert_eq!(app.selected_lane, Lane::Xmr, "Apple defaults to CPU-XMR");
+    }
+
+    /// An AMD **RDNA2** box (RX 6800 XT / Navi 21). SRBMiner removed RDNA2
+    /// pearlhash support upstream in 3.5.0 and v0.6.8 pins 3.5.4, so this card
+    /// cannot mine GPU-PRL at all.
+    fn amd_rdna2_device() -> alice_miner_core::detect::DeviceProfile {
+        let mut d = amd_device();
+        d.gpu.model = "AMD Navi 21".into();
+        d.amd_gpu_pci_ids = vec![0x73BF];
+        d
+    }
+
+    /// THE GUI HALF OF THE RDNA2 FIX. Before it, this device offered GPU-PRL as
+    /// the pre-selected default chip: the owner would click Start and get an
+    /// engine that cannot mine — the exact silent lane v0.6.8 promises to
+    /// prevent. Now the lane is Unavailable, so it is neither offered nor
+    /// selectable, the default falls back to CPU-XMR, and the reason the chip
+    /// renders is the true one.
+    #[test]
+    fn amd_rdna2_box_is_not_offered_the_prl_lane_in_the_gui() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        app.set_device(amd_rdna2_device());
+
+        assert_eq!(
+            app.lane_support(Lane::GpuPrl),
+            LaneSupport::Unavailable,
+            "RDNA2 cannot run SRBMiner pearlhash"
+        );
+        assert!(
+            app.offered_gpu_lanes().is_empty(),
+            "an RDNA2 box must be offered no GPU engine at all"
+        );
+        assert_eq!(
+            app.selected_lane,
+            Lane::Xmr,
+            "the pre-selected lane falls back to CPU-XMR, not the dead GPU lane"
+        );
+        // The chip's reason is the RDNA2 one, so the UI can say why instead of
+        // claiming the box "needs an NVIDIA/AMD GPU" — it HAS one.
+        assert_eq!(
+            app.lane_reason(Lane::GpuPrl),
+            Some(alice_miner_core::detect::capability::PRL_REASON_AMD_RDNA2)
+        );
+        // Clicking it anyway must not select it (the selector gates on runnable,
+        // and `select_lane` re-checks defensively).
+        app.select_lane(Lane::GpuPrl);
+        assert_eq!(app.selected_lane, Lane::Xmr, "an unavailable lane cannot be selected");
+        // Dual-mine needs 2 runnable lanes; only XMR is left.
+        assert!(!app.dual_viable(), "no second lane to dual-mine with");
+    }
+
+    /// An AMD card we could not identify keeps the lane REACHABLE (it may well be
+    /// an RDNA3 card we have never seen) but must never be pre-selected for the
+    /// user — the whole point of the third state.
+    #[test]
+    fn unidentified_amd_box_offers_prl_but_does_not_default_to_it() {
+        let mut app = MinerApp::new().expect("engine spawns");
+        let mut d = amd_device();
+        d.gpu.model = "AMD GPU [1002:67df]".into();
+        d.amd_gpu_pci_ids = vec![0x67DF]; // RX 580 / Polaris 10 — not in the table
+        app.set_device(d);
+
+        assert_eq!(app.lane_support(Lane::GpuPrl), LaneSupport::Viable);
+        assert_eq!(
+            app.offered_gpu_lanes(),
+            vec![Lane::GpuPrl],
+            "still offered — an explicit pick must remain possible"
+        );
+        assert_eq!(
+            app.selected_lane,
+            Lane::Xmr,
+            "but NOT pre-selected: we do not route an unidentified card into it"
+        );
+        // A deliberate click still works.
+        app.select_lane(Lane::GpuPrl);
+        assert_eq!(app.selected_lane, Lane::GpuPrl);
+        assert!(app.lane_user_picked, "reaching it required a manual pick");
     }
 
     /// The multi-GPU picker must show for ALL three GPU lanes (PRL, Alpha, RVN), so
@@ -2935,6 +3030,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             memory_gb: 64,
             display: "AMD Ryzen 9 5950X · 16 cores".into(),
             warnings: vec![],
+            amd_gpu_pci_ids: Vec::new(),
         }
     }
 
@@ -3895,6 +3991,7 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
             memory_gb: 64,
             display: "AMD Ryzen 9 5950X · 16 cores".into(),
             warnings: vec![],
+            amd_gpu_pci_ids: Vec::new(),
         }
     }
 

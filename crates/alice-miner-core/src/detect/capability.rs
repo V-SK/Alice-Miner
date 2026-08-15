@@ -21,12 +21,53 @@
 //!
 //! The viability rules (the M3 matrix, from the brief / PLAN §5 M3):
 //!
-//! | device                  | XMR      | PRL (mainline)                | RVN          |
-//! |-------------------------|----------|-------------------------------|--------------|
-//! | CPU only / no GPU       | Viable   | Unavailable                   | Unavailable  |
-//! | NVIDIA GPU              | Viable   | **Viable**                    | Viable       |
-//! | AMD GPU                 | Viable   | **Viable** (SRBMiner)         | ComingSoon   |
-//! | Apple Silicon           | Viable   | Unavailable (no macOS SRBMiner)| Unavailable |
+//! | device                    | XMR      | PRL (mainline)                  | RVN          |
+//! |---------------------------|----------|---------------------------------|--------------|
+//! | CPU only / no GPU         | Viable   | Unavailable                     | Unavailable  |
+//! | NVIDIA GPU (CC ≥ 7.5)     | Viable   | **Viable**                      | ComingSoon   |
+//! | NVIDIA Volta (CC 7.0)     | Viable   | Unavailable (→ Alpha)           | ComingSoon   |
+//! | AMD **RDNA3 or newer**    | Viable   | **Viable** (SRBMiner)           | ComingSoon   |
+//! | AMD **RDNA2** (RX 6xxx)   | Viable   | **Unavailable** (dropped ≥3.5.0)| ComingSoon   |
+//! | AMD, arch unidentified    | Viable   | Viable but **never auto-picked**| ComingSoon   |
+//! | Apple Silicon             | Viable   | Unavailable (no macOS SRBMiner) | Unavailable  |
+//!
+//! ## The AMD split, and why "unknown" is its own answer
+//!
+//! SRBMiner **removed AMD RDNA2 (RX 6000-series) pearlhash support upstream in
+//! 3.5.0**, and v0.6.8 pins 3.5.4. The v0.6.8 release notes promise RDNA2 owners
+//! that the lane "simply becomes unavailable" rather than mining wrongly. This
+//! module is where that promise is kept — using the per-card PCI device ids the
+//! probe now carries ([`super::DeviceProfile::amd_gpu_pci_ids`] → [`super::amd`]).
+//!
+//! Three inputs, three different answers:
+//!
+//!   * **Positively RDNA2** → [`LaneSupport::Unavailable`]. `start`, `setup` and
+//!     the GUI all refuse it, `doctor` FAILs it, and every one of them prints
+//!     [`PRL_REASON_AMD_RDNA2`], which names the upstream removal.
+//!   * **Positively RDNA3 or newer** → [`LaneSupport::Viable`] and eligible to be
+//!     the recommended one-click default, exactly as before.
+//!   * **Unidentified** → [`LaneSupport::Viable`] (so `--lane prl` still works)
+//!     but **never** the auto-selected `recommended` lane, with reason
+//!     [`PRL_REASON_AMD_UNIDENTIFIED`] and an operator note.
+//!
+//! That last rule is the one judgement call here, so the reasoning, explicitly:
+//! the two errors are not symmetric. **Offering** the lane to a card that cannot
+//! mine reproduces the exact failure this release exists to fix, and it does so
+//! *silently* — the miner sees an engine that idles. **Withholding** it from a
+//! card that could mine costs real earnings — but only if it is truly withheld.
+//! "Runnable but never auto-picked" withholds nothing except the default: the
+//! lane stays selectable by name, so a card we failed to identify costs its owner
+//! one explicit `--lane prl`, not their hashrate. Meanwhile nobody is ever
+//! *routed* into an unidentified card by `--lane auto`, `setup`, or the GUI's
+//! pre-selection. Making unknown mean `Unavailable` would have been the stricter
+//! reading, but it would rot: the id table can only ever be complete for
+//! hardware that already exists, so every future AMD card would be denied by
+//! default until someone shipped a new client.
+//!
+//! The unidentified bucket is also, in practice, dominated by cards that
+//! genuinely cannot mine this lane — every pre-RDNA2 AMD part (Polaris, Vega,
+//! GCN, RDNA1), for which we hold no evidence the pinned engine works either.
+//! Not auto-picking it is right for that population too.
 //!
 //! **CREDIT-ONLY / pure derivation.** This module reads the profile and computes
 //! a lane set; it touches no reward / payout / chain surface and no key.
@@ -37,8 +78,28 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::amd::AmdArch;
 use super::{DeviceProfile, GpuVendor};
 use crate::lane::Lane;
+
+// ── The AMD / GPU-PRL reason tokens ──────────────────────────────────────────
+//
+// These are the machine-readable strings `LaneViability::reasons` carries for
+// the GPU-PRL lane on an AMD box. They are `pub const` (not inline literals)
+// because `recompute_recommended` matches on one of them — an inline typo there
+// would silently re-promote a lane we deliberately demoted.
+
+/// GPU-PRL on a positively-identified **RDNA2** card: SRBMiner removed
+/// pearlhash support for RDNA2 upstream in 3.5.0 and v0.6.8 pins 3.5.4, so the
+/// lane cannot run at all. Surfaced by `start` / `setup` / `doctor`.
+pub const PRL_REASON_AMD_RDNA2: &str = "prl_amd_rdna2_removed_upstream_in_srbminer_3_5_0";
+/// GPU-PRL on a positively-identified **RDNA3-or-newer** card — the only AMD
+/// generation the pinned engine is documented to still support.
+pub const PRL_REASON_AMD_RDNA3_PLUS: &str = "prl_amd_rdna3_or_newer_supported";
+/// GPU-PRL on an AMD card whose architecture we could **not** identify. The lane
+/// stays runnable (an explicit `--lane prl` works) but is never auto-selected —
+/// see the module docs for why this is neither "yes" nor "no".
+pub const PRL_REASON_AMD_UNIDENTIFIED: &str = "prl_amd_arch_unidentified_not_auto_selected";
 
 /// How well the client supports a given lane on this device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,7 +267,38 @@ pub fn derive_lane_viability(profile: &DeviceProfile) -> LaneViability {
             (LaneSupport::Unavailable, "prl_srbminer_needs_cc_7_5_use_alpha")
         }
         GpuVendor::Nvidia => (LaneSupport::Viable, "nvidia_present"),
-        GpuVendor::Amd => (LaneSupport::Viable, "amd_srbminer_supported"),
+        // AMD splits three ways on the card's ARCHITECTURE, not just the vendor:
+        // SRBMiner dropped RDNA2 pearlhash in 3.5.0 (and v0.6.8 pins 3.5.4), so a
+        // vendor-only rule handed the lane — as the RECOMMENDED one — to cards
+        // that cannot mine it. See the module docs for the unknown-case reasoning.
+        GpuVendor::Amd => match profile.amd_arch() {
+            AmdArch::Rdna3OrNewer => (LaneSupport::Viable, PRL_REASON_AMD_RDNA3_PLUS),
+            AmdArch::Rdna2 => {
+                notes.push(format!(
+                    "{} detected (RDNA2) — SRBMiner removed RDNA2 pearlhash support \
+                     upstream in 3.5.0, so the GPU-PRL lane is permanently unavailable \
+                     on this card. There is no version of the client that keeps it. \
+                     The CPU (XMR) lane still runs.",
+                    if profile.gpu.model.is_empty() {
+                        "AMD GPU".to_string()
+                    } else {
+                        profile.gpu.model.clone()
+                    }
+                ));
+                (LaneSupport::Unavailable, PRL_REASON_AMD_RDNA2)
+            }
+            AmdArch::Unknown => {
+                notes.push(
+                    "AMD GPU detected but its architecture could not be identified, so \
+                     GPU-PRL is NOT selected automatically. SRBMiner dropped RDNA2 \
+                     (RX 6000-series) pearlhash support in 3.5.0: if this is an RX 6xxx \
+                     card the lane will not mine. You can still start it explicitly with \
+                     `--lane prl` if you know the card is RDNA3 or newer."
+                        .to_string(),
+                );
+                (LaneSupport::Viable, PRL_REASON_AMD_UNIDENTIFIED)
+            }
+        },
         GpuVendor::Apple => (
             LaneSupport::Unavailable,
             "prl_requires_nvidia_or_amd_apple_excluded",
@@ -241,7 +333,10 @@ pub fn derive_lane_viability(profile: &DeviceProfile) -> LaneViability {
             .unwrap_or(LaneSupport::Unavailable)
             .is_runnable()
     };
-    let recommended = if is_runnable(Lane::GpuPrl) {
+    // GPU-PRL is runnable on an AMD card we could not identify, but it must never
+    // be the lane we pick FOR the user — `--lane auto`, `setup`'s default and the
+    // GUI's pre-selection all read `recommended`. See the module docs.
+    let recommended = if is_runnable(Lane::GpuPrl) && prl_reason != PRL_REASON_AMD_UNIDENTIFIED {
         Lane::GpuPrl
     } else if is_runnable(Lane::GpuAlpha) {
         // GPU-PRL not runnable but Alpha is = a Volta/V100 NVIDIA box (SRBMiner can't
@@ -364,17 +459,40 @@ pub fn apply_lane_override(
 /// Pick the recommended lane: the prior recommendation if still runnable, else
 /// GPU-PRL (the mainline) if runnable, else GPU-RVN if runnable, else XMR
 /// (fail-safe default).
+///
+/// GPU-PRL on an **unidentified AMD card** is skipped here for the same reason
+/// [`derive_lane_viability`] skips it: it is runnable but must never be chosen
+/// *for* the user. The one path that can still land on it is an operator who
+/// excluded every other lane by hand (`ALICE_MINER_LANES=prl`) — at which point
+/// they have asked for it by name, which is exactly the bar we set.
 fn recompute_recommended(v: &LaneViability) -> Lane {
     if v.is_runnable(v.recommended) {
         return v.recommended;
     }
-    if v.is_runnable(Lane::GpuPrl) {
+    if prl_eligible_for_auto_default(v) {
         return Lane::GpuPrl;
     }
     if v.is_runnable(Lane::GpuRvn) {
         return Lane::GpuRvn;
     }
+    if v.is_runnable(Lane::Xmr) {
+        return Lane::Xmr;
+    }
+    // Last resort: an operator override left ONLY the unidentified-AMD GPU-PRL
+    // lane runnable. They named it, so point at it rather than at a lane that is
+    // not runnable either.
+    if v.is_runnable(Lane::GpuPrl) {
+        return Lane::GpuPrl;
+    }
     Lane::Xmr
+}
+
+/// Whether GPU-PRL may be chosen as the AUTO default (`--lane auto`, `setup`'s
+/// default, the GUI's pre-selection). Runnable is necessary but not sufficient:
+/// on an AMD card whose architecture we could not identify the lane is runnable
+/// **on request only**, never by default.
+fn prl_eligible_for_auto_default(v: &LaneViability) -> bool {
+    v.is_runnable(Lane::GpuPrl) && v.reason(Lane::GpuPrl) != Some(PRL_REASON_AMD_UNIDENTIFIED)
 }
 
 /// The full auto-detection bundle the front-ends consume: the raw
@@ -436,6 +554,7 @@ mod tests {
             memory_gb: 32,
             display: "Test CPU · 8 cores".into(),
             warnings: vec![],
+            amd_gpu_pci_ids: Vec::new(),
         }
     }
 
@@ -477,12 +596,38 @@ mod tests {
         )
     }
 
-    fn amd() -> DeviceProfile {
-        profile_with(
+    /// An AMD box with the given PCI device ids (the input the RDNA2 split needs).
+    fn amd_with_ids(model: &str, ids: &[u16]) -> DeviceProfile {
+        let mut p = profile_with(
             OsFamily::Linux,
             false,
-            GpuInfo { vendor: GpuVendor::Amd, model: "AMD GPU".into(), vram_gb: 0, gpus: Vec::new(), max_compute_cap_x10: None },
-        )
+            GpuInfo {
+                vendor: GpuVendor::Amd,
+                model: model.into(),
+                vram_gb: 0,
+                gpus: Vec::new(),
+                max_compute_cap_x10: None,
+            },
+        );
+        p.amd_gpu_pci_ids = ids.to_vec();
+        p
+    }
+
+    /// An RX 6800 XT — Navi 21, **RDNA2**: the card the v0.6.8 notes name.
+    fn amd_rdna2() -> DeviceProfile {
+        amd_with_ids("AMD Navi 21", &[0x73BF])
+    }
+
+    /// An RX 7900 XTX — Navi 31, **RDNA3**: still supported by the pinned engine.
+    fn amd_rdna3() -> DeviceProfile {
+        amd_with_ids("AMD Navi 31", &[0x744C])
+    }
+
+    /// An AMD card we cannot place (here: an RX 580 / Polaris 10, which the id
+    /// table deliberately does not enumerate). Also the shape of an AMD box whose
+    /// device ids could not be read at all.
+    fn amd_unidentified() -> DeviceProfile {
+        amd_with_ids("AMD GPU [1002:67df]", &[0x67DF])
     }
 
     fn cpu_only() -> DeviceProfile {
@@ -545,22 +690,119 @@ mod tests {
         assert_eq!(v.runnable_lanes(), vec![Lane::GpuAlpha, Lane::Xmr]);
     }
 
-    /// AMD → RVN "coming soon" (NOT runnable), but PRL viable (SRBMiner supports
-    /// AMD) so PRL is the recommended GPU mainline; XMR viable as the CPU lane.
+    /// AMD **RDNA3** → RVN "coming soon" (NOT runnable), PRL viable (the pinned
+    /// SRBMiner still supports this generation) and the recommended GPU mainline.
+    ///
+    /// ASSERTION CHANGED (was `viability_matrix_amd_rvn_coming_soon`): that test
+    /// built a vendor-only "AMD GPU" profile and pinned `recommended == GpuPrl`
+    /// for it — i.e. it actively locked in the bug, because that same profile is
+    /// what an RX 6800 produced. The AMD cases are now split by architecture; this
+    /// is the half where the old expectation is still correct.
     #[test]
-    fn viability_matrix_amd_rvn_coming_soon() {
-        let v = derive_lane_viability(&amd());
+    fn viability_matrix_amd_rdna3_prl_viable_and_recommended() {
+        let v = derive_lane_viability(&amd_rdna3());
         assert_eq!(v.support(Lane::Xmr), LaneSupport::Viable);
         assert_eq!(v.support(Lane::GpuRvn), LaneSupport::ComingSoon);
         assert!(!v.is_runnable(Lane::GpuRvn)); // coming-soon is NOT runnable
-        // PRL is runnable on AMD (SRBMiner) → it's the recommended mainline lane.
+        // PRL is runnable on RDNA3+ → it's the recommended mainline lane.
         assert_eq!(v.support(Lane::GpuPrl), LaneSupport::Viable);
         assert!(v.is_runnable(Lane::GpuPrl));
         assert_eq!(v.recommended, Lane::GpuPrl);
+        assert_eq!(v.reason(Lane::GpuPrl), Some(PRL_REASON_AMD_RDNA3_PLUS));
         assert_eq!(v.reason(Lane::GpuRvn), Some("rvn_amd_coming_soon"));
         assert!(v.notes.iter().any(|n| n.contains("AMD")));
         // runnable set = PRL (recommended) first, then XMR; RVN is coming-soon.
         assert_eq!(v.runnable_lanes(), vec![Lane::GpuPrl, Lane::Xmr]);
+    }
+
+    /// THE REGRESSION GATE for this fix: an **RDNA2** card (RX 6800 XT / Navi 21)
+    /// must NOT be offered GPU-PRL at all. SRBMiner removed RDNA2 pearlhash
+    /// support in 3.5.0 and v0.6.8 pins 3.5.4, so the lane cannot work — and the
+    /// release notes promise these owners it "simply becomes unavailable".
+    /// Before this fix the same device produced `Viable` + `recommended`.
+    #[test]
+    fn viability_matrix_amd_rdna2_prl_unavailable_and_never_recommended() {
+        let v = derive_lane_viability(&amd_rdna2());
+        // The lane is UNAVAILABLE — not "coming soon", which would imply it might
+        // arrive. It will not.
+        assert_eq!(v.support(Lane::GpuPrl), LaneSupport::Unavailable);
+        assert!(!v.is_runnable(Lane::GpuPrl));
+        assert_eq!(v.reason(Lane::GpuPrl), Some(PRL_REASON_AMD_RDNA2));
+        // ...so it can never be recommended, and the CPU lane is what's left
+        // (alpha-miner is NVIDIA-CUDA only, RVN is unpinned).
+        assert_eq!(v.recommended, Lane::Xmr);
+        assert_eq!(v.runnable_lanes(), vec![Lane::Xmr]);
+        assert_eq!(v.support(Lane::Xmr), LaneSupport::Viable);
+        // The operator-facing note names the card and says it is permanent.
+        assert!(v
+            .notes
+            .iter()
+            .any(|n| n.contains("RDNA2") && n.contains("3.5.0")));
+    }
+
+    /// A whole rig of RDNA2 cards is still RDNA2 (no card can mine), while a rig
+    /// with even one RDNA3 card runs — the RDNA2 card simply cannot participate.
+    #[test]
+    fn viability_matrix_amd_multi_gpu_rigs() {
+        let all_rdna2 = derive_lane_viability(&amd_with_ids("AMD Navi 21", &[0x73BF, 0x73BF]));
+        assert_eq!(all_rdna2.support(Lane::GpuPrl), LaneSupport::Unavailable);
+        assert_eq!(all_rdna2.recommended, Lane::Xmr);
+
+        let mixed = derive_lane_viability(&amd_with_ids("AMD Navi 21 + Navi 31", &[0x73BF, 0x744C]));
+        assert_eq!(mixed.support(Lane::GpuPrl), LaneSupport::Viable);
+        assert_eq!(mixed.recommended, Lane::GpuPrl);
+    }
+
+    /// THE THIRD STATE: an AMD card we could not identify is treated as neither.
+    /// The lane stays runnable (an explicit `--lane prl` works, so a card we
+    /// simply don't know about is not stripped of its hashrate) but it is NEVER
+    /// the auto-selected default — `--lane auto`, `setup` and the GUI all land on
+    /// XMR, and the reason + note say why.
+    #[test]
+    fn viability_matrix_amd_unidentified_is_runnable_but_never_auto_selected() {
+        let v = derive_lane_viability(&amd_unidentified());
+        assert_eq!(v.support(Lane::GpuPrl), LaneSupport::Viable);
+        assert!(v.is_runnable(Lane::GpuPrl)); // `--lane prl` still works
+        assert_eq!(v.reason(Lane::GpuPrl), Some(PRL_REASON_AMD_UNIDENTIFIED));
+        // ...but it is NOT what we pick for the user.
+        assert_eq!(v.recommended, Lane::Xmr);
+        // It is still listed as runnable (so the UI offers it), just not first.
+        assert_eq!(v.runnable_lanes(), vec![Lane::Xmr, Lane::GpuPrl]);
+        // And the note names RDNA2 explicitly, so this is never silent.
+        assert!(v
+            .notes
+            .iter()
+            .any(|n| n.contains("could not be identified") && n.contains("RDNA2")));
+    }
+
+    /// An AMD box whose PCI device ids could not be read at all (empty list) is
+    /// the same "unknown" case — it must NOT fall back to the old vendor-only
+    /// "AMD is supported" answer.
+    #[test]
+    fn viability_matrix_amd_with_no_readable_ids_is_unidentified_not_supported() {
+        let v = derive_lane_viability(&amd_with_ids("AMD GPU", &[]));
+        assert_eq!(v.reason(Lane::GpuPrl), Some(PRL_REASON_AMD_UNIDENTIFIED));
+        assert_eq!(v.recommended, Lane::Xmr);
+    }
+
+    /// An operator who names the lane by hand still gets it on an unidentified
+    /// card — the demotion withholds the DEFAULT, not the lane.
+    #[test]
+    fn unidentified_amd_prl_is_still_reachable_by_explicit_override() {
+        let base = derive_lane_viability(&amd_unidentified());
+        assert_eq!(base.recommended, Lane::Xmr);
+        let v = apply_lane_override(base, Some(&[Lane::GpuPrl]), false);
+        assert!(v.is_runnable(Lane::GpuPrl));
+        assert_eq!(v.recommended, Lane::GpuPrl);
+    }
+
+    /// ...but an override that merely narrows AWAY from PRL must not accidentally
+    /// re-promote it: with XMR requested, XMR stays the recommendation.
+    #[test]
+    fn unidentified_amd_prl_is_not_repromoted_by_an_unrelated_override() {
+        let base = derive_lane_viability(&amd_unidentified());
+        let v = apply_lane_override(base, Some(&[Lane::Xmr]), false);
+        assert_eq!(v.recommended, Lane::Xmr);
     }
 
     /// CPU-only / all-probes-failed → XMR viable everywhere, RVN unavailable.
