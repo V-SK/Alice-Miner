@@ -98,12 +98,20 @@ pub const RELEASE_PUBKEY_B64: &str = "8P+XmZZFEsUHLmqeB62Xqr5GnwW5K9vf2sQHvRzfi5
 /// often is NOT the thing whose compromise is remote-code-execution on every
 /// miner's machine.
 ///
-/// **EMPTY = fail-closed.** Until V generates the sub-key offline (same custody
-/// as the release key: held offline in encrypted storage, signed by hand, agent never
-/// reads it) this constant stays empty and the client uses ONLY the pins baked
-/// into its own binary. An empty key never "verifies" anything — see
-/// [`engine_pin_key_status`].
-pub const ENGINE_PIN_PUBKEY_B64: &str = "";
+/// **EMPTY = fail-closed.** With no key here the client uses ONLY the pins baked
+/// into its own binary: it fetches no pin document and refuses one if handed it.
+/// An empty key never "verifies" anything — see [`engine_pin_key_status`].
+///
+/// Generated offline 2026-08-15 and live from v0.6.8. The PRIVATE half has the
+/// same custody as the release key — held offline in encrypted storage, used by
+/// hand, never read by an agent. Only the public half below was ever handed over,
+/// and it is public by construction: it ships inside a binary in a public repo.
+///
+/// Rotating it is a breaking change in one direction only: a client shipped with
+/// this key cannot verify a document signed by a different one, so it would fall
+/// back to its built-in pins — fail-closed, but the out-of-band channel would be
+/// dead for every already-shipped client until they update.
+pub const ENGINE_PIN_PUBKEY_B64: &str = "Ym+Hyr+YVGgRsPu57V2zszXJ0M5A8hwe7ZxOf0jFXX0=";
 
 /// Default location of the signed engine-pin document (`engines.json`, detached
 /// signature at `engines.json.sig`). Served as a **release asset that can be

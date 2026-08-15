@@ -4632,8 +4632,31 @@ mod tests {
     }
 
     /// Wait (bounded) for `pred` to hold of the lane's stats.
+    /// Poll until `pred` holds, or give up.
+    ///
+    /// `secs` is HARNESS SLACK, not a property under test — every one of these
+    /// tests asserts what happened, never how fast. The budget is therefore raised
+    /// to a floor and scalable from the environment, because it is racing machine
+    /// load: 34 call sites poll for five or ten seconds while the full suite runs
+    /// 683 tests in parallel, many of them spawning real child processes. On this
+    /// Mac that is comfortable; on a shared CI runner it is not, and a budget that
+    /// expires under load produces a failure that reads exactly like a real defect.
+    ///
+    /// This codebase has already lost time to that: one test passed ONLY under
+    /// parallel load and failed 8/8 alone, and the passing was the accident. A
+    /// suite that goes red for reasons unrelated to the code teaches everyone to
+    /// ignore red, which is worse than a slow suite.
+    ///
+    /// `ALICE_TEST_WAIT_SCALE` multiplies the budget for a slow machine.
     async fn wait_for(s: &LaneSupervisor, secs: u64, pred: impl Fn(&LaneStats) -> bool) -> bool {
-        for _ in 0..(secs * 10) {
+        const FLOOR_SECS: u64 = 30;
+        let scale: u64 = std::env::var("ALICE_TEST_WAIT_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(1);
+        let budget = secs.max(FLOOR_SECS) * scale;
+        for _ in 0..(budget * 10) {
             if pred(&s.stats()) {
                 return true;
             }
