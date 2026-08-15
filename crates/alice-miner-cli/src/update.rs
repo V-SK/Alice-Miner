@@ -86,8 +86,15 @@ pub fn run(args: UpdateArgs) -> i32 {
             )
         );
     }
-    let outcome = release::evaluate(manifest, current);
+    act(release::evaluate(manifest, current), args.check, args.yes)
+}
 
+/// What to DO about a check result.
+///
+/// Split out of [`run`] so the `--check` contract can be tested at all: `run`
+/// cannot be called without a network, and the arm that ignored `--check` was
+/// therefore the one arm with no test on it.
+fn act(outcome: CheckOutcome, check: bool, yes: bool) -> i32 {
     match outcome {
         CheckOutcome::UpToDate { current } => {
             println!(
@@ -121,8 +128,25 @@ pub fn run(args: UpdateArgs) -> i32 {
                 manifest.version
             );
             print_notes(&manifest);
-            // A hard-upgrade notice: offer the same apply flow (it IS newer).
-            apply_flow(&manifest, manifest.artifact_for_current_platform(), args.yes, current.as_str())
+            // A hard-upgrade notice: offer the same apply flow.
+            //
+            // Two things this arm used to get wrong, both of them because
+            // `evaluate` tests `min_supported` BEFORE `is_newer`, so this state
+            // does NOT imply the manifest is offering something newer.
+            //
+            //   * `--check` was never consulted, so the flag documented as
+            //     "only CHECK and report, never apply" downloaded and installed;
+            //   * neither was `is_newer`, so a manifest pairing an unreachable
+            //     `min_supported` with an OLD `version` landed here and was
+            //     applied as a "required upgrade" that is in fact a downgrade —
+            //     on a loop, since the downgraded build is still unsupported.
+            //
+            // The no-downgrade half is enforced in the shared gate (both
+            // front-ends), not here; this is the `--check` half.
+            if check {
+                return report_only();
+            }
+            apply_flow(&manifest, manifest.artifact_for_current_platform(), yes, current.as_str())
         }
         CheckOutcome::UpdateAvailable { current, manifest, artifact } => {
             println!(
@@ -131,25 +155,28 @@ pub fn run(args: UpdateArgs) -> i32 {
                 manifest.version
             );
             print_notes(&manifest);
-            if args.check {
-                // --check: report only, point at how to apply.
-                println!(
-                    "  {}  alice-miner update",
-                    tr!("apply it with:", "应用更新:")
-                );
-                return EXIT_OK;
+            if check {
+                return report_only();
             }
-            apply_flow(&manifest, Some(&artifact), args.yes, current.as_str())
+            apply_flow(&manifest, Some(&artifact), yes, current.as_str())
         }
     }
+}
+
+/// `--check`: say how to apply it, and apply nothing. The ONE place that decides
+/// what `--check` does, so a new outcome arm cannot quietly forget to honour it.
+fn report_only() -> i32 {
+    println!(
+        "  {}  alice-miner update",
+        tr!("apply it with:", "应用更新:")
+    );
+    EXIT_OK
 }
 
 /// The confirm → download → verify → apply → arm-health-gate flow for a newer
 /// manifest. With `yes`, applies without prompting; otherwise asks for an explicit
 /// interactive confirm (and if stdin is NOT a TTY, refuses to apply — never silent).
 fn apply_flow(manifest: &Manifest, artifact: Option<&Artifact>, yes: bool, current: &str) -> i32 {
-    let _ = current;
-
     // The SHARED guardrails — the same ones the automatic path applies, run from
     // the same driver in `alice_miner_core::autoupdate` so there is exactly one
     // copy of them (AM-REL-009). This also records the sighting, so a version
@@ -161,7 +188,7 @@ fn apply_flow(manifest: &Manifest, artifact: Option<&Artifact>, yes: bool, curre
     // and it does not settle the second, explicit question a concern raises: a
     // flag typed before we knew anything cannot be consent to something we only
     // learned afterwards.
-    let check = alice_miner_core::autoupdate::manual_check(manifest, artifact);
+    let check = alice_miner_core::autoupdate::manual_check(manifest, artifact, current);
     if let Some(line) = &check.visibility {
         println!("  {line}");
     }
@@ -1014,7 +1041,7 @@ mod tests {
             let dir = alice_miner_core::autoupdate::state_dir();
             assert!(!dir.join("update-seen.json").exists());
             let m = newer_manifest(&"cd".repeat(32));
-            let check = alice_miner_core::autoupdate::manual_check(&m, Some(&m.artifacts[0]));
+            let check = alice_miner_core::autoupdate::manual_check(&m, Some(&m.artifacts[0]), "0.6.7");
             assert_eq!(
                 check.outcome,
                 alice_miner_core::autoupdate::ManualOutcome::Proceed,
@@ -1028,6 +1055,114 @@ mod tests {
             // choosing has the same fact the automatic path decides on.
             let v = check.visibility.expect("a visibility line");
             assert!(v.contains("9.9.9") && v.contains("less than a minute"), "{v}");
+        });
+    }
+
+    // ── `--check` must never install, and no "required upgrade" may go backwards ──
+
+    /// `--check` is documented as "Only CHECK + report …; never apply", and the
+    /// `Unsupported` arm never looked at it: it called `apply_flow`
+    /// unconditionally, so `alice-miner update --check --yes` downloaded and
+    /// installed, and without `--yes` on a terminal it put an unexpected apply
+    /// prompt in front of someone who asked for a report.
+    ///
+    /// The discriminator is the seen ledger, not the exit code. `apply_flow`'s
+    /// first act is the shared gate, which RECORDS the sighting; `--check` never
+    /// enters it, so the file must not exist. The control — the same manifest,
+    /// same everything, `check = false` — writes it, which is what shows the
+    /// file's absence means "the flow was not entered" rather than "the flow
+    /// does not write files".
+    #[test]
+    fn check_only_never_enters_the_apply_flow_on_a_hard_upgrade_notice() {
+        with_temp_dir(|| {
+            set_lang(Lang::En);
+            let dir = alice_miner_core::autoupdate::state_dir();
+            let ledger = dir.join("update-seen.json");
+
+            // A genuine hard-upgrade notice: newer version, and this build is
+            // below `min_supported`, so `evaluate` returns `Unsupported`.
+            let mut m = newer_manifest(&"aa".repeat(32));
+            m.min_supported = "99.0.0".to_string();
+            assert!(matches!(
+                release::evaluate(m.clone(), "0.6.7"),
+                CheckOutcome::Unsupported { .. }
+            ));
+
+            // The ledger is checked FIRST and deliberately. The exit code is the
+            // weaker signal — an apply that merely failed to download offline
+            // also returns non-zero — so the assertion that must fire when this
+            // regresses is the one about the flow having been entered at all.
+            let code = act(release::evaluate(m.clone(), "0.6.7"), /* check */ true, /* yes */ true);
+            assert!(
+                !ledger.exists(),
+                "--check must not reach the apply flow at all (ledger: {:?})",
+                std::fs::read_to_string(&ledger).unwrap_or_default()
+            );
+            assert_eq!(code, EXIT_OK);
+
+            // The control: identical input, `--check` dropped. Now the flow IS
+            // entered — the sighting lands — and only the offline download stops
+            // it. Without this, the assertion above would pass on a build that
+            // simply never records anything.
+            act(release::evaluate(m, "0.6.7"), /* check */ false, /* yes */ true);
+            assert!(
+                ledger.exists(),
+                "the control must show --check is what stopped it"
+            );
+        });
+    }
+
+    /// `evaluate` tests `min_supported` BEFORE `is_newer`, so a manifest saying
+    /// `min_supported: 99.0.0` with `version: 0.6.4` arrives as `Unsupported` —
+    /// the state the CLI renders as "you must upgrade" — while what it offers is
+    /// a DOWNGRADE. Applied, that is a signed, silent return to exactly the
+    /// builds this release exists to escape, on a loop, because the downgraded
+    /// build is still below `min_supported`.
+    ///
+    /// The exit code alone would prove nothing here: `EXIT_RUNTIME` is also what
+    /// an offline download failure returns. So this uses the ordering trick the
+    /// F1 tests use — with no package for this platform, an ungated flow returns
+    /// `EXIT_OK` at the "download it yourself" branch, and the newer-version
+    /// control shows that is genuinely where it lands. `EXIT_RUNTIME` can then
+    /// only be the gate, and the history line names which gate.
+    #[test]
+    fn a_required_upgrade_that_is_really_a_downgrade_is_refused() {
+        with_temp_dir(|| {
+            set_lang(Lang::En);
+            let dir = alice_miner_core::autoupdate::state_dir();
+            let hist =
+                || std::fs::read_to_string(dir.join("update-history.jsonl")).unwrap_or_default();
+
+            // No package for this platform → the ungated flow ends at EXIT_OK.
+            let mut newer = newer_manifest(&"aa".repeat(32));
+            newer.min_supported = "99.0.0".to_string();
+            newer.artifacts[0].platform = "definitely-not-this-platform".to_string();
+            assert_eq!(
+                act(release::evaluate(newer, "0.6.7"), false, true),
+                EXIT_OK,
+                "the control: a genuine hard upgrade with no package here"
+            );
+            assert!(!hist().contains("manual-downgrade-refused"), "{}", hist());
+
+            // The same shape, pointing backwards.
+            let mut down = newer_manifest(&"aa".repeat(32));
+            down.version = "0.6.4".to_string();
+            down.min_supported = "99.0.0".to_string();
+            down.artifacts[0].platform = "definitely-not-this-platform".to_string();
+            match release::evaluate(down.clone(), "0.6.8") {
+                CheckOutcome::Unsupported { manifest, .. } => assert_eq!(manifest.version, "0.6.4"),
+                other => panic!("expected the trap state, got {other:?}"),
+            }
+            assert_eq!(
+                act(release::evaluate(down, "0.6.8"), false, true),
+                EXIT_RUNTIME,
+                "a 'required upgrade' that is a downgrade must not be applied"
+            );
+            assert!(
+                hist().contains("manual-downgrade-refused"),
+                "the gate must be what stopped it, not a download failure: {}",
+                hist()
+            );
         });
     }
 

@@ -21,9 +21,13 @@
 //! 100` and `released:` to last week would have guardrails in name only. So:
 //!
 //!   * the **soak window** is anchored on when THIS machine first *saw* the
-//!     version (a local, tamper-proof clock), never on the manifest's `released`
-//!     field, and the manifest's `soak_hours` can only extend it past the
-//!     [`SOAK_FLOOR`] the client hard-codes;
+//!     version — a local clock the manifest cannot move — and the manifest's
+//!     `soak_hours` can only extend it past the [`SOAK_FLOOR`] the client
+//!     hard-codes. The manifest's `released` field is read for exactly one
+//!     purpose, a FLOOR under that anchor ([`soak_anchor`]): a machine cannot
+//!     have seen a version before it was published, so a local sighting that
+//!     predates `released` is a broken clock rather than a long soak. That use
+//!     can only push an install later, never sooner;
 //!   * the **rollout percentage** is a ceiling the manifest can only lower;
 //!   * the **artifact hash for a version is remembered forever**: the same
 //!     version re-appearing with different bytes is refused outright, so the
@@ -266,6 +270,15 @@ pub enum Hold {
     /// shout: a re-published version is either a mistake or an attack, and we do
     /// not need to know which to know we should not install it.
     HashConflict { seen_sha256: String, now_sha256: String },
+    /// This machine could not write the sighting to its own update ledger, so
+    /// the hash-conflict refusal has nothing to compare against — now or ever.
+    ///
+    /// That check is the one guarantee in the whole update path that does not
+    /// rest on the release key, and an unattended install is the one act that
+    /// depends on it most. With the ledger dead we cannot make the promise, so
+    /// we do not perform the act. A human can still install by hand and is told
+    /// what is missing (see [`ManualConcern::UnrecordedSighting`]).
+    LedgerUnwritable,
 }
 
 /// A version newer than the one we are running, together with the only fact
@@ -345,6 +358,11 @@ pub struct Input<'a> {
     /// The artifact sha256 this machine recorded the first time it saw this
     /// version, if any.
     pub seen_sha256: Option<&'a str>,
+    /// Whether that sighting is actually ON RECORD — i.e. whether the local
+    /// ledger accepted the write. `false` means `seen_sha256` is a value we
+    /// invented this run and will invent again next run, so it can never
+    /// disagree with the manifest and the hash-conflict refusal is dead.
+    pub sighting_on_record: bool,
     /// Versions that failed a health probation here.
     pub pinned: &'a [String],
     /// Whether a last-known-good copy exists on disk right now.
@@ -366,7 +384,9 @@ pub fn decide(input: &Input<'_>) -> Decision {
         let newer = if crate::is_newer(&m.version, input.current) && !m.is_revoked(&m.version) {
             Some(NewerRelease {
                 version: m.version.clone(),
-                visible_for_s: input.now_unix.saturating_sub(input.first_seen_unix),
+                visible_for_s: input
+                    .now_unix
+                    .saturating_sub(soak_anchor(input.first_seen_unix, m.released_unix())),
             })
         } else {
             None
@@ -413,12 +433,23 @@ pub fn decide(input: &Input<'_>) -> Decision {
         _ => {}
     }
 
+    // 3b. From here on we are deciding to install something nobody asked for,
+    //     and that decision leans on the local ledger: it is what makes "the
+    //     same version, different bytes" detectable at all. If the sighting did
+    //     not make it to disk, the ledger will agree with whatever the server
+    //     says forever, so the check is not merely failing — it is gone. Hold.
+    //     (This is checked HERE, after the mode gates, so a machine set to
+    //     `off`/`notify` still hears the reason it actually cares about.)
+    if !input.sighting_on_record {
+        return notify(Hold::LedgerUnwritable);
+    }
+
     // 4. Soak. Anchored on OUR first sighting, floored by OUR constant; the
     //    manifest may only push it further out.
     let soak = SOAK_FLOOR
         .as_secs()
         .max(m.soak_hours.unwrap_or(0).saturating_mul(3600));
-    let ready_at = input.first_seen_unix.saturating_add(soak);
+    let ready_at = soak_anchor(input.first_seen_unix, m.released_unix()).saturating_add(soak);
     if input.now_unix < ready_at {
         return notify(Hold::Soaking {
             ready_in_s: ready_at - input.now_unix,
@@ -465,12 +496,20 @@ pub fn decide(input: &Input<'_>) -> Decision {
 #[derive(Debug, Clone)]
 pub struct ManualInput<'a> {
     pub manifest: &'a Manifest,
+    /// The version this process is RUNNING. Not the version some earlier check
+    /// reported, and not a version the manifest supplies: the manual path must
+    /// be able to answer "is this thing older than what I am" from a fact the
+    /// publisher cannot restate.
+    pub current: &'a str,
     /// The sha256 of the artifact we are about to install, if this platform has
     /// one. `None` means there is nothing to install here (manual download), and
     /// there is correspondingly nothing to compare against the ledger.
     pub artifact_sha256: Option<&'a str>,
     /// The sha256 this machine recorded the FIRST time it saw this version.
     pub seen_sha256: Option<&'a str>,
+    /// Whether that sighting is actually on record (see
+    /// [`Input::sighting_on_record`]). `true` when there was nothing to record.
+    pub sighting_on_record: bool,
     /// Versions that failed a health probation here.
     pub pinned: &'a [String],
 }
@@ -490,6 +529,24 @@ pub enum ManualRefusal {
     /// and "install it anyway" is never the right answer to it. The remedy is a
     /// new version number, not a louder click.
     HashConflict { seen_sha256: String, now_sha256: String },
+    /// The build being offered is not newer than the one running. `update` means
+    /// "move forward"; it has never meant "put an older build back".
+    ///
+    /// This is not a theoretical tidiness rule. `evaluate` tests `min_supported`
+    /// BEFORE it tests `is_newer`, so a manifest saying `min_supported: 99.0.0`
+    /// with `version: 0.6.4` lands in `CheckOutcome::Unsupported` — a state whose
+    /// whole purpose is "you must upgrade" — while pointing at a DOWNGRADE. On a
+    /// client that reads that state as a hard-upgrade notice and applies it, the
+    /// reachable end of that is a signed, silent return to the exact builds this
+    /// release exists to escape (v0.6.5/6/7 pin an engine that cannot mine
+    /// post-fork Pearl), reinstalled on a loop because the downgraded build is
+    /// still below `min_supported`.
+    ///
+    /// No override, for the same reason as the hash conflict: the evidence is
+    /// the version this process is running, which the publisher cannot rewrite.
+    /// The remedy for a genuinely wanted downgrade is a manual install, not a
+    /// flag on the updater.
+    NotNewer { offered: String, current: String },
     /// The publisher has withdrawn this version.
     Revoked,
 }
@@ -503,6 +560,16 @@ pub enum ManualConcern {
     /// decision they get to make knowingly, and a `--yes` on the command line is
     /// not that decision.
     Pinned,
+    /// The sighting could not be written to the local ledger, so the
+    /// hash-conflict refusal — the one check here with no override — is not
+    /// running on this machine and will not run on the next install either.
+    ///
+    /// A concern rather than a refusal, deliberately. Refusing would mean a
+    /// machine with an unwritable `~/.alice` could never update by hand at all,
+    /// and the person typing the command is the one entitled to weigh that. But
+    /// it must not pass silently under `--yes`: "stop asking me questions" was
+    /// typed before anyone knew the machine had stopped remembering answers.
+    UnrecordedSighting,
 }
 
 /// What the manual path may do.
@@ -520,12 +587,12 @@ pub enum ManualVerdict {
 
 /// The manual-path gate, as one pure function.
 ///
-/// Ordering is deliberate. The hash conflict comes first because it is the only
-/// finding here that rests on evidence the publisher cannot restate: the local
-/// ledger. Revocation and the pin are both claims made elsewhere — one by the
-/// manifest (attacker-controlled under key compromise), one by this machine's
-/// own past — and if two findings apply at once, the one the user most needs to
-/// read is the one nobody upstream could have written.
+/// Ordering is deliberate. The two findings that rest on evidence the publisher
+/// cannot restate come first — the local ledger, and the version this process is
+/// actually running. Revocation and the pin are claims made elsewhere: one by the
+/// manifest (attacker-controlled under key compromise), one by this machine's own
+/// past. If several findings apply at once, the one the user most needs to read
+/// is the one nobody upstream could have written.
 pub fn decide_manual(input: &ManualInput<'_>) -> ManualVerdict {
     let m = input.manifest;
 
@@ -537,18 +604,72 @@ pub fn decide_manual(input: &ManualInput<'_>) -> ManualVerdict {
             });
         }
     }
+    if !crate::is_newer(&m.version, input.current) {
+        return ManualVerdict::Refuse(ManualRefusal::NotNewer {
+            offered: m.version.clone(),
+            current: input.current.to_string(),
+        });
+    }
     if m.is_revoked(&m.version) {
         return ManualVerdict::Refuse(ManualRefusal::Revoked);
     }
     if input.pinned.iter().any(|p| p == &m.version) {
         return ManualVerdict::ConfirmFirst(ManualConcern::Pinned);
     }
+    if !input.sighting_on_record {
+        return ManualVerdict::ConfirmFirst(ManualConcern::UnrecordedSighting);
+    }
     ManualVerdict::Proceed
+}
+
+/// The instant the soak window may be measured from.
+///
+/// `first_seen_unix` is a wall-clock reading taken on THIS machine, and that is
+/// exactly its weakness. A rig whose RTC has no battery — ordinary on cheap
+/// mining boxes — boots at a fixed old date, records its one sighting there, and
+/// then NTP corrects the clock. The subtraction `now - first_seen` is now years,
+/// so the soak floor is satisfied instantly by a version that has existed for
+/// minutes: the single guardrail that costs an attacker holding the release key
+/// real time, defeated by a dead coin cell rather than by anything the attacker
+/// had to do.
+///
+/// The repair is the only other timestamp in the problem, `released`, used as a
+/// FLOOR and nothing else. Read the direction carefully, because this is a
+/// manifest field and every manifest field is attacker-controlled under key
+/// compromise:
+///
+///   * an attacker back-dating `released` (or writing garbage into it) makes the
+///     floor lower than the sighting, so `max` picks the sighting and the
+///     behaviour is *exactly* what it was before this function existed — they
+///     gain nothing;
+///   * an attacker post-dating `released` pushes the anchor later, i.e. makes
+///     the soak LONGER — the harmless direction;
+///   * an honest manifest on a machine with a working clock is a no-op: you
+///     cannot see a version before it is published, so the sighting is always
+///     the later of the two.
+///
+/// It bites in exactly one case: a local clock claiming to have seen a version
+/// before that version existed. Which is the bug.
+///
+/// What it does NOT fix, stated plainly: a stolen key plus a broken clock. An
+/// attacker who knows a target's RTC is dead can back-date `released` and get
+/// today's (defective) behaviour on that machine. Fixing that needs a time
+/// source the release key does not control, which this client does not have.
+pub fn soak_anchor(first_seen_unix: u64, released_unix: Option<u64>) -> u64 {
+    match released_unix {
+        Some(released) => first_seen_unix.max(released),
+        None => first_seen_unix,
+    }
 }
 
 /// How long a version has been visible to this machine, in seconds. Saturating,
 /// so a clock that went backwards reads as "just seen" rather than as an
 /// enormous, install-clearing age.
+///
+/// Callers that have the manifest should pass [`soak_anchor`]'s output rather
+/// than the raw sighting, so the reported age and the enforced soak cannot
+/// disagree — a notice reading "seen for 2400 days" next to a hold that is
+/// counting down would be the client contradicting itself.
 pub fn visible_for(now_unix: u64, first_seen_unix: u64) -> u64 {
     now_unix.saturating_sub(first_seen_unix)
 }
@@ -658,20 +779,51 @@ fn read_seen(state_dir: &Path) -> Vec<Seen> {
         .unwrap_or_default()
 }
 
+/// A sighting, plus the one thing the caller cannot see from the record itself:
+/// whether the ledger actually kept it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sighting {
+    pub seen: Seen,
+    /// `true` when this sighting is on disk — either because it was already
+    /// there, or because we just wrote it successfully.
+    ///
+    /// `false` is not a detail. [`note_seen`] hands back the record it MADE
+    /// whether or not the write landed, and that record trivially agrees with
+    /// the manifest it was built from, so a caller that cannot tell the two
+    /// apart will compare the server's hash against the server's hash and
+    /// conclude, forever, that nothing is wrong.
+    pub on_record: bool,
+}
+
 /// Record that we have seen `version` carrying `sha256`, and return the record
-/// this machine holds — the FIRST one, never overwritten.
+/// this machine holds — the FIRST one, never overwritten — together with whether
+/// the ledger accepted it.
 ///
 /// This is the append-only local half of a transparency log. It is what makes
 /// "the same version, different bytes" detectable on the client rather than only
-/// on a server we would also have to trust.
-pub fn note_seen(state_dir: &Path, version: &str, sha256: &str) -> Seen {
+/// on a server we would also have to trust. Which is precisely why a failed
+/// write is reported rather than swallowed: an unwritable state directory used
+/// to disarm that check permanently and invisibly.
+///
+/// The recorded timestamp is also floored by the newest timestamp already in
+/// this machine's own ledger. A clock that reads EARLIER than something this
+/// machine has already written down is a clock that went backwards (a dead RTC
+/// at boot, a dual-boot BIOS in local time), and anchoring a soak window on it
+/// would credit the version with time that has not passed. Moving the anchor
+/// forward can only ever make the soak longer, so the clamp is safe in the one
+/// direction it acts.
+pub fn note_seen(state_dir: &Path, version: &str, sha256: &str) -> Sighting {
     let mut all = read_seen(state_dir);
     if let Some(existing) = all.iter().find(|s| s.version == version) {
-        return existing.clone();
+        return Sighting {
+            seen: existing.clone(),
+            on_record: true,
+        };
     }
+    let floor = all.iter().map(|s| s.first_seen_unix).max().unwrap_or(0);
     let rec = Seen {
         version: version.to_string(),
-        first_seen_unix: now_unix(),
+        first_seen_unix: now_unix().max(floor),
         sha256: sha256.to_ascii_lowercase(),
     };
     all.push(rec.clone());
@@ -682,10 +834,14 @@ pub fn note_seen(state_dir: &Path, version: &str, sha256: &str) -> Seen {
         let drop = all.len() - 200;
         all.drain(..drop);
     }
-    if let Ok(bytes) = serde_json::to_vec_pretty(&all) {
-        let _ = write_atomic(&seen_path(state_dir), &bytes);
+    let on_record = serde_json::to_vec_pretty(&all)
+        .ok()
+        .map(|bytes| write_atomic(&seen_path(state_dir), &bytes).is_ok())
+        .unwrap_or(false);
+    Sighting {
+        seen: rec,
+        on_record,
     }
-    rec
 }
 
 fn pins_path(state_dir: &Path) -> PathBuf {
@@ -809,6 +965,42 @@ pub fn log_event(state_dir: &Path, event: &str, detail: serde_json::Value) {
 // Health probation for an AUTO-installed build
 // ────────────────────────────────────────────────────────────────────────────
 
+/// What the machine knows, at the moment of an unattended install, about whether
+/// the build being REPLACED was earning.
+///
+/// There are three answers, not two, and collapsing them into a bool is the F5
+/// half of the F4 bug. [`was_recently_productive`] reads one stamp and reports
+/// "an accepted share landed here within [`PRODUCTIVE_WINDOW`]" — and the
+/// acceptance guard (layer 3) freezes that stamp on purpose when it halts a lane,
+/// which is exactly what a multi-day upstream collapse looks like. The August
+/// 2026 outage ran 78 hours, past the 72-hour window. [`judge_session`] knows
+/// about that halt and abstains; `mark_productive`'s caller knows about it and
+/// declines to refresh a frozen counter. The ARMING path did not, so a build
+/// installed mid-outage armed as "there was no baseline anyway", and
+/// [`confirm_start`] then committed it — dropping last-known-good — on the first
+/// `status` or `stop` the user typed, having never mined a share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EarningBaseline {
+    /// An accepted share landed here recently. The mining half of the probation
+    /// is armed: the new build can be rolled back for not earning.
+    Earning,
+    /// Nothing was earning here and nothing was stopping it — an idle rig, a
+    /// fresh install, a machine that has never mined. "The new build is not
+    /// earning either" would say nothing about the new build, so the probation
+    /// commits on the start proof alone, the same bar a manual update clears.
+    NotEarning,
+    /// We cannot tell: the acceptance guard was holding this machine's lane when
+    /// the install happened, which freezes the earning stamp by design.
+    ///
+    /// Neither of the other two answers is available here, and both are wrong in
+    /// a costly direction — `Earning` would let an upstream outage roll back an
+    /// innocent build, `NotEarning` would throw away last-known-good for a build
+    /// that has not mined once. So this one waits: it never strikes and never
+    /// rolls back, it commits when a real accepted share arrives, and failing
+    /// that it expires with [`PROBATION_MAX`] like any other stalled trial.
+    Unknown,
+}
+
 /// The on-disk probation record for a build installed without being asked for.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Probation {
@@ -824,9 +1016,29 @@ pub struct Probation {
     /// Whether the OUTGOING build was landing accepted shares shortly before the
     /// swap. When false the mining half of the probation abstains entirely.
     pub previous_productive: bool,
+    /// Whether that `false` means "we could not tell" rather than "it was not
+    /// earning" — see [`EarningBaseline::Unknown`].
+    ///
+    /// `#[serde(default)]` so a probation record written by an earlier build
+    /// still parses, and reads as the answer that build believed it had.
+    #[serde(default)]
+    pub baseline_unknown: bool,
     /// Mining sessions of at least [`MIN_JUDGED_SESSION`] that saw zero accepted
     /// shares.
     pub failed_sessions: u32,
+}
+
+impl Probation {
+    /// The three-valued baseline behind the two persisted flags.
+    pub fn baseline(&self) -> EarningBaseline {
+        if self.previous_productive {
+            EarningBaseline::Earning
+        } else if self.baseline_unknown {
+            EarningBaseline::Unknown
+        } else {
+            EarningBaseline::NotEarning
+        }
+    }
 }
 
 fn probation_path(app_path: &Path) -> PathBuf {
@@ -855,7 +1067,12 @@ fn clear_probation(app_path: &Path) {
 /// NOT also arm `lib.rs`'s manual first-launch marker: this record subsumes it
 /// (it covers crash-on-launch too) and, unlike the manual gate, it deliberately
 /// keeps the last-known-good copy until a verdict is in.
-pub fn arm(app_path: &Path, version: &str, previous: &str, previous_productive: bool) -> Result<()> {
+pub fn arm(
+    app_path: &Path,
+    version: &str,
+    previous: &str,
+    baseline: EarningBaseline,
+) -> Result<()> {
     write_probation(
         app_path,
         &Probation {
@@ -864,7 +1081,8 @@ pub fn arm(app_path: &Path, version: &str, previous: &str, previous_productive: 
             armed_at_unix: now_unix(),
             launches: 0,
             started_ok: false,
-            previous_productive,
+            previous_productive: baseline == EarningBaseline::Earning,
+            baseline_unknown: baseline == EarningBaseline::Unknown,
             failed_sessions: 0,
         },
     )
@@ -1010,10 +1228,16 @@ pub fn confirm_start(state_dir: &Path, app_path: &Path, running_version: &str) -
     if p.version != running_version {
         return false;
     }
-    if !p.previous_productive {
+    if p.baseline() == EarningBaseline::NotEarning {
         // The build we replaced was not earning either, so "this one is not
         // earning" would say nothing about this one. Commit on the start proof
         // alone — the same bar a manual update clears.
+        //
+        // Note which of the three baselines reaches this: only the one that
+        // means "nothing was earning and nothing was stopping it".
+        // `EarningBaseline::Unknown` — the lane was HALTED when this landed —
+        // must not, because "we watched it not run" is not a reason to throw
+        // away the copy we would roll back to.
         clear_probation(app_path);
         let _ = crate::commit_update(app_path);
         log_event(
@@ -1145,22 +1369,44 @@ pub enum SessionAction {
 /// zero is layer 3's doing) nor commit it (we did not watch it earn — we watched
 /// it not run).
 pub fn judge_session(p: &Probation, running_version: &str, result: &SessionResult) -> SessionAction {
-    if p.version != running_version || !p.previous_productive {
+    if p.version != running_version {
         return SessionAction::Ignore;
     }
-    if result.evidence.abstains() {
-        return SessionAction::Abstain(result.evidence);
-    }
-    if result.accepted > 0 {
-        return SessionAction::Commit;
-    }
-    if result.ran_secs < MIN_JUDGED_SESSION.as_secs() {
-        return SessionAction::Ignore;
-    }
-    if p.failed_sessions.saturating_add(1) >= FAILED_SESSIONS_TO_ROLLBACK {
-        SessionAction::RollBack
-    } else {
-        SessionAction::Strike
+    match p.baseline() {
+        // No baseline and no reason to expect one: the mining half never votes.
+        EarningBaseline::NotEarning => SessionAction::Ignore,
+
+        // We could not tell what the outgoing build was doing, because layer 3
+        // was holding the lane when this build landed. That is not a licence to
+        // judge the new one either way — but a genuine accepted share is proof
+        // enough on its own, and it is the one outcome that can end the trial
+        // honestly. Everything short of that waits.
+        EarningBaseline::Unknown => {
+            if result.evidence.abstains() {
+                return SessionAction::Abstain(result.evidence);
+            }
+            if result.accepted > 0 {
+                return SessionAction::Commit;
+            }
+            SessionAction::Ignore
+        }
+
+        EarningBaseline::Earning => {
+            if result.evidence.abstains() {
+                return SessionAction::Abstain(result.evidence);
+            }
+            if result.accepted > 0 {
+                return SessionAction::Commit;
+            }
+            if result.ran_secs < MIN_JUDGED_SESSION.as_secs() {
+                return SessionAction::Ignore;
+            }
+            if p.failed_sessions.saturating_add(1) >= FAILED_SESSIONS_TO_ROLLBACK {
+                SessionAction::RollBack
+            } else {
+                SessionAction::Strike
+            }
+        }
     }
 }
 
@@ -1269,7 +1515,12 @@ mod tests {
             product: crate::PRODUCT.to_string(),
             version: version.to_string(),
             min_supported: "0.3.0".into(),
-            released: "2026-08-14T00:00:00Z".into(),
+            // Before the fixture's `now_unix` (2001-09-09) and before every
+            // `first_seen_unix` derived from it, i.e. the ordinary relationship
+            // between the two: you cannot see a version before it is published.
+            // `soak_anchor` is therefore a no-op in every test that does not set
+            // out to exercise it.
+            released: "2001-01-01T00:00:00Z".into(),
             notes: String::new(),
             artifacts: vec![artifact()],
             rollout_pct: None,
@@ -1288,6 +1539,7 @@ mod tests {
             now_unix: 1_000_000_000,
             first_seen_unix: 1_000_000_000 - 10 * 24 * 3600,
             seen_sha256: None,
+            sighting_on_record: true,
             pinned: pins,
             lkg_present: true,
         }
@@ -1429,14 +1681,115 @@ mod tests {
         assert!(matches!(decide(&i), Decision::Install { .. }));
     }
 
+    /// `released` may only ever make the soak LONGER. A back-dated one — the
+    /// field an attacker holding the key would reach for — changes nothing at
+    /// all, because the anchor is the later of the two and our own sighting is
+    /// already later.
     #[test]
-    fn soak_ignores_the_manifests_released_field_entirely() {
-        // `released` is attacker-controlled; only our own first sighting counts.
+    fn a_back_dated_released_field_cannot_shorten_the_soak() {
         let mut m = manifest("0.6.8");
-        m.released = "2020-01-01T00:00:00Z".into();
+        m.released = "1970-01-02T00:00:00Z".into();
         let mut i = input(&m, &[]);
-        i.first_seen_unix = i.now_unix;
-        assert!(matches!(decide(&i), Decision::Notify { hold: Hold::Soaking { .. }, .. }));
+        i.first_seen_unix = i.now_unix; // just seen
+        match decide(&i) {
+            Decision::Notify { hold: Hold::Soaking { ready_in_s }, .. } => {
+                assert_eq!(ready_in_s, SOAK_FLOOR.as_secs(), "the full floor, unchanged");
+            }
+            other => panic!("expected the full soak hold, got {other:?}"),
+        }
+        // Unparseable is the same story: no floor, so no change either.
+        m.released = "whenever, really".into();
+        let mut i = input(&m, &[]);
+        i.first_seen_unix = i.now_unix - SOAK_FLOOR.as_secs();
+        assert!(
+            matches!(decide(&i), Decision::Install { .. }),
+            "an unreadable `released` must fall back to the pre-existing behaviour"
+        );
+    }
+
+    /// The dead-RTC defect. A rig whose clock battery is gone boots at a fixed
+    /// old date, records its one sighting THERE, and then NTP corrects the
+    /// clock. `now - first_seen` is suddenly years, so the 24-hour soak — the
+    /// only guardrail that costs an attacker holding the release key real time —
+    /// is satisfied instantly by a version that has existed for minutes.
+    ///
+    /// The two clamps that stop it are tested here as they compose in practice:
+    /// the anchor cannot predate the publisher's own `released` (a floor a
+    /// manifest can only raise), and it cannot predate what this machine has
+    /// already written in its own ledger.
+    #[test]
+    fn a_backdated_sighting_does_not_satisfy_the_soak() {
+        let mut m = manifest("0.6.8");
+        // Published one hour before "now"; the machine cannot have seen it for
+        // longer than that no matter what its clock says.
+        m.released = "2001-09-09T00:46:40Z".into(); // now_unix - 3600
+        let mut i = input(&m, &[]);
+        // The broken clock's story: "I have been looking at this for 6 years."
+        i.first_seen_unix = i.now_unix - 6 * 365 * 24 * 3600;
+
+        assert_eq!(
+            soak_anchor(i.first_seen_unix, m.released_unix()),
+            i.now_unix - 3600,
+            "the anchor must come forward to the publication time"
+        );
+        match decide(&i) {
+            Decision::Notify { hold: Hold::Soaking { ready_in_s }, .. } => {
+                assert_eq!(
+                    ready_in_s,
+                    SOAK_FLOOR.as_secs() - 3600,
+                    "a version published an hour ago has 23 hours of soak left"
+                );
+            }
+            other => panic!("a backdated sighting must not clear the soak, got {other:?}"),
+        }
+
+        // And the withdrawal notice cannot tell the user the opposite story
+        // while the hold is counting down.
+        m.revoked = vec!["0.6.7".into()];
+        let i = Input { manifest: &m, ..input(&m, &[]) };
+        let mut i = Input { first_seen_unix: i.now_unix - 6 * 365 * 24 * 3600, ..i };
+        i.current = "0.6.7";
+        match decide(&i) {
+            Decision::CurrentRevoked { newer: Some(n), .. } => {
+                assert_eq!(n.visible_for_s, 3600, "not 2190 days");
+                assert!(n.inside_soak());
+            }
+            other => panic!("expected a successor, got {other:?}"),
+        }
+    }
+
+    /// The second clamp on its own, with no help from the manifest: the ledger
+    /// is this machine's own record, and a clock that reads EARLIER than
+    /// something already written in it has gone backwards. A sighting recorded
+    /// on such a clock is floored at the newest timestamp the ledger holds, so
+    /// the anchor can only move forward — never into credit for time that has
+    /// not passed.
+    #[test]
+    fn a_sighting_is_never_recorded_before_what_the_ledger_already_knows() {
+        let d = tmp("clockback");
+        let now = now_unix();
+        // Something this machine wrote "in the future" relative to the broken
+        // clock we are about to simulate — i.e. an ordinary record written
+        // before the RTC lost its battery.
+        let ahead = Seen {
+            version: "0.6.7".into(),
+            first_seen_unix: now + 3600,
+            sha256: "cc".repeat(32),
+        };
+        std::fs::write(
+            d.join("update-seen.json"),
+            serde_json::to_vec(&vec![ahead]).unwrap(),
+        )
+        .unwrap();
+
+        let s = note_seen(&d, "0.6.8", &"aa".repeat(32));
+        assert!(s.on_record);
+        assert!(
+            s.seen.first_seen_unix >= now + 3600,
+            "a sighting must not be recorded before the ledger's own high-water mark: {} < {}",
+            s.seen.first_seen_unix,
+            now + 3600
+        );
     }
 
     // ── revocation ──────────────────────────────────────────────────────────
@@ -1541,8 +1894,10 @@ mod tests {
     fn manual<'a>(m: &'a Manifest, pins: &'a [String]) -> ManualInput<'a> {
         ManualInput {
             manifest: m,
+            current: "0.6.7",
             artifact_sha256: Some(&m.artifacts[0].sha256),
             seen_sha256: None,
+            sighting_on_record: true,
             pinned: pins,
         }
     }
@@ -1625,6 +1980,119 @@ mod tests {
         assert_eq!(visible_for(10, 1_000), 0);
     }
 
+    /// A build that is not NEWER than the one running is refused on the manual
+    /// path, and the refusal is not negotiable by `--yes`.
+    ///
+    /// The reachable version of this is not hypothetical. `crate::evaluate`
+    /// tests `min_supported` BEFORE `is_newer`, so a manifest pairing an
+    /// unreachable `min_supported` with an OLD `version` lands in
+    /// `CheckOutcome::Unsupported` — the state a client reads as "you must
+    /// upgrade" — while what it is actually offering is a downgrade. The second
+    /// half of this test pins that ordering, because it is the thing that makes
+    /// the first half reachable rather than academic.
+    #[test]
+    fn manual_refuses_a_build_that_is_not_newer_than_the_running_one() {
+        let older = manifest("0.6.4");
+        let mut i = manual(&older, &[]);
+        i.current = "0.6.8";
+        assert_eq!(
+            decide_manual(&i),
+            ManualVerdict::Refuse(ManualRefusal::NotNewer {
+                offered: "0.6.4".into(),
+                current: "0.6.8".into(),
+            }),
+            "a downgrade is not an update"
+        );
+
+        // The same build number is not an update either.
+        let same = manifest("0.6.8");
+        let mut i = manual(&same, &[]);
+        i.current = "0.6.8";
+        assert!(matches!(
+            decide_manual(&i),
+            ManualVerdict::Refuse(ManualRefusal::NotNewer { .. })
+        ));
+
+        // …and a genuinely newer one still proceeds, so the refusal is about the
+        // ordering and not about the gate having become a wall.
+        let newer = manifest("0.6.9");
+        let mut i = manual(&newer, &[]);
+        i.current = "0.6.8";
+        assert_eq!(decide_manual(&i), ManualVerdict::Proceed);
+
+        // The route that gets a downgrade in front of this gate in the first
+        // place: `min_supported` is tested first, so an OLD `version` with an
+        // unreachable `min_supported` is reported as a required upgrade.
+        let mut trap = manifest("0.6.4");
+        trap.min_supported = "99.0.0".into();
+        match crate::evaluate(trap, "0.6.8") {
+            crate::CheckOutcome::Unsupported { manifest, .. } => {
+                assert_eq!(manifest.version, "0.6.4");
+                assert!(
+                    !crate::is_newer(&manifest.version, "0.6.8"),
+                    "the 'required upgrade' is a downgrade — this is the trap"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// The ledger is what makes "same version, different bytes" detectable, and
+    /// a state directory that cannot be written disarms it permanently: the
+    /// record handed back is the one we just built from the manifest, so it
+    /// agrees with the manifest by construction, every run, forever.
+    ///
+    /// The automatic path must therefore hold rather than install — and say so
+    /// as itself, not as a soak that is quietly never going to end.
+    #[test]
+    fn an_unwritable_ledger_holds_the_automatic_path_and_asks_on_the_manual_one() {
+        let m = manifest("0.6.8");
+
+        // Control: everything else identical, ledger fine → it installs.
+        assert!(matches!(decide(&input(&m, &[])), Decision::Install { .. }));
+
+        let mut i = input(&m, &[]);
+        i.sighting_on_record = false;
+        assert_eq!(
+            decide(&i),
+            Decision::Notify { version: "0.6.8".into(), hold: Hold::LedgerUnwritable },
+            "an unattended install must not rest on a check that cannot run"
+        );
+
+        // The manual path is a person, not a machine: it asks rather than
+        // refusing, but it must not pass silently under `--yes`.
+        let mut mi = manual(&m, &[]);
+        assert_eq!(decide_manual(&mi), ManualVerdict::Proceed);
+        mi.sighting_on_record = false;
+        assert_eq!(
+            decide_manual(&mi),
+            ManualVerdict::ConfirmFirst(ManualConcern::UnrecordedSighting)
+        );
+    }
+
+    /// …and the write failure is actually detected, rather than being a flag no
+    /// caller can ever set. A state "directory" that is a regular file fails
+    /// `create_dir_all` on every platform, which is the failure this models.
+    #[test]
+    fn note_seen_reports_a_ledger_it_could_not_write() {
+        let d = tmp("nowrite");
+        let not_a_dir = d.join("state");
+        std::fs::write(&not_a_dir, b"this is a file, not a directory").unwrap();
+
+        let s = note_seen(&not_a_dir, "0.6.8", &"aa".repeat(32));
+        assert!(
+            !s.on_record,
+            "a sighting that never reached disk must not be reported as recorded"
+        );
+        // And the trap it used to lay: the record handed back agrees with the
+        // manifest it came from, so a caller that trusted it would compare the
+        // server's hash against the server's hash.
+        assert_eq!(s.seen.sha256, "aa".repeat(32));
+
+        // A writable directory reports the truth in the other direction.
+        assert!(note_seen(&d, "0.6.8", &"aa".repeat(32)).on_record);
+    }
+
     /// With no artifact for this platform there are no bytes to compare, and the
     /// gate must not invent a conflict out of the absence.
     #[test]
@@ -1633,8 +2101,10 @@ mod tests {
         let seen = "bb".repeat(32);
         let i = ManualInput {
             manifest: &m,
+            current: "0.6.7",
             artifact_sha256: None,
             seen_sha256: Some(&seen),
+            sighting_on_record: true,
             pinned: &[],
         };
         assert_eq!(decide_manual(&i), ManualVerdict::Proceed);
@@ -1717,8 +2187,9 @@ mod tests {
         let first = note_seen(&d, "0.6.8", "AA");
         std::thread::sleep(Duration::from_millis(5));
         let again = note_seen(&d, "0.6.8", "BB");
-        assert_eq!(first.first_seen_unix, again.first_seen_unix);
-        assert_eq!(again.sha256, "aa", "first bytes win; the ledger is append-only");
+        assert_eq!(first.seen.first_seen_unix, again.seen.first_seen_unix);
+        assert_eq!(again.seen.sha256, "aa", "first bytes win; the ledger is append-only");
+        assert!(first.on_record && again.on_record, "a writable dir records both");
     }
 
     #[test]
@@ -1777,7 +2248,7 @@ mod tests {
         let lkg = PathBuf::from(lkg);
         // No earning baseline: this is exactly the case where `confirm_start`
         // commits on the start proof alone.
-        arm(&app, "0.6.8", "0.6.7", /* previous_productive */ false).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::NotEarning).unwrap();
         assert!(matches!(
             register_launch(&d, &app, "0.6.8"),
             LaunchVerdict::OnTrial { mining_gate: false, .. }
@@ -1807,6 +2278,139 @@ mod tests {
         assert!(!lkg.exists(), "the commit drops the last-known-good copy");
     }
 
+    /// The arming path's own version of the F4 bug.
+    ///
+    /// `previous_productive` is derived at install time from one stamp, and the
+    /// acceptance guard freezes that stamp on purpose when it halts a lane —
+    /// which is what a multi-day upstream collapse looks like. August 2026 ran
+    /// 78 hours, past the 72-hour `PRODUCTIVE_WINDOW`. So a build that installs
+    /// itself mid-outage sees a stale stamp, arms as "there was no baseline
+    /// anyway", and the very next command the user types — `status`, `stop`,
+    /// anything that reaches `confirm_start` — ends the probation and deletes
+    /// last-known-good. The build becomes permanent without having mined once.
+    ///
+    /// `EarningBaseline::Unknown` is the third answer that stops it.
+    #[test]
+    fn a_build_installed_during_a_halt_does_not_commit_on_the_first_start() {
+        let d = tmp("halted-arm");
+        let app = fake_app(&d, "NEW", "OLD");
+        let mut lkg = app.as_os_str().to_os_string();
+        lkg.push(".lkg");
+        let lkg = PathBuf::from(lkg);
+
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::Unknown).unwrap();
+        assert_eq!(probation(&app).unwrap().baseline(), EarningBaseline::Unknown);
+        assert!(matches!(
+            register_launch(&d, &app, "0.6.8"),
+            LaunchVerdict::OnTrial { mining_gate: false, .. }
+        ));
+
+        // The step that used to end it. Twice, because `confirm_start` is
+        // reached by every command and being idempotent is not the point.
+        assert!(!confirm_start(&d, &app, "0.6.8"));
+        assert!(!confirm_start(&d, &app, "0.6.8"));
+        assert!(
+            probation(&app).is_some(),
+            "a build that has never mined must stay on trial"
+        );
+        assert!(
+            lkg.exists(),
+            "last-known-good must survive: this build has shown nothing yet"
+        );
+
+        // Nor does a long, empty session convict it — we have no baseline to
+        // convict it against, and blaming it for an outage is the mistake at the
+        // other end of the same stick.
+        let long = SessionResult::judgeable(MIN_JUDGED_SESSION.as_secs(), 0);
+        assert_eq!(
+            note_session(&d, &app, "0.6.8", long),
+            SessionVerdict::NoChange
+        );
+        assert!(lkg.exists() && pins(&d).is_empty(), "nothing rolled back, nothing pinned");
+
+        // One real accepted share is proof it works, and ends the trial.
+        assert_eq!(
+            note_session(&d, &app, "0.6.8", SessionResult::judgeable(60, 1)),
+            SessionVerdict::Committed { version: "0.6.8".into() }
+        );
+        assert!(!lkg.exists() && probation(&app).is_none());
+    }
+
+    /// The control for the test above: with a genuinely absent baseline —
+    /// nothing was earning and nothing was stopping it — `confirm_start` still
+    /// commits on the start proof alone. The fix must not turn every idle rig
+    /// into one that keeps a spare copy of the app forever.
+    #[test]
+    fn a_build_installed_on_an_idle_rig_still_commits_on_start() {
+        let d = tmp("idle-arm");
+        let app = fake_app(&d, "NEW", "OLD");
+        let mut lkg = app.as_os_str().to_os_string();
+        lkg.push(".lkg");
+        let lkg = PathBuf::from(lkg);
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::NotEarning).unwrap();
+        assert!(confirm_start(&d, &app, "0.6.8"));
+        assert!(probation(&app).is_none() && !lkg.exists());
+    }
+
+    /// The pure decision table for the third baseline: a frozen counter is still
+    /// not evidence (the F4 ordering holds), a real share commits, and nothing
+    /// else moves.
+    #[test]
+    fn an_unknown_baseline_never_strikes_and_never_rolls_back() {
+        let p = Probation {
+            version: "0.6.8".into(),
+            previous: "0.6.7".into(),
+            armed_at_unix: 0,
+            launches: 1,
+            started_ok: true,
+            previous_productive: false,
+            baseline_unknown: true,
+            failed_sessions: FAILED_SESSIONS_TO_ROLLBACK - 1,
+        };
+        let long = MIN_JUDGED_SESSION.as_secs();
+
+        // The same record with `Earning` would roll back right here…
+        let earning = Probation { previous_productive: true, baseline_unknown: false, ..p.clone() };
+        assert_eq!(
+            judge_session(&earning, "0.6.8", &SessionResult::judgeable(long, 0)),
+            SessionAction::RollBack,
+            "the control: this is genuinely the tipping session"
+        );
+        // …and with `Unknown` it does nothing at all.
+        assert_eq!(
+            judge_session(&p, "0.6.8", &SessionResult::judgeable(long, 0)),
+            SessionAction::Ignore
+        );
+        // A halted lane's frozen counter is not a commit either — the F4
+        // ordering has to hold in this branch too, or the fix for one bug
+        // becomes the other bug.
+        assert_eq!(
+            judge_session(
+                &p,
+                "0.6.8",
+                &SessionResult { ran_secs: long, accepted: 99, evidence: SessionEvidence::MiningHalted }
+            ),
+            SessionAction::Abstain(SessionEvidence::MiningHalted)
+        );
+        // A genuine share commits.
+        assert_eq!(
+            judge_session(&p, "0.6.8", &SessionResult::judgeable(long, 1)),
+            SessionAction::Commit
+        );
+    }
+
+    /// A probation record written by an earlier build has no `baseline_unknown`
+    /// field. It must still parse, and it must read as the answer that build
+    /// believed it had — not as the new third state.
+    #[test]
+    fn an_older_probation_record_still_parses() {
+        let legacy = br#"{"version":"0.6.8","previous":"0.6.7","armed_at_unix":1,
+            "launches":1,"started_ok":true,"previous_productive":false,"failed_sessions":0}"#;
+        let p: Probation = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(p.baseline(), EarningBaseline::NotEarning);
+        assert!(!p.baseline_unknown);
+    }
+
     /// `note_launch_ok` is inert when there is no probation, or when this process
     /// is not the build on trial.
     #[test]
@@ -1814,7 +2418,7 @@ mod tests {
         let d = tmp("launchok2");
         let app = fake_app(&d, "NEW", "OLD");
         assert!(!note_launch_ok(&app, "0.6.8"), "no probation armed");
-        arm(&app, "0.6.8", "0.6.7", false).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::NotEarning).unwrap();
         assert!(!note_launch_ok(&app, "0.6.7"), "not the build on trial");
         assert!(!probation(&app).unwrap().started_ok);
     }
@@ -1845,7 +2449,7 @@ mod tests {
     fn crash_on_launch_rolls_back_and_pins() {
         let d = tmp("crash");
         let app = fake_app(&d, "NEW", "OLD");
-        arm(&app, "0.6.8", "0.6.7", true).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::Earning).unwrap();
 
         // First launch: on trial.
         assert!(matches!(
@@ -1870,7 +2474,7 @@ mod tests {
     fn a_build_that_starts_and_earns_commits_and_drops_lkg() {
         let d = tmp("earn");
         let app = fake_app(&d, "NEW", "OLD");
-        arm(&app, "0.6.8", "0.6.7", true).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::Earning).unwrap();
         assert!(matches!(
             register_launch(&d, &app, "0.6.8"),
             LaunchVerdict::OnTrial { mining_gate: true, .. }
@@ -1892,7 +2496,7 @@ mod tests {
     fn a_build_that_stops_earning_rolls_back_after_two_long_sessions() {
         let d = tmp("stop");
         let app = fake_app(&d, "NEW", "OLD");
-        arm(&app, "0.6.8", "0.6.7", true).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::Earning).unwrap();
         register_launch(&d, &app, "0.6.8");
         confirm_start(&d, &app, "0.6.8");
 
@@ -1923,7 +2527,7 @@ mod tests {
         // replaced. The client must not blame itself.
         let d = tmp("outage");
         let app = fake_app(&d, "NEW", "OLD");
-        arm(&app, "0.6.8", "0.6.7", /* previous_productive */ false).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::NotEarning).unwrap();
         assert!(matches!(
             register_launch(&d, &app, "0.6.8"),
             LaunchVerdict::OnTrial { mining_gate: false, .. }
@@ -1954,7 +2558,7 @@ mod tests {
     fn a_halted_lane_never_produces_a_stopped_earning_rollback() {
         let d = tmp("halted");
         let app = fake_app(&d, "NEW", "OLD");
-        arm(&app, "0.6.8", "0.6.7", /* previous_productive */ true).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::Earning).unwrap();
         register_launch(&d, &app, "0.6.8");
         confirm_start(&d, &app, "0.6.8");
 
@@ -1987,7 +2591,7 @@ mod tests {
         let mut lkg = app.as_os_str().to_os_string();
         lkg.push(".lkg");
         let lkg = PathBuf::from(lkg);
-        arm(&app, "0.6.8", "0.6.7", true).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::Earning).unwrap();
         register_launch(&d, &app, "0.6.8");
 
         for reason in [
@@ -2023,7 +2627,7 @@ mod tests {
     fn a_network_wide_collapse_makes_the_probation_abstain() {
         let d = tmp("networkwide");
         let app = fake_app(&d, "NEW", "OLD");
-        arm(&app, "0.6.8", "0.6.7", true).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::Earning).unwrap();
         register_launch(&d, &app, "0.6.8");
         confirm_start(&d, &app, "0.6.8");
 
@@ -2065,7 +2669,7 @@ mod tests {
     fn would_roll_back_matches_what_note_session_does_and_writes_nothing() {
         let d = tmp("would");
         let app = fake_app(&d, "NEW", "OLD");
-        arm(&app, "0.6.8", "0.6.7", true).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::Earning).unwrap();
         register_launch(&d, &app, "0.6.8");
         let long = SessionResult::judgeable(MIN_JUDGED_SESSION.as_secs(), 0);
 
@@ -2110,6 +2714,7 @@ mod tests {
             launches: 1,
             started_ok: true,
             previous_productive: true,
+            baseline_unknown: false,
             failed_sessions: 0,
         };
         let long = MIN_JUDGED_SESSION.as_secs();
@@ -2180,7 +2785,7 @@ mod tests {
     fn a_stale_probation_for_another_version_is_discarded() {
         let d = tmp("stale");
         let app = fake_app(&d, "NEW", "OLD");
-        arm(&app, "0.6.8", "0.6.7", true).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::Earning).unwrap();
         assert_eq!(register_launch(&d, &app, "0.6.7"), LaunchVerdict::Normal);
         assert!(probation(&app).is_none());
         assert_eq!(std::fs::read_to_string(&app).unwrap(), "NEW", "no surprise rollback");
@@ -2190,7 +2795,7 @@ mod tests {
     fn an_abandoned_probation_expires_instead_of_hoarding_a_backup() {
         let d = tmp("expire");
         let app = fake_app(&d, "NEW", "OLD");
-        arm(&app, "0.6.8", "0.6.7", true).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::Earning).unwrap();
         let mut p = probation(&app).unwrap();
         p.armed_at_unix = now_unix() - PROBATION_MAX.as_secs() - 1;
         write_probation(&app, &p).unwrap();
@@ -2213,7 +2818,7 @@ mod tests {
         let d = tmp("openfile");
         let app = fake_app(&d, "NEW", "OLD");
         let held = std::fs::File::open(&app).expect("hold the failed build open");
-        arm(&app, "0.6.8", "0.6.7", true).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::Earning).unwrap();
         register_launch(&d, &app, "0.6.8");
         match register_launch(&d, &app, "0.6.8") {
             LaunchVerdict::RolledBack { restored, .. } => {
@@ -2236,7 +2841,7 @@ mod tests {
         let d = tmp("nolkg");
         let app = d.join(if cfg!(windows) { "alice-miner.exe" } else { "alice-miner" });
         std::fs::write(&app, "NEW").unwrap(); // no .lkg sibling
-        arm(&app, "0.6.8", "0.6.7", true).unwrap();
+        arm(&app, "0.6.8", "0.6.7", EarningBaseline::Earning).unwrap();
         register_launch(&d, &app, "0.6.8");
         match register_launch(&d, &app, "0.6.8") {
             LaunchVerdict::RolledBack { restored, failed_version, .. } => {
@@ -2258,7 +2863,7 @@ mod tests {
             let d = tmp("shapes");
             let app = d.join(name);
             std::fs::write(&app, "NEW").unwrap();
-            arm(&app, "1.0.0", "0.9.0", false).unwrap();
+            arm(&app, "1.0.0", "0.9.0", EarningBaseline::NotEarning).unwrap();
             let marker = probation_path(&app);
             assert_eq!(
                 marker.file_name().unwrap().to_string_lossy(),

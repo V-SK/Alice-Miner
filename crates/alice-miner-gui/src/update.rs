@@ -354,7 +354,11 @@ impl UpdateManager {
         self.ui = UpdateUi::Applying;
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let check = alice_miner_core::autoupdate::manual_check(&manifest, Some(&artifact));
+            let check = alice_miner_core::autoupdate::manual_check(
+                &manifest,
+                Some(&artifact),
+                release::current_version(),
+            );
             let msg = match &check.outcome {
                 alice_miner_core::autoupdate::ManualOutcome::Refuse { message } => {
                     Msg::Checked(Box::new(UpdateUi::Refused {
@@ -404,7 +408,10 @@ fn gate(ui: UpdateUi) -> UpdateUi {
     else {
         return ui;
     };
-    let check = alice_miner_core::autoupdate::manual_check(manifest, Some(artifact));
+    // The RUNNING version, not the `current` the checked state carries: the
+    // no-downgrade refusal has to rest on what this process actually is.
+    let check =
+        alice_miner_core::autoupdate::manual_check(manifest, Some(artifact), release::current_version());
     with_gate(ui, check)
 }
 

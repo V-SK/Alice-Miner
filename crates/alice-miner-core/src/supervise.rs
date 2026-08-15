@@ -6111,6 +6111,7 @@ mod tests {
                 launches: 1,
                 started_ok: true,
                 previous_productive: true,
+                baseline_unknown: false,
                 failed_sessions: alice_release::auto::FAILED_SESSIONS_TO_ROLLBACK - 1,
             };
             let ran = alice_release::auto::MIN_JUDGED_SESSION.as_secs();
