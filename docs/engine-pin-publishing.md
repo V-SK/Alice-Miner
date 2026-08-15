@@ -43,18 +43,126 @@ The sub-key is strictly weaker by construction, and the client enforces that:
 * **Same version ⇒ same hash, forever** — every `(kind, target, version) → sha`
   ever accepted (including the built-in floor) is remembered; a document that
   re-issues a known version with different bytes is refused **whole**.
+* **Versions only go forward** — see §2b. A pin that moves an engine backwards is
+  refused unless it says so, with a reason.
 * **Verified-before-effective** — the engine is downloaded and hashed before the
   pin takes effect. A hash mismatch refuses the document; a network failure just
   defers it. In both cases the previous pin stays in force and mining continues.
 * **Fail-closed everywhere else** — bad signature, unknown schema, wrong product,
-  malformed entry, unsafe filename or archive member ⇒ the document is ignored and
-  the client says which pins it is actually using.
+  malformed entry, unsafe filename or archive member, an algorithm token that is
+  really a flag, an extra argument that restates a flag the client owns, a log
+  parser this build does not have ⇒ the document is ignored and the client says
+  which pins it is actually using.
 
 Honest cost, stated plainly: this puts a second signing key in regular use, and
 that key can make every miner fetch a different (upstream-hosted, allow-listed)
 binary. The engine already *is* a third-party binary we exec, so the blast radius
 is not new — but the frequency of use is. Compensations: offline by-hand signing,
-the allow-list, the epoch ratchet, the version↔hash ratchet, and this log.
+the allow-list, the epoch ratchet, the version↔hash ratchet, the version-direction
+ratchet, and this log. The risk this does **not** cover — an upstream account
+compromise, which the pin then distributes faithfully — is written up as an
+accepted risk in `ENGINE-TRUST-LOG.md`.
+
+## 2a. The pin carries the CALL, not just the bytes
+
+A pin used to say only *which bytes*. **How to invoke them** and **how to read
+their output** were compiled into the client — which meant the headline claim
+("every fork after this one needs no release") was not true for a fork that
+changed either.
+
+That is not hypothetical. SRBMiner-MULTI 3.5.4 reshaped both log lines our parser
+depends on, and on 2026-08-14 a healthy GPU landing accepted shares at 44.8 TH/s
+displayed `0 H/s · 0A/0R · STALL` for a whole twenty-minute run while the
+no-progress watchdog restarted the engine on that false reading. No `engines.json`
+could have fixed it.
+
+So an entry in `engines-sources.json` may now also carry:
+
+| field | what it does | bound |
+|---|---|---|
+| `algorithm` | replaces the client's compiled-in algorithm token (`pearlhash`) wherever a lane's argv carries one | short ASCII token, never flag-shaped, ≤ 64 chars |
+| `extra_args` | argv appended **after** every flag the client owns | ≤ 16 tokens, no URL, no path, no whitespace, and **never** one of the flags the client owns (pool, login, password, log file, devices, algorithm, config, api/http, donate) |
+| `parser` | which compiled-in log parser reads this engine's output — `xmrig`, `kawpow`, `srbminer`, `alpha`, `generic` | must be an id **this client has**; an unknown id refuses the document whole |
+
+All three are optional. Omitted ⇒ byte-for-byte the behaviour that shipped before
+they existed. All three are validated when the document is accepted **and again
+at the moment argv is built**, so a lane fails to start rather than launching a
+call nobody checked. `scripts/build_engines_manifest.py` reads the parser list out
+of the client source (the same trick it uses for the URL allow-list), so a typo is
+caught at publish time rather than on a rig.
+
+### What this still does NOT remove
+
+Be precise about this when describing the feature. A **client release** is still
+required when:
+
+* the fork's output needs a parser this client does not compile in (adding one is
+  code — the pin can only *choose* among parsers already shipped);
+* the engine renames or restructures one of the flags the client owns — the pool,
+  the wallet/login, the password, the log file, the device selection. Those are
+  deliberately not publishable: a key we touch often must not be able to redirect
+  where shares go or who is credited;
+* the new flag's name contains `seed` or `priv` — the argv honesty gate refuses
+  those substrings outright, and we keep it strict (a gate that costs a release
+  beats a gate with a hole);
+* the engine moves to a host outside `ALLOWED_URL_PREFIXES`, or the fork needs a
+  new engine *kind* / a new lane.
+
+Everything else — a new version, new bytes, a renamed algorithm, an added switch,
+a different one of our existing parsers — is a published document away.
+
+## 2b. Versions only go forward
+
+Nothing used to stop a pin pointing at an **older** upstream build that is still
+hosted on an allow-listed page. Every other guard would wave it through: the bytes
+are genuine, the hash matches what the client already trusts for that version, and
+the epoch went up. Pointing the fleet back at SRBMiner 3.4.1 after the fork is a
+one-key replay of the 78-hour August outage; so is any rollback to a build with a
+known hole.
+
+The client now remembers, per `(kind, target)`, the **highest version ever in
+force** — seeded from the pins compiled into it, so a fresh install is not
+downgradeable either — and refuses a document that moves an engine backwards.
+
+Ordering is deliberately conservative (`engine_pins::compare_versions`): a single
+optional leading `v` is tolerated and plain dotted-numeric versions are compared
+component-wise, with missing trailing components read as `0`. **Anything else is
+`Unordered` and is treated exactly like a downgrade** — `3.5.4-rc1`, `3.5.4b`,
+`2026.08.14-nightly`, `3.5.4+build7`. Upstream version strings are not ours, and
+the client refuses rather than guesses. (Note it does *not* reuse
+`alice_release::parse_version`, which truncates `1.4.0-rc1` to `(1,4,0)` — right
+for versions we mint, wrong for a third party's, where the suffix may be the whole
+difference between two builds.)
+
+**A deliberate downgrade is allowed** — sometimes it is the right call — but it
+must be declared:
+
+```json
+{ "kind": "gpu-prl", "version": "3.5.0", …,
+  "downgrade": true,
+  "downgrade_reason": "3.5.4 crashes on RDNA3; reverting while upstream fixes it" }
+```
+
+The reason is required (a bare flag is refused) because it is shown verbatim to
+every miner by `alice-miner engines` and flagged by `alice-miner doctor`. The
+ratchet is **raised, never lowered**: accepting a declared downgrade does not
+re-base it, so republishing the older build keeps re-stating the marker rather
+than quietly becoming the new normal. `doctor` also warns on a machine-local
+regression the document forgot to declare.
+
+Operational consequence worth knowing before it surprises you: an **unorderable**
+version string never becomes the new reference either — the ratchet keeps
+comparing against the last version it actually understood. So if an upstream moved
+permanently to a scheme this client cannot order, *every* publish would need the
+marker, and the marker would stop meaning anything. If that happens, the answer is
+a client release that teaches `compare_versions` the new scheme — not a standing
+`"downgrade": true`. (Plain date versions like `2026.08.14` order fine; it is
+suffixes — `-rc1`, `-nightly`, `+build7` — that do not.)
+
+> ⚠️ **Before the first real publish:** `release-assets/engines-sources.json`
+> still carries the **3.4.1** baseline while v0.6.8 clients compile in **3.5.4**.
+> Those clients will refuse that document whole, as an unmarked downgrade. Bump
+> the sources file to the endorsed 3.5.4 hashes first.
 
 ## 3. Publishing, step by step
 
@@ -78,12 +186,28 @@ the allow-list, the epoch ratchet, the version↔hash ratchet, and this log.
    `--epoch` must be strictly greater than the currently published one; clients
    refuse a repeat or a rollback. `--min-epoch` retires everything below it.
 
-3. **Prove it on hardware.** Point a test rig at the candidate before publishing:
+3. **Prove it on hardware — all three checks, not just the first.** Point a test
+   rig at the candidate before publishing:
 
    ```sh
    ALICE_MINER_ENGINES_URL=file-served-staging-url alice-miner engines --check
-   alice-miner start --lane prl        # confirm ACCEPTED shares, not just "it runs"
+   alice-miner start --lane prl
    ```
+
+   and confirm, from that one run:
+
+   1. **accepted shares upstream** — it mines the live chain;
+   2. **the argv is the argv it wants** — check the engine's own startup banner;
+      nothing rejected, nothing silently ignored;
+   3. **the client reads its output** — hashrate and the accepted/rejected
+      counters move in `alice-miner`'s own display, not only in the engine's log.
+
+   **Check 1 alone is not enough, and we know that from having done exactly it.**
+   The 2026-08-14 endorsement run landed 8 accepted shares while the client showed
+   `0 H/s · 0A/0R · STALL` and its watchdog restarted a healthy engine. If check 3
+   fails, fix the parser (client release) or name a different compiled-in parser
+   in the entry — do not publish. The full write-up is in `ENGINE-TRUST-LOG.md`
+   under *The invocation check*.
 
 4. **Sign, offline, by hand (V).** With the encrypted image attached:
 
@@ -112,7 +236,11 @@ the allow-list, the epoch ratchet, the version↔hash ratchet, and this log.
   the pin layer never kills a working engine mid-share.
 * `alice-miner engines` shows the pinned sha256, upstream version + release URL,
   endorsement date, whether the pin came from the built-in table or a signed list
-  (with its epoch), and whether the bytes are installed and verified here.
+  (with its epoch), whether the bytes are installed and verified here, any
+  algorithm / extra argv / parser the pin overrides, and — loudly — a declared
+  downgrade with its reason or a version regression this machine can see.
+* `alice-miner doctor` carries an `engine version direction` check that WARNs on
+  either of those, with the published reason.
 * `alice-miner engines --check` forces the check now and prints exactly what
   happened — including "could not reach the list" and "REFUSED the list", which
   exit non-zero.
@@ -127,7 +255,8 @@ Two things must happen before any of this is live, and both are V's:
    nothing, and `alice-miner engines` says so.
 2. **Ship one client release** carrying that key. This is the honest limit of
    this layer: *this* fork still needs a client release; every fork after it does
-   not.
+   not — **subject to the four exceptions listed in §2a**, which are real and
+   should be quoted alongside the claim rather than after it.
 
 ## 6. Known gaps (tracked, not hidden)
 

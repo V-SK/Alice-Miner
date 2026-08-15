@@ -1074,7 +1074,14 @@ fn main() {
     // AM-REL-009, step 2: the process is demonstrably up. Commit a pending update
     // (drop last-known-good) or report a rollback that already happened.
     update::confirm_launch_health(&launch_health);
-    alice_miner_core::autoupdate::confirm_start();
+    // The GUARDED-auto-update probation gets the weaker claim here, on purpose. All
+    // that has been proved at this line is that the binary loads and understands its
+    // command line — `--version` reaches it too. That is enough to rule out
+    // crash-on-launch (and so must be recorded, or a second `--version` would look
+    // like one and trigger a rollback); it is NOT enough to commit an update the
+    // machine never asked for and discard its only copy of the build it replaced.
+    // The commit moved below, past clap's exit path, so a real command has to run.
+    alice_miner_core::autoupdate::note_launch_ok();
     if let Some(msg) = auto_rollback {
         eprintln!("{msg}");
     }
@@ -1090,6 +1097,10 @@ fn main() {
     // output. Order: --lang flag → saved settings → interactive first-run prompt →
     // LANG/LC_ALL/LANGUAGE env → English. See `resolve_language`.
     resolve_language(cli.lang.as_deref(), cli.command.as_ref());
+    // A command the user actually asked for is about to run: THIS is the start the
+    // auto-update probation may commit on. (`--version` / `--help` / a usage error
+    // exited above without reaching it.)
+    alice_miner_core::autoupdate::confirm_start();
     let code = match cli.command {
         Some(Command::Detect(args)) => cmd_detect(args),
         Some(Command::GpuDevices(args)) => cmd_gpu_devices(args),

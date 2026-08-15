@@ -238,6 +238,7 @@ pub fn build_srbminer_pearl_launch_plan(
     pop_token: &str,
     log_path: &Path,
     gpus: &GpuSelection,
+    algorithm: Option<&str>,
 ) -> Result<GpuLaunchPlan, String> {
     if !MINING_EXECUTION_ALLOWED {
         return Err("mining execution is not enabled in this build".into());
@@ -257,9 +258,34 @@ pub fn build_srbminer_pearl_launch_plan(
     let worker = derive_worker_id(reward)?; // fail-closed Alice-address validation
     let wallet = format!("{reward}.{worker}");
     let pool = pool_url(region_endpoint)?;
+    // The algorithm token: the compiled-in `pearlhash` unless the SIGNED engine pin
+    // in force names another one ([`crate::engine_pins::EngineInvocation`]). This is
+    // the argv half of "the pin carries the call, not just the bytes" — an upstream
+    // that RENAMES its algorithm on a fork is then a published `engines.json` away
+    // rather than a client release. The token has already passed
+    // `engine_pins::check_algorithm` (bounded, ASCII, never flag-shaped) both when
+    // the document was accepted and again when the caller resolved it; it is
+    // re-checked here so this builder cannot be handed one that did not.
+    let algo = match algorithm.map(str::trim).filter(|a| !a.is_empty()) {
+        None => PEARLHASH_ALGO.to_string(),
+        Some(a) => {
+            if a.starts_with('-')
+                || a.len() > 64
+                || !a
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | '+'))
+            {
+                return Err(format!(
+                    "refusing to launch SRBMiner with the algorithm token {a:?}: an algorithm name \
+                     is a short ASCII token and never a flag"
+                ));
+            }
+            a.to_string()
+        }
+    };
     let mut args = vec![
         "--algorithm".into(),
-        PEARLHASH_ALGO.into(),
+        algo,
         "--pool".into(),
         pool,
         "--wallet".into(),
@@ -275,6 +301,10 @@ pub fn build_srbminer_pearl_launch_plan(
         args.push(SRBMINER_GPU_ID_FLAG.into());
         args.push(csv);
     }
+    // NOTE: a signed pin's EXTRA argv is deliberately NOT appended here. It is
+    // appended once, for every bundled lane, by `engine::with_pin_extra_args` — one
+    // place where publisher-supplied argv enters a launch, always after every flag
+    // this client owns.
     Ok(GpuLaunchPlan { program, args })
 }
 
@@ -333,6 +363,7 @@ pub fn build_srbminer_pearl_launch_plan_for(
     pop_token: &str,
     log_path: &Path,
     gpus: &GpuSelection,
+    algorithm: Option<&str>,
 ) -> Result<GpuLaunchPlan, String> {
     let ordered = plan.ordered_from_cursor();
     let Some(active) = ordered.first() else {
@@ -345,6 +376,7 @@ pub fn build_srbminer_pearl_launch_plan_for(
         pop_token,
         log_path,
         gpus,
+        algorithm,
     )
 }
 
@@ -686,6 +718,7 @@ mod tests {
             "pop=ch123:c2lnYmFzZTY0",
             &lp,
             &GpuSelection::All,
+            None,
         )
         .expect("plan");
         let a = &plan.args;
@@ -710,6 +743,73 @@ mod tests {
         assert!(!a.iter().any(|x| x == "--gpu-id"));
     }
 
+    /// F6: the algorithm token comes from the SIGNED engine pin when it names one.
+    /// Before this, `pearlhash` was compiled in — so an upstream that renamed its
+    /// algorithm on a fork could not be followed by publishing a pin, which is the
+    /// exact thing the engine-pin feature claims to make possible.
+    #[test]
+    fn srbminer_argv_takes_its_algorithm_token_from_the_signed_pin() {
+        let addr = valid_address();
+        let lp = log_path();
+        let plan = build_srbminer_pearl_launch_plan(
+            PathBuf::from("/opt/SRBMiner-MULTI"),
+            addr,
+            "us.aliceprotocol.org:3340",
+            "pop=ch123:c2lnYmFzZTY0",
+            &lp,
+            &GpuSelection::All,
+            Some("pearlhash2"),
+        )
+        .expect("plan");
+        let a = &plan.args;
+        let alg = a.iter().position(|x| x == "--algorithm").expect("--algorithm");
+        assert_eq!(a[alg + 1], "pearlhash2");
+        // Everything else is untouched — the pin picks the algorithm, never the
+        // pool, the login or the password.
+        let pool = a.iter().position(|x| x == "--pool").expect("--pool");
+        assert_eq!(a[pool + 1], "stratum+tcp://us.aliceprotocol.org:3340");
+        let pw = a.iter().position(|x| x == "--password").expect("--password");
+        assert_eq!(a[pw + 1], "pop=ch123:c2lnYmFzZTY0");
+
+        // An empty/blank override is "no override", not an empty --algorithm value.
+        for blank in [Some(""), Some("   ")] {
+            let p = build_srbminer_pearl_launch_plan(
+                PathBuf::from("/opt/SRBMiner-MULTI"),
+                addr,
+                "us.aliceprotocol.org:3340",
+                "pop=a:b",
+                &lp,
+                &GpuSelection::All,
+                blank,
+            )
+            .expect("plan");
+            let i = p.args.iter().position(|x| x == "--algorithm").unwrap();
+            assert_eq!(p.args[i + 1], "pearlhash");
+        }
+    }
+
+    /// The argv boundary re-checks the token rather than trusting that whoever
+    /// resolved the pin validated it. `engine_pins` refuses a flag-shaped algorithm
+    /// when the document is accepted; this is the second lock on the same door, and
+    /// it is the one standing closest to `exec`.
+    #[test]
+    fn a_flag_shaped_algorithm_token_is_refused_at_the_argv_boundary() {
+        let addr = valid_address();
+        let lp = log_path();
+        for bad in ["--config", "-a", "pearl hash", "pearl;rm -rf /"] {
+            let got = build_srbminer_pearl_launch_plan(
+                PathBuf::from("/opt/SRBMiner-MULTI"),
+                addr,
+                "us.aliceprotocol.org:3340",
+                "pop=a:b",
+                &lp,
+                &GpuSelection::All,
+                Some(bad),
+            );
+            assert!(got.is_err(), "algorithm {bad:?} must be refused at launch");
+        }
+    }
+
     /// A5b REGRESSION GUARD: with [`GpuSelection::All`] the argv must be
     /// **byte-for-byte identical** to the pre-A5b builder (the new `gpus` param
     /// is purely additive — `All` appends nothing). We pin the exact expected
@@ -725,6 +825,7 @@ mod tests {
             "pop=ch:sig",
             &lp,
             &GpuSelection::All,
+            None,
         )
         .expect("plan");
         let worker = derive_worker_id(addr).unwrap();
@@ -757,6 +858,7 @@ mod tests {
             "pop=ch:sig",
             &lp,
             &GpuSelection::Ids(vec![0, 1, 2]),
+            None,
         )
         .expect("plan");
         // The flag is present with the comma-joined index list as its value.
@@ -778,6 +880,7 @@ mod tests {
             "pop=ch:sig",
             &lp,
             &GpuSelection::Ids(vec![1]),
+            None,
         )
         .unwrap();
         let g1 = plan1.args.iter().position(|x| x == "--gpu-id").unwrap();
@@ -798,6 +901,7 @@ mod tests {
             "pop=abc:def",
             &lp,
             &GpuSelection::Ids(vec![0, 1]),
+            None,
         )
         .unwrap();
         let joined = plan.args.join(" ");
@@ -829,6 +933,7 @@ mod tests {
             "pop=abc:def",
             &lp,
             &GpuSelection::All,
+            None,
         )
         .unwrap();
         let joined = plan.args.join(" ");
@@ -861,6 +966,7 @@ mod tests {
             "pop=a:b",
             &lp,
             &GpuSelection::All,
+            None,
         )
         .is_err());
         // Wrong-network (substrate-42) address rejected.
@@ -871,6 +977,7 @@ mod tests {
             "pop=a:b",
             &lp,
             &GpuSelection::All,
+            None,
         )
         .is_err());
     }
@@ -892,6 +999,7 @@ mod tests {
             "pop=a:b",
             &lp,
             &GpuSelection::All,
+            None,
         )
         .unwrap();
         let pool = lplan.args.iter().position(|x| x == "--pool").unwrap();
@@ -916,6 +1024,7 @@ mod tests {
             "pop=a:b",
             &lp,
             &GpuSelection::All,
+            None,
         )
         .unwrap();
         let pool = lplan.args.iter().position(|x| x == "--pool").unwrap();
@@ -937,6 +1046,7 @@ mod tests {
             "pop=a:b",
             &lp,
             &GpuSelection::All,
+            None,
         )
         .unwrap();
         let pool = lplan.args.iter().position(|x| x == "--pool").unwrap();

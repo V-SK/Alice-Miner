@@ -663,6 +663,14 @@ pub fn register_launch() -> Option<String> {
     }
 }
 
+/// The binary loaded and parsed its command line — enough to rule out
+/// crash-on-launch, and NOT enough to commit the update. Best-effort.
+pub fn note_launch_ok() {
+    if let Ok(app_path) = release::current_app_path() {
+        auto::note_launch_ok(&app_path, release::current_version());
+    }
+}
+
 /// The process is demonstrably up and doing real work. Best-effort.
 pub fn confirm_start() {
     if let Ok(app_path) = release::current_app_path() {

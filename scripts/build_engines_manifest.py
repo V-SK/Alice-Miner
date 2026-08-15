@@ -17,6 +17,21 @@ What it deliberately does NOT do:
     script prints the hash it computed and marks it UNCONFIRMED, so the trust-log
     entry cannot pretend a second source existed.
 
+What "independently" does and does NOT mean here — read this before writing
+"independently verified" anywhere (finding F10):
+
+    This script computes the hash from ITS OWN download, which catches a corrupted
+    or truncated transfer and a mistyped hash in the input file. It does NOT
+    corroborate AUTHENTICITY. When the `expected_*` hash was copied from a vendor
+    `.md5` (or a checksum printed in the release body) published on the SAME GitHub
+    release page as the artifact, that is ONE source agreeing with itself: an
+    attacker who can replace the asset can replace the checksum beside it. Where a
+    genuinely separate channel exists — xmrig's and alpha-miner's `SHA256SUMS`, or
+    GitHub's own server-side asset digest — say which, in the trust-log entry. Where
+    it does not, the entry says UNCONFIRMED (single source), and
+    ENGINE-TRUST-LOG.md carries the accepted-risk paragraph that spells out the
+    blast radius.
+
 Usage
 -----
     python3 scripts/build_engines_manifest.py --epoch 2 [--min-epoch 1] \
@@ -58,11 +73,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE_PINS_RS = ROOT / "crates/alice-miner-core/src/engine_pins.rs"
+STATS_MOD_RS = ROOT / "crates/alice-miner-core/src/stats/mod.rs"
 DEFAULT_SOURCES = ROOT / "release-assets/engines-sources.json"
 DEFAULT_OUT = ROOT / "dist/engines"
 DOC_SCHEMA = 1
 DOC_PRODUCT = "alice-miner-engines"
 MAX_BYTES = 256 * 1024 * 1024
+
+# Fields that describe HOW to call an engine, not which bytes it is. Copied
+# through verbatim from the endorsement input; the client validates every one of
+# them and refuses the whole document if any fails (see `engine_pins`).
+INVOCATION_FIELDS = ("algorithm", "extra_args", "parser")
+# The deliberate-downgrade marker (finding F8). A pin that moves an engine
+# BACKWARDS is refused by every client unless it carries this, with a reason.
+DOWNGRADE_FIELDS = ("downgrade", "downgrade_reason")
 
 
 def allowed_prefixes() -> list[str]:
@@ -79,6 +103,23 @@ def allowed_prefixes() -> list[str]:
     if not prefixes:
         sys.exit("ALLOWED_URL_PREFIXES parsed as empty — refusing to continue")
     return prefixes
+
+
+def known_parsers() -> list[str]:
+    """Read the log-parser ids out of the CLIENT source, for the same reason as the
+    allow-list: a document naming a parser the client does not compile in is refused
+    WHOLE, so catching it here beats catching it on a miner's rig."""
+    text = STATS_MOD_RS.read_text(encoding="utf-8")
+    m = re.search(r"KNOWN_IDS: &'static \[&'static str\] = &\[(.*?)\];", text, re.S)
+    if not m:
+        sys.exit(
+            "cannot find ParserKind::KNOWN_IDS in %s — refusing to guess the parser list"
+            % STATS_MOD_RS
+        )
+    ids = re.findall(r'"([^"]+)"', m.group(1))
+    if not ids:
+        sys.exit("ParserKind::KNOWN_IDS parsed as empty — refusing to continue")
+    return ids
 
 
 def fetch(url: str) -> bytes:
@@ -113,6 +154,7 @@ def extract(url: str, archive: bytes, member: str) -> bytes:
 
 def build(args: argparse.Namespace) -> int:
     prefixes = allowed_prefixes()
+    parsers = known_parsers()
     src = json.loads(Path(args.sources).read_text(encoding="utf-8"))
     engines_in = src.get("engines", [])
     if not engines_in:
@@ -120,6 +162,7 @@ def build(args: argparse.Namespace) -> int:
 
     out_engines = []
     unconfirmed = []
+    downgrades = []
     for e in engines_in:
         for field in ("kind", "target", "filename", "version", "source_url", "endorsed_by", "endorsed_at"):
             if not e.get(field):
@@ -150,6 +193,38 @@ def build(args: argparse.Namespace) -> int:
         }
         if e.get("notes"):
             entry["notes"] = e["notes"]
+
+        # How to CALL these bytes (finding F6). Optional; absent ⇒ the client uses
+        # the invocation compiled into it, which is byte-for-byte what it used
+        # before these fields existed.
+        for field in INVOCATION_FIELDS:
+            if e.get(field) not in (None, "", []):
+                entry[field] = e[field]
+        if "parser" in entry and entry["parser"] not in parsers:
+            sys.exit(
+                f"entry {e['kind']}/{e['target']}: parser {entry['parser']!r} is not one the "
+                f"client compiles in ({', '.join(parsers)}). The client refuses such a document "
+                "WHOLE — adding a parser is a client release."
+            )
+        if "extra_args" in entry and not isinstance(entry["extra_args"], list):
+            sys.exit(f"entry {e['kind']}/{e['target']}: extra_args must be a LIST of argv tokens")
+
+        # The deliberate-downgrade marker (finding F8).
+        if e.get("downgrade"):
+            reason = (e.get("downgrade_reason") or "").strip()
+            if len(reason) < 8:
+                sys.exit(
+                    f"entry {e['kind']}/{e['target']}: marked as a downgrade with no reason. "
+                    "Every miner is shown that reason — write one."
+                )
+            entry["downgrade"] = True
+            entry["downgrade_reason"] = reason
+            downgrades.append(f"{e['kind']}/{e['target']} → {e['version']}: {reason}")
+        elif e.get("downgrade_reason"):
+            sys.exit(
+                f"entry {e['kind']}/{e['target']}: has downgrade_reason but downgrade is not "
+                "true — say which you mean."
+            )
 
         if e.get("archive_url"):
             member = e.get("binary_path_in_archive")
@@ -217,6 +292,17 @@ def build(args: argparse.Namespace) -> int:
         print(
             "  Record this honestly in ENGINE-TRUST-LOG.md: the hash was reproduced from ONE\n"
             "  download, not corroborated by a second published source."
+        )
+    if downgrades:
+        print()
+        print("DELIBERATE DOWNGRADES in this document — every miner will be shown these:")
+        for dgr in downgrades:
+            print(f"  - {dgr}")
+        print(
+            "  A client whose recorded version for that engine is HIGHER refuses an unmarked\n"
+            "  downgrade outright. Marked, it is accepted and surfaced loudly by\n"
+            "  `alice-miner engines` and `alice-miner doctor`. Make sure the trust-log entry\n"
+            "  says the same thing this reason does."
         )
     print()
     print("NEXT (V, offline, by hand — this script never signs and never publishes):")

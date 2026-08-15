@@ -697,19 +697,42 @@ pub fn pins(state_dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// How many failed versions one machine remembers. Each entry costs a few bytes
+/// and each one costs an install + a full probation + a rollback to earn, so the
+/// list cannot realistically grow to this in a machine's lifetime; the cap exists
+/// so a misbehaving update server cannot make the file unbounded.
+const MAX_PINS: usize = 512;
+
 /// Pin a version so it is never auto-installed on this machine again. A manual
 /// `alice-miner update` can still install it — the user overriding a machine's
 /// own bad experience is a decision they are allowed to make, with the warning
 /// in front of them.
+///
+/// When the cap is reached the LOWEST version is dropped, not the oldest entry.
+/// The updater only ever installs something [`crate::is_newer`] than what is
+/// running, so the lowest pinned version is the one least able to be offered
+/// again; dropping by insertion order could evict a *high* version that is very
+/// much still offerable. (Residual, stated rather than hidden: any bounded list
+/// can in principle forget a version that is later re-published as `latest`. With
+/// this rule that needs 512 distinct failed auto-updates on one machine first.)
 pub fn pin(state_dir: &Path, version: &str) {
     let mut all = pins(state_dir);
     if all.iter().any(|v| v == version) {
         return;
     }
     all.push(version.to_string());
-    if all.len() > 50 {
-        let drop = all.len() - 50;
-        all.drain(..drop);
+    while all.len() > MAX_PINS {
+        // The lowest by the same comparator the updater uses to decide "newer".
+        // An unparseable version reads as (0,0,0) — which also makes it the one the
+        // updater can never consider newer than anything, so it is the right one to
+        // lose first.
+        let lowest = all
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, v)| crate::parse_version(v))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        all.remove(lowest);
     }
     if let Ok(bytes) = serde_json::to_vec_pretty(&all) {
         let _ = write_atomic(&pins_path(state_dir), &bytes);
@@ -943,10 +966,39 @@ fn do_rollback(
     }
 }
 
+/// The binary LOADED and got as far as understanding its command line — it is not
+/// crash-on-launch. Records only that; it never commits the update and never drops
+/// the last-known-good copy.
+///
+/// Split out of [`confirm_start`] because those are two different claims and the
+/// CLI could only make the weaker one at the point it was calling the stronger:
+/// `alice-miner --version` prints and exits, which proves the binary loads and
+/// proves nothing about mining. Without this half, simply *not* calling
+/// `confirm_start` on such a run would leave `started_ok` false and make the second
+/// `--version` look like a crash-on-launch and trigger a rollback.
+///
+/// Returns `true` if a probation record was updated.
+pub fn note_launch_ok(app_path: &Path, running_version: &str) -> bool {
+    let Some(mut p) = probation(app_path) else {
+        return false;
+    };
+    if p.version != running_version || p.started_ok {
+        return false;
+    }
+    p.started_ok = true;
+    write_probation(app_path, &p).is_ok()
+}
+
 /// The build got past startup into real work. Records that fact, and — when
 /// there is no fair mining baseline to judge against — ends the probation right
 /// here rather than holding a last-known-good copy hostage to a verdict we have
 /// no honest way to reach.
+///
+/// "Real work" means a command the user actually asked for is about to run. It
+/// does NOT mean `--version` or `--help`: those exit before anything happens, and
+/// treating them as a successful start is how a build could commit itself (and
+/// discard its rollback copy) without ever having mined. Use [`note_launch_ok`]
+/// for that weaker claim.
 pub fn confirm_start(state_dir: &Path, app_path: &Path, running_version: &str) -> bool {
     let Some(mut p) = probation(app_path) else {
         return false;
@@ -1664,6 +1716,94 @@ mod tests {
         pin(&d, "0.6.8");
         pin(&d, "0.6.9");
         assert_eq!(pins(&d), vec!["0.6.8".to_string(), "0.6.9".to_string()]);
+    }
+
+    /// F12: the cap evicts the LOWEST version, not the oldest entry. The updater
+    /// only installs something newer than what is running, so the lowest pinned
+    /// version is the one least able to be offered again — while eviction by
+    /// insertion order would throw away a high version that very much can be.
+    #[test]
+    fn the_pin_cap_evicts_the_lowest_version_not_the_oldest_entry() {
+        let d = tmp("pincap");
+        // A high version pinned FIRST (so it is the oldest entry), then the cap
+        // filled with lower ones.
+        pin(&d, "9.9.9");
+        for i in 0..MAX_PINS {
+            pin(&d, &format!("1.0.{i}"));
+        }
+        let all = pins(&d);
+        assert_eq!(all.len(), MAX_PINS);
+        assert!(
+            all.contains(&"9.9.9".to_string()),
+            "the highest version must survive even though it was pinned first"
+        );
+        assert!(
+            !all.contains(&"1.0.0".to_string()),
+            "the lowest version is the one dropped"
+        );
+        // An unparseable version reads as (0,0,0) — the updater can never call it
+        // newer than anything, so it is also the first thing to lose.
+        let d2 = tmp("pincap2");
+        pin(&d2, "not-a-version");
+        for i in 0..MAX_PINS {
+            pin(&d2, &format!("1.0.{i}"));
+        }
+        assert!(!pins(&d2).contains(&"not-a-version".to_string()));
+    }
+
+    /// F11: `alice-miner --version` proves the binary LOADS. It must be recorded
+    /// as such — otherwise a second `--version` looks like crash-on-launch — and it
+    /// must NOT commit the update or drop the rollback copy, which is what the CLI
+    /// used to do the instant clap finished parsing.
+    #[test]
+    fn a_version_print_proves_launch_but_never_commits_the_update() {
+        let d = tmp("launchok");
+        let app = fake_app(&d, "NEW", "OLD");
+        let mut lkg = app.as_os_str().to_os_string();
+        lkg.push(".lkg");
+        let lkg = PathBuf::from(lkg);
+        // No earning baseline: this is exactly the case where `confirm_start`
+        // commits on the start proof alone.
+        arm(&app, "0.6.8", "0.6.7", /* previous_productive */ false).unwrap();
+        assert!(matches!(
+            register_launch(&d, &app, "0.6.8"),
+            LaunchVerdict::OnTrial { mining_gate: false, .. }
+        ));
+
+        // `--version`: loaded, nothing more.
+        assert!(note_launch_ok(&app, "0.6.8"));
+        assert!(
+            probation(&app).is_some(),
+            "a --version run must NOT end the probation"
+        );
+        assert!(lkg.exists(), "a --version run must NOT drop the rollback copy");
+        assert!(probation(&app).unwrap().started_ok);
+
+        // …and a SECOND --version must not be mistaken for crash-on-launch, which
+        // is the trap that makes "just don't call confirm_start" the wrong fix.
+        assert!(matches!(
+            register_launch(&d, &app, "0.6.8"),
+            LaunchVerdict::OnTrial { .. }
+        ));
+        assert!(lkg.exists());
+        assert!(pins(&d).is_empty(), "nothing was rolled back or pinned");
+
+        // A real command: now it commits, exactly as before.
+        assert!(confirm_start(&d, &app, "0.6.8"));
+        assert!(probation(&app).is_none());
+        assert!(!lkg.exists(), "the commit drops the last-known-good copy");
+    }
+
+    /// `note_launch_ok` is inert when there is no probation, or when this process
+    /// is not the build on trial.
+    #[test]
+    fn note_launch_ok_is_inert_off_the_probation_path() {
+        let d = tmp("launchok2");
+        let app = fake_app(&d, "NEW", "OLD");
+        assert!(!note_launch_ok(&app, "0.6.8"), "no probation armed");
+        arm(&app, "0.6.8", "0.6.7", false).unwrap();
+        assert!(!note_launch_ok(&app, "0.6.7"), "not the build on trial");
+        assert!(!probation(&app).unwrap().started_ok);
     }
 
     #[test]

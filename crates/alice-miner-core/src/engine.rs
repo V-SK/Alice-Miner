@@ -1037,6 +1037,15 @@ fn start_one_lane(
                     &secrets,
                     None,
                 )?;
+                // How to CALL these bytes, from the SIGNED pin in force. Resolved
+                // on every (re)build, not captured once: a pin that arrives while
+                // the lane is running takes effect at the next start (and at every
+                // failover rebuild) instead of being frozen at process launch. An
+                // invalid invocation fails the build CLOSED — we do not fall back
+                // to the compiled-in call for an engine whose pin we could not
+                // fully validate.
+                let invocation =
+                    crate::engine_pins::effective_invocation(crate::binaries::MinerKind::GpuPrl)?;
                 let p = gpu_prl::build_srbminer_pearl_launch_plan(
                     program,
                     &addr_prl,
@@ -1044,6 +1053,7 @@ fn start_one_lane(
                     &token.password,
                     &log_path,
                     &gpus_prl,
+                    invocation.algorithm.as_deref(),
                 )?;
                 Ok((p.program, p.args))
             })
@@ -1100,7 +1110,22 @@ fn start_one_lane(
             })
         }
         };
-        (rebuild, crate::stats::ParserKind::for_lane(lane), None)
+        // ── The signed pin's INVOCATION, applied to the bundled lane ──────────
+        // Two halves of the same 2026-08-14 lesson (see `engine_pins`): a pin can
+        // hand the fleet an engine whose ARGV shape or LOG format the compiled-in
+        // client does not match, and publishing a new `engines.json` could not fix
+        // either. The algorithm slot is structural and belongs to the lane's own
+        // builder (above); extra argv and the parser choice are applied here, in
+        // ONE place, for every bundled lane — so no lane can silently ignore what
+        // a publisher signed.
+        let kind = bundled_kind_for(lane);
+        // Fail closed: a pin whose invocation does not validate stops the lane
+        // start with the reason, rather than launching the engine with the
+        // compiled-in call and hoping.
+        let parser = crate::engine_pins::effective_invocation(kind)?
+            .parser
+            .unwrap_or_else(|| crate::stats::ParserKind::for_lane(lane));
+        (with_pin_extra_args(kind, rebuild), parser, None)
     };
 
     // Build the initial launch plan (Layer A: all endpoints, primary first).
@@ -1187,8 +1212,48 @@ fn custom_log_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("alice-custom-{}-{}.log", std::process::id(), nanos))
 }
 
+/// The BUNDLED engine a lane runs. The pin layer is keyed on this
+/// ([`crate::engine_pins::effective_invocation`]), not on the lane.
+fn bundled_kind_for(lane: Lane) -> crate::binaries::MinerKind {
+    match lane {
+        Lane::Xmr => crate::binaries::MinerKind::CpuXmr,
+        Lane::GpuRvn => crate::binaries::MinerKind::GpuRvn,
+        Lane::GpuPrl => crate::binaries::MinerKind::GpuPrl,
+        Lane::GpuAlpha => crate::binaries::MinerKind::GpuAlpha,
+    }
+}
+
+/// Wrap a bundled lane's rebuild closure so the SIGNED engine pin's extra argv is
+/// appended to whatever the lane built.
+///
+/// One place, all four bundled lanes, and always LAST — after every flag the client
+/// owns (pool, login, password, log file, device selection), so a publisher-supplied
+/// argument cannot shadow one of ours even on an engine whose own parsing is
+/// last-wins. `engine_pins::check_extra_args` already refuses those flags by name;
+/// this ordering means the invariant does not rest on that list being exhaustive for
+/// an engine we have not met yet.
+///
+/// Re-resolved on every rebuild (not captured), and fails the rebuild CLOSED if the
+/// pin's invocation stops validating — a lane that will not start with a reason beats
+/// a lane running argv nobody checked.
+fn with_pin_extra_args(
+    kind: crate::binaries::MinerKind,
+    inner: crate::supervise::RebuildFn,
+) -> crate::supervise::RebuildFn {
+    Arc::new(move |eps: &[Endpoint]| {
+        let (program, mut args) = inner(eps)?;
+        crate::engine_pins::effective_invocation(kind)?.apply_extra_args(&mut args);
+        Ok((program, args))
+    })
+}
+
 /// The mining algorithm token a lane's argv carries (`pearlhash` / `rx/0` /
 /// `kawpow`). Argv-only; used to fill the custom miner's [`crate::backend::ArgContext`].
+///
+/// Deliberately NOT pin-aware: a custom (bring-your-own) miner is the user's own
+/// binary and has no SHA pin, so there is no signed statement about how to call
+/// *it*. A custom-miner user on a fork that renames its algorithm sets the token in
+/// their own preset/template — which is the point of the custom backend.
 fn lane_algo(lane: Lane) -> &'static str {
     match lane {
         Lane::GpuPrl | Lane::GpuAlpha => "pearlhash",
@@ -1611,6 +1676,102 @@ fn build_prl_payout_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F6 AT THE LAUNCH BOUNDARY: extra argv carried by a SIGNED engine-pin
+    /// document reaches the argv a lane actually starts with — appended last,
+    /// after every flag the client owns, and without disturbing anything the lane
+    /// built. `engine_pins` proves the document is accepted and that
+    /// `effective_invocation` returns the fields; this proves the launch path
+    /// consumes them, which is the half that makes the feature true.
+    #[test]
+    fn a_signed_pins_extra_argv_reaches_the_argv_a_lane_launches_with() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let _guard = crate::MINER_BIN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("alice-engine-inv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var(crate::engine_pins::ENGINES_DIR_ENV, &dir);
+        crate::engine_pins::invalidate_cache();
+
+        // Baseline: no document ⇒ the wrapper is a pass-through, so today's argv is
+        // byte-for-byte what it was before any of this existed.
+        let built: Vec<String> = ["--algorithm", "pearlhash", "--pool", "p", "--gpu-id", "0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let base = built.clone();
+        let inner: crate::supervise::RebuildFn =
+            Arc::new(move |_eps: &[Endpoint]| Ok((std::path::PathBuf::from("/bin/engine"), base.clone())));
+        let wrapped = with_pin_extra_args(crate::binaries::MinerKind::GpuPrl, inner.clone());
+        assert_eq!(wrapped(&[]).unwrap().1, built, "no pin ⇒ argv unchanged");
+
+        // Now activate a signed document that adds two argv tokens.
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        *crate::engine_pins::test_trust_key()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(B64.encode(sk.verifying_key().to_bytes()));
+        let engine_bytes = b"engine payload".to_vec();
+        let sha = alice_release::sha256_hex(&engine_bytes);
+        let staged = engine_bytes.clone();
+        *crate::engine_pins::test_fetch_hook()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move |_e| Ok(staged.clone())));
+        let member = if cfg!(windows) {
+            "SRBMiner-Multi/SRBMiner-MULTI.exe"
+        } else {
+            "SRBMiner-Multi/SRBMiner-MULTI"
+        };
+        let doc = format!(
+            r#"{{"schema":1,"product":"alice-miner-engines","epoch":2,"min_engine_epoch":1,
+  "issued":"2026-08-15T00:00:00Z","engines":[
+  {{"kind":"gpu-prl","engine":"srbminer-multi","version":"9.9.9","target":"{target}",
+    "filename":"{filename}","sha256":"{sha}",
+    "extra_args":["--pearl-fork-salt","3"],
+    "archive_url":"https://github.com/doktor83/SRBMiner-Multi/releases/download/9.9.9/a.tar.gz",
+    "archive_sha256":"{sha}","binary_path_in_archive":"{member}",
+    "source_url":"https://github.com/doktor83/SRBMiner-Multi/releases/tag/9.9.9",
+    "endorsed_at":"2026-08-15T00:00:00Z","endorsed_by":"V"}}]}}"#,
+            target = crate::binaries::current_target_triple(),
+            filename = crate::binaries::MinerKind::GpuPrl.binary_name(),
+        );
+        let sig = B64.encode(sk.sign(doc.as_bytes()).to_bytes());
+        let mut st = crate::engine_pins::load_state();
+        crate::engine_pins::apply_document(doc.as_bytes(), &sig, &mut st).expect("accepted");
+
+        let got = wrapped(&[]).unwrap().1;
+        assert_eq!(
+            got,
+            [
+                "--algorithm",
+                "pearlhash",
+                "--pool",
+                "p",
+                "--gpu-id",
+                "0",
+                "--pearl-fork-salt",
+                "3"
+            ],
+            "the pin's argv is appended LAST, after every flag the client owns"
+        );
+
+        // Another lane's engine is unaffected — the pin is per (kind, target).
+        let xmr = with_pin_extra_args(crate::binaries::MinerKind::CpuXmr, inner);
+        assert_eq!(xmr(&[]).unwrap().1, built);
+
+        *crate::engine_pins::test_trust_key()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *crate::engine_pins::test_fetch_hook()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        std::env::remove_var(crate::engine_pins::ENGINES_DIR_ENV);
+        crate::engine_pins::invalidate_cache();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// T4: a CUSTOM (bring-your-own) miner on the XMR lane produces a launch plan that
     /// runs the USER's binary with the reward-attribution login (`<addr>.<worker>`), the
