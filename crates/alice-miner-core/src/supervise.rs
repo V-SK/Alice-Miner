@@ -1826,20 +1826,7 @@ impl LaneSupervisor {
                     // (a read-only home is not worth failing a mining run over).
                     let _ = crate::settings::save_last_good_region(&tag);
                 }
-                if clear_halt {
-                    // The lane MEASURED a healthy period — the pool is accepting again.
-                    // That is the only evidence that retires a persisted halt (and its
-                    // ladder); everything else is a guess.
-                    acceptance::clear_halt_record(lane_for_logs);
-                }
-                if let Some(rec) = save_halt {
-                    // The re-probe has landed a share. Best-effort, like every other
-                    // halt write: a rig with an unwritable home loses only the
-                    // across-restart half of this.
-                    if let Err(e) = acceptance::save_halt_record(&rec) {
-                        log_verbose("halt record not persisted", &e);
-                    }
-                }
+                apply_pending_halt_io(&inner_for_logs, lane_for_logs, gen, clear_halt, save_halt);
             }
         });
 
@@ -3885,8 +3872,19 @@ fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
     // re-probe ladder. Nothing else — not an uptime, not a reconnect, not a restart —
     // is evidence that the pool started accepting again.
     if g.halt_probes > 0 && matches!(verdict, LaneVerdict::Healthy(_)) {
-        g.halt_probes = 0;
-        g.halt_record = None;
+        // Stage the retirement; do NOT drop the in-memory halt here. The file is
+        // unlinked by the log pump, off this hot path, and the memory is cleared
+        // only AFTER that unlink lands (see the pump's `clear_halt` arm).
+        //
+        // The old order — clear memory here, unlink later — pointed the wrong way:
+        // a process that died in between re-adopted, on its next start, a halt that
+        // a MEASUREMENT had already lifted, and parked a healthy lane for the rest
+        // of its cooldown. Same shape as spending `probe_earned` before the probe
+        // it authorised: the durable record must not outlive the state it describes.
+        //
+        // The cost of the new order is that the lane reads `Probing` for one more
+        // pump iteration. That makes the auto-update probation abstain, which is
+        // the safe direction, so it is a cost worth paying.
         g.halt_probe_at = None;
         g.pending_halt_clear = true;
     }
@@ -4210,6 +4208,42 @@ fn parse_nvidia_telemetry_csv(csv: &str) -> Option<NvidiaTelemetry> {
     best
 }
 
+/// Apply the halt-record side effects the log pump stages under the lock, AFTER
+/// releasing it — the disk I/O this deliberately keeps off the stats hot path.
+///
+/// Ordering is load-bearing. The unlink happens BEFORE the in-memory halt is
+/// dropped, so a process that dies between them leaves a record whose lane still
+/// holds it (the next start re-measures, costing one window) rather than a record
+/// that outlived the measurement which retired it (costing the whole cooldown on a
+/// pool that is already healthy).
+///
+/// It lives here, and not inlined in the pump, because the test helper used to be a
+/// hand-copy of the pump and the two drifted. One implementation, both callers.
+fn apply_pending_halt_io(
+    inner: &std::sync::Arc<std::sync::Mutex<Inner>>,
+    lane: Lane,
+    gen: u64,
+    clear_halt: bool,
+    save_halt: Option<acceptance::HaltRecord>,
+) {
+    if clear_halt {
+        acceptance::clear_halt_record(lane);
+        let mut g = inner.lock().expect("mutex");
+        if g.generation == gen {
+            g.halt_probes = 0;
+            g.halt_record = None;
+            g.halt_probe_at = None;
+        }
+    }
+    if let Some(rec) = save_halt {
+        // The re-probe has landed a share. Best-effort, like every other halt
+        // write: a rig with an unwritable home loses only the across-restart half.
+        if let Err(e) = acceptance::save_halt_record(&rec) {
+            log_verbose("halt record not persisted", &e);
+        }
+    }
+}
+
 /// A higher-than-best hashrate counts as progress (re-arms the watchdog). A
 /// steady or falling rate does NOT (so a lane that connects but never lands a
 /// share, with a flat hashrate, will still eventually trip the watchdog).
@@ -4469,12 +4503,9 @@ mod tests {
             g.pending_halt_persist = false;
             (c, save)
         };
-        if clear {
-            acceptance::clear_halt_record(s.lane);
-        }
-        if let Some(rec) = save {
-            let _ = acceptance::save_halt_record(&rec);
-        }
+        // The SHIPPED post-lock step, not a hand-copy of it.
+        let gen = s.inner.lock().unwrap().generation;
+        apply_pending_halt_io(&s.inner, s.lane, gen, clear, save);
     }
 
     /// [`spawn_env_guard`] plus a PRIVATE `$ALICE_IDENTITY_DIR`, so a persisted halt
