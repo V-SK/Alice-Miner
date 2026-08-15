@@ -177,6 +177,13 @@ pub const DEFAULT_UPDATE_URL: &str =
 /// Env override for the manifest URL.
 pub const UPDATE_URL_ENV: &str = "ALICE_MINER_UPDATE_URL";
 
+/// The human releases page. Where we send someone who has to fetch a build
+/// themselves — a platform with no in-app package, or a withdrawal with nowhere
+/// forward to go. Deliberately the PUBLIC apex, never an internal host, and
+/// deliberately a constant rather than a string typed out at each call site: it
+/// is the one address we ask people to trust when the in-app path has failed.
+pub const RELEASES_PAGE_URL: &str = "https://github.com/V-SK/alice-miner/releases/latest";
+
 /// Manifest schema version this build understands. A manifest with a higher
 /// `schema` is treated as "newer than we can safely parse": we refuse to act on
 /// it (fail closed) rather than guess.

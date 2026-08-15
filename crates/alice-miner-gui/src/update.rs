@@ -46,9 +46,23 @@ pub enum UpdateUi {
         current: String,
         version: String,
         notes: String,
+        /// How long this machine has been able to see this version — the fact
+        /// the automatic path decides on, shown to the person deciding instead.
+        /// `None` when there was no sighting to record.
+        visibility: Option<String>,
+        /// A concern the shared guardrails raised that does not refuse the
+        /// install but must be answered in its own right. When this is `Some`,
+        /// the panel names it and the button becomes an explicit "install
+        /// anyway" — never the ordinary "Update now".
+        risk: Option<String>,
         manifest: Box<Manifest>,
         artifact: Artifact,
     },
+    /// The shared guardrails REFUSED this install: the publisher withdrew the
+    /// version, or the same version number is now being offered with different
+    /// bytes than this machine first saw it carrying. There is no button here on
+    /// purpose — this is not a confirmation, it is a refusal.
+    Refused { version: String, message: String },
     /// A newer version exists but ships no artifact for this platform — point the
     /// user at the download page instead of an in-app update.
     AvailableNoArtifact { current: String, version: String },
@@ -75,8 +89,9 @@ impl UpdateUi {
     /// Whether this state should draw a badge on the Settings nav so the user
     /// notices it without opening Settings — i.e. there is something actionable
     /// about the build (an offer, a manual-download pointer, a forced-upgrade
-    /// notice, or an applied build waiting on a restart). `Idle`/`Checking`/
-    /// `UpToDate`/`Applying`/`Failed` carry no standing call-to-action here.
+    /// notice, an applied build waiting on a restart, or a refusal they need to
+    /// know about). `Idle`/`Checking`/`UpToDate`/`Applying`/`Failed` carry no
+    /// standing call-to-action here.
     pub fn wants_attention(&self) -> bool {
         matches!(
             self,
@@ -84,15 +99,19 @@ impl UpdateUi {
                 | UpdateUi::AvailableNoArtifact { .. }
                 | UpdateUi::Unsupported { .. }
                 | UpdateUi::Applied { .. }
+                | UpdateUi::Refused { .. }
         )
     }
 }
 
 /// A message from a background updater job back to the UI thread.
 enum Msg {
-    /// A completed check. The (large) [`CheckOutcome`] is boxed to keep the enum
-    /// small (it can carry a full manifest).
-    Checked(Box<CheckOutcome>),
+    /// A completed check, already through the shared manual guardrails. The
+    /// (large) state is boxed to keep the enum small (it can carry a full
+    /// manifest). The gate runs on the worker thread rather than in `poll`
+    /// because it touches the disk (the seen ledger, the failure pins) and
+    /// `poll` runs once per frame on the UI thread.
+    Checked(Box<UpdateUi>),
     CheckFailed(String),
     Applied(String),
     ApplyFailed(String),
@@ -251,7 +270,7 @@ impl UpdateManager {
     pub fn poll(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Checked(outcome) => self.ui = outcome_to_ui(*outcome),
+                Msg::Checked(ui) => self.ui = *ui,
                 Msg::CheckFailed(m) => self.ui = UpdateUi::Failed { message: m },
                 Msg::Applied(version) => self.ui = UpdateUi::Applied { version },
                 Msg::ApplyFailed(m) => self.ui = UpdateUi::Failed { message: m },
@@ -272,33 +291,128 @@ impl UpdateManager {
         let tx = self.tx.clone();
         thread::spawn(move || {
             let msg = match release::check_for_update(release::current_version()) {
-                Ok(outcome) => Msg::Checked(Box::new(outcome)),
+                Ok(outcome) => Msg::Checked(Box::new(outcome_to_ui(outcome))),
                 Err(e) => Msg::CheckFailed(e.to_string()),
             };
             let _ = tx.send(msg);
         });
     }
 
-    /// Apply the currently-`Available` update (download → verify → atomic swap →
-    /// arm health gate). No-op unless the UI is in the `Available` state. The
-    /// artifact is re-verified (size + SHA-256) before anything is written, and
-    /// the swap can never touch the keystore (`assert_not_in_data_dir`).
+    /// Apply the currently-`Available` update (guardrails → download → verify →
+    /// atomic swap → arm health gate). No-op unless the UI is in the `Available`
+    /// state. The artifact is re-verified (size + SHA-256) before anything is
+    /// written, and the swap can never touch the keystore
+    /// (`assert_not_in_data_dir`).
+    ///
+    /// The shared guardrails run AGAIN here, on the worker thread, rather than
+    /// being trusted from the state the check left behind. That state can be
+    /// minutes or hours old, and the two findings that matter — the publisher
+    /// withdrawing the version, and the bytes behind the version number
+    /// changing — are exactly the ones that appear between a check and a click.
+    /// A refusal found here turns the click into the refusal notice; a concern
+    /// found here that the user has NOT already been shown turns the click into
+    /// showing it, rather than into an install.
     pub fn apply(&mut self) {
-        let (manifest, artifact) = match &self.ui {
+        let (manifest, artifact, acknowledged) = match &self.ui {
             UpdateUi::Available {
-                manifest, artifact, ..
-            } => (manifest.clone(), artifact.clone()),
+                manifest,
+                artifact,
+                risk,
+                ..
+            } => (manifest.clone(), artifact.clone(), risk.is_some()),
             _ => return,
         };
         self.ui = UpdateUi::Applying;
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let msg = match apply_pipeline(&manifest, &artifact) {
-                Ok(version) => Msg::Applied(version),
-                Err(e) => Msg::ApplyFailed(e),
+            let check = alice_miner_core::autoupdate::manual_check(&manifest, Some(&artifact));
+            let msg = match &check.outcome {
+                alice_miner_core::autoupdate::ManualOutcome::Refuse { message } => {
+                    Msg::Checked(Box::new(UpdateUi::Refused {
+                        version: manifest.version.clone(),
+                        message: message.clone(),
+                    }))
+                }
+                // A concern the user has not been shown yet is not something a
+                // click can have answered. Surface it and let them press again.
+                alice_miner_core::autoupdate::ManualOutcome::Confirm { .. } if !acknowledged => {
+                    Msg::Checked(Box::new(with_gate(
+                        UpdateUi::Available {
+                            current: release::current_version().to_string(),
+                            version: manifest.version.clone(),
+                            notes: manifest.notes.clone(),
+                            visibility: None,
+                            risk: None,
+                            manifest: manifest.clone(),
+                            artifact: artifact.clone(),
+                        },
+                        check,
+                    )))
+                }
+                _ => match apply_pipeline(&manifest, &artifact) {
+                    Ok(version) => Msg::Applied(version),
+                    Err(e) => Msg::ApplyFailed(e),
+                },
             };
             let _ = tx.send(msg);
         });
+    }
+}
+
+/// Run the SHARED manual guardrails over a freshly-checked state.
+///
+/// This is the GUI's half of the F1 fix. `alice-miner update` and this button are
+/// the same act, and until now only the CLI ran any of these checks — the GUI's
+/// "Update now" went straight from a verified manifest to a download, past the
+/// seen ledger, past the hash-conflict refusal and past the failure pin. Both
+/// front-ends now call one driver in `alice_miner_core::autoupdate`.
+fn gate(ui: UpdateUi) -> UpdateUi {
+    let UpdateUi::Available {
+        ref manifest,
+        ref artifact,
+        ..
+    } = ui
+    else {
+        return ui;
+    };
+    let check = alice_miner_core::autoupdate::manual_check(manifest, Some(artifact));
+    with_gate(ui, check)
+}
+
+/// Fold a completed guardrail result into an `Available` state.
+fn with_gate(ui: UpdateUi, check: alice_miner_core::autoupdate::ManualCheck) -> UpdateUi {
+    use alice_miner_core::autoupdate::ManualOutcome;
+    let UpdateUi::Available {
+        current,
+        version,
+        notes,
+        manifest,
+        artifact,
+        ..
+    } = ui
+    else {
+        return ui;
+    };
+    match check.outcome {
+        ManualOutcome::Refuse { message } => UpdateUi::Refused { version, message },
+        ManualOutcome::Confirm { message } => UpdateUi::Available {
+            current,
+            version,
+            notes,
+            visibility: check.visibility,
+            risk: Some(message),
+            manifest,
+            artifact,
+        },
+        ManualOutcome::Proceed => UpdateUi::Available {
+            current,
+            version,
+            notes,
+            visibility: check.visibility,
+            risk: None,
+            manifest,
+            artifact,
+        },
     }
 }
 
@@ -315,8 +429,19 @@ fn apply_pipeline(manifest: &Manifest, artifact: &Artifact) -> Result<String, St
     Ok(manifest.version.clone())
 }
 
-/// Map a verified [`CheckOutcome`] onto the UI state.
+/// Map a verified [`CheckOutcome`] onto the UI state, guardrails included.
+///
+/// This is the ONLY conversion production code uses, and it is deliberately the
+/// one with the plain name. The unguarded mapping below is `map_outcome`, which
+/// reads as the special case it is: reaching an installable `Available` state
+/// without the shared guardrails having run should require asking for it by
+/// name, not be what you get by writing the obvious thing.
 fn outcome_to_ui(outcome: CheckOutcome) -> UpdateUi {
+    gate(map_outcome(outcome))
+}
+
+/// The pure half: shape only, no disk, no policy.
+fn map_outcome(outcome: CheckOutcome) -> UpdateUi {
     match outcome {
         CheckOutcome::UpToDate { current } => UpdateUi::UpToDate { current },
         CheckOutcome::UpdateAvailable {
@@ -327,6 +452,9 @@ fn outcome_to_ui(outcome: CheckOutcome) -> UpdateUi {
             current,
             version: manifest.version.clone(),
             notes: manifest.notes.clone(),
+            // Filled in by `gate`, which is the half that touches the disk.
+            visibility: None,
+            risk: None,
             manifest: Box::new(manifest),
             artifact,
         },
@@ -390,7 +518,7 @@ mod tests {
     #[test]
     fn newer_manifest_with_artifact_is_offered() {
         let m = manifest_with("99.0.0", "0.0.1", true);
-        let ui = outcome_to_ui(release::evaluate(m, "0.1.0"));
+        let ui = map_outcome(release::evaluate(m, "0.1.0"));
         match ui {
             UpdateUi::Available {
                 version, artifact, ..
@@ -407,7 +535,7 @@ mod tests {
     #[test]
     fn newer_manifest_without_artifact_points_to_download() {
         let m = manifest_with("99.0.0", "0.0.1", false);
-        let ui = outcome_to_ui(release::evaluate(m, "0.1.0"));
+        let ui = map_outcome(release::evaluate(m, "0.1.0"));
         assert!(matches!(ui, UpdateUi::AvailableNoArtifact { .. }));
     }
 
@@ -416,7 +544,7 @@ mod tests {
     #[test]
     fn downgrade_manifest_is_rejected_as_up_to_date() {
         let m = manifest_with("0.0.1", "0.0.1", true);
-        let ui = outcome_to_ui(release::evaluate(m, "9.9.9"));
+        let ui = map_outcome(release::evaluate(m, "9.9.9"));
         assert!(matches!(ui, UpdateUi::UpToDate { .. }), "got {ui:?}");
     }
 
@@ -424,7 +552,7 @@ mod tests {
     #[test]
     fn equal_version_is_up_to_date() {
         let m = manifest_with("1.2.3", "0.0.1", true);
-        let ui = outcome_to_ui(release::evaluate(m, "1.2.3"));
+        let ui = map_outcome(release::evaluate(m, "1.2.3"));
         assert!(matches!(ui, UpdateUi::UpToDate { .. }));
     }
 
@@ -432,7 +560,7 @@ mod tests {
     #[test]
     fn below_min_supported_is_unsupported() {
         let m = manifest_with("99.0.0", "2.0.0", true);
-        let ui = outcome_to_ui(release::evaluate(m, "1.0.0"));
+        let ui = map_outcome(release::evaluate(m, "1.0.0"));
         match ui {
             UpdateUi::Unsupported { min_supported, .. } => assert_eq!(min_supported, "2.0.0"),
             other => panic!("expected Unsupported, got {other:?}"),
@@ -467,7 +595,7 @@ mod tests {
 
     /// A WRONG-PRODUCT manifest (the Wallet's) signed by the same key is rejected
     /// at parse time — proving the cross-product guard the GUI relies on. (We test
-    /// the parse guard directly since `outcome_to_ui` only ever sees a verified,
+    /// the parse guard directly since `map_outcome` only ever sees a verified,
     /// product-checked manifest.)
     #[test]
     fn wrong_product_manifest_is_rejected_before_offer() {
@@ -555,5 +683,171 @@ mod tests {
         assert!(UpdateUi::Applying.is_busy());
         assert!(!UpdateUi::Idle.is_busy());
         assert!(!UpdateUi::UpToDate { current: "x".into() }.is_busy());
+    }
+
+    // ── F1: the GUI's "Update now" runs the SAME guardrails ──────────────────
+
+    fn offered(version: &str) -> UpdateUi {
+        let m = manifest_with(version, "0.0.1", true);
+        let artifact = m.artifacts[0].clone();
+        UpdateUi::Available {
+            current: "0.1.0".into(),
+            version: version.to_string(),
+            notes: m.notes.clone(),
+            visibility: None,
+            risk: None,
+            manifest: Box::new(m),
+            artifact,
+        }
+    }
+
+    fn check(outcome: alice_miner_core::autoupdate::ManualOutcome) -> alice_miner_core::autoupdate::ManualCheck {
+        alice_miner_core::autoupdate::ManualCheck {
+            outcome,
+            visibility: Some("seen for 3 days".into()),
+            visible_for_s: 3 * 24 * 3600,
+            inside_soak: false,
+        }
+    }
+
+    /// A refusal from the shared driver replaces the offer entirely. There is no
+    /// "Update now" button in the `Refused` state on purpose: a refusal is not a
+    /// confirmation dialog with its buttons rearranged.
+    ///
+    /// Before this, the GUI's manual path ran NONE of these checks — it went from
+    /// a verified manifest straight to a download, past the seen ledger, past the
+    /// hash-conflict refusal and past the failure pin. The CLI had (some of) them
+    /// and the GUI had none, which is the same shape as AM-REL-009.
+    #[test]
+    fn a_refusal_from_the_shared_driver_removes_the_update_button() {
+        use alice_miner_core::autoupdate::ManualOutcome;
+        let ui = with_gate(
+            offered("99.0.0"),
+            check(ManualOutcome::Refuse {
+                message: "REFUSED: the bytes changed".into(),
+            }),
+        );
+        match ui {
+            UpdateUi::Refused { version, message } => {
+                assert_eq!(version, "99.0.0");
+                assert!(message.contains("REFUSED"));
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        // A refusal is something the user needs to see without digging.
+        assert!(UpdateUi::Refused {
+            version: "99.0.0".into(),
+            message: "m".into()
+        }
+        .wants_attention());
+    }
+
+    /// A concern turns the ordinary offer into an explicit one: the panel names
+    /// what is wrong and the button becomes "Install anyway".
+    #[test]
+    fn a_concern_from_the_shared_driver_becomes_an_explicit_second_question() {
+        use alice_miner_core::autoupdate::ManualOutcome;
+        match with_gate(
+            offered("99.0.0"),
+            check(ManualOutcome::Confirm {
+                message: "this machine rolled it back before".into(),
+            }),
+        ) {
+            UpdateUi::Available { risk, visibility, .. } => {
+                assert_eq!(risk.as_deref(), Some("this machine rolled it back before"));
+                assert_eq!(visibility.as_deref(), Some("seen for 3 days"));
+            }
+            other => panic!("expected Available with a risk, got {other:?}"),
+        }
+    }
+
+    /// A clean version is offered normally — and still carries the visibility
+    /// line, so a manual install is made with the same facts the automatic path
+    /// decides on.
+    #[test]
+    fn a_clean_version_is_offered_with_its_visibility_stated() {
+        use alice_miner_core::autoupdate::ManualOutcome;
+        match with_gate(offered("99.0.0"), check(ManualOutcome::Proceed)) {
+            UpdateUi::Available { risk, visibility, .. } => {
+                assert_eq!(risk, None);
+                assert_eq!(visibility.as_deref(), Some("seen for 3 days"));
+            }
+            other => panic!("expected a plain offer, got {other:?}"),
+        }
+    }
+
+    /// The gate only ever rewrites an `Available` state; every other state
+    /// passes through untouched (there is nothing to install from them).
+    #[test]
+    fn the_gate_leaves_non_offer_states_alone() {
+        use alice_miner_core::autoupdate::ManualOutcome;
+        let ui = UpdateUi::UpToDate { current: "1.0.0".into() };
+        assert_eq!(
+            with_gate(ui.clone(), check(ManualOutcome::Refuse { message: "x".into() })),
+            ui,
+            "a refusal about nothing must not invent a Refused state"
+        );
+    }
+
+    /// The wiring itself, not a stand-in for it: the conversion `check` actually
+    /// calls, driven against the REAL shared driver and a real (temporary)
+    /// `~/.alice`. The three tests above pin what the GUI does with a verdict;
+    /// this one pins that a state reaching the UI has been through the
+    /// guardrails at all, which is the half that was missing — the GUI's manual
+    /// path went from a verified manifest straight to a download.
+    ///
+    /// `$ALICE_IDENTITY_DIR` is a process global, so this holds the crate-wide
+    /// env lock; without it a parallel test could restore the variable mid-run
+    /// and this would write into the developer's real `~/.alice`.
+    #[test]
+    fn a_checked_state_reaches_the_ui_already_through_the_guardrails() {
+        let _g = crate::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("ALICE_IDENTITY_DIR").ok();
+        let dir = std::env::temp_dir().join(format!(
+            "alice-gui-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+
+        // A clean offer survives — and comes back carrying the visibility line,
+        // which only the shared driver can produce.
+        let clean = outcome_to_ui(release::evaluate(manifest_with("99.0.0", "0.0.1", true), "0.1.0"));
+        let clean_ok =
+            matches!(&clean, UpdateUi::Available { visibility: Some(_), risk: None, .. });
+
+        // Now teach this machine that 98.0.0 carried different bytes than the
+        // ones about to be offered for it, and that offer must come back
+        // refused. (A different version number, because the ledger is
+        // append-only: the sighting the clean case just recorded is final.)
+        alice_miner_core::alice_release::auto::note_seen(&dir, "98.0.0", &"bb".repeat(32));
+        let conflicted =
+            outcome_to_ui(release::evaluate(manifest_with("98.0.0", "0.0.1", true), "0.1.0"));
+        let refused = matches!(&conflicted, UpdateUi::Refused { .. });
+
+        // The unguarded mapping is the control: same input, and it hands back an
+        // installable offer. That is what `check` used to do.
+        let ungated = map_outcome(release::evaluate(manifest_with("98.0.0", "0.0.1", true), "0.1.0"));
+        let ungated_offers = matches!(&ungated, UpdateUi::Available { .. });
+
+        match prev {
+            Some(v) => std::env::set_var("ALICE_IDENTITY_DIR", v),
+            None => std::env::remove_var("ALICE_IDENTITY_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(clean_ok, "a clean offer must survive and carry visibility: {clean:?}");
+        assert!(
+            refused,
+            "a re-published version must be refused in the GUI too: {conflicted:?}"
+        );
+        assert!(
+            ungated_offers,
+            "the control must show the refusal came from the gate: {ungated:?}"
+        );
     }
 }

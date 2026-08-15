@@ -175,11 +175,16 @@ pub fn tick(quiet_holds: bool) -> Outcome {
     match auto::decide(&input) {
         Decision::UpToDate => Outcome::Quiet,
 
-        Decision::CurrentRevoked { current, latest, rollback_available } => {
+        Decision::CurrentRevoked { current, newer, rollback_available } => {
             auto::log_event(
                 &dir,
                 "current-revoked",
-                serde_json::json!({ "current": current, "latest": latest }),
+                serde_json::json!({
+                    "current": current,
+                    "newer": newer.as_ref().map(|n| n.version.clone()),
+                    "newer_visible_for_s": newer.as_ref().map(|n| n.visible_for_s),
+                    "newer_inside_soak": newer.as_ref().map(|n| n.inside_soak()),
+                }),
             );
             // Revocation is the publisher saying "this build should not be
             // running". Where we are allowed to act unattended AND there is a
@@ -210,36 +215,8 @@ pub fn tick(quiet_holds: bool) -> Outcome {
                     serde_json::json!({ "from": current }),
                 );
             }
-            let tail = if reverted {
-                tr!(
-                    "The previous version has been restored on disk — restart alice-miner to run it. This process is still the withdrawn build.",
-                    "上一个版本已恢复到磁盘 —— 请重启 alice-miner 以运行它。当前进程仍是被撤回的版本。"
-                )
-                .to_string()
-            } else if rollback_available {
-                tr!(
-                    "A previous version is still on this machine, but this machine is set not to install anything on its own, so nothing was changed.",
-                    "本机仍保留上一个版本,但本机设置为不自动安装任何东西,因此未做任何更改。"
-                )
-                .to_string()
-            } else {
-                tr!(
-                    "There is no previous version on this machine to fall back to.",
-                    "本机没有可回退的旧版本。"
-                )
-                .to_string()
-            };
             Outcome::CurrentRevoked {
-                message: format!(
-                    "{} {}",
-                    tr!(
-                        format!("⚠ v{current} has been WITHDRAWN by the publisher. Install v{latest} with `alice-miner update` as soon as you can."),
-                        format!("⚠ v{current} 已被发布方撤回。请尽快运行 `alice-miner update` 安装 v{latest}。")
-                    ),
-                    tail
-                )
-                .trim_end()
-                .to_string(),
+                message: describe_revoked(&current, &newer, reverted, rollback_available),
             }
         }
 
@@ -327,7 +304,123 @@ fn install(
     Ok(())
 }
 
+/// The whole withdrawal notice: what is wrong, what (if anything) there is to
+/// move to, and what this machine did or did not do about it.
+///
+/// Three clauses, and the middle one is the load-bearing change. It used to read
+/// "Install v{latest} with `alice-miner update` as soon as you can" and it was
+/// generated on every machine in the fleet the moment a `revoked` list arrived.
+fn describe_revoked(
+    current: &str,
+    newer: &Option<auto::NewerRelease>,
+    reverted: bool,
+    rollback_available: bool,
+) -> String {
+    let tail = if reverted {
+        tr!(
+            "The previous version has been restored on disk — restart alice-miner to run it. This process is still the withdrawn build.",
+            "上一个版本已恢复到磁盘 —— 请重启 alice-miner 以运行它。当前进程仍是被撤回的版本。"
+        )
+    } else if rollback_available {
+        tr!(
+            "A previous version is still on this machine, but this machine is set not to install anything on its own, so nothing was changed.",
+            "本机仍保留上一个版本,但本机设置为不自动安装任何东西,因此未做任何更改。"
+        )
+    } else {
+        tr!(
+            "There is no previous version on this machine to fall back to.",
+            "本机没有可回退的旧版本。"
+        )
+    };
+    [
+        tr!(
+            format!("⚠ WARNING: v{current} has been WITHDRAWN by the publisher — do not keep running it."),
+            format!("⚠ 警告:v{current} 已被发布方撤回 —— 请不要继续运行它。")
+        ),
+        describe_forward(newer, reverted),
+        tail.to_string(),
+    ]
+    .iter()
+    .filter(|s| !s.is_empty())
+    .cloned()
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+/// After a withdrawal: what — if anything — there is to move TO, stated as
+/// facts and never as an instruction.
+///
+/// A withdrawal notice is the one message we send that arrives sounding urgent
+/// and carrying our voice on every machine at once, and under key compromise the
+/// attacker writes the `revoked` list that triggers it. An instruction here
+/// ("install vNEW as soon as you can") would therefore be OUR contribution to
+/// the attack: it collapses the soak window from a day to however long it takes
+/// someone to read a line of text, on a version they have no reason to distrust
+/// because we just told them to take it. So this says what is true and stops.
+fn describe_forward(newer: &Option<auto::NewerRelease>, reverted: bool) -> String {
+    match newer {
+        // F2b — the ordinary case: we shipped it, it is bad, we pulled it. The
+        // withdrawn build IS the newest published version, so there is nowhere
+        // forward to go and we must not pretend there is.
+        None if reverted => {
+            // The tail already says the previous build is back on disk. Pointing
+            // at the releases page on top of that would be noise.
+            String::new()
+        }
+        None => tr!(
+            format!("There is no newer version to move to — the withdrawn build is the newest one published. Leaving it means reinstalling the previous release yourself from {url}; this client cannot put it back for you from here.", url = release::RELEASES_PAGE_URL),
+            format!("没有可以升级过去的更新版本 —— 被撤回的就是当前最新发布版本。要离开它,需要你自己从 {url} 重新安装上一个版本;客户端无法在这里替你装回去。", url = release::RELEASES_PAGE_URL)
+        ),
+        Some(n) if n.inside_soak() => {
+            let v = &n.version;
+            let age = age_phrase(n.visible_for_s);
+            tr!(
+                format!("A newer version v{v} exists, but this machine has only been able to see it for {age} — less than the day this client waits before it will trust a new build on its own. Installing it right now is NOT advised, and nothing here will install it for you."),
+                format!("存在更新的版本 v{v},但本机只见到它 {age} —— 短于本客户端自动信任一个新版本所需的一天。现在就安装并不可取,本机也不会替你安装。")
+            )
+        }
+        Some(n) => {
+            let v = &n.version;
+            let age = age_phrase(n.visible_for_s);
+            tr!(
+                format!("A newer version v{v} exists and this machine has been able to see it for {age}. What to do next is your call: a withdrawal says something is wrong with the build you have, not which build you should take instead."),
+                format!("存在更新的版本 v{v},本机已见到它 {age}。接下来怎么做由你决定:撤回说明的是你手上这个版本有问题,而不是你接下来该换成哪个版本。")
+            )
+        }
+    }
+}
+
+/// A rough, honest age. Rough on purpose — the reader needs "minutes" versus
+/// "days", and a precise number would imply a precision the local clock does not
+/// have.
+fn age_phrase(secs: u64) -> String {
+    if secs < 60 {
+        return tr!("less than a minute", "不到一分钟").to_string();
+    }
+    if secs < 90 * 60 {
+        let n = secs / 60;
+        return tr!(format!("{n} minutes"), format!("{n} 分钟"));
+    }
+    if secs < 48 * 3600 {
+        let n = secs / 3600;
+        return tr!(format!("{n} hours"), format!("{n} 小时"));
+    }
+    let n = secs / (24 * 3600);
+    tr!(format!("{n} days"), format!("{n} 天"))
+}
+
 /// One honest line for every reason we did not install something.
+///
+/// A hold is not a problem to be worked around, and the line that reports it
+/// must not read as one. Three of these exist because the user CHOSE a quieter
+/// setting (`ModeOff`, `NotifyOnly`, `NotSecurity`) and for those, "run
+/// `alice-miner update`" genuinely is the remedy — it is the thing their setting
+/// asked us to leave to them. The rest exist for a safety reason: the soak
+/// window, the staged rollout and the failure pin are the guardrails, and a line
+/// that ends by offering the command to skip them is our own copy walking the
+/// user off the guarded path onto the unguarded one. Those lines still say the
+/// command exists — hiding it would be its own dishonesty — but they say what
+/// using it costs, and they never present it as the fix.
 fn describe_hold(version: &str, hold: &Hold) -> String {
     match hold {
         Hold::ModeOff => tr!(
@@ -345,17 +438,17 @@ fn describe_hold(version: &str, hold: &Hold) -> String {
         Hold::Soaking { ready_in_s } => {
             let h = (*ready_in_s).div_ceil(3600);
             tr!(
-                format!("v{version} is available. New versions are held for a day before this machine installs them on its own (~{h}h to go) — `alice-miner update` installs it now."),
-                format!("有新版本 v{version}。新版本会先观察一天本机才会自动安装(还剩约 {h} 小时)—— 运行 `alice-miner update` 可立即安装。")
+                format!("v{version} is available. Nothing is wrong and there is nothing to do: this machine waits a day before installing a new version on its own, so that problems are found on the machines that took it first (~{h}h to go). `alice-miner update` would install it immediately, which is you taking that first look instead of waiting for it."),
+                format!("有新版本 v{version}。一切正常,你无需做任何事:本机会先等待一天再自动安装新版本,好让问题先在最早安装的机器上暴露(还剩约 {h} 小时)。`alice-miner update` 可以立刻安装,那等于由你来当第一批试用者,而不是等别人先试。")
             )
         }
         Hold::Rollout { bucket, pct } => tr!(
-            format!("v{version} is available and is rolling out to {pct}% of machines first; this one is in group {bucket} and is not in that slice yet — `alice-miner update` installs it now."),
-            format!("有新版本 v{version},正在向 {pct}% 的机器分批放量;本机分组为 {bucket},尚未轮到 —— 运行 `alice-miner update` 可立即安装。")
+            format!("v{version} is available and is going to {pct}% of machines first; this one is in group {bucket} and is not in that slice yet. Nothing is wrong and there is nothing to do — a staged rollout exists so a bad build stops at the first slice instead of reaching everyone. `alice-miner update` would install it immediately, which opts this machine out of that."),
+            format!("有新版本 v{version},正在先向 {pct}% 的机器放量;本机分组为 {bucket},尚未轮到。一切正常,你无需做任何事 —— 分批放量的意义在于让有问题的版本止步于第一批,而不是一次铺到所有人。`alice-miner update` 可以立刻安装,那等于让本机退出这一保护。")
         ),
         Hold::Pinned => tr!(
-            format!("v{version} is available but this machine already tried it and rolled back, so it will not install it again on its own. `alice-miner update` will still install it if you want to retry."),
-            format!("有新版本 v{version},但本机曾安装并回滚过,因此不会再自动安装。如需重试,可运行 `alice-miner update`。")
+            format!("v{version} is available, but this machine installed it before and rolled it back automatically, so it will not install it again on its own. That is a record of something having gone wrong here, not a formality. `alice-miner update` can retry it if you have reason to think it will behave differently this time — it will ask you again first."),
+            format!("有新版本 v{version},但本机曾安装它并自动回滚过,因此不会再自动安装。那是本机确实出过问题的记录,不是走过场。若你有理由认为这次会不同,可以用 `alice-miner update` 重试 —— 它会再次向你确认。")
         ),
         Hold::Revoked => tr!(
             format!("v{version} is the newest published version but the publisher has WITHDRAWN it. It will not be installed."),
@@ -378,6 +471,147 @@ fn describe_hold(version: &str, hold: &Hold) -> String {
 
 fn short(sha: &str) -> String {
     sha.chars().take(12).collect()
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// The MANUAL path — same guardrails, one driver, both front-ends
+//
+// `alice-miner update` and the GUI's "Update now" used to be the way around
+// every check in this file. The automatic path refused a version whose bytes had
+// changed under a fixed version number; the manual path downloaded it. The
+// automatic path anchored a soak window on this machine's own first sighting;
+// the manual path never recorded a sighting at all, so a version installed by
+// hand left no trace for the NEXT check to compare against.
+//
+// This is the one place both front-ends run those checks, for the same reason
+// `tick` is the one place they run the automatic ones (AM-REL-009: two copies of
+// an update flow is how one front-end ends up with a safety mechanism the other
+// does not have).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// What the manual path may do, already phrased for a human.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualOutcome {
+    /// Nothing known stands in the way. The caller's ordinary confirmation
+    /// (or `--yes`, or a click) is enough.
+    Proceed,
+    /// Do NOT install. Not with `--yes`, not with a click, not at all.
+    Refuse { message: String },
+    /// Install only after a SEPARATE, explicit, interactive confirmation that
+    /// names this. A "don't ask me" flag must never satisfy it.
+    Confirm { message: String },
+}
+
+/// The result of running the manual guardrails, including the facts the
+/// automatic path uses so the person choosing has the same ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualCheck {
+    pub outcome: ManualOutcome,
+    /// One line saying how long this machine has been able to see this version.
+    /// `None` only when there is no package for this platform, so there was no
+    /// sighting to record.
+    pub visibility: Option<String>,
+    /// Seconds this machine has been able to see the version.
+    pub visible_for_s: u64,
+    /// Whether that is still inside the soak floor the automatic path enforces.
+    pub inside_soak: bool,
+}
+
+/// Run the manual path's guardrails and record the sighting.
+///
+/// Two things happen here and the order matters. First the sighting is recorded,
+/// exactly as `tick` does it, so that a version installed by hand still starts
+/// this machine's local soak clock and still pins the bytes we saw it carrying —
+/// a manual install that left no record would blind the next automatic check.
+/// Then the pure gate runs against that record.
+///
+/// What this deliberately does NOT enforce: the soak window, the rollout slice
+/// and the mode. Those are statements about how eager the machine may be without
+/// being asked, and someone typing the command has answered all three. They are
+/// REPORTED instead ([`ManualCheck::visibility`]), because a person installing a
+/// version twenty minutes old should know that is what they are doing.
+pub fn manual_check(
+    manifest: &release::Manifest,
+    artifact: Option<&release::Artifact>,
+) -> ManualCheck {
+    let dir = state_dir();
+    // The ledger is keyed by (version, platform artifact hash). With no artifact
+    // for this platform there is no hash to record, and writing a placeholder
+    // would poison the append-only ledger with bytes we never saw.
+    let seen = artifact.map(|a| auto::note_seen(&dir, &manifest.version, &a.sha256));
+    let visible_for_s = seen
+        .as_ref()
+        .map(|s| auto::visible_for(now_unix(), s.first_seen_unix))
+        .unwrap_or(0);
+    let inside_soak = auto::inside_soak(visible_for_s);
+    let pins = auto::pins(&dir);
+    let verdict = auto::decide_manual(&auto::ManualInput {
+        manifest,
+        artifact_sha256: artifact.map(|a| a.sha256.as_str()),
+        seen_sha256: seen.as_ref().map(|s| s.sha256.as_str()),
+        pinned: &pins,
+    });
+
+    let version = &manifest.version;
+    let outcome = match verdict {
+        auto::ManualVerdict::Proceed => ManualOutcome::Proceed,
+        auto::ManualVerdict::Refuse(auto::ManualRefusal::HashConflict {
+            seen_sha256,
+            now_sha256,
+        }) => {
+            auto::log_event(
+                &dir,
+                "manual-hash-conflict",
+                serde_json::json!({
+                    "version": version,
+                    "seen_sha256": seen_sha256,
+                    "now_sha256": now_sha256,
+                }),
+            );
+            let first = short(&seen_sha256);
+            let now = short(&now_sha256);
+            ManualOutcome::Refuse {
+                message: tr!(
+                    format!("REFUSED to install v{version}: this machine first saw that version with package {first}, and the server is now offering {now} under the SAME version number. Nothing was downloaded. This is not something to click past — a version number that changes its bytes is either a mistake on our side or someone else signing with our key, and neither is fixed by installing it. Report it, and take a version with a different number."),
+                    format!("已拒绝安装 v{version}:本机首次见到该版本时安装包是 {first},而服务器现在以同一个版本号提供 {now}。没有下载任何内容。这不是点一下就能跳过的事 —— 同一个版本号换了字节,要么是我方出错,要么是别人拿着我们的密钥在签名,而这两种情况都不会因为你装上去而变好。请上报,并改装一个版本号不同的版本。")
+                ),
+            }
+        }
+        auto::ManualVerdict::Refuse(auto::ManualRefusal::Revoked) => ManualOutcome::Refuse {
+            message: tr!(
+                format!("v{version} has been WITHDRAWN by the publisher and will not be installed."),
+                format!("v{version} 已被发布方撤回,不会被安装。")
+            ),
+        },
+        auto::ManualVerdict::ConfirmFirst(auto::ManualConcern::Pinned) => ManualOutcome::Confirm {
+            message: tr!(
+                format!("this machine installed v{version} before and rolled it back automatically, because it either failed to start or stopped landing accepted shares here."),
+                format!("本机曾安装过 v{version} 并自动回滚,原因是它要么无法启动,要么在本机不再有被接受的份额。")
+            ),
+        },
+    };
+
+    let visibility = seen.as_ref().map(|_| {
+        let age = age_phrase(visible_for_s);
+        if inside_soak {
+            tr!(
+                format!("This machine first saw v{version} {age} ago. The automatic updater waits a day before trusting a new version on its own, so installing it now means you are looking at it first rather than after other machines have."),
+                format!("本机首次见到 v{version} 已过去 {age}。自动更新会先等待一天才信任一个新版本,所以现在安装意味着由你先行试用,而不是等别的机器先试。")
+            )
+        } else {
+            tr!(
+                format!("This machine has been able to see v{version} for {age} — past the day the automatic updater waits."),
+                format!("本机见到 v{version} 已有 {age} —— 已超过自动更新等待的一天。")
+            )
+        }
+    });
+
+    ManualCheck {
+        outcome,
+        visibility,
+        visible_for_s,
+        inside_soak,
+    }
 }
 
 fn now_unix() -> u64 {
@@ -583,5 +817,335 @@ mod tests {
         }
         .message()
         .is_some());
+    }
+
+    // ── F1: a hold must not read as an invitation to bypass itself ───────────
+
+    /// The imperative form — "run `alice-miner update` [to install it]" — in
+    /// both languages. This is the shape that turns a line the user reads into
+    /// an instruction they follow.
+    fn reads_as_an_instruction(s: &str) -> bool {
+        s.contains("run `alice-miner update`")
+            || s.contains("运行 `alice-miner update`")
+            || s.contains("installs it now")
+            || s.contains("可立即安装")
+    }
+
+    /// Three holds exist because the USER chose a quieter setting. For those,
+    /// "run `alice-miner update`" is the remedy — it is precisely the step their
+    /// setting asked us to leave to them — and the line should say so.
+    ///
+    /// Three other holds exist for a SAFETY reason: the soak window, the staged
+    /// rollout and the failure pin. Every one of those lines used to end with an
+    /// offer to skip it (`— alice-miner update installs it now`), which meant our
+    /// own copy walked the user off the guarded path onto the unguarded one at
+    /// the exact moment the guard engaged. Under a stolen key that sentence is
+    /// worth more to the attacker than the guardrail is worth to us.
+    ///
+    /// The line may still say the command exists. It must not present it as the
+    /// fix.
+    #[test]
+    fn a_safety_hold_never_reads_as_an_invitation_to_bypass_itself() {
+        let _g = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let safety = [
+            Hold::Soaking { ready_in_s: 3600 },
+            Hold::Rollout { bucket: 42, pct: 10 },
+            Hold::Pinned,
+        ];
+        let preference = [Hold::ModeOff, Hold::NotifyOnly, Hold::NotSecurity];
+
+        for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
+            crate::i18n::set_lang(lang);
+            for h in &safety {
+                let s = describe_hold("0.6.8", h);
+                assert!(
+                    !reads_as_an_instruction(&s),
+                    "a safety hold must not tell the user to run the bypass ({lang:?}): {s}"
+                );
+                assert!(
+                    s.contains("alice-miner update"),
+                    "…but it must not hide that the command exists either ({lang:?}): {s}"
+                );
+            }
+            for h in &preference {
+                let s = describe_hold("0.6.8", h);
+                assert!(
+                    reads_as_an_instruction(&s),
+                    "a hold that exists because of a SETTING should name the remedy ({lang:?}): {s}"
+                );
+            }
+        }
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+    }
+
+    // ── F2 / F2b: a withdrawal is not an install instruction ─────────────────
+
+    fn newer(version: &str, visible_for_s: u64) -> auto::NewerRelease {
+        auto::NewerRelease {
+            version: version.to_string(),
+            visible_for_s,
+        }
+    }
+
+    /// F2 — the attack this closes: a stolen key publishes a malicious vNEW and
+    /// lists every legitimate version in `revoked[]`. The withdrawal branch then
+    /// prints, on every machine, a correctly-signed, urgent-sounding instruction
+    /// to install vNEW at once — collapsing the soak window from a day to
+    /// however long it takes someone to read one line.
+    ///
+    /// Inside the soak floor the wording must say the OPPOSITE, and it must say
+    /// how long the thing has actually been public.
+    #[test]
+    fn a_withdrawal_inside_the_soak_floor_advises_against_installing() {
+        let _g = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
+            crate::i18n::set_lang(lang);
+            let s = describe_forward(&Some(newer("9.9.9", 2 * 3600)), false);
+            assert!(
+                !reads_as_an_instruction(&s),
+                "a withdrawal must never double as an install instruction ({lang:?}): {s}"
+            );
+            assert!(s.contains("9.9.9"), "must name the version ({lang:?}): {s}");
+            assert!(
+                s.contains("2 hours") || s.contains("2 小时"),
+                "must say how long it has been visible ({lang:?}): {s}"
+            );
+            assert!(
+                s.contains("NOT advised") || s.contains("并不可取"),
+                "must advise against it, not for it ({lang:?}): {s}"
+            );
+        }
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+    }
+
+    /// Past the soak floor the notice is neutral: facts, and no next move chosen
+    /// on the user's behalf. A withdrawal says something is wrong with the build
+    /// they have — it is not a statement about which build they should take.
+    #[test]
+    fn a_withdrawal_past_the_soak_floor_states_facts_without_instructing() {
+        let _g = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let s = describe_forward(&Some(newer("9.9.9", 5 * 24 * 3600)), false);
+        assert!(!reads_as_an_instruction(&s), "{s}");
+        assert!(s.contains("5 days"), "{s}");
+        assert!(!s.contains("NOT advised"), "no scolding past the floor: {s}");
+    }
+
+    /// F2b — the most common withdrawal there is: we shipped v0.6.9, it is bad,
+    /// we pulled it. `latest == current`, so the old branch rendered "v0.6.9 has
+    /// been withdrawn, please install v0.6.9" and the manual path then hard-errored
+    /// on the very thing it had just recommended.
+    #[test]
+    fn a_withdrawal_with_nowhere_to_go_says_so_and_points_at_the_releases_page() {
+        let _g = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
+            crate::i18n::set_lang(lang);
+            let s = describe_forward(&None, false);
+            assert!(!reads_as_an_instruction(&s), "({lang:?}): {s}");
+            assert!(
+                s.contains(release::RELEASES_PAGE_URL),
+                "must point at the releases page ({lang:?}): {s}"
+            );
+            assert!(
+                s.contains("cannot") || s.contains("无法"),
+                "must say plainly that we cannot do it from here ({lang:?}): {s}"
+            );
+        }
+        // …unless we already put the previous build back, in which case the tail
+        // covers it and a releases-page link would be noise.
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        assert_eq!(describe_forward(&None, true), "");
+    }
+
+    /// The whole notice, as the miner actually reads it. The clause tests above
+    /// check the middle sentence in isolation; this checks that assembling it
+    /// does not put an instruction back in, and that a skipped clause does not
+    /// leave a hole in the line.
+    #[test]
+    fn the_assembled_withdrawal_notice_warns_without_instructing() {
+        let _g = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
+            crate::i18n::set_lang(lang);
+            for (newer, reverted, lkg) in [
+                (Some(newer("9.9.9", 2 * 3600)), false, false),
+                (Some(newer("9.9.9", 9 * 24 * 3600)), false, true),
+                (None, false, false),
+                (None, true, true),
+            ] {
+                let s = describe_revoked("0.6.9", &newer, reverted, lkg);
+                assert!(
+                    !reads_as_an_instruction(&s),
+                    "({lang:?}) the notice must never become an install instruction: {s}"
+                );
+                assert!(s.contains("0.6.9"), "({lang:?}) names the withdrawn build: {s}");
+                assert!(
+                    s.contains("⚠"),
+                    "({lang:?}) reaches the user as a warning: {s}"
+                );
+                assert!(!s.contains("  "), "({lang:?}) a skipped clause left a hole: {s}");
+            }
+        }
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+    }
+
+    #[test]
+    fn age_phrase_reads_in_the_unit_a_human_would_use() {
+        let _g = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        assert_eq!(age_phrase(30), "less than a minute");
+        assert_eq!(age_phrase(20 * 60), "20 minutes");
+        assert_eq!(age_phrase(5 * 3600), "5 hours");
+        assert_eq!(age_phrase(9 * 24 * 3600), "9 days");
+    }
+
+    // ── F1: the manual path runs the same guardrails ─────────────────────────
+
+    /// An isolated `$ALICE_IDENTITY_DIR` so `state_dir()` (and therefore the
+    /// seen ledger and the pins) never touches the developer's real `~/.alice`.
+    fn with_state_dir<T>(name: &str, f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _g = crate::IDENTITY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "alice-manual-{}-{}-{}",
+            name,
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+        let out = f(&dir);
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    fn test_manifest(version: &str) -> release::Manifest {
+        release::Manifest {
+            schema: 1,
+            product: release::PRODUCT.to_string(),
+            version: version.to_string(),
+            min_supported: "0.1.0".to_string(),
+            released: "2026-08-14T00:00:00Z".to_string(),
+            notes: String::new(),
+            artifacts: vec![release::Artifact {
+                platform: release::current_platform().to_string(),
+                url: "https://example.invalid/pkg.tar.gz".to_string(),
+                sha256: "aa".repeat(32),
+                size: 1,
+            }],
+            rollout_pct: None,
+            soak_hours: None,
+            revoked: Vec::new(),
+            security: None,
+        }
+    }
+
+    /// The manual path records the sighting. Without this the ledger only ever
+    /// learned about versions the AUTOMATIC path looked at, so a version
+    /// installed by hand left no trace for the next check to compare against —
+    /// and the hash-conflict guard had nothing to guard with.
+    #[test]
+    fn the_manual_path_records_the_sighting_and_reports_visibility() {
+        let _l = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        with_state_dir("seen", |dir| {
+            let m = test_manifest("9.9.9");
+            let check = manual_check(&m, Some(&m.artifacts[0]));
+            assert_eq!(check.outcome, ManualOutcome::Proceed);
+            assert!(
+                dir.join("update-seen.json").exists(),
+                "the manual path must write the seen ledger too"
+            );
+            assert!(check.inside_soak, "a version seen just now is inside the floor");
+            let v = check.visibility.expect("a visibility line");
+            assert!(v.contains("9.9.9"), "{v}");
+            assert!(
+                v.contains("less than a minute"),
+                "a manual install must SAY how long the version has been visible: {v}"
+            );
+            // The recorded hash is the one we were offered.
+            let seen = auto::note_seen(dir, "9.9.9", "ff".repeat(32).as_str());
+            assert_eq!(seen.sha256, "aa".repeat(32), "first bytes win");
+        });
+    }
+
+    /// The F1 headline: a version this machine first saw carrying one package,
+    /// now offered as different bytes under the same version number, is refused
+    /// on the MANUAL path exactly as it is on the automatic one.
+    #[test]
+    fn the_manual_path_refuses_a_republished_version() {
+        let _l = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        with_state_dir("conflict", |dir| {
+            // This machine saw 9.9.9 carrying "bb…" first.
+            auto::note_seen(dir, "9.9.9", "bb".repeat(32).as_str());
+            // The server now offers "aa…" under the same number.
+            let m = test_manifest("9.9.9");
+            let check = manual_check(&m, Some(&m.artifacts[0]));
+            match check.outcome {
+                ManualOutcome::Refuse { message } => {
+                    assert!(message.contains("REFUSED"), "{message}");
+                    assert!(message.contains("bbbbbbbbbbbb"), "names the first bytes: {message}");
+                    assert!(message.contains("aaaaaaaaaaaa"), "names the offered bytes: {message}");
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+            // …and it is on the local record, which is the only place a fleet
+            // operator can see it without a server.
+            let hist = std::fs::read_to_string(dir.join("update-history.jsonl")).unwrap_or_default();
+            assert!(hist.contains("manual-hash-conflict"), "history: {hist}");
+        });
+    }
+
+    /// A version this machine already rolled back is a SECOND question, not a
+    /// refusal: the user may still choose it, knowing what happened here.
+    #[test]
+    fn the_manual_path_asks_again_about_a_version_this_machine_rolled_back() {
+        let _l = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        with_state_dir("pinned", |dir| {
+            auto::pin(dir, "9.9.9");
+            let m = test_manifest("9.9.9");
+            match manual_check(&m, Some(&m.artifacts[0])).outcome {
+                ManualOutcome::Confirm { message } => {
+                    assert!(message.contains("9.9.9"), "{message}");
+                    assert!(message.contains("rolled it back"), "{message}");
+                }
+                other => panic!("expected a second question, got {other:?}"),
+            }
+        });
+    }
+
+    /// With no package for this platform there is nothing to compare, and the
+    /// gate must not invent a conflict out of the absence — nor write a
+    /// placeholder hash into an append-only ledger.
+    #[test]
+    fn the_manual_path_with_no_platform_package_records_nothing() {
+        with_state_dir("noartifact", |dir| {
+            let m = test_manifest("9.9.9");
+            let check = manual_check(&m, None);
+            assert_eq!(check.outcome, ManualOutcome::Proceed);
+            assert_eq!(check.visibility, None);
+            assert!(!dir.join("update-seen.json").exists());
+        });
     }
 }

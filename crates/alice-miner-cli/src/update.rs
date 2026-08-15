@@ -150,50 +150,34 @@ pub fn run(args: UpdateArgs) -> i32 {
 fn apply_flow(manifest: &Manifest, artifact: Option<&Artifact>, yes: bool, current: &str) -> i32 {
     let _ = current;
 
-    // A version the publisher has WITHDRAWN is never installed — not automatically,
-    // and not by hand either. `--yes` does not override this: revocation is the one
-    // switch we have for "we know this build is harmful", and a flag that means "do
-    // not ask me" must not also mean "ignore what we know".
-    if manifest.is_revoked(&manifest.version) {
-        eprintln!(
-            "error: {}",
-            tr!(
-                format!(
-                    "v{} has been WITHDRAWN by the publisher and will not be installed.",
-                    manifest.version
-                ),
-                format!("v{} 已被发布方撤回,不会被安装。", manifest.version)
-            )
-        );
-        return EXIT_RUNTIME;
+    // The SHARED guardrails — the same ones the automatic path applies, run from
+    // the same driver in `alice_miner_core::autoupdate` so there is exactly one
+    // copy of them (AM-REL-009). This also records the sighting, so a version
+    // installed by hand still starts this machine's soak clock and still pins the
+    // bytes we saw it carrying.
+    //
+    // Note what `--yes` does and does not reach. It means "stop asking me", and
+    // it settles the ordinary confirmation below. It does not settle a refusal,
+    // and it does not settle the second, explicit question a concern raises: a
+    // flag typed before we knew anything cannot be consent to something we only
+    // learned afterwards.
+    let check = alice_miner_core::autoupdate::manual_check(manifest, artifact);
+    if let Some(line) = &check.visibility {
+        println!("  {line}");
     }
-
-    // A version that already failed its health probation ON THIS MACHINE is not
-    // installed silently again. The user may still choose it — their machine, their
-    // call — but they get told first, and `--yes` alone is not that consent.
-    let pinned = alice_miner_core::alice_release::auto::pins(
-        &alice_miner_core::autoupdate::state_dir(),
-    )
-    .iter()
-    .any(|p| p == &manifest.version);
-    if pinned {
-        println!(
-            "  {}",
-            tr!(
-                format!(
-                    "note: this machine installed v{} before and rolled it back automatically.",
-                    manifest.version
-                ),
-                format!(
-                    "提示:本机曾安装过 v{} 并自动回滚。",
-                    manifest.version
-                )
-            )
-        );
-        if !confirm_apply_pinned(&manifest.version) {
-            println!("{}", tr!("Update cancelled.", "已取消更新。"));
-            return EXIT_OK;
+    match &check.outcome {
+        alice_miner_core::autoupdate::ManualOutcome::Refuse { message } => {
+            eprintln!("error: {message}");
+            return EXIT_RUNTIME;
         }
+        alice_miner_core::autoupdate::ManualOutcome::Confirm { message } => {
+            println!("  {} {message}", tr!("note:", "提示:"));
+            if !confirm_apply_pinned(&manifest.version) {
+                println!("{}", tr!("Update cancelled.", "已取消更新。"));
+                return EXIT_OK;
+            }
+        }
+        alice_miner_core::autoupdate::ManualOutcome::Proceed => {}
     }
 
     let Some(artifact) = artifact else {
@@ -840,17 +824,10 @@ mod tests {
         });
     }
 
-    /// A manifest that WITHDRAWS its own newest version must be refused by the
-    /// manual path too — including under `--yes`.
-    ///
-    /// Revocation is the only switch we have for "we know this build is
-    /// harmful". A flag whose meaning is "stop asking me" must not quietly also
-    /// mean "ignore what we know", so this asserts the refusal happens BEFORE
-    /// the confirmation prompt and before any byte is downloaded.
-    #[test]
-    fn manual_apply_refuses_a_revoked_version_even_with_yes() {
-        set_lang(Lang::En);
-        let mut m = Manifest {
+    /// A manifest for a version newer than this build, with a package for this
+    /// platform. `sha` is what the server is offering for it.
+    fn newer_manifest(sha: &str) -> Manifest {
+        Manifest {
             schema: 1,
             product: release::PRODUCT.to_string(),
             version: "9.9.9".to_string(),
@@ -860,25 +837,151 @@ mod tests {
             artifacts: vec![Artifact {
                 platform: release::current_platform().to_string(),
                 url: "https://example.invalid/pkg.tar.gz".to_string(),
-                sha256: "00".repeat(32),
+                sha256: sha.to_string(),
                 size: 1,
             }],
             rollout_pct: None,
             soak_hours: None,
-            revoked: vec!["9.9.9".to_string()],
+            revoked: Vec::new(),
             security: None,
-        };
-        let artifact = m.artifacts[0].clone();
-        assert_eq!(
-            apply_flow(&m, Some(&artifact), true, "0.6.7"),
-            EXIT_RUNTIME,
-            "a withdrawn version must not be installed by hand either"
-        );
-        // …and the same manifest without the revocation is NOT refused here (it
-        // proceeds to the download, which this offline test does not follow):
-        // the point is that the refusal is the revocation and nothing else.
-        m.revoked.clear();
-        assert!(!m.is_revoked(&m.version));
+        }
+    }
+
+    /// A manifest that WITHDRAWS its own newest version must be refused by the
+    /// manual path too — including under `--yes`.
+    ///
+    /// Revocation is the only switch we have for "we know this build is
+    /// harmful". A flag whose meaning is "stop asking me" must not quietly also
+    /// mean "ignore what we know", so this asserts the refusal happens BEFORE
+    /// the confirmation prompt and before any byte is downloaded.
+    #[test]
+    fn manual_apply_refuses_a_revoked_version_even_with_yes() {
+        with_temp_dir(|| {
+            set_lang(Lang::En);
+            let mut m = newer_manifest(&"00".repeat(32));
+            m.revoked = vec!["9.9.9".to_string()];
+            let artifact = m.artifacts[0].clone();
+            assert_eq!(
+                apply_flow(&m, Some(&artifact), true, "0.6.7"),
+                EXIT_RUNTIME,
+                "a withdrawn version must not be installed by hand either"
+            );
+            // …and the same manifest without the revocation is NOT refused here (it
+            // proceeds to the download, which this offline test does not follow):
+            // the point is that the refusal is the revocation and nothing else.
+            m.revoked.clear();
+            assert!(!m.is_revoked(&m.version));
+        });
+    }
+
+    /// F1 — the headline defect. The AUTOMATIC path refuses a version whose
+    /// bytes changed under a fixed version number; the manual path installed it,
+    /// which made `alice-miner update` the front door around the guardrail.
+    ///
+    /// The discriminator matters here, so it is worth stating rather than
+    /// assumed. `apply_flow` returns an exit code, and BOTH "the gate refused"
+    /// and "the download failed" are `EXIT_RUNTIME` — so asserting `EXIT_RUNTIME`
+    /// under `--yes` and stopping there would pass just as happily with the
+    /// entire gate deleted, because `https://example.invalid/` cannot be fetched
+    /// in a test either way. (It does: that exact assertion was written first,
+    /// and it survived deleting the guard.) Nor can the test fall back to the
+    /// no-`--yes` path, which reaches an interactive prompt and would block on a
+    /// developer's terminal.
+    ///
+    /// What pins it down is the gate's own local history line.
+    /// `manual-hash-conflict` is written by the refusal and by nothing else, so
+    /// its presence says the ledger was consulted and the version was refused on
+    /// it — and the clean-bytes control shows the marker is specific to the
+    /// conflict rather than to running the gate at all.
+    #[test]
+    fn yes_does_not_defeat_a_hash_conflict_on_the_manual_path() {
+        with_temp_dir(|| {
+            set_lang(Lang::En);
+            let dir = alice_miner_core::autoupdate::state_dir();
+            let hist = || {
+                std::fs::read_to_string(dir.join("update-history.jsonl")).unwrap_or_default()
+            };
+            // This machine first saw 9.9.9 carrying "bb…".
+            alice_miner_core::alice_release::auto::note_seen(&dir, "9.9.9", &"bb".repeat(32));
+
+            // The control: the SAME version, offering the bytes this machine
+            // actually recorded. It is not refused — it goes on to the download,
+            // which fails offline — and it leaves no conflict on the record.
+            let same = newer_manifest(&"bb".repeat(32));
+            apply_flow(&same, Some(&same.artifacts[0]), /* yes */ true, "0.6.7");
+            assert!(
+                !hist().contains("manual-hash-conflict"),
+                "matching bytes are not a conflict: {}",
+                hist()
+            );
+
+            // The server now offers "aa…" under the SAME version number.
+            let m = newer_manifest(&"aa".repeat(32));
+            assert_eq!(
+                apply_flow(&m, Some(&m.artifacts[0]), /* yes */ true, "0.6.7"),
+                EXIT_RUNTIME,
+                "`--yes` must not install a version whose bytes changed under it"
+            );
+            assert!(
+                hist().contains("manual-hash-conflict"),
+                "the ledger must be what stopped it, not a later download failure: {}",
+                hist()
+            );
+        });
+    }
+
+    /// …and the guardrails run BEFORE the rest of `apply_flow`, not somewhere
+    /// after it. This is the ordering proof, and it needs no network and no
+    /// terminal: with no package for this platform the ungated flow returns
+    /// `EXIT_OK` at the "download it yourself" branch, so a withdrawn version
+    /// reaching `EXIT_RUNTIME` can only be the gate having fired first.
+    #[test]
+    fn the_guardrails_run_before_the_rest_of_the_manual_flow() {
+        with_temp_dir(|| {
+            set_lang(Lang::En);
+            let mut m = newer_manifest(&"00".repeat(32));
+            m.artifacts[0].platform = "definitely-not-this-platform".to_string();
+
+            // Clean version, no package here → the download-it-yourself branch.
+            assert_eq!(apply_flow(&m, None, true, "0.6.7"), EXIT_OK);
+
+            // Withdrawn, everything else identical → refused before that branch.
+            m.revoked = vec!["9.9.9".to_string()];
+            assert_eq!(
+                apply_flow(&m, None, true, "0.6.7"),
+                EXIT_RUNTIME,
+                "the guardrails must be consulted before anything else in the flow"
+            );
+        });
+    }
+
+    /// The manual path must RECORD the sighting, not just read it. Before this,
+    /// nothing on the manual path ever wrote the seen ledger, so a version
+    /// installed by hand left no bytes on record for the next check to compare
+    /// against — the hash-conflict guard had nothing to guard with on exactly
+    /// the machines that update by hand.
+    #[test]
+    fn the_manual_path_records_what_it_was_offered() {
+        with_temp_dir(|| {
+            set_lang(Lang::En);
+            let dir = alice_miner_core::autoupdate::state_dir();
+            assert!(!dir.join("update-seen.json").exists());
+            let m = newer_manifest(&"cd".repeat(32));
+            let check = alice_miner_core::autoupdate::manual_check(&m, Some(&m.artifacts[0]));
+            assert_eq!(
+                check.outcome,
+                alice_miner_core::autoupdate::ManualOutcome::Proceed,
+                "a clean version is not blocked just because it is new"
+            );
+            assert!(
+                dir.join("update-seen.json").exists(),
+                "the manual path must write the seen ledger"
+            );
+            // And it says how long the version has been visible, so the person
+            // choosing has the same fact the automatic path decides on.
+            let v = check.visibility.expect("a visibility line");
+            assert!(v.contains("9.9.9") && v.contains("less than a minute"), "{v}");
+        });
     }
 
     /// `quiet=true` (the `--json` / machine paths) is also a no-op.

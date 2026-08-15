@@ -237,6 +237,40 @@ pub enum Hold {
     HashConflict { seen_sha256: String, now_sha256: String },
 }
 
+/// A version newer than the one we are running, together with the only fact
+/// about it that this machine can actually vouch for: how long it has been able
+/// to SEE it.
+///
+/// This exists because of what a withdrawal notice is capable of. An attacker
+/// holding the release key can publish a malicious version and revoke every
+/// legitimate one, and the withdrawal message then goes out on every machine in
+/// the fleet carrying our voice. If that message says "install the new one now",
+/// the soak window — the single guardrail that costs an attacker real time — is
+/// gone, not because it was bypassed but because we talked the user out of it.
+/// So the notice carries the visibility instead of an instruction, and a caller
+/// that renders it has the facts to say "this has been public for two hours"
+/// rather than "install it".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewerRelease {
+    pub version: String,
+    /// Seconds since THIS machine first saw this version (the same local,
+    /// tamper-proof clock the soak window is anchored on).
+    pub visible_for_s: u64,
+}
+
+impl NewerRelease {
+    /// Whether this version is still inside the client's soak floor — i.e.
+    /// whether the automatic path would refuse to install it right now.
+    pub fn inside_soak(&self) -> bool {
+        self.visible_for_s < SOAK_FLOOR.as_secs()
+    }
+
+    /// Whole hours of visibility, rounded down; the unit a human notice uses.
+    pub fn visible_hours(&self) -> u64 {
+        self.visible_for_s / 3600
+    }
+}
+
 /// What the caller should do after a check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -247,8 +281,21 @@ pub enum Decision {
     /// Do not install; tell the user a newer version exists and why we held.
     Notify { version: String, hold: Hold },
     /// The version we are RUNNING has been withdrawn by the publisher.
+    ///
+    /// `newer` is the version the manifest offers to move to, if there is one
+    /// that is both strictly newer AND not itself withdrawn. It is `None` in the
+    /// most ordinary withdrawal there is — "we shipped it, it is bad, we pulled
+    /// it" — where the withdrawn build IS the newest published version and there
+    /// is nowhere forward to go. Callers must render that case differently:
+    /// telling someone to install the version they are already running and have
+    /// just been told is broken is not a recovery instruction, it is noise.
+    ///
     /// `rollback_available` says whether a last-known-good copy is on disk.
-    CurrentRevoked { current: String, latest: String, rollback_available: bool },
+    CurrentRevoked {
+        current: String,
+        newer: Option<NewerRelease>,
+        rollback_available: bool,
+    },
 }
 
 /// Everything [`decide`] needs, all of it already fetched/verified/read by the
@@ -280,9 +327,22 @@ pub fn decide(input: &Input<'_>) -> Decision {
     // 1. Is the build we are RUNNING withdrawn? This outranks everything: a
     //    revoked build is one we have said out loud should not be running.
     if m.is_revoked(input.current) {
+        // Where there is somewhere forward to go, say where AND how long this
+        // machine has been able to see it — never "install it now". A version
+        // that is itself withdrawn is not somewhere to go, and neither is the
+        // version we are already running (the `latest == current` case, which is
+        // what an ordinary "we pulled the release we just shipped" looks like).
+        let newer = if crate::is_newer(&m.version, input.current) && !m.is_revoked(&m.version) {
+            Some(NewerRelease {
+                version: m.version.clone(),
+                visible_for_s: input.now_unix.saturating_sub(input.first_seen_unix),
+            })
+        } else {
+            None
+        };
         return Decision::CurrentRevoked {
             current: input.current.to_string(),
-            latest: m.version.clone(),
+            newer,
             rollback_available: input.lkg_present,
         };
     }
@@ -347,6 +407,129 @@ pub fn decide(input: &Input<'_>) -> Decision {
         artifact,
         security: m.is_security(),
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// The MANUAL path (pure)
+//
+// `decide` above answers "may this machine install this WITHOUT being asked".
+// The manual path asks a different question and must not reuse that answer: a
+// soak hold, a rollout slice and a mode setting are all statements about how
+// eager the machine is allowed to be, and a human typing `alice-miner update` has
+// overridden all three on purpose. That is what manual means.
+//
+// But three of the checks in `decide` are not about eagerness at all. They are
+// statements about the ARTIFACT — "the publisher withdrew this", "the bytes
+// behind this version number changed", "this exact build already failed here" —
+// and those do not become less true because a human typed a command. Until now
+// they lived only on the automatic path, which made `alice-miner update` the
+// front door around every one of them: a re-published version was refused
+// automatically and installed manually.
+//
+// So the manual path gets its own pure gate. It is deliberately NARROWER than
+// `decide` (no soak, no rollout, no mode) and it never widens it.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Everything [`decide_manual`] needs. Pure in, pure out, like [`Input`].
+#[derive(Debug, Clone)]
+pub struct ManualInput<'a> {
+    pub manifest: &'a Manifest,
+    /// The sha256 of the artifact we are about to install, if this platform has
+    /// one. `None` means there is nothing to install here (manual download), and
+    /// there is correspondingly nothing to compare against the ledger.
+    pub artifact_sha256: Option<&'a str>,
+    /// The sha256 this machine recorded the FIRST time it saw this version.
+    pub seen_sha256: Option<&'a str>,
+    /// Versions that failed a health probation here.
+    pub pinned: &'a [String],
+}
+
+/// A refusal on the manual path. These are not negotiable by a "don't ask me"
+/// flag: `--yes` means "stop asking me questions", and it must never quietly
+/// also mean "ignore what we already know".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualRefusal {
+    /// The version this machine first saw carrying one package is now being
+    /// offered as a DIFFERENT package under the same version number.
+    ///
+    /// There is no override for this, by design. Every other guardrail here has
+    /// a human escape hatch because a human can have context we do not. This one
+    /// does not, because the evidence is the machine's own append-only ledger —
+    /// the one input in the whole update path that a stolen key cannot rewrite —
+    /// and "install it anyway" is never the right answer to it. The remedy is a
+    /// new version number, not a louder click.
+    HashConflict { seen_sha256: String, now_sha256: String },
+    /// The publisher has withdrawn this version.
+    Revoked,
+}
+
+/// A concern that does not refuse the install but must be raised, in its own
+/// right, before it happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualConcern {
+    /// This machine installed this exact version before and rolled it back.
+    /// The user may still choose it — their machine, their call — but it is a
+    /// decision they get to make knowingly, and a `--yes` on the command line is
+    /// not that decision.
+    Pinned,
+}
+
+/// What the manual path may do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualVerdict {
+    /// Nothing we know stands in the way. The caller's ordinary confirmation
+    /// (or `--yes`) is enough.
+    Proceed,
+    /// Do not install. Not with `--yes`, not with a click.
+    Refuse(ManualRefusal),
+    /// Install only after a SEPARATE, explicit, interactive confirmation that
+    /// names the concern. Never satisfied by `--yes`.
+    ConfirmFirst(ManualConcern),
+}
+
+/// The manual-path gate, as one pure function.
+///
+/// Ordering is deliberate. The hash conflict comes first because it is the only
+/// finding here that rests on evidence the publisher cannot restate: the local
+/// ledger. Revocation and the pin are both claims made elsewhere — one by the
+/// manifest (attacker-controlled under key compromise), one by this machine's
+/// own past — and if two findings apply at once, the one the user most needs to
+/// read is the one nobody upstream could have written.
+pub fn decide_manual(input: &ManualInput<'_>) -> ManualVerdict {
+    let m = input.manifest;
+
+    if let (Some(seen), Some(now)) = (input.seen_sha256, input.artifact_sha256) {
+        if !seen.eq_ignore_ascii_case(now) {
+            return ManualVerdict::Refuse(ManualRefusal::HashConflict {
+                seen_sha256: seen.to_string(),
+                now_sha256: now.to_string(),
+            });
+        }
+    }
+    if m.is_revoked(&m.version) {
+        return ManualVerdict::Refuse(ManualRefusal::Revoked);
+    }
+    if input.pinned.iter().any(|p| p == &m.version) {
+        return ManualVerdict::ConfirmFirst(ManualConcern::Pinned);
+    }
+    ManualVerdict::Proceed
+}
+
+/// How long a version has been visible to this machine, in seconds. Saturating,
+/// so a clock that went backwards reads as "just seen" rather than as an
+/// enormous, install-clearing age.
+pub fn visible_for(now_unix: u64, first_seen_unix: u64) -> u64 {
+    now_unix.saturating_sub(first_seen_unix)
+}
+
+/// Whether that visibility is still inside the client's soak floor — i.e.
+/// whether the automatic path would decline to install it right now.
+///
+/// The manual path does NOT gate on this. It reports it: a human who asks for a
+/// version minutes after it appeared is allowed to have it, and is entitled to
+/// know they are the one taking the first look.
+pub fn inside_soak(visible_for_s: u64) -> bool {
+    visible_for_s < SOAK_FLOOR.as_secs()
 }
 
 /// This machine's stable 0..99 bucket for a given version. Deterministic (the
@@ -1060,7 +1243,10 @@ mod tests {
             d,
             Decision::CurrentRevoked {
                 current: "0.6.7".into(),
-                latest: "0.6.8".into(),
+                newer: Some(NewerRelease {
+                    version: "0.6.8".into(),
+                    visible_for_s: 10 * 24 * 3600,
+                }),
                 rollback_available: true,
             }
         );
@@ -1068,6 +1254,173 @@ mod tests {
         let mut m2 = manifest("0.6.7");
         m2.revoked = vec!["0.6.7".into()];
         assert!(matches!(decide(&input(&m2, &[])), Decision::CurrentRevoked { .. }));
+    }
+
+    /// F2b — the ORDINARY withdrawal: we shipped v0.6.9, it is bad, we withdrew
+    /// it. The withdrawn build IS the newest published version, so there is
+    /// nowhere forward to go and the notice must not pretend otherwise. The old
+    /// shape carried `latest = m.version`, which read as "v0.6.9 has been
+    /// withdrawn, please install v0.6.9" on what is by far the most common
+    /// withdrawal there is.
+    #[test]
+    fn withdrawing_the_newest_version_offers_nowhere_to_go() {
+        let mut m = manifest("0.6.9");
+        m.revoked = vec!["0.6.9".into()];
+        let mut i = input(&m, &[]);
+        i.current = "0.6.9";
+        match decide(&i) {
+            Decision::CurrentRevoked { current, newer, .. } => {
+                assert_eq!(current, "0.6.9");
+                assert_eq!(newer, None, "the withdrawn build must never be its own remedy");
+            }
+            other => panic!("expected CurrentRevoked, got {other:?}"),
+        }
+    }
+
+    /// A newer version that is ITSELF withdrawn is not somewhere to go either —
+    /// "revoke everything" must not resolve to "so install this other revoked
+    /// thing".
+    #[test]
+    fn a_revoked_successor_is_not_offered_as_a_destination() {
+        let mut m = manifest("0.6.8");
+        m.revoked = vec!["0.6.7".into(), "0.6.8".into()];
+        match decide(&input(&m, &[])) {
+            Decision::CurrentRevoked { newer, .. } => assert_eq!(newer, None),
+            other => panic!("expected CurrentRevoked, got {other:?}"),
+        }
+    }
+
+    /// F2 — the withdrawal notice carries the successor's LOCAL visibility, so a
+    /// caller can say "this has been public for two hours" instead of "install it
+    /// now". Without this the notice is a social-engineering channel: a stolen
+    /// key revokes every good version and every machine in the fleet reads an
+    /// urgent, correctly-signed instruction to take the attacker's build inside
+    /// the soak window.
+    #[test]
+    fn a_withdrawal_reports_how_long_the_successor_has_been_visible() {
+        let mut m = manifest("9.9.9");
+        m.revoked = vec!["0.6.7".into()];
+        let mut i = input(&m, &[]);
+        i.first_seen_unix = i.now_unix - 2 * 3600; // seen two hours ago
+        match decide(&i) {
+            Decision::CurrentRevoked { newer: Some(n), .. } => {
+                assert_eq!(n.version, "9.9.9");
+                assert_eq!(n.visible_for_s, 2 * 3600);
+                assert_eq!(n.visible_hours(), 2);
+                assert!(n.inside_soak(), "two hours is inside the 24h floor");
+            }
+            other => panic!("expected a successor, got {other:?}"),
+        }
+        // …and past the floor it reads the other way.
+        i.first_seen_unix = i.now_unix - SOAK_FLOOR.as_secs();
+        match decide(&i) {
+            Decision::CurrentRevoked { newer: Some(n), .. } => assert!(!n.inside_soak()),
+            other => panic!("expected a successor, got {other:?}"),
+        }
+    }
+
+    // ── the manual path ─────────────────────────────────────────────────────
+
+    fn manual<'a>(m: &'a Manifest, pins: &'a [String]) -> ManualInput<'a> {
+        ManualInput {
+            manifest: m,
+            artifact_sha256: Some(&m.artifacts[0].sha256),
+            seen_sha256: None,
+            pinned: pins,
+        }
+    }
+
+    /// F1 — the core of it. The automatic path refuses a version whose bytes
+    /// changed under a fixed version number; the manual path used to install it.
+    #[test]
+    fn manual_refuses_the_same_version_with_different_bytes() {
+        let m = manifest("0.6.8");
+        let seen = "bb".repeat(32);
+        let mut i = manual(&m, &[]);
+        i.seen_sha256 = Some(&seen);
+        match decide_manual(&i) {
+            ManualVerdict::Refuse(ManualRefusal::HashConflict { seen_sha256, now_sha256 }) => {
+                assert_eq!(seen_sha256, seen);
+                assert_eq!(now_sha256, "aa".repeat(32));
+            }
+            other => panic!("expected a hash-conflict refusal, got {other:?}"),
+        }
+        // Matching bytes are fine, case-insensitively — the ledger lower-cases
+        // what it stores and a manifest may not.
+        let up = "AA".repeat(32);
+        i.seen_sha256 = Some(&up);
+        assert_eq!(decide_manual(&i), ManualVerdict::Proceed);
+    }
+
+    /// The hash conflict outranks the other findings: it is the only one whose
+    /// evidence a stolen key cannot restate.
+    #[test]
+    fn a_hash_conflict_outranks_a_revocation_and_a_pin() {
+        let mut m = manifest("0.6.8");
+        m.revoked = vec!["0.6.8".into()];
+        let seen = "bb".repeat(32);
+        let pins = vec!["0.6.8".to_string()];
+        let mut i = manual(&m, &pins);
+        i.seen_sha256 = Some(&seen);
+        assert!(matches!(
+            decide_manual(&i),
+            ManualVerdict::Refuse(ManualRefusal::HashConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn manual_refuses_a_withdrawn_version_and_double_checks_a_pinned_one() {
+        let mut m = manifest("0.6.8");
+        m.revoked = vec!["0.6.8".into()];
+        assert_eq!(
+            decide_manual(&manual(&m, &[])),
+            ManualVerdict::Refuse(ManualRefusal::Revoked)
+        );
+
+        let clean = manifest("0.6.8");
+        let pins = vec!["0.6.8".to_string()];
+        assert_eq!(
+            decide_manual(&manual(&clean, &pins)),
+            ManualVerdict::ConfirmFirst(ManualConcern::Pinned)
+        );
+        assert_eq!(decide_manual(&manual(&clean, &[])), ManualVerdict::Proceed);
+    }
+
+    /// The manual gate is NARROWER than the automatic one on purpose: soak,
+    /// rollout and mode are statements about how eager the machine may be, and a
+    /// human typing the command has answered all three. A manual path that also
+    /// enforced the soak would not be a manual path.
+    #[test]
+    fn manual_does_not_inherit_the_soak_the_rollout_or_the_mode() {
+        let mut m = manifest("0.6.8");
+        m.soak_hours = Some(72);
+        m.rollout_pct = Some(0);
+        // The automatic path holds this hard…
+        let mut i = input(&m, &[]);
+        i.first_seen_unix = i.now_unix;
+        assert!(matches!(decide(&i), Decision::Notify { hold: Hold::Soaking { .. }, .. }));
+        // …and the manual path lets a human have it, while reporting that they
+        // are the one taking the first look.
+        assert_eq!(decide_manual(&manual(&m, &[])), ManualVerdict::Proceed);
+        assert!(inside_soak(visible_for(1_000, 1_000)));
+        assert!(!inside_soak(SOAK_FLOOR.as_secs()));
+        // A clock that went backwards reads as "just seen", never as "ancient".
+        assert_eq!(visible_for(10, 1_000), 0);
+    }
+
+    /// With no artifact for this platform there are no bytes to compare, and the
+    /// gate must not invent a conflict out of the absence.
+    #[test]
+    fn manual_without_a_platform_artifact_finds_no_conflict() {
+        let m = manifest("0.6.8");
+        let seen = "bb".repeat(32);
+        let i = ManualInput {
+            manifest: &m,
+            artifact_sha256: None,
+            seen_sha256: Some(&seen),
+            pinned: &[],
+        };
+        assert_eq!(decide_manual(&i), ManualVerdict::Proceed);
     }
 
     #[test]
