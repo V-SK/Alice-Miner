@@ -83,6 +83,13 @@
 //!     window RE-MEASURING a halted lane. The engine is running and the halt flag is
 //!     off (it must be, or the probe's own child could not start), so this session
 //!     looks exactly like an ordinary miner earning nothing — and it is not one.
+//!   * [`SessionEvidence::AcceptanceUndecided`] — the guard is mining the lane
+//!     normally and has reached NO verdict about it (warm-up, an incomplete period,
+//!     or an engine that cannot report rejections). Its zero is unmeasured, not
+//!     measured-as-bad. This is the case the two above do not cover: they are states
+//!     the guard only enters AFTER it has concluded something, and concluding takes
+//!     ten minutes and twenty submissions — hours on a slow rig, forever on a lane
+//!     that submits nothing — while two 20-minute sessions roll a build back.
 //!   * [`SessionEvidence::NetworkWide`] — the network-wide lane health says every
 //!     miner on this lane is being rejected. Blaming the local build for a
 //!     network-wide failure is never correct.
@@ -1277,6 +1284,19 @@ pub enum SessionEvidence {
     /// history log is the only place anybody will ever see which of the two spared a
     /// build its rollback.
     AcceptanceProbe,
+    /// The acceptance guard is mining this lane normally and has NOT reached a
+    /// verdict about it: it is still inside its warm-up, still gathering a period
+    /// that has reached neither its window nor its sample floor, or driving an
+    /// engine that cannot report pool rejections at all.
+    ///
+    /// The guard's own rule is that a lane it has not measured is `Unknown`, never
+    /// 0%. This is that rule applied one layer up: a zero-accepted session on a lane
+    /// nobody has judged is UNMEASURED, not measured-as-broken, and the build must
+    /// not be uninstalled over it. It bites hardest exactly where the guard is
+    /// slowest — a rig submitting under ~1 share/min needs hours to complete a
+    /// period, and one whose relay is unreachable never completes one at all, while
+    /// two 20-minute sessions are enough to roll a build back and pin it forever.
+    AcceptanceUndecided,
     /// The network-wide lane health says every miner on this lane is being
     /// rejected right now. The local build cannot be the cause.
     NetworkWide,
@@ -1294,6 +1314,7 @@ impl SessionEvidence {
             SessionEvidence::Judgeable => "judgeable",
             SessionEvidence::MiningHalted => "mining-halted",
             SessionEvidence::AcceptanceProbe => "acceptance-probe",
+            SessionEvidence::AcceptanceUndecided => "acceptance-undecided",
             SessionEvidence::NetworkWide => "network-wide",
         }
     }
@@ -2597,6 +2618,7 @@ mod tests {
         for reason in [
             SessionEvidence::MiningHalted,
             SessionEvidence::AcceptanceProbe,
+            SessionEvidence::AcceptanceUndecided,
             SessionEvidence::NetworkWide,
         ] {
             // Even WITH accepted shares on the clock: a session layer 3 disqualified
@@ -2686,6 +2708,7 @@ mod tests {
         for reason in [
             SessionEvidence::MiningHalted,
             SessionEvidence::AcceptanceProbe,
+            SessionEvidence::AcceptanceUndecided,
             SessionEvidence::NetworkWide,
         ] {
             assert!(

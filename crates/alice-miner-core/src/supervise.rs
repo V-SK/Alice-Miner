@@ -44,7 +44,7 @@ use crate::acceptance::{
 use crate::endpoint::{Endpoint, EndpointPlan};
 use crate::lane::Lane;
 use crate::stats::parse_kawpow;
-use crate::stats::parse_srbminer;
+use crate::stats::{parse_srbminer, SrbScope};
 use crate::stats::{parse_generic, ParserKind};
 
 /// Grace period for a graceful miner stop before SIGKILL (verbatim from Wallet).
@@ -363,6 +363,10 @@ pub struct LaneStats {
     /// start) and is still not evidence about the installed build. Anything that
     /// reasons about "did this lane earn on its own account" must read THIS, not
     /// `halted` — see [`GuardCustody`].
+    ///
+    /// It answers who OWNS the lane, and only that. Whether the guard has reached a
+    /// VERDICT about it is [`Self::acceptance`]'s answer, and a zero-accepted stretch
+    /// needs both before it means anything — see [`lane_activity`].
     pub activity: GuardCustody,
 }
 
@@ -565,6 +569,17 @@ struct Inner {
     /// directly.
     generic_accepted_pending: Option<u64>,
     generic_rejected_pending: Option<u64>,
+
+    /// SRBMiner only: whether an AGGREGATE (`Total:`) status line carrying real
+    /// figures has been seen during this run ([`crate::stats::SrbScope`]).
+    ///
+    /// One-way within a run, and that is the whole safety property: until it is set,
+    /// a per-card `GPU<n>` line's rate and counts are used (so a rig that never
+    /// prints an aggregate is not blind — it would otherwise read `0 H/s · 0A/0R`
+    /// forever and false-trip the no-progress watchdog, which is exactly the
+    /// 2026-08-14 bug); once it is set, per-card figures can never move the totals
+    /// again, so the downward flap this exists to prevent cannot come back.
+    srb_aggregate_seen: bool,
 
     // ── Layer 3: acceptance-rate collapse self-protection ───────────────────────
     /// Watches the dimension nothing else watched: whether the pool is ACCEPTING
@@ -779,6 +794,7 @@ impl LaneSupervisor {
                 pending_good_region: None,
                 generic_accepted_pending: None,
                 generic_rejected_pending: None,
+                srb_aggregate_seen: false,
                 // Keyed on the PARSER, not the lane: only the parser knows whether the
                 // engine actually reports pool rejections (a custom miner breaks the
                 // lane→format mapping, and alpha-miner reports submissions, not accepts).
@@ -1028,8 +1044,9 @@ impl LaneSupervisor {
         }
         match cause {
             // The user has dealt with it (or has decided to pay for the power anyway).
-            // Either way it is his rig: everything goes, including the ladder.
-            StartCause::User => self.clear_halt_state(),
+            // Either way it is his rig: everything goes, including the ladder — but
+            // only once an engine is actually running. See [`Self::start_by_user`].
+            StartCause::User => return self.start_by_user(program, args),
             // Nobody acted — a service manager relaunched us. Honor the halt.
             StartCause::Automatic => match self.adopt_persisted_halt(&program, &args) {
                 // Still cooling down: the engine is NOT spawned. The lane publishes the
@@ -1043,21 +1060,102 @@ impl LaneSupervisor {
         self.spawn_run(program, args, RunKind::Fresh)
     }
 
-    /// Forget the acceptance halt entirely — in memory AND on disk. A user Start is
-    /// the only caller: it is the one action that means "I know, I've dealt with it".
-    fn clear_halt_state(&self) {
-        {
-            let mut g = self.inner.lock().expect("mutex");
-            g.halted = false;
-            g.halt_probes = 0;
-            g.halt_record = None;
-            g.halt_probe_at = None;
-            g.pending_halt_clear = false;
-            // Any pending re-probe countdown is bound to the retry token; bumping it
-            // makes that task a no-op the moment it next looks.
-            g.retry_token = g.retry_token.wrapping_add(1);
+    /// A person pressed Start. Clear the halt, the ladder and the persisted record —
+    /// and do it in the one order that cannot lie.
+    ///
+    /// A user Start clearing everything is right, and it happens IMMEDIATELY: the
+    /// in-memory clear is [`Self::spawn_run`]'s own [`RunKind::Fresh`] step, taken
+    /// under the same lock that starts the run. What must NOT happen immediately is
+    /// the DESTRUCTION of the evidence when there turns out to be nothing running.
+    ///
+    /// A Start can fail: the engine binary is gone, was quarantined by an antivirus,
+    /// lost its execute bit, or the OS refuses another process. The old order cleared
+    /// the halt, the ladder, the on-disk record and the armed re-probe first and only
+    /// then tried to spawn — so a Start that failed left a dead lane reporting
+    /// [`GuardCustody::Mining`] with the reason it was idle deleted: the state said "a
+    /// human took responsibility for this lane and it is mining" when nothing was
+    /// mining, nothing would restart it, and nothing was left to explain why. The same
+    /// lie the acceptance guard exists to stop, told about the guard itself.
+    ///
+    /// So the file is unlinked only on success, and a failed Start puts the lane back
+    /// where it was — halted, with its evidence and its rung — as though the Start had
+    /// never been attempted.
+    fn start_by_user(
+        &self,
+        program: std::path::PathBuf,
+        args: Vec<String>,
+    ) -> Result<(), String> {
+        let held = self.held_halt();
+        match self.spawn_run(program, args, RunKind::Fresh) {
+            Ok(()) => {
+                // The engine is up. NOW the halt is really over: drop the file too, and
+                // the staged "a healthy period cleared it" flag the run no longer needs.
+                self.inner.lock().expect("mutex").pending_halt_clear = false;
+                acceptance::clear_halt_record(self.lane);
+                Ok(())
+            }
+            Err(e) => {
+                self.restore_halt_after_failed_start(held);
+                Err(e)
+            }
         }
-        acceptance::clear_halt_record(self.lane);
+    }
+
+    /// Snapshot the guard's hold on this lane WITHOUT disturbing it. `None` when there
+    /// is nothing to hold — i.e. exactly when [`lane_activity`] would say `Mining`.
+    fn held_halt(&self) -> Option<HeldHalt> {
+        let g = self.inner.lock().expect("mutex");
+        (lane_activity(&g) != GuardCustody::Mining).then(|| HeldHalt {
+            halted: g.halted,
+            probes: g.halt_probes,
+            record: g.halt_record.clone(),
+            probe_at: g.halt_probe_at,
+        })
+    }
+
+    /// Put back what [`Self::start_by_user`] was about to retire, after the Start it
+    /// was retiring it for did not happen.
+    ///
+    /// The persisted record was never unlinked, so this only has to restore memory and
+    /// re-publish — and it re-arms the countdown on the deadline the halt ALREADY had,
+    /// not a fresh rung, because a failed Start is not a re-probe and must not buy the
+    /// pool another six hours of grace. A halt whose countdown a user Stop had already
+    /// cancelled (`probe_at: None`) stays cancelled.
+    fn restore_halt_after_failed_start(&self, held: Option<HeldHalt>) {
+        let Some(held) = held else {
+            return;
+        };
+        let armed = {
+            let mut g = self.inner.lock().expect("mutex");
+            g.halted = held.halted;
+            g.halt_probes = held.probes;
+            g.halt_record = held.record;
+            g.halt_probe_at = held.probe_at;
+            if g.state.is_active() {
+                // `spawn_run` refused the Start because a run — very possibly the
+                // guard's own re-probe — already owns the lane, and refused it without
+                // touching a thing. The custody fields above are back; that run's
+                // status is its own and must not be overwritten with a halt line.
+                return;
+            }
+            if !held.halted {
+                return; // a spent rung, no halt: nothing to publish and nothing to arm
+            }
+            g.state = ProcState::Error;
+            let remaining = held
+                .probe_at
+                .map(|t| t.saturating_duration_since(Instant::now()));
+            g.retry_token = g.retry_token.wrapping_add(1);
+            if let Some(rec) = g.halt_record.clone() {
+                let collapse = rec.collapse();
+                let attribution = rec.attribution();
+                set_halt_status_locked(&mut g, &collapse, attribution, remaining);
+            }
+            remaining.map(|d| (g.generation, g.retry_token, d))
+        };
+        if let Some((gen, token, wait)) = armed {
+            self.spawn_halt_probe_task(gen, token, wait);
+        }
     }
 
     /// Read this lane's persisted halt and decide what an AUTOMATIC start may do.
@@ -1411,6 +1509,14 @@ impl LaneSupervisor {
             // belonged to the previous child's output stream (see `fold_cumulative`).
             g.generic_accepted_pending = None;
             g.generic_rejected_pending = None;
+            // The SRBMiner aggregate latch belongs to the RUN, not the child: a
+            // failover keeps it (so per-card lines stay ignored across the seam,
+            // where a re-learn would open a fresh window for the flap), and a fresh
+            // start or a re-probe drops it along with the counters — that start may
+            // be a different engine entirely on a bring-your-own lane.
+            if kind.resets_counters() {
+                g.srb_aggregate_seen = false;
+            }
             g.progress_accepted = g.accepted;
             g.progress_submissions = g.accepted.saturating_add(g.rejected);
             g.last_line.clear();
@@ -2460,7 +2566,19 @@ fn set_halt_status_locked(
 /// it, which is exactly what an unspent rung (`halt_probes > 0`) or a live halt record
 /// says, and both are retired by the only two things that legitimately hand the lane
 /// back — a MEASURED healthy period (`apply_log_line`) or a user Start
-/// (`clear_halt_state`). Those retirements are why this cannot get stuck abstaining.
+/// (`LaneSupervisor::start_by_user`). Those retirements are why this cannot get stuck
+/// abstaining.
+///
+/// **This is only half of what layer 2 needs, and the half that is about CUSTODY.**
+/// Every state here presupposes that the guard has already concluded something — a
+/// halt exists, or a rung has been spent on one. Reaching a conclusion takes a full
+/// window AND twenty submissions, which is hours on a slow rig and never on a lane
+/// that submits nothing, so this function correctly answers `Mining` for the whole of
+/// that gap. Whether the guard has an OPINION about the lane is a different question,
+/// answered by the acceptance verdict itself
+/// ([`crate::acceptance::LaneVerdict::is_conclusive`]) and folded in one layer up, in
+/// [`crate::autoupdate::MiningEvidence`]. Do not try to encode it here: this value is
+/// published per lane, and a lane in warm-up is being mined, not held.
 fn lane_activity(g: &Inner) -> GuardCustody {
     if g.halted {
         GuardCustody::Halted
@@ -2476,6 +2594,20 @@ fn lane_activity(g: &Inner) -> GuardCustody {
 fn reprobe_wait(g: &Inner) -> Duration {
     g.reprobe_override
         .unwrap_or_else(|| acceptance::reprobe_delay(g.halt_probes))
+}
+
+/// The guard's hold on a lane, lifted out of the supervisor so a user Start that
+/// FAILS can put it back exactly as it was (see
+/// [`LaneSupervisor::restore_halt_after_failed_start`]). Deliberately the whole hold —
+/// the flag, the rung, the evidence and the armed deadline — because restoring three
+/// of the four would be its own quiet lie.
+struct HeldHalt {
+    halted: bool,
+    probes: u32,
+    record: Option<HaltRecord>,
+    /// The MONOTONIC deadline the re-probe was already counting down to, or `None`
+    /// when a user Stop had cancelled it.
+    probe_at: Option<Instant>,
 }
 
 /// What an AUTOMATIC start found on disk (see [`LaneSupervisor::adopt_persisted_halt`]).
@@ -3396,18 +3528,48 @@ fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
             // `parse_srbminer` is validated against a real pearlhash log: the TH/s
             // rate + the cumulative `[acc|rej|..]` bracket / `Shares acc./rej.`
             // summary (per-share event lines carry a latency, not a count → ignored).
-            if let Some(sample) = parse_srbminer(&line) {
-                if let Some(hr) = sample.hashrate_hs {
-                    g.hashrate_hs = Some(hr);
-                    note_hashrate_progress(g, hr);
+            //
+            // WHOSE numbers a line carries is the parser's [`SrbScope`]; what to do
+            // about it is decided here, because the decision needs the one thing a
+            // per-line parser cannot hold — whether an aggregate line has ever been
+            // seen (`srb_aggregate_seen`). An aggregate always wins; a per-card line
+            // is used only until one appears, and never after.
+            if let Some(parsed) = parse_srbminer(&line) {
+                let sample = parsed.sample;
+                let rig_wide = match parsed.scope {
+                    // `Total:` (3.5.x) and the rig-wide summary/average lines.
+                    SrbScope::Aggregate | SrbScope::Unscoped => true,
+                    // One card's share of the rig. On a single-card rig that IS the
+                    // rig, which is why it is the fallback rather than discarded.
+                    SrbScope::PerCard => !g.srb_aggregate_seen,
+                };
+                if rig_wide {
+                    if let Some(hr) = sample.hashrate_hs {
+                        g.hashrate_hs = Some(hr);
+                        note_hashrate_progress(g, hr);
+                    }
+                    if let Some(a) = sample.accepted {
+                        adopt_child_accepted(g, a);
+                        note_accepted_progress(g, g.accepted);
+                    }
+                    if let Some(r) = sample.rejected {
+                        adopt_child_rejected(g, r);
+                    }
                 }
-                if let Some(a) = sample.accepted {
-                    adopt_child_accepted(g, a);
-                    note_accepted_progress(g, g.accepted);
+                // Latch on an aggregate line we could actually READ. 3.4.x prints a
+                // `TOTAL:  283W` line that is watts and nothing else; latching on
+                // that would make a 3.4.x rig discard the per-GPU lines that carry
+                // all of its real numbers. (`parse_srbminer` already returns `None`
+                // for it — this is the belt to that brace.)
+                if parsed.scope == SrbScope::Aggregate
+                    && (sample.hashrate_hs.is_some()
+                        || sample.accepted.is_some()
+                        || sample.rejected.is_some())
+                {
+                    g.srb_aggregate_seen = true;
                 }
-                if let Some(r) = sample.rejected {
-                    adopt_child_rejected(g, r);
-                }
+                // Telemetry is NOT scoped: temp/power/fan are documented as the
+                // HOTTEST card's reading, so a per-card line is their right source.
                 apply_telemetry(g, &sample);
             }
         }
@@ -5557,6 +5719,137 @@ mod tests {
         assert_eq!(g.pending_good_region, None, "same region → no duplicate persist");
     }
 
+    // ── SRBMiner: whose numbers is this line carrying? ──────────────────────────
+
+    /// A two-card 3.5.x cycle. The aggregate `Total:` line owns both the rate and the
+    /// counts, and once it has been seen a per-card line can never move either again.
+    ///
+    /// The counts half shipped in v0.6.8; the RATE half did not, and the release notes
+    /// claimed the multi-GPU flap was fixed. It was half fixed: `hashrate_hs` was
+    /// last-line-wins, so a two-card rig displayed one card's rate whenever a per-card
+    /// line came last — under-reporting the rig by the number of cards.
+    #[test]
+    fn srbminer_aggregate_line_owns_the_rate_and_the_counts() {
+        let s = LaneSupervisor::new(Lane::GpuPrl);
+        let mut g = s.inner.lock().unwrap();
+        let srb = |g: &mut Inner, line: &str| apply_log_line(g, ParserKind::Srbminer, line);
+
+        // First status cycle: two cards, then the rig.
+        srb(&mut g, "[ts] GPU0 RTX 3060: 44.99 TH/s [T:71C FAN:63% P:169.9W EFF:0.265 CC:1672 MC:7301 A:3 R:0 HW:0]");
+        srb(&mut g, "[ts] GPU1 RTX 3060: 44.90 TH/s [T:66C FAN:60% P:168.0W EFF:0.265 CC:1672 MC:7301 A:5 R:1 HW:0]");
+        srb(&mut g, "[ts] Total: 89.89 TH/s [P:337.9W EFF:0.265 A:8 R:1 HW:0]");
+        assert_eq!(g.hashrate_hs, Some(89.89e12), "the rig's rate, not one card's");
+        assert_eq!((g.accepted, g.rejected), (8, 1));
+
+        // Second cycle: the per-card lines must now change NOTHING. This is the flap.
+        srb(&mut g, "[ts] GPU0 RTX 3060: 45.01 TH/s [T:71C FAN:63% P:169.9W EFF:0.265 CC:1672 MC:7301 A:4 R:0 HW:0]");
+        srb(&mut g, "[ts] GPU1 RTX 3060: 44.88 TH/s [T:66C FAN:60% P:168.0W EFF:0.265 CC:1672 MC:7301 A:6 R:1 HW:0]");
+        assert_eq!(g.hashrate_hs, Some(89.89e12), "a per-card rate must not halve the rig");
+        assert_eq!((g.accepted, g.rejected), (8, 1), "nor may a per-card count walk it down");
+        // …and telemetry still comes from the cards, where the hottest one lives.
+        assert_eq!(g.telem_temp_c, Some(66.0));
+
+        srb(&mut g, "[ts] Total: 89.95 TH/s [P:337.9W EFF:0.265 A:10 R:1 HW:0]");
+        assert_eq!(g.hashrate_hs, Some(89.95e12));
+        assert_eq!(g.accepted, 10);
+    }
+
+    /// The fallback, and the reason the aggregate rule is not simply "`Total:` or
+    /// nothing": the premise is UNVERIFIED — no multi-card 3.5.x capture exists
+    /// anywhere reachable, and SRBMiner's strings are encrypted so the format cannot
+    /// be checked statically. A rig that never prints an aggregate line must still be
+    /// readable, or it reports `0 H/s · 0A/0R` forever, the no-progress watchdog
+    /// restarts a healthy engine every ten minutes, and the acceptance guard is blind
+    /// to the lane on top of it — the whole 2026-08-14 failure, reintroduced.
+    #[test]
+    fn srbminer_falls_back_to_per_card_until_an_aggregate_line_appears() {
+        let s = LaneSupervisor::new(Lane::GpuPrl);
+        let mut g = s.inner.lock().unwrap();
+        let srb = |g: &mut Inner, line: &str| apply_log_line(g, ParserKind::Srbminer, line);
+
+        srb(&mut g, "[ts] GPU0 RTX 3060: 44.99 TH/s [T:71C FAN:63% P:169.9W EFF:0.265 CC:1672 MC:7301 A:3 R:0 HW:0]");
+        assert_eq!(g.hashrate_hs, Some(44.99e12), "one card is better than no reading");
+        assert_eq!((g.accepted, g.rejected), (3, 0));
+        srb(&mut g, "[ts] GPU0 RTX 3060: 45.02 TH/s [T:71C FAN:63% P:169.9W EFF:0.265 CC:1672 MC:7301 A:9 R:1 HW:0]");
+        assert_eq!(g.hashrate_hs, Some(45.02e12));
+        assert_eq!((g.accepted, g.rejected), (9, 1));
+        assert!(!g.srb_aggregate_seen);
+
+        // The moment one does appear it takes over — for good.
+        srb(&mut g, "[ts] Total: 89.95 TH/s [P:337.9W EFF:0.265 A:14 R:1 HW:0]");
+        assert!(g.srb_aggregate_seen);
+        assert_eq!(g.accepted, 14);
+        srb(&mut g, "[ts] GPU0 RTX 3060: 45.02 TH/s [T:71C FAN:63% P:169.9W EFF:0.265 CC:1672 MC:7301 A:9 R:1 HW:0]");
+        assert_eq!(g.accepted, 14, "the fallback is one-way; it cannot flap back");
+        assert_eq!(g.hashrate_hs, Some(89.95e12));
+    }
+
+    /// **3.4.x must be completely unaffected.** Its `TOTAL:` line is watts and nothing
+    /// else, and latching on it would make the client discard the per-GPU lines that
+    /// carry every real number a 3.4.x rig has — reading zero shares forever on a
+    /// bring-your-own-miner lane. The block below is verbatim from the real 12-hour
+    /// capture (`matrix_4070-narissa-2026-06-26.log`).
+    #[test]
+    fn srbminer_3_4_x_has_no_aggregate_line_and_keeps_reading_its_per_gpu_lines() {
+        let s = LaneSupervisor::new(Lane::GpuPrl);
+        let mut g = s.inner.lock().unwrap();
+        let srb = |g: &mut Inner, line: &str| apply_log_line(g, ParserKind::Srbminer, line);
+
+        for (rate, acc) in [("125.18", 33u64), ("125.33", 34), ("125.28", 35)] {
+            srb(&mut g, &format!(
+                "[2026-06-26 01:26:23] GPU2: {rate} TH/s        [     {acc}|    0|   0|  442.31 GH/W]"
+            ));
+            srb(&mut g, "[2026-06-26 01:26:23] GPU2: [T:  73c CC:  2610MHz MC:  10251MHz FAN:    68 P:  283W]");
+            srb(&mut g, "[2026-06-26 01:26:23] TOTAL:                                                    283W");
+            assert!(!g.srb_aggregate_seen, "a watts-only line is not an aggregate reading");
+            assert_eq!(g.accepted, acc, "the per-GPU bracket is still the source");
+        }
+        assert_eq!(g.hashrate_hs, Some(125.28e12));
+        // The rig-wide summary lines are unscoped and keep working exactly as before.
+        srb(&mut g, "[2026-06-26 01:25:18] Shares acc.  : 36");
+        assert_eq!(g.accepted, 36);
+    }
+
+    /// The latch belongs to the RUN: a failover keeps it (a re-learn would open a
+    /// fresh window for the flap at exactly the moment counters are being carried
+    /// across a seam), a fresh start drops it (that start may be a different engine
+    /// entirely on a bring-your-own lane).
+    #[test]
+    fn the_srbminer_aggregate_latch_survives_a_failover_and_not_a_fresh_start() {
+        let _env = spawn_env_guard();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::GpuPrl);
+            let (program, args) = idle_child();
+            s.start_simple(program.clone(), args.clone()).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+            {
+                let mut g = s.inner.lock().unwrap();
+                apply_log_line(
+                    &mut g,
+                    ParserKind::Srbminer,
+                    "[ts] Total: 89.89 TH/s [P:337.9W EFF:0.265 A:8 R:1 HW:0]",
+                );
+                assert!(g.srb_aggregate_seen);
+            }
+            s.spawn_run(program.clone(), args.clone(), RunKind::Failover)
+                .expect("failover relaunch");
+            assert!(
+                s.inner.lock().unwrap().srb_aggregate_seen,
+                "a failover keeps the run's knowledge of the log's shape"
+            );
+            s.request_stop();
+            assert!(wait_for(&s, 5, |st| !st.running).await);
+
+            s.start_simple(program, args).expect("fresh start");
+            assert!(
+                !s.inner.lock().unwrap().srb_aggregate_seen,
+                "a fresh start re-learns it — the engine may not even be the same one"
+            );
+            s.request_stop();
+        });
+    }
+
     /// The XMR/RVN relay host is NOT a region relay → nothing is recorded (a CPU-XMR
     /// run never writes a bogus last-good region).
     #[test]
@@ -6298,6 +6591,179 @@ mod tests {
         });
     }
 
+    /// **THE HOLE THE CUSTODY FIX DID NOT COVER: the window before the guard has
+    /// concluded anything at all.**
+    ///
+    /// `GuardCustody` can only report `Probing`/`Halted` once a halt EXISTS, and a
+    /// halt needs a completed period — ten minutes AND twenty submissions, both. A rig
+    /// submitting slower than about one share a minute takes hours to get there
+    /// (`acceptance` says so itself and calls it correct), and a lane whose relay is
+    /// unreachable — connected, hashing, submitting nothing — never gets there at all.
+    ///
+    /// Meanwhile `MIN_JUDGED_SESSION` is twenty minutes and `FAILED_SESSIONS_TO_ROLLBACK`
+    /// is two. So in the gap between "the pool is rejecting everything" and "the guard
+    /// can say so", custody honestly reported `Mining`, the session was `Judgeable`
+    /// with zero accepted, and two of them rolled the build back and pinned it
+    /// permanently. The network-wide backstop cannot intervene: `LaneHealth::attribute`
+    /// answers `Unknown`, never `NetworkWide`, for a figure drawn from fewer than two
+    /// miners, and PRL is a single-miner lane.
+    ///
+    /// This drives the real supervisor into that gap — warm, submitting, judged by
+    /// nobody — and asserts the probation abstains.
+    #[test]
+    fn a_lane_the_guard_has_not_judged_yet_is_not_evidence_against_the_build() {
+        use alice_release::auto::{
+            judge_session, Probation, SessionAction, SessionEvidence, SessionResult,
+        };
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::GpuPrl);
+            // A sample floor this rig will never reach inside a window — the shipped
+            // state machine, on the trickle it was written to protect.
+            s.set_acceptance_config(AcceptanceConfig {
+                warmup: Duration::from_millis(30),
+                min_window: Duration::from_millis(50),
+                min_submissions: 5_000,
+                ..fast_acceptance()
+            });
+            let (program, args) = idle_child();
+            s.start_simple(program, args).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await, "child up");
+
+            // The August shape at a trickle: everything rejected, nothing accepted,
+            // never enough samples for the guard to open its mouth.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            for i in 1..=12u64 {
+                feed(&s, &format!("net      rejected (0/{i}) diff 100 (10 ms)"));
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let st = s.stats();
+            assert_eq!(st.acceptance, "gathering", "the guard has reached no verdict: {st:?}");
+            assert!(!st.halted);
+            assert_eq!(
+                st.activity,
+                GuardCustody::Mining,
+                "and it honestly reports ordinary mining — custody cannot carry this case"
+            );
+            assert_eq!(st.accepted, 0, "with nothing to show for twelve submissions");
+
+            // What the front-ends feed the updater, through the shipped derivation.
+            let mining = crate::autoupdate::MiningEvidence::from_snapshot(&snapshot_of(&s));
+            assert!(mining.guard_undecided, "the unjudged verdict must reach layer 2");
+            assert!(
+                !crate::autoupdate::session_may_consult_the_network(
+                    alice_release::auto::MIN_JUDGED_SESSION,
+                    &mining
+                ),
+                "decided locally: a single-miner lane cannot be asked about"
+            );
+
+            // The probation that used to fire: installed yesterday, on a machine that
+            // WAS earning, one long empty session already recorded.
+            let on_trial = Probation {
+                version: "0.6.8".into(),
+                previous: "0.6.7".into(),
+                armed_at_unix: 0,
+                launches: 1,
+                started_ok: true,
+                previous_productive: true,
+                baseline_unknown: false,
+                failed_sessions: alice_release::auto::FAILED_SESSIONS_TO_ROLLBACK - 1,
+            };
+            let ran = alice_release::auto::MIN_JUDGED_SESSION.as_secs();
+            assert_eq!(
+                judge_session(&on_trial, "0.6.8", &SessionResult::judgeable(ran, 0)),
+                SessionAction::RollBack,
+                "this is genuinely the tipping session — otherwise the test proves nothing"
+            );
+            let evidence = crate::autoupdate::evidence_for_session(&mining, true, || false);
+            assert_eq!(
+                evidence,
+                SessionEvidence::AcceptanceUndecided,
+                "a zero nobody has measured is not a measurement"
+            );
+            assert_eq!(
+                judge_session(
+                    &on_trial,
+                    "0.6.8",
+                    &SessionResult { ran_secs: ran, accepted: mining.accepted, evidence }
+                ),
+                SessionAction::Abstain(SessionEvidence::AcceptanceUndecided),
+                "v0.6.8 must not roll itself back over a lane nobody has judged"
+            );
+
+            s.request_stop();
+        });
+    }
+
+    /// The other direction, and the thing that keeps the abstain from becoming a
+    /// permanent immunity: an accepted share on an unjudged lane still COMMITS.
+    ///
+    /// This is the answer to "what if the guard never concludes?" — the trial is not
+    /// stuck waiting for a verdict, it is waiting for one accepted share, exactly as
+    /// an `EarningBaseline::Unknown` probation already does. Failing even that, it
+    /// expires with `PROBATION_MAX` and commits; last-known-good is retained the whole
+    /// time, and every abstention that spared the build a rollback is written to the
+    /// local history log.
+    #[test]
+    fn an_accepted_share_on_an_unjudged_lane_still_commits_the_build() {
+        use alice_release::auto::{
+            judge_session, Probation, SessionAction, SessionEvidence, SessionResult,
+        };
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::GpuPrl);
+            s.set_acceptance_config(AcceptanceConfig {
+                warmup: Duration::from_millis(30),
+                min_window: Duration::from_millis(50),
+                min_submissions: 5_000, // never judged
+                ..fast_acceptance()
+            });
+            let (program, args) = idle_child();
+            s.start_simple(program, args).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            feed(&s, "net      accepted (3/0) diff 100 (10 ms)");
+
+            let st = s.stats();
+            assert_eq!(st.acceptance, "gathering", "still no verdict");
+            assert_eq!(st.accepted, 3);
+            let mining = crate::autoupdate::MiningEvidence::from_snapshot(&snapshot_of(&s));
+            assert!(mining.guard_undecided);
+            assert!(
+                mining.counts_as_earning(),
+                "a real accepted share on a lane that is mining IS this machine earning — \
+                 the baseline a future update is judged against must keep refreshing"
+            );
+
+            let on_trial = Probation {
+                version: "0.6.8".into(),
+                previous: "0.6.7".into(),
+                armed_at_unix: 0,
+                launches: 1,
+                started_ok: true,
+                previous_productive: true,
+                baseline_unknown: false,
+                failed_sessions: 0,
+            };
+            let evidence = crate::autoupdate::evidence_for_session(&mining, false, || false);
+            assert_eq!(evidence, SessionEvidence::Judgeable);
+            assert_eq!(
+                judge_session(
+                    &on_trial,
+                    "0.6.8",
+                    &SessionResult { ran_secs: 60, accepted: mining.accepted, evidence }
+                ),
+                SessionAction::Commit,
+                "an unjudged lane must not become a permanent immunity from the probation"
+            );
+            s.request_stop();
+        });
+    }
+
     /// A lane the guard has HANDED BACK is evidence again. The abstain must be
     /// self-clearing, or it becomes a permanent immunity from the health probation —
     /// which would be the same bug pointing the other way.
@@ -6329,6 +6795,129 @@ mod tests {
             );
             assert!(crate::autoupdate::MiningEvidence::from_snapshot(&snapshot_of(&s))
                 .judges_the_build());
+            s.request_stop();
+        });
+    }
+
+    /// **A user Start that FAILS must not destroy the reason the lane is idle.**
+    ///
+    /// Clearing everything on a user Start is right — it is his rig and he has taken
+    /// responsibility for it. Doing it BEFORE knowing whether an engine actually came
+    /// up was not: the binary can be missing, quarantined by an antivirus, or stripped
+    /// of its execute bit, and the lane was then left in `Error` with no child, no
+    /// re-probe armed, the on-disk evidence deleted and the ladder back at rung 0 —
+    /// while `GuardCustody::Mining` told layer 2 "a human is mining this lane". A
+    /// state that says a person took responsibility and the rig is mining, when
+    /// nothing is mining and the evidence for why has been erased, is the same class
+    /// of lie the acceptance guard exists to stop.
+    #[test]
+    fn a_user_start_that_fails_leaves_the_halt_and_its_evidence_intact() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            // A long rung, so the restored countdown is unmistakably the ORIGINAL one.
+            s.set_reprobe_timing(Duration::from_secs(3_600));
+            let (program, args) = idle_child();
+            s.start_simple(program, args).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+            drive_to_halt(&s).await;
+            let recorded = wait_for_halt_record(Lane::Xmr).await;
+            let armed_before = s.stats().message_args.and_then(|a| a.retry_in_s).expect("armed");
+
+            // The engine is gone (uninstalled, quarantined, unreadable). The user
+            // presses Start and it fails.
+            let missing = std::env::temp_dir().join("alice-no-such-engine-r3guard");
+            let _ = std::fs::remove_file(&missing);
+            let err = s
+                .start_simple(missing, vec![])
+                .expect_err("a missing engine cannot start");
+            assert!(err.to_lowercase().contains("failed to start"), "{err}");
+
+            // Everything the halt consisted of is still here.
+            let st = s.stats();
+            assert!(st.halted, "the lane is still stopped by the guard: {st:?}");
+            assert_eq!(
+                st.activity,
+                GuardCustody::Halted,
+                "and layer 2 must not be told a human is mining this lane"
+            );
+            assert_eq!(s.halt_probes(), recorded.probes, "the ladder did not rewind");
+            assert_eq!(
+                acceptance::load_halt_record(Lane::Xmr),
+                Some(recorded),
+                "the evidence must survive a Start that did not happen"
+            );
+            let args = st.message_args.expect("the halt must still explain itself");
+            assert!(
+                args.shares_rejected.unwrap_or(0) > 0,
+                "in the user's own numbers: {args:?}"
+            );
+            let restored = args.retry_in_s.expect("the re-probe must be armed again");
+            assert!(
+                restored <= armed_before,
+                "the countdown resumes where it was ({restored}s) rather than \
+                 buying the pool a fresh rung ({armed_before}s)"
+            );
+
+            // …and a Start that SUCCEEDS still clears the lot, immediately.
+            let (program, args) = idle_child();
+            s.start_simple(program, args).expect("the user may always start again");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+            let st = s.stats();
+            assert!(!st.halted);
+            assert_eq!(st.activity, GuardCustody::Mining);
+            assert_eq!(s.halt_probes(), 0);
+            assert_eq!(acceptance::load_halt_record(Lane::Xmr), None, "and the file is gone");
+            s.request_stop();
+        });
+    }
+
+    /// The other way a user Start fails: the lane is ALREADY running — very possibly
+    /// the guard's own re-probe. `spawn_run` refuses it without touching anything, so
+    /// the refusal must leave the guard's hold exactly as it found it.
+    ///
+    /// The old order wiped the halt, the ladder and the on-disk record BEFORE
+    /// discovering the lane was busy, so a Start that was rejected outright still
+    /// disarmed the guard — over a live probe child that was in the middle of
+    /// measuring for it.
+    #[test]
+    fn a_user_start_refused_because_the_lane_is_busy_disarms_nothing() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::new(Lane::Xmr);
+            s.set_acceptance_config(fast_acceptance());
+            s.set_reprobe_timing(Duration::from_millis(200));
+            let (program, args) = idle_child();
+            s.start_simple(program.clone(), args.clone()).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+            drive_to_halt(&s).await;
+            let recorded = wait_for_halt_record(Lane::Xmr).await;
+
+            // The halt lifts itself; the probe child is now up and measuring.
+            assert!(
+                wait_for(&s, 10, |st| st.activity == GuardCustody::Probing && st.running).await,
+                "the re-probe must be running: {:?}",
+                s.stats()
+            );
+            let probes = s.halt_probes();
+
+            let err = s
+                .start_simple(program, args)
+                .expect_err("a running lane refuses a second start");
+            assert!(err.contains("already running"), "{err}");
+            assert_eq!(
+                s.stats().activity,
+                GuardCustody::Probing,
+                "the guard still owns this lane — the Start never happened"
+            );
+            assert_eq!(s.halt_probes(), probes, "and the ladder is untouched");
+            let on_disk = acceptance::load_halt_record(Lane::Xmr)
+                .expect("the evidence must survive a Start that was refused");
+            assert_eq!(on_disk.probes, probes, "the persisted rung agrees with memory");
+            assert_eq!(on_disk.run_rejected, recorded.run_rejected, "same halt, same numbers");
             s.request_stop();
         });
     }

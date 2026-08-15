@@ -28,16 +28,66 @@
 //! counts (from the bracket or the summary) and `None` for a field a line can't
 //! determine. It is per-line and tolerant — `None` for a line carrying no figure.
 //!
-//! KNOWN LIMITATION: with multiple ACTIVE GPUs SRBMiner prints one `GPU<N>:` line
-//! per card; this per-line parser reports the most-recent card's rate (still far
-//! better than 0). Summing across cards within a cycle is a follow-up; the field
-//! reports were single-active-GPU boxes.
+//! # Whose figures is this line carrying? ([`SrbScope`])
+//!
+//! On a multi-GPU rig SRBMiner prints one `GPU<n>:` line PER CARD, each with that
+//! card's own rate and its own share of the counts, and (in 3.5.x) an aggregate
+//! `Total:` line for the rig. A parser that just takes the last line it saw reports
+//! one card as if it were the rig — the counts flap up and down between cards, and
+//! the hashrate under-reports by a factor of the card count.
+//!
+//! The fix cannot live entirely here: "have we ever seen an aggregate line?" is
+//! STATE, and this is a pure per-line function. So this parser reports the figures
+//! plus [`SrbScope`] — whose line they came from — and the supervisor
+//! (`supervise::apply_log_line`) applies the policy: an aggregate line always wins,
+//! per-card figures are used only until an aggregate has been seen, and once one has
+//! been seen per-card figures can never move the totals again. That fallback matters
+//! because the premise is UNVERIFIED: no multi-card 3.5.x capture exists anywhere we
+//! can reach, and SRBMiner's strings are encrypted so the format cannot be checked
+//! statically. If some rig never prints `Total:`, an aggregate-only rule would read
+//! zero shares forever — the exact shape of the 2026-08-14 bug (`0 H/s · 0A/0R ·
+//! STALL` on a GPU that was landing shares), and the acceptance guard would be blind
+//! to that lane on top of it.
+//!
+//! Telemetry is deliberately NOT scoped: `temp_c`/`power_w`/`fan_pct` are documented
+//! as the HOTTEST card's reading, so a per-card line is the right source for them.
+//!
+//! KNOWN LIMITATION, unfixed and stated rather than implied: on **3.4.x** there is no
+//! aggregate status line at all (its `TOTAL:` line carries only watts), so a
+//! multi-card 3.4.x rig still takes whichever card's `[acc|rej|…]` bracket came last
+//! and can still flap downwards between the per-card brackets and the rig-wide
+//! `Shares acc.` summary. Fixing that honestly needs per-card summation with cycle
+//! detection, and there is no multi-card capture in any version to validate it
+//! against. The bundled engine is 3.5.4, which does emit `Total:`.
 
 use super::KawpowSample;
 
-/// Parse one SRBMiner log line into a [`KawpowSample`] (H/s + accepted/rejected).
+/// Whose figures a line carries — the input to the supervisor's aggregate-wins
+/// policy (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrbScope {
+    /// The rig-wide `Total:` status line (3.5.x): rate and counts for ALL cards.
+    Aggregate,
+    /// A single card's `GPU<n>` line. On a one-card rig this IS the rig; on a
+    /// multi-card rig it is a fraction of it, which is why it must be scoped.
+    PerCard,
+    /// Neither — a summary line (`Shares acc.`), an average, engine chatter. These
+    /// are rig-wide where they carry a figure at all, and are used unconditionally.
+    #[default]
+    Unscoped,
+}
+
+/// One parsed SRBMiner line: what it said, and whose numbers those are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SrbLine {
+    pub sample: KawpowSample,
+    pub scope: SrbScope,
+}
+
+/// Parse one SRBMiner log line into a [`KawpowSample`] (H/s + accepted/rejected)
+/// plus the [`SrbScope`] saying whose figures they are.
 /// Returns `None` when the line carries no recognizable figure.
-pub fn parse_srbminer(raw: &str) -> Option<KawpowSample> {
+pub fn parse_srbminer(raw: &str) -> Option<SrbLine> {
     let line = raw.trim();
     if line.is_empty() {
         return None;
@@ -64,8 +114,42 @@ pub fn parse_srbminer(raw: &str) -> Option<KawpowSample> {
     {
         None
     } else {
-        Some(sample)
+        Some(SrbLine { sample, scope: line_scope(line) })
     }
+}
+
+/// Classify a line by whose figures it carries.
+///
+/// Keyed on how the message STARTS (after the `[timestamp]`), not on a substring
+/// anywhere: `GPU DeviceID 0 … reported total memory: 12281 MB` contains both "gpu"
+/// and "total" and is neither.
+fn line_scope(line: &str) -> SrbScope {
+    let msg = message_after_timestamp(line).to_ascii_lowercase();
+    if let Some(rest) = msg.strip_prefix("total") {
+        if rest.trim_start_matches(' ').starts_with(':') {
+            return SrbScope::Aggregate;
+        }
+    }
+    if let Some(rest) = msg.strip_prefix("gpu") {
+        // `GPU0 RTX 3060: …`, `GPU2: …`, `GPU2[t0] share accepted …` — a digit right
+        // after the prefix is what distinguishes a card from the word "GPU".
+        if rest.starts_with(|c: char| c.is_ascii_digit()) {
+            return SrbScope::PerCard;
+        }
+    }
+    SrbScope::Unscoped
+}
+
+/// The message with a leading `[…]` timestamp stripped. Every SRBMiner log line
+/// carries one; a line without one is returned unchanged.
+fn message_after_timestamp(line: &str) -> &str {
+    let t = line.trim_start();
+    if let Some(rest) = t.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[end + 1..].trim_start();
+        }
+    }
+    t
 }
 
 /// Best-effort telemetry (temp/power/util/fan) from an SRBMiner line. SRBMiner prints
@@ -128,17 +212,15 @@ fn share_counts(line: &str, lower: &str) -> (Option<u64>, Option<u64>) {
         return (Some(a), Some(r));
     }
     // 1b. SRBMiner 3.5.x replaced that bracket with `key:value` fields (see
-    //     `kv_bracket`). Read the counts ONLY from the aggregate `Total:` line —
-    //     the per-GPU `GPU<n> <model>: ...` line carries that CARD's share of the
-    //     count, so on a multi-GPU rig taking whichever line came last would make
-    //     the total flap downwards. `Total:` is emitted at the same cadence.
-    if lower.contains("total:") {
-        if let Some(seg) = kv_bracket(line) {
-            let a = kv_int(seg, "a");
-            let r = kv_int(seg, "r");
-            if a.is_some() || r.is_some() {
-                return (a, r);
-            }
+    //     `kv_bracket`). Both the aggregate `Total:` line and each per-GPU line
+    //     carry one; WHOSE counts these are is [`SrbScope`]'s answer, and the
+    //     aggregate-wins policy is the supervisor's (it needs the "have we ever
+    //     seen an aggregate" state a per-line parser cannot hold).
+    if let Some(seg) = kv_bracket(line) {
+        let a = kv_int(seg, "a");
+        let r = kv_int(seg, "r");
+        if a.is_some() || r.is_some() {
+            return (a, r);
         }
     }
     // 2. The summary abbreviations `acc.` / `rej.` (each on its own line).
@@ -342,6 +424,11 @@ fn parse_hashrate_hs(lower: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
+    /// The figures only — every assertion that predates [`SrbScope`] reads this.
+    fn parse(raw: &str) -> Option<KawpowSample> {
+        parse_srbminer(raw).map(|l| l.sample)
+    }
+
     // ── Real lines from SRBMiner-MULTI 3.5.4, RTX 3060, pearlhash, captured on a
     //    rented GPU 2026-08-14 22:51–23:11Z while the shares were being accepted
     //    upstream (8 accepted, 0 rejected). 3.5.x reshaped every line this parser
@@ -352,7 +439,7 @@ mod tests {
     /// 12h one. The live rate must survive it.
     #[test]
     fn v354_average_line_reports_the_warm_window_not_the_cold_one() {
-        let s = parse_srbminer(
+        let s = parse(
             "[2026-08-14 22:52:15] Average hashrate: 1m 44.99 TH/s | 1h 0.00 H/s | 6h 0.00 H/s | 12h 0.00 H/s",
         )
         .expect("the 1m window is a real reading");
@@ -361,7 +448,7 @@ mod tests {
         // Within the first minute nothing is warm yet. That is "no reading", NOT a
         // rate of zero — returning zero here is what zeroed the panel and tripped
         // the watchdog.
-        assert!(parse_srbminer(
+        assert!(parse(
             "[2026-08-14 22:51:30] Average hashrate: 1m 0.00 H/s | 1h 0.00 H/s | 6h 0.00 H/s | 12h 0.00 H/s"
         )
         .is_none());
@@ -369,31 +456,78 @@ mod tests {
 
     /// The per-GPU line: TH/s still readable, and temperature/fan/power now come
     /// out of the `key:value` bracket that replaced the `[acc|rej|…]` one.
+    ///
+    /// Its rate and its counts are ONE CARD's, and the line says so
+    /// ([`SrbScope::PerCard`]). What the supervisor then does with them — ignore
+    /// them once an aggregate line has been seen, use them as a fallback if one
+    /// never is — is tested in `supervise` (that policy needs state this pure
+    /// function cannot hold).
     #[test]
     fn v354_per_gpu_line_hashrate_and_telemetry() {
-        let s = parse_srbminer(
+        let l = parse_srbminer(
             "[2026-08-14 22:52:15] GPU0 RTX 3060: 44.99 TH/s [T:71C FAN:63% P:169.9W EFF:0.265 CC:1672 MC:7301 A:0 R:0 HW:0]",
         )
         .unwrap();
-        assert_eq!(s.hashrate_hs, Some(44.99e12));
-        assert_eq!(s.temp_c, Some(71.0));
-        assert_eq!(s.fan_pct, Some(63.0));
-        assert_eq!(s.power_w, Some(169.9));
-        // Counts are deliberately NOT taken from a per-GPU line: on a multi-GPU rig
-        // that is this card's share, and letting it win would flap the total down.
-        assert_eq!(s.accepted, None);
-        assert_eq!(s.rejected, None);
+        assert_eq!(l.sample.hashrate_hs, Some(44.99e12));
+        assert_eq!(l.sample.temp_c, Some(71.0));
+        assert_eq!(l.sample.fan_pct, Some(63.0));
+        assert_eq!(l.sample.power_w, Some(169.9));
+        assert_eq!(l.sample.accepted, Some(0));
+        assert_eq!(l.sample.rejected, Some(0));
+        assert_eq!(l.scope, SrbScope::PerCard, "these are one card's numbers");
     }
 
-    /// The aggregate line is where the counts come from.
+    /// The aggregate line is where the rig's numbers come from.
     #[test]
     fn v354_total_line_carries_the_share_counts() {
-        let s =
+        let l =
             parse_srbminer("[2026-08-14 23:02:02] Total: 44.94 TH/s [P:169.8W EFF:0.265 A:2 R:0 HW:0]")
                 .unwrap();
-        assert_eq!(s.hashrate_hs, Some(44.94e12));
-        assert_eq!(s.accepted, Some(2));
-        assert_eq!(s.rejected, Some(0));
+        assert_eq!(l.sample.hashrate_hs, Some(44.94e12));
+        assert_eq!(l.sample.accepted, Some(2));
+        assert_eq!(l.sample.rejected, Some(0));
+        assert_eq!(l.scope, SrbScope::Aggregate);
+    }
+
+    /// The scope classifier, on every real line shape from both captures.
+    ///
+    /// The two that must NOT be mistaken for an aggregate are `GPU DeviceID 0 …
+    /// reported total memory` (contains "total" and starts with "GPU") and the 3.4.x
+    /// `TOTAL:  283W` power line — the latter because latching on it would make a
+    /// 3.4.x rig ignore every per-GPU line it has and read nothing at all. It is
+    /// classified as an aggregate here and is harmless only because it carries no
+    /// figure, so `parse_srbminer` never returns it; the supervisor latches on a
+    /// line it could actually read, which is the belt to this brace.
+    #[test]
+    fn line_scope_keys_on_how_the_message_starts() {
+        let cases = [
+            ("[ts] Total: 44.94 TH/s [P:1W A:2 R:0 HW:0]", SrbScope::Aggregate),
+            ("[ts] TOTAL:                          283W", SrbScope::Aggregate),
+            ("[ts] GPU0 RTX 3060: 44.99 TH/s [A:0 R:0 HW:0]", SrbScope::PerCard),
+            ("[ts] GPU2: 125.35 TH/s        [ 719| 1| 0| 442.94 GH/W]", SrbScope::PerCard),
+            ("[ts] GPU2: [T:  73c CC:  2610MHz MC:  10251MHz FAN:    68 P:  283W]", SrbScope::PerCard),
+            ("[ts] GPU2[t0] share accepted [  180ms] [pearlhash][0]", SrbScope::PerCard),
+            ("[ts] Shares acc.  : 713", SrbScope::Unscoped),
+            ("[ts] Avg. 1 min.  : 125.32 TH/s", SrbScope::Unscoped),
+            ("[ts] Average hashrate: 1m 44.99 TH/s | 12h 0.00 H/s", SrbScope::Unscoped),
+            ("[ts] GPU DeviceID 0 [BUS:06] reported total memory: 12281 MB", SrbScope::Unscoped),
+            ("[ts] Found 2 GPU device/s on platform 0", SrbScope::Unscoped),
+            ("connecting to pool...", SrbScope::Unscoped),
+        ];
+        for (line, want) in cases {
+            assert_eq!(line_scope(line), want, "{line}");
+        }
+    }
+
+    /// The 3.4.x `TOTAL:` line is watts, not a rig hashrate — it must stay
+    /// unreadable, or a 3.4.x rig would latch on it and then discard the per-GPU
+    /// lines that carry all of its real numbers.
+    #[test]
+    fn the_3_4_x_total_power_line_carries_no_figure_at_all() {
+        assert!(
+            parse_srbminer("[2026-06-26 01:26:23] TOTAL:                             283W").is_none(),
+            "a watts-only line is not a reading of anything this parser reports"
+        );
     }
 
     /// `MC:7301` contains an `a`-less digit run, `CC:1672` likewise, and a future
@@ -417,7 +551,7 @@ mod tests {
     /// 3.5.x, and still the trap that once read `375` accepted shares.
     #[test]
     fn v354_share_event_line_is_still_ignored() {
-        assert!(parse_srbminer(
+        assert!(parse(
             "[2026-08-14 22:55:15] GPU0[t0] share accepted [  375ms] [pearlhash][0]"
         )
         .is_none());
@@ -427,7 +561,7 @@ mod tests {
     /// cold AVERAGES, not real zeroes on the live line.
     #[test]
     fn v354_a_real_zero_on_the_live_line_still_reports_zero() {
-        let s = parse_srbminer("[ts] Total: 0.00 H/s [P:12.0W EFF:0.000 A:2 R:0 HW:0]").unwrap();
+        let s = parse("[ts] Total: 0.00 H/s [P:12.0W EFF:0.000 A:2 R:0 HW:0]").unwrap();
         assert_eq!(s.hashrate_hs, Some(0.0));
     }
 
@@ -436,7 +570,7 @@ mod tests {
     #[test]
     fn real_per_gpu_line_hashrate_th_s_and_bracket_counts() {
         // The dominant informative line: TH/s rate + the cumulative `[acc|rej|..]`.
-        let s = parse_srbminer(
+        let s = parse(
             "[2026-06-26 13:05:45] GPU2: 125.35 TH/s        [    719|    1|   0|  442.94 GH/W]",
         )
         .unwrap();
@@ -447,7 +581,7 @@ mod tests {
 
     #[test]
     fn gh_per_w_efficiency_is_not_read_as_hashrate() {
-        let s = parse_srbminer(
+        let s = parse(
             "[2026-06-26 00:56:22] GPU2: 119.55 TH/s        [      1|    0|   0|  422.44 GH/W]",
         )
         .unwrap();
@@ -459,7 +593,7 @@ mod tests {
         // The old parser read "the integer after accepted" → 180 (the latency!).
         // The real cumulative count comes from the bracket/summary, so this event
         // line must contribute nothing (and the line carries no other figure).
-        assert!(parse_srbminer(
+        assert!(parse(
             "[2026-06-26 13:06:07] GPU2[t0] share accepted [  180ms] [pearlhash][0]"
         )
         .is_none());
@@ -467,7 +601,7 @@ mod tests {
 
     #[test]
     fn share_rejected_event_line_with_text_reason_is_ignored() {
-        assert!(parse_srbminer(
+        assert!(parse(
             "[2026-06-26 11:30:52] GPU2[t0] share rejected [jackpot condition not satisfied: hash does not meet difficulty target] [pearlhash][0]"
         )
         .is_none());
@@ -475,10 +609,10 @@ mod tests {
 
     #[test]
     fn summary_acc_and_rej_lines() {
-        let a = parse_srbminer("[2026-06-26 01:01:17] Shares acc.  : 713").unwrap();
+        let a = parse("[2026-06-26 01:01:17] Shares acc.  : 713").unwrap();
         assert_eq!(a.accepted, Some(713));
         assert_eq!(a.rejected, None);
-        let r = parse_srbminer("[2026-06-26 01:01:17] Shares rej.  : 1").unwrap();
+        let r = parse("[2026-06-26 01:01:17] Shares rej.  : 1").unwrap();
         assert_eq!(r.rejected, Some(1));
         assert_eq!(r.accepted, None);
     }
@@ -486,7 +620,7 @@ mod tests {
     #[test]
     fn shares_total_ratio_bracket_is_not_a_count() {
         // `[100.00|0.00]` holds floats → must not be parsed as accepted/rejected.
-        let s = parse_srbminer("[2026-06-26 01:01:17] Shares tot.  : 7 [100.00|0.00]");
+        let s = parse("[2026-06-26 01:01:17] Shares tot.  : 7 [100.00|0.00]");
         // "tot." is neither acc. nor rej. and the bracket is non-integer → no figure.
         assert!(s.is_none());
     }
@@ -494,21 +628,21 @@ mod tests {
     #[test]
     fn avg_1_min_is_a_valid_rate_but_multi_hour_avgs_are_suppressed() {
         assert_eq!(
-            parse_srbminer("[2026-06-26 01:01:17] Avg. 1 min.  : 125.32 TH/s")
+            parse("[2026-06-26 01:01:17] Avg. 1 min.  : 125.32 TH/s")
                 .unwrap()
                 .hashrate_hs,
             Some(125.32e12)
         );
         // The warm-up `0.00 H/s` multi-hour averages must NOT zero the live rate.
-        assert!(parse_srbminer("[2026-06-26 01:01:17] Avg. 6  hr.  : 0.00 H/s").is_none());
-        assert!(parse_srbminer("[2026-06-26 01:01:17] Avg. 12 hr.  : 0.00 H/s").is_none());
+        assert!(parse("[2026-06-26 01:01:17] Avg. 6  hr.  : 0.00 H/s").is_none());
+        assert!(parse("[2026-06-26 01:01:17] Avg. 12 hr.  : 0.00 H/s").is_none());
     }
 
     #[test]
     fn sub_th_rate_uses_correct_unit() {
         // The "865549824.00 kH/s" field report was really ~0.87 TH/s; with TH/s now
         // recognized the value + counts parse correctly.
-        let s = parse_srbminer("[ts] GPU0: 0.87 TH/s [3|0|0| 1.20 GH/W]").unwrap();
+        let s = parse("[ts] GPU0: 0.87 TH/s [3|0|0| 1.20 GH/W]").unwrap();
         assert_eq!(s.hashrate_hs, Some(0.87e12));
         assert_eq!(s.accepted, Some(3));
         assert_eq!(s.rejected, Some(0));
@@ -518,10 +652,10 @@ mod tests {
 
     #[test]
     fn unit_scaling_kh_mh_gh_th() {
-        assert_eq!(parse_srbminer("speed 500 kh/s").unwrap().hashrate_hs, Some(500_000.0));
-        assert_eq!(parse_srbminer("speed 2 Gh/s").unwrap().hashrate_hs, Some(2_000_000_000.0));
+        assert_eq!(parse("speed 500 kh/s").unwrap().hashrate_hs, Some(500_000.0));
+        assert_eq!(parse("speed 2 Gh/s").unwrap().hashrate_hs, Some(2_000_000_000.0));
         assert_eq!(
-            parse_srbminer("speed 1.5 Th/s").unwrap().hashrate_hs,
+            parse("speed 1.5 Th/s").unwrap().hashrate_hs,
             Some(1_500_000_000_000.0)
         );
     }
@@ -531,7 +665,7 @@ mod tests {
     #[test]
     fn device_table_temp_fan_power_captured() {
         // SRBMiner's periodic device line with labelled telemetry.
-        let s = parse_srbminer(
+        let s = parse(
             "[2026-06-26 13:05:45] GPU0: Temperature: 62C, Fan: 55%, Power: 145W",
         )
         .expect("telemetry line");
@@ -544,7 +678,7 @@ mod tests {
     fn gh_per_w_efficiency_is_not_read_as_board_power() {
         // The per-GPU hashrate line carries `442.94 GH/W` efficiency — this is per-hash
         // power, NOT board power, and must never populate power_w.
-        let s = parse_srbminer(
+        let s = parse(
             "[2026-06-26 13:05:45] GPU2: 125.35 TH/s        [    719|    1|   0|  442.94 GH/W]",
         )
         .unwrap();
@@ -555,7 +689,7 @@ mod tests {
     #[test]
     fn srbminer_telemetry_is_fail_soft() {
         // Garbled telemetry must not disturb the hashrate/share parse.
-        let s = parse_srbminer("[ts] GPU0: 0.87 TH/s temperature: --C [3|0|0| 1.20 GH/W]")
+        let s = parse("[ts] GPU0: 0.87 TH/s temperature: --C [3|0|0| 1.20 GH/W]")
             .expect("parsed");
         assert_eq!(s.hashrate_hs, Some(0.87e12));
         assert_eq!(s.accepted, Some(3));
@@ -564,8 +698,8 @@ mod tests {
 
     #[test]
     fn noise_line_returns_none() {
-        assert!(parse_srbminer("connecting to pool...").is_none());
-        assert!(parse_srbminer("[2026-06-26 00:55:19] Connected to 127.0.0.1:11200 [0]").is_none());
-        assert!(parse_srbminer("").is_none());
+        assert!(parse("connecting to pool...").is_none());
+        assert!(parse("[2026-06-26 00:55:19] Connected to 127.0.0.1:11200 [0]").is_none());
+        assert!(parse("").is_none());
     }
 }
