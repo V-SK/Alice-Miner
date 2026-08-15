@@ -74,17 +74,49 @@
 //! [`PinEntry::extra_args`] and [`PinEntry::parser`]
 //! ([`EngineInvocation`]). All three are **optional**: absent ⇒ byte-for-byte
 //! today's compiled-in behaviour. All three are **fail-closed**: an unknown parser
-//! id, an implausible algorithm token, or an extra argument that touches anything
-//! the client owns (the pool, the login, the password, the log file) rejects the
-//! whole document. And all three are re-validated at argv-build time, so the
-//! property belongs to the launch path and not only to the acceptance path.
+//! id, an implausible algorithm token, an algorithm on a kind whose argv has no
+//! algorithm slot, or an extra argument that is not on the reviewed allow-list for
+//! that engine rejects the whole document. And all three are re-validated at
+//! argv-build time, so the property belongs to the launch path and not only to the
+//! acceptance path.
+//!
+//! ### `extra_args` is an ALLOW-list, and why it had to become one (2026-08-15)
+//!
+//! The first cut of this feature policed publisher argv with a **deny**-list of
+//! flags the client owns ([`CLIENT_OWNED_FLAGS`]) and let everything else through.
+//! That is not a decidable rule: it requires us to have enumerated every spelling
+//! of every credit/transport/write flag of a third-party binary whose surface we
+//! do not control and which changes between versions. It failed on the very engine
+//! this repo ships — xmrig 6.26 spells `--user`/`--pass` *also* as `--userpass`,
+//! `--proxy` also as `-x`, and `--log-file` also as `-l`; none of those three were
+//! on the list, and each was live-verified to redirect credit, transport or writes
+//! (see the tests at the bottom of this file).
+//!
+//! So the rule is inverted. A pin's extra argv may contain **only** flags on a
+//! per-engine-kind list that a human has reviewed against that engine's own
+//! documented flag surface ([`extra_arg_allowlist`]), each declaring whether it
+//! takes a value, with values restricted to a charset that cannot spell a host, a
+//! `user:pass` pair or a path. What this **does** guarantee: an alias nobody
+//! enumerated cannot pass, because passing requires being named, not requires not
+//! being named. What it **does not** guarantee: that a flag we *did* review is
+//! harmless on a future version of that engine — a vendor may repurpose a flag, and
+//! only re-review catches that. The deny-list stays as a second, independent belt
+//! (it can only ever refuse more), and a test asserts the two lists are disjoint so
+//! it cannot rot into decoration.
+//!
+//! The price is stated plainly rather than hidden: a fork that needs a switch we
+//! have never reviewed now costs a **client release** (a one-line table entry),
+//! where the deny-list would have published it. That is the trade the August
+//! outage argues for in the other direction — and it is still the right one,
+//! because the deny-list's failure mode was every share on the lane being credited
+//! to whoever held the sub-key.
 //!
 //! **What this does NOT remove**, stated plainly (also in
 //! `docs/engine-pin-publishing.md`): a fork whose output needs a parser this
 //! client does not compile in, an engine that needs a *different argv shape*
-//! (flag renames on the pool/login/password/log-file flags this client owns), a
-//! new upstream host, or a new engine kind — each of those still needs a client
-//! release.
+//! (flag renames on the pool/login/password/log-file flags this client owns), an
+//! extra switch nobody has reviewed for that engine, a new upstream host, or a new
+//! engine kind — each of those still needs a client release.
 //!
 //! ## What this module deliberately does NOT do
 //!
@@ -155,25 +187,119 @@ const MAX_ALGORITHM_LEN: usize = 64;
 /// depend on. Compared case-insensitively and with any `=value` tail stripped, so
 /// `-P`, `--pool=…` and `--POOL` are all caught by one entry.
 ///
-/// This list is the reason the invocation fields are safe to sign with a key we
-/// touch often: the sub-key can tell the client *how to ask an upstream engine for
-/// the new algorithm*, and it cannot tell the client to mine somewhere else, for
-/// someone else, or to write a file of its choosing.
+/// **This list is NOT the security boundary, and must never be described as one.**
+/// It is a deny-list over a third-party flag surface we do not control, and it was
+/// proved incomplete against the engine this repo already ships: xmrig 6.26's
+/// `--userpass`, `-x` and `-l` are aliases of three entries below and were absent
+/// from it. The boundary is [`extra_arg_allowlist`] — a pin's argv must be *named*
+/// there to pass. This list survives as a second, independent belt: it can only
+/// ever refuse more, it gives a sharper error when a publisher reaches for an
+/// obvious client-owned flag, and the `the_deny_list_and_the_allow_list_can_never_overlap`
+/// test pins the two apart so a future allow-list entry cannot quietly re-open one
+/// of these.
 const CLIENT_OWNED_FLAGS: &[&str] = &[
     // algorithm — carried by `algorithm`, never by a raw flag
     "-a", "--algo", "--algorithm", "--coin",
     // pool / transport
-    "-o", "-p", "--pool", "--url", "--server", "--port", "--host", "--tls", "--proxy",
-    // login / credit attribution
+    "-o", "-p", "--pool", "--url", "--server", "--port", "--host", "--tls", "--proxy", "-x",
+    // login / credit attribution. `--userpass`/`-O` set BOTH halves of the login in
+    // one token — the alias that made the deny-list-only design fail. (`-O` also
+    // folds onto `-o` under the case-insensitive compare below.)
     "-u", "--user", "--wallet", "--address", "--worker", "--rig-id", "--pass", "--password",
+    "--userpass",
     // where the engine writes, and what it exposes
-    "--log-file", "--logfile", "--config", "-c", "--api-bind", "--api-port", "--http-port",
+    "--log-file", "--logfile", "-l", "--config", "-c", "--api-bind", "--api-port", "--http-port",
     "--http-host", "--http-enabled", "--api-enabled",
     // device selection is the user's setting, not the publisher's
     "--gpu-id", "--devices", "--cuda-devices", "--opencl-devices",
     // never let a pin quietly raise the vendor's donation cut
     "--donate-level", "--donate-over-proxy",
 ];
+
+/// One flag a signed pin is allowed to add to a given engine's argv.
+///
+/// `flag` is the exact **lower-case** spelling; `takes_value` says whether it is
+/// followed by a value (either `--flag=v` or `--flag` `v` as two list entries).
+/// Getting `takes_value` wrong is fail-closed in the safe direction: a value-taking
+/// flag declared `false` refuses the `=` form and leaves its value token orphaned
+/// (refused), and a boolean declared `true` refuses for want of a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtraArgSpec {
+    pub flag: &'static str,
+    pub takes_value: bool,
+}
+
+const fn boolean(flag: &'static str) -> ExtraArgSpec {
+    ExtraArgSpec {
+        flag,
+        takes_value: false,
+    }
+}
+const fn valued(flag: &'static str) -> ExtraArgSpec {
+    ExtraArgSpec {
+        flag,
+        takes_value: true,
+    }
+}
+
+/// **xmrig** (`cpu-xmr`). Reviewed 2026-08-15 against `--help` of the exact 6.26.0
+/// binary this repo ships (`release-assets/aarch64-apple-darwin/xmrig`). Every
+/// entry is a CPU/RandomX tuning knob: none names a pool, a login, a file or a
+/// device, none detaches the process (`-B/--background`), exits early
+/// (`--dry-run`, `--print-platforms`, `--export-topology`), disables mining
+/// (`--no-cpu`) or touches the donation cut — those were considered and left off.
+const XMRIG_EXTRA_ARGS: &[ExtraArgSpec] = &[
+    valued("--randomx-mode"),      // auto | fast | light
+    valued("--randomx-init"),      // dataset init threads
+    boolean("--randomx-1gb-pages"),
+    boolean("--randomx-no-numa"),
+    valued("--randomx-wrmsr"),     // MSR tweak value, or -1 to disable
+    boolean("--randomx-no-rdmsr"),
+    boolean("--randomx-cache-qos"),
+    boolean("--huge-pages-jit"),
+    boolean("--no-huge-pages"),
+    valued("--cpu-max-threads-hint"),
+    boolean("--cpu-no-yield"),
+    valued("--asm"),               // auto | none | intel | ryzen | bulldozer
+    valued("--dns-ttl"),
+];
+
+/// The flags a signed pin may add, per engine kind.
+///
+/// **Empty is the correct, deliberate state for an engine nobody has reviewed.** An
+/// entry here is a claim that a human read that engine's own flag documentation and
+/// confirmed the flag cannot name a pool, a login, a proxy, a file or a device — the
+/// four things a stolen sub-key must never be able to choose. We can make that claim
+/// for xmrig because its binary (and therefore its `--help`) is in this repo. We
+/// cannot make it for SRBMiner-MULTI, alpha-miner or kawpowminer: SRBMiner is
+/// closed-source and ships no macOS build, and neither of the others has been read
+/// here. Guessing at their surface is exactly the mistake that produced the
+/// deny-list. Populating one of these is a client release, on purpose.
+fn extra_arg_allowlist(kind: &str) -> &'static [ExtraArgSpec] {
+    match kind {
+        "cpu-xmr" => XMRIG_EXTRA_ARGS,
+        // SRBMiner-MULTI. UNREVIEWED — see the doc comment above.
+        "gpu-prl" => &[],
+        // kawpowminer. UNREVIEWED.
+        "gpu-rvn" => &[],
+        // alpha-miner. UNREVIEWED.
+        "gpu-alpha" => &[],
+        // An unknown kind never reaches here (validate_entry refuses it first), and
+        // if it ever did, "no flags at all" is the fail-closed answer.
+        _ => &[],
+    }
+}
+
+/// The engine kinds whose lane argv actually CARRIES an algorithm token, and for
+/// which [`PinEntry::algorithm`] therefore has somewhere to go.
+///
+/// Only the GPU-PRL lane: alpha-miner has no algorithm flag by design, xmrig is
+/// driven by `--coin monero`, and kawpowminer takes none. A pin setting `algorithm`
+/// on any other kind used to be accepted and shown by `alice-miner engines` as
+/// though it were in force while the argv never mentioned it — a signed instruction
+/// silently dropped, which is its own hazard (the publisher believes the fleet moved
+/// and it did not). Refused instead.
+const KINDS_WITH_ALGORITHM_SLOT: &[&str] = &["gpu-prl"];
 
 // ────────────────────────────────────────────────────────────────────────────
 // Trust + fetch seams
@@ -308,12 +434,22 @@ pub struct PinEntry {
     /// an upstream that RENAMES its algorithm on a fork does not cost a client
     /// release; it can never widen anything, because it is one bounded token in one
     /// argv slot the client itself places.
+    ///
+    /// Accepted only on a kind in [`KINDS_WITH_ALGORITHM_SLOT`]. On any other kind
+    /// there is no slot to substitute into, so the field would be signed, displayed
+    /// as in force, and never reach the engine — refused instead.
     #[serde(default)]
     pub algorithm: Option<String>,
-    /// Extra argv appended AFTER every flag the client controls. For a fork that
-    /// needs a new switch (`--pearl-fork-tweak`). Held to
-    /// [`CLIENT_OWNED_FLAGS`] and to the same credit-only / anti-leak scan a
-    /// bring-your-own miner's argv gets ([`crate::backend::forbidden_in_arg`]).
+    /// Extra argv spliced in BEFORE every flag the client controls, for a reviewed
+    /// tuning switch this engine build wants.
+    ///
+    /// Bounded by [`extra_arg_allowlist`] — the flag must be one a human has checked
+    /// against THAT engine's own flag surface — plus the same credit-only /
+    /// anti-leak scan a bring-your-own miner's argv gets
+    /// ([`crate::backend::forbidden_in_arg`]) and, as a second belt,
+    /// [`CLIENT_OWNED_FLAGS`]. It is deliberately NOT a general "add any switch a
+    /// fork needs" channel any more: see the module header for the aliases that
+    /// broke that version of the rule.
     #[serde(default)]
     pub extra_args: Option<Vec<String>>,
     /// Which compiled-in log parser reads this engine's output
@@ -382,11 +518,24 @@ impl PinEntry {
     /// never degrades to "launch it anyway with the compiled-in call".
     pub fn invocation(&self) -> Result<EngineInvocation, String> {
         let algorithm = match self.algorithm.as_deref() {
-            Some(a) => Some(check_algorithm(a)?),
+            Some(a) => {
+                if !KINDS_WITH_ALGORITHM_SLOT.contains(&self.kind.as_str()) {
+                    return Err(format!(
+                        "engine pin entry for {} sets an algorithm ({a:?}), but this client's {} \
+                         argv carries no algorithm token — it would be accepted, displayed as in \
+                         force, and never passed to the engine. Refusing rather than silently \
+                         dropping a signed instruction (only {} has an algorithm slot).",
+                        self.kind,
+                        self.kind,
+                        KINDS_WITH_ALGORITHM_SLOT.join(", ")
+                    ));
+                }
+                Some(check_algorithm(a)?)
+            }
             None => None,
         };
         let extra_args = match self.extra_args.as_deref() {
-            Some(list) => check_extra_args(list)?,
+            Some(list) => check_extra_args(&self.kind, list)?,
             None => Vec::new(),
         };
         let parser = match self.parser.as_deref() {
@@ -418,11 +567,12 @@ impl PinEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EngineInvocation {
     /// Replaces the lane's compiled-in algorithm token, where the lane's argv has
-    /// one. (Only the GPU-PRL lane's bundled argv carries an algorithm flag today:
-    /// alpha-miner has none by design, xmrig is driven by `--coin monero`, and
-    /// kawpowminer takes none.)
+    /// one. Only ever `Some` for a kind in [`KINDS_WITH_ALGORITHM_SLOT`] (today:
+    /// GPU-PRL) — a pin that sets it on a kind whose argv has no algorithm token is
+    /// refused rather than accepted-and-ignored.
     pub algorithm: Option<String>,
-    /// Appended after every client-controlled flag, in order.
+    /// Placed BEFORE every client-controlled flag, in order — see
+    /// [`EngineInvocation::apply_extra_args`] for why that position and not the end.
     pub extra_args: Vec<String>,
     /// Which compiled-in parser reads this engine's output.
     pub parser: Option<crate::stats::ParserKind>,
@@ -435,9 +585,36 @@ impl EngineInvocation {
         self.algorithm.is_none() && self.extra_args.is_empty() && self.parser.is_none()
     }
 
-    /// Append this invocation's extra argv to a launch plan's args.
+    /// Splice this invocation's extra argv into a launch plan's args, **before**
+    /// every flag the client built.
+    ///
+    /// ## Why first, and what that is and is not worth
+    ///
+    /// It is NOT the invariant. Ordering cannot be a security control here, because
+    /// precedence is the engine's choice, not ours: on a **last-wins** parser the
+    /// last occurrence of a flag wins, on a **first-wins** parser the first does,
+    /// and a pin's argv can only be on one side. Whichever end we pick is the
+    /// winning end for exactly one of those two families. The invariant is
+    /// [`extra_arg_allowlist`]: publisher argv can only contain flags reviewed for
+    /// that engine, so it does not matter who wins.
+    ///
+    /// Given that, first is the better *default*, on evidence rather than on
+    /// symmetry: xmrig 6.26 — the one bundled engine whose binary is in this repo,
+    /// so the only one we can actually test — is last-wins (verified: an appended
+    /// `--userpass=…` overrode an earlier `-u`, and the same token placed first lost
+    /// to it). No bundled engine is known to be first-wins. The previous code
+    /// appended, and its doc comment claimed that end was the safe one "even on an
+    /// engine whose own parsing is last-wins", which was backwards.
+    ///
+    /// One behavioural note this position does carry: xmrig applies *per-pool* flags
+    /// to the most recent preceding `-o`, so a pool-scoped flag placed here is
+    /// global instead. No allow-listed flag is pool-scoped, and a pin cannot add
+    /// `-o` itself.
     pub fn apply_extra_args(&self, args: &mut Vec<String>) {
-        args.extend(self.extra_args.iter().cloned());
+        if self.extra_args.is_empty() {
+            return;
+        }
+        args.splice(0..0, self.extra_args.iter().cloned());
     }
 }
 
@@ -832,17 +1009,32 @@ fn check_algorithm(a: &str) -> Result<String, String> {
     Ok(t.to_string())
 }
 
-/// The extra argv, validated. See [`CLIENT_OWNED_FLAGS`] for the core rule: a
-/// signed pin may add switches to an engine, and may never restate one of the
-/// flags that decide where shares go, who is credited, or where the engine writes.
-fn check_extra_args(list: &[String]) -> Result<Vec<String>, String> {
+/// The extra argv, validated **against the allow-list for that engine kind**.
+///
+/// The rule, in one sentence: a token passes only if it is a flag this client has
+/// reviewed for this engine ([`extra_arg_allowlist`]), or the value of one. That is
+/// the inversion described in the module header — the old rule ("anything not on a
+/// deny-list") could not survive an engine whose aliases we had not enumerated, and
+/// did not survive the one this repo ships.
+///
+/// The walk is positional, because a flag's value is a separate argv token: a value
+/// is accepted **only** in the slot immediately after a flag declared
+/// [`ExtraArgSpec::takes_value`]. A stray token in any other position — including a
+/// dangling value at the end of the list — refuses the whole document. Values are
+/// held to [`check_extra_arg_value`], which is narrower than the token scan: it
+/// cannot spell a host:port, a `user:pass` pair or a path.
+fn check_extra_args(kind: &str, list: &[String]) -> Result<Vec<String>, String> {
     if list.len() > MAX_EXTRA_ARGS {
         return Err(format!(
             "engine pin entry carries {} extra arguments; at most {MAX_EXTRA_ARGS} are accepted",
             list.len()
         ));
     }
+    let allowed = extra_arg_allowlist(kind);
     let mut out = Vec::with_capacity(list.len());
+    // `Some(spec)` while the previous token was a value-taking flag written in the
+    // two-token form, i.e. THIS token must be its value.
+    let mut awaiting_value: Option<&ExtraArgSpec> = None;
     for raw in list {
         let t = raw.trim();
         if t.is_empty() || t.len() > MAX_EXTRA_ARG_LEN {
@@ -859,9 +1051,23 @@ fn check_extra_args(list: &[String]) -> Result<Vec<String>, String> {
                  characters; give each argv token its own list entry"
             ));
         }
-        // The flags the client owns. Compare on the flag half only, case-folded, so
-        // `--pool=x`, `--POOL` and `-P` all collide with one list entry.
-        let flag = t.split('=').next().unwrap_or(t).to_ascii_lowercase();
+        // ── The value slot ────────────────────────────────────────────────────
+        if let Some(spec) = awaiting_value.take() {
+            check_extra_arg_token_content(raw, t)?;
+            check_extra_arg_value(spec.flag, t)?;
+            out.push(t.to_string());
+            continue;
+        }
+
+        // ── Otherwise this token must be a flag ───────────────────────────────
+        let (flag_part, inline_value) = match t.split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (t, None),
+        };
+        let flag = flag_part.to_ascii_lowercase();
+
+        // Belt: the deny-list still speaks first, for a sharper message. It cannot
+        // be the only check (that is the whole bug) but it can never be wrong.
         if let Some(owned) = CLIENT_OWNED_FLAGS
             .iter()
             .find(|f| f.eq_ignore_ascii_case(&flag))
@@ -873,31 +1079,117 @@ fn check_extra_args(list: &[String]) -> Result<Vec<String>, String> {
                  whole list"
             ));
         }
-        // No URLs and no filesystem paths: an engine-pin document has no business
-        // naming a host or a file, and both are how a "harmless extra flag" turns
-        // into a redirect or an arbitrary write under some flag we did not enumerate.
-        if t.contains("://") {
+        check_extra_arg_token_content(raw, t)?;
+
+        let Some(spec) = allowed.iter().find(|s| s.flag == flag) else {
+            let known = if allowed.is_empty() {
+                "no extra argument at all has been reviewed for this engine yet".to_string()
+            } else {
+                format!(
+                    "reviewed for this engine: {}",
+                    allowed
+                        .iter()
+                        .map(|s| s.flag)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             return Err(format!(
-                "engine pin entry's extra argument {raw:?} carries a URL; the relay endpoints are \
-                 the client's to choose — refusing"
+                "engine pin entry's extra argument {raw:?} is not on the reviewed argv allow-list \
+                 for engine kind '{kind}' ({known}). A signed pin may only pass switches a human \
+                 has checked against THIS engine's own flag surface — a deny-list cannot be trusted \
+                 to have enumerated every alias of a third-party binary (xmrig spells --user as \
+                 --userpass, --proxy as -x and --log-file as -l). Adding one is a client release, \
+                 on purpose — refusing the whole list"
             ));
-        }
-        if t.starts_with('/') || t.starts_with('~') || t.contains('\\') || t.contains("..") {
-            return Err(format!(
-                "engine pin entry's extra argument {raw:?} looks like a filesystem path; a pin may \
-                 not choose where the engine reads or writes — refusing"
-            ));
-        }
-        // The same credit-only / anti-leak scan a bring-your-own miner's argv gets.
-        if let Some(bad) = crate::backend::forbidden_in_arg(t) {
-            return Err(format!(
-                "engine pin entry's extra argument {raw:?} is refused by the argv honesty gate \
-                 ({bad:?}) — refusing the whole list"
-            ));
+        };
+
+        match (spec.takes_value, inline_value) {
+            // `--flag=value`
+            (true, Some(v)) => check_extra_arg_value(spec.flag, v)?,
+            // `--flag` `value` — the value must be the very next token.
+            (true, None) => awaiting_value = Some(spec),
+            (false, Some(_)) => {
+                return Err(format!(
+                    "engine pin entry's extra argument {raw:?} gives a value to `{}`, which takes \
+                     none — refusing rather than guessing what the engine would do with it",
+                    spec.flag
+                ))
+            }
+            (false, None) => {}
         }
         out.push(t.to_string());
     }
+    if let Some(spec) = awaiting_value {
+        return Err(format!(
+            "engine pin entry's extra argument `{}` needs a value and the list ends there; \
+             a half-written flag is refused, never sent",
+            spec.flag
+        ));
+    }
     Ok(out)
+}
+
+/// Characters an allow-listed flag's VALUE may contain.
+///
+/// Deliberately narrower than the token scan above: a value is the half an attacker
+/// would need to name a destination, so it may not contain `:` (host:port,
+/// `user:pass`), `/` or `\` (paths, URLs), `@`, or anything else outside this set.
+/// Every value the reviewed flags actually take — `light`, `75`, `-1`, `intel`,
+/// `auto` — is inside it. A future flag needing a richer value shape is a client
+/// release, which is the same price as the flag itself.
+/// The content scans every extra-argv token faces, flag or value: no URL, no
+/// filesystem path, and the same credit-only / anti-leak scan a bring-your-own
+/// miner's argv gets. Independent of the allow-list, and kept because a token can
+/// be shaped wrong in ways the allow-list would never see (a value, an `=` tail).
+fn check_extra_arg_token_content(raw: &str, t: &str) -> Result<(), String> {
+    if t.contains("://") {
+        return Err(format!(
+            "engine pin entry's extra argument {raw:?} carries a URL; the relay endpoints are \
+             the client's to choose — refusing"
+        ));
+    }
+    if t.starts_with('/') || t.starts_with('~') || t.contains('\\') || t.contains("..") {
+        return Err(format!(
+            "engine pin entry's extra argument {raw:?} looks like a filesystem path; a pin may \
+             not choose where the engine reads or writes — refusing"
+        ));
+    }
+    if let Some(bad) = crate::backend::forbidden_in_arg(t) {
+        return Err(format!(
+            "engine pin entry's extra argument {raw:?} is refused by the argv honesty gate \
+             ({bad:?}) — refusing the whole list"
+        ));
+    }
+    Ok(())
+}
+
+fn is_extra_arg_value_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ',' | '+')
+}
+
+/// One allow-listed flag's value, validated.
+fn check_extra_arg_value(flag: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > MAX_EXTRA_ARG_LEN {
+        return Err(format!(
+            "engine pin entry gives `{flag}` an implausible value {value:?} \
+             (1..={MAX_EXTRA_ARG_LEN} characters)"
+        ));
+    }
+    if !value.chars().all(is_extra_arg_value_char) {
+        return Err(format!(
+            "engine pin entry gives `{flag}` the value {value:?}, which contains characters a \
+             tuning value never has (allowed: letters, digits, and . - _ , +). A value is where a \
+             host:port, a user:pass pair or a path would have to live — refusing"
+        ));
+    }
+    if let Some(bad) = crate::backend::forbidden_in_arg(value) {
+        return Err(format!(
+            "engine pin entry's value {value:?} for `{flag}` is refused by the argv honesty gate \
+             ({bad:?}) — refusing the whole list"
+        ));
+    }
+    Ok(())
 }
 
 /// The parser id, resolved against the parsers compiled into THIS build. An id we
@@ -1745,28 +2037,44 @@ mod tests {
 
     // ── F6: the pin carries the CALL, not just the bytes ───────────────────────
 
-    /// The happy path: a signed entry names the algorithm token, the extra argv and
-    /// the parser, and all three come back out validated. This is the whole point —
-    /// SRBMiner 3.5.4 reshaped its output on 2026-08-14 and a published pin could
-    /// not have said so.
+    /// The happy path: a signed entry names the algorithm token and the parser, and
+    /// both come back out validated. This is the whole point — SRBMiner 3.5.4
+    /// reshaped its output on 2026-08-14 and a published pin could not have said so.
+    ///
+    /// `extra_args` is exercised separately (and on `cpu-xmr`) since 2026-08-15: it
+    /// is now bounded by a per-engine reviewed allow-list, and nothing has been
+    /// reviewed for SRBMiner — see `an_unreviewed_extra_flag_is_refused_…`.
     #[test]
-    fn a_pin_can_carry_the_algorithm_extra_argv_and_the_parser_it_needs() {
+    fn a_pin_can_carry_the_algorithm_and_the_parser_it_needs() {
         let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
             2,
             "3.6.0",
             SHA_A,
-            r#""algorithm":"pearlhash2","extra_args":["--pearl-fork-salt","3"],"parser":"srbminer","#,
+            r#""algorithm":"pearlhash2","parser":"srbminer","#,
         ))
         .unwrap();
         validate_doc(&doc).expect("a document that says how to call the engine is valid");
         let inv = doc.engines[0].invocation().expect("invocation");
         assert_eq!(inv.algorithm.as_deref(), Some("pearlhash2"));
-        assert_eq!(
-            inv.extra_args,
-            vec!["--pearl-fork-salt".to_string(), "3".to_string()]
-        );
+        assert!(inv.extra_args.is_empty());
         assert_eq!(inv.parser, Some(crate::stats::ParserKind::Srbminer));
         assert!(!inv.is_default());
+
+        // …and the extra-argv half, on the engine that has a reviewed list.
+        let xmr: EnginesDoc = serde_json::from_str(&linux_xmr_doc(
+            2,
+            "6.27.0",
+            SHA_A,
+            r#""extra_args":["--randomx-mode","light"],"parser":"xmrig","#,
+        ))
+        .unwrap();
+        validate_doc(&xmr).expect("a reviewed tuning flag is publishable");
+        let inv = xmr.engines[0].invocation().expect("invocation");
+        assert_eq!(
+            inv.extra_args,
+            vec!["--randomx-mode".to_string(), "light".to_string()]
+        );
+        assert_eq!(inv.parser, Some(crate::stats::ParserKind::Xmr));
     }
 
     /// A DOCUMENTED limitation, pinned by a test so it cannot rot into a surprise:
@@ -1792,6 +2100,295 @@ mod tests {
             };
             assert!(err.contains("honesty gate"), "got: {err}");
         }
+    }
+
+    /// A one-entry document for the **linux cpu-xmr** slot. Used by the extra-argv
+    /// tests because `cpu-xmr` is the one kind with a NON-EMPTY reviewed allow-list
+    /// — so a refusal there proves the rule and not merely "the list is empty".
+    fn linux_xmr_doc(epoch: u64, version: &str, sha: &str, extra_fields: &str) -> String {
+        format!(
+            r#"{{"schema":1,"product":"alice-miner-engines","epoch":{epoch},
+              "min_engine_epoch":1,"issued":"2026-08-15T00:00:00Z","engines":[
+              {{"kind":"cpu-xmr","engine":"xmrig","version":"{version}",
+                "target":"x86_64-unknown-linux-gnu","filename":"xmrig",
+                "sha256":"{sha}",
+                {extra_fields}
+                "archive_url":"https://github.com/xmrig/xmrig/releases/download/v{version}/xmrig-linux-x64.tar.gz",
+                "archive_sha256":"{sha}",
+                "binary_path_in_archive":"xmrig-{version}/xmrig",
+                "source_url":"https://github.com/xmrig/xmrig/releases/tag/v{version}",
+                "endorsed_at":"2026-08-15T00:00:00Z","endorsed_by":"V"}}]}}"#
+        )
+    }
+
+    /// Refuse a one-entry cpu-xmr document carrying `extra_args`, returning the error.
+    fn xmr_extra_args_err(args: &[&str]) -> String {
+        let doc: EnginesDoc = serde_json::from_str(&linux_xmr_doc(
+            2,
+            "6.27.0",
+            SHA_A,
+            &format!(
+                r#""extra_args":{},"#,
+                serde_json::to_string(args).unwrap()
+            ),
+        ))
+        .unwrap();
+        match validate_doc(&doc) {
+            Err(e) => e,
+            Ok(()) => panic!("extra args {args:?} must be refused"),
+        }
+    }
+
+    // ── S2: the argv allow-list (2026-08-15) ───────────────────────────────────
+
+    /// **THE DEFECT.** The deny-list did not name the pinned engine's own documented
+    /// aliases, so each of these passed validation and reached xmrig's argv. All
+    /// three were verified against the exact binary in
+    /// `release-assets/aarch64-apple-darwin/xmrig` before this test was written:
+    ///
+    /// * `--userpass=<addr>:x` — an alias of `--user`+`--pass`. Appended after the
+    ///   client's `-u VICTIM -p x` it WON (xmrig is last-wins): the stratum login
+    ///   this miner sent carried the attacker's address. Every share, credited to
+    ///   someone else. The value clears the URL/path/honesty scans because an SS58
+    ///   address is base58 — no `0x`, no `prl1p`, no pool name.
+    /// * `-x <host:port>` — an alias of `--proxy`. The whole plaintext stratum
+    ///   session routed through a host of the publisher's choosing.
+    /// * `-l <file>` — an alias of `--log-file`. The file was created.
+    ///
+    /// Note the attack needed no new engine version at all: re-publishing the current
+    /// entry byte-for-byte with the flag added is `VersionOrder::Same`, staging is
+    /// skipped because the bytes already match, and within one refresh every miner on
+    /// the lane relaunches with it.
+    #[test]
+    fn a_pinned_engines_own_alias_of_a_client_owned_flag_is_refused() {
+        // Exactly the argv the live reproduction used.
+        for args in [
+            vec!["--userpass=5Gw3sAttackerAddress:zz"],
+            vec!["--userpass", "5Gw3sAttackerAddress:zz"],
+            vec!["-x", "198.51.100.9:1080"],
+            vec!["-x=198.51.100.9:1080"],
+            vec!["-l", "stolen.log"],
+            vec!["-l=stolen.log"],
+            // …and the upper-case spellings, since argv parsers rarely case-fold but
+            // our comparison must not be the weak link either way.
+            vec!["--USERPASS=5Gw3sAttackerAddress:zz"],
+            vec!["-O", "5Gw3sAttackerAddress:zz"],
+        ] {
+            let err = xmr_extra_args_err(&args);
+            assert!(
+                err.contains("this client controls") || err.contains("not on the reviewed argv"),
+                "args {args:?} got: {err}"
+            );
+        }
+    }
+
+    /// The RULE, not the three fixed aliases: a flag no deny-list entry names, that
+    /// carries no URL, no path and nothing the honesty gate dislikes, is STILL
+    /// refused — because it was never reviewed for this engine. This is the property
+    /// that does not depend on us having enumerated a third-party binary's surface,
+    /// and it is what makes the next unknown alias a non-event.
+    #[test]
+    fn an_unreviewed_extra_flag_is_refused_even_though_no_deny_list_entry_names_it() {
+        for args in [
+            vec!["--verbose"],           // real xmrig flag, deliberately not reviewed
+            vec!["--background"],        // detaches the child from our supervisor
+            vec!["--dry-run"],           // exits immediately: mining just stops
+            vec!["--no-cpu"],            // disables the only backend this lane has
+            vec!["--export-topology"],   // writes a file and exits
+            vec!["--self-select"],       // (also deny-listed nowhere) block templates
+            vec!["--totally-new-fork-switch"],
+        ] {
+            let err = xmr_extra_args_err(&args);
+            assert!(
+                err.contains("not on the reviewed argv allow-list"),
+                "args {args:?} got: {err}"
+            );
+        }
+        // Same rule on an engine whose reviewed list is EMPTY on purpose: SRBMiner is
+        // closed-source and its binary is not in this repo, so nothing has been
+        // checked for it. The formerly-blessed example flag is now a client release.
+        let doc: EnginesDoc = serde_json::from_str(&linux_prl_doc(
+            2,
+            "3.6.0",
+            SHA_A,
+            r#""extra_args":["--pearl-fork-salt","3"],"#,
+        ))
+        .unwrap();
+        let err = validate_doc(&doc).unwrap_err();
+        assert!(
+            err.contains("no extra argument at all has been reviewed for this engine yet"),
+            "got: {err}"
+        );
+    }
+
+    /// The capability that survives: a reviewed tuning flag, in both argv spellings,
+    /// with its value. Without this the allow-list would just be an off switch.
+    #[test]
+    fn a_reviewed_flag_and_its_value_are_accepted_in_both_spellings() {
+        for args in [
+            vec!["--randomx-1gb-pages"],
+            vec!["--randomx-mode=light"],
+            vec!["--randomx-mode", "light"],
+            vec!["--cpu-max-threads-hint", "75", "--huge-pages-jit"],
+            vec!["--randomx-wrmsr", "-1"], // a value may itself look like a flag
+            vec!["--asm=intel", "--randomx-no-numa", "--dns-ttl=30"],
+        ] {
+            let doc: EnginesDoc = serde_json::from_str(&linux_xmr_doc(
+                2,
+                "6.27.0",
+                SHA_A,
+                &format!(r#""extra_args":{},"#, serde_json::to_string(&args).unwrap()),
+            ))
+            .unwrap();
+            validate_doc(&doc).unwrap_or_else(|e| panic!("args {args:?} must be accepted: {e}"));
+            assert_eq!(doc.engines[0].invocation().unwrap().extra_args, args);
+        }
+    }
+
+    /// A value is accepted ONLY in the slot a value-taking flag opened, and only if
+    /// it cannot spell a destination. Both halves matter: the first stops a bare
+    /// token riding along behind an innocent flag, the second stops the reviewed
+    /// flag's own value from becoming the redirect.
+    #[test]
+    fn a_reviewed_flags_value_slot_is_positional_and_cannot_spell_a_destination() {
+        // A bare token no flag opened a slot for.
+        assert!(
+            xmr_extra_args_err(&["--randomx-1gb-pages", "198.51.100.9:1080"])
+                .contains("not on the reviewed argv allow-list"),
+            "a value with no flag before it must be refused"
+        );
+        assert!(
+            xmr_extra_args_err(&["evil.example.com"])
+                .contains("not on the reviewed argv allow-list"),
+            "a lone bare token must be refused"
+        );
+        // A flag that needs a value, with the list ending there.
+        assert!(
+            xmr_extra_args_err(&["--randomx-mode"]).contains("needs a value and the list ends"),
+            "a half-written flag must be refused"
+        );
+        // A boolean handed a value.
+        let err = xmr_extra_args_err(&["--randomx-1gb-pages=1"]);
+        assert!(err.contains("which takes none"), "got: {err}");
+        // And the value charset: no host:port, no user:pass, no path-ish token, in
+        // either spelling.
+        for args in [
+            vec!["--randomx-mode=198.51.100.9:1080"],
+            vec!["--randomx-mode", "198.51.100.9:1080"],
+            vec!["--asm", "a:b"],
+            vec!["--asm=x@y"],
+        ] {
+            let err = xmr_extra_args_err(&args);
+            assert!(
+                err.contains("a tuning value never has"),
+                "args {args:?} got: {err}"
+            );
+        }
+    }
+
+    /// The two tables must never overlap, and the allow-list must be spelled the way
+    /// the lookup spells it. Without this a future "harmless" allow-list entry could
+    /// silently re-open a flag the deny-list exists to forbid, and the belt would go
+    /// on looking like it was holding.
+    #[test]
+    fn the_deny_list_and_the_allow_list_can_never_overlap() {
+        for kind in ["cpu-xmr", "gpu-rvn", "gpu-prl", "gpu-alpha"] {
+            for spec in extra_arg_allowlist(kind) {
+                assert_eq!(
+                    spec.flag,
+                    spec.flag.to_ascii_lowercase(),
+                    "allow-list entries are compared lower-cased: {}",
+                    spec.flag
+                );
+                assert!(
+                    spec.flag.starts_with("--") && spec.flag.len() > 3,
+                    "allow-list entries are long-form flags: {}",
+                    spec.flag
+                );
+                assert!(
+                    !CLIENT_OWNED_FLAGS
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(spec.flag)),
+                    "{kind}: `{}` is on BOTH the allow-list and the client-owned deny-list",
+                    spec.flag
+                );
+            }
+        }
+        // The aliases that broke the deny-list-only design are named there now, too —
+        // belt and braces, not the boundary.
+        for alias in ["--userpass", "-x", "-l"] {
+            assert!(
+                CLIENT_OWNED_FLAGS.iter().any(|f| f.eq_ignore_ascii_case(alias)),
+                "{alias} must be deny-listed as well"
+            );
+        }
+    }
+
+    /// **DEFECT 2.** Publisher argv is spliced in BEFORE every flag the client built,
+    /// not after. On a last-wins engine — which xmrig 6.26, the one bundled engine we
+    /// can actually run, was verified to be — "last" is the position from which an
+    /// override WINS, so appending handed the publisher the tie it should always
+    /// lose. Ordering is not the invariant (the allow-list is), but it must not be
+    /// documented backwards, and the safe default must be the one the evidence
+    /// supports.
+    #[test]
+    fn publisher_argv_is_placed_before_every_flag_the_client_owns() {
+        let doc: EnginesDoc = serde_json::from_str(&linux_xmr_doc(
+            2,
+            "6.27.0",
+            SHA_A,
+            r#""extra_args":["--randomx-mode","light"],"#,
+        ))
+        .unwrap();
+        validate_doc(&doc).expect("a reviewed flag is accepted");
+        let inv = doc.engines[0].invocation().unwrap();
+        let mut args: Vec<String> = ["-o", "relay:3333", "-u", "VICTIM", "-p", "x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        inv.apply_extra_args(&mut args);
+        assert_eq!(
+            args,
+            ["--randomx-mode", "light", "-o", "relay:3333", "-u", "VICTIM", "-p", "x"],
+            "the pin's argv goes FIRST, so the client's login is the last word"
+        );
+        // Order among the publisher's own tokens is preserved (a flag keeps its value).
+        assert_eq!(&args[0..2], ["--randomx-mode", "light"]);
+    }
+
+    /// **DEFECT 3.** Only the GPU-PRL lane's argv carries an algorithm token. A pin
+    /// setting `algorithm` on any other kind used to be accepted and rendered by
+    /// `alice-miner engines` as if in force, while the argv never mentioned it —
+    /// a signed instruction silently dropped.
+    #[test]
+    fn an_algorithm_on_a_kind_whose_argv_has_no_algorithm_slot_is_refused() {
+        let doc: EnginesDoc = serde_json::from_str(&linux_xmr_doc(
+            2,
+            "6.27.0",
+            SHA_A,
+            r#""algorithm":"rx/1","#,
+        ))
+        .unwrap();
+        let err = validate_doc(&doc).unwrap_err();
+        assert!(
+            err.contains("carries no algorithm token") && err.contains("gpu-prl"),
+            "got: {err}"
+        );
+        // The kind that DOES have the slot still takes it.
+        let ok: EnginesDoc = serde_json::from_str(&linux_prl_doc(
+            2,
+            "3.6.0",
+            SHA_A,
+            r#""algorithm":"pearlhash2","#,
+        ))
+        .unwrap();
+        validate_doc(&ok).expect("gpu-prl has an algorithm slot");
+        assert_eq!(
+            ok.engines[0].invocation().unwrap().algorithm.as_deref(),
+            Some("pearlhash2")
+        );
+        // And every kind we claim has no slot is a kind whose builder really has none.
+        assert_eq!(KINDS_WITH_ALGORITHM_SLOT, &["gpu-prl"]);
     }
 
     /// An entry that says nothing about the call is byte-for-byte the compiled-in
@@ -2319,9 +2916,16 @@ mod tests {
     }
 
     /// The SAME contract for the fields the script gained with the invocation and
-    /// the downgrade marker: captured verbatim from a run of
-    /// `scripts/build_engines_manifest.py` (field order, key names, JSON types), so
-    /// a change on either side breaks this test rather than a miner's engine.
+    /// the downgrade marker: field order, key names and JSON types as
+    /// `scripts/build_engines_manifest.py` emits them, so a change on either side
+    /// breaks this test rather than a miner's engine.
+    ///
+    /// The gpu-prl entry is the script's own smoke output, verbatim, with one
+    /// edit made on 2026-08-15: its `extra_args` moved to a second `cpu-xmr` entry
+    /// carrying a REVIEWED flag, because extra argv became bounded by a per-engine
+    /// allow-list that (deliberately) has no SRBMiner entries. Everything the
+    /// contract is about — the key shape of `extra_args` as a JSON list of argv
+    /// tokens — is still exercised.
     #[test]
     fn the_publishing_scripts_invocation_and_downgrade_output_validates() {
         let produced = r#"{
@@ -2342,10 +2946,6 @@ mod tests {
       "endorsed_by": "V",
       "endorsed_at": "2026-08-15T00:00:00Z",
       "algorithm": "pearlhash2",
-      "extra_args": [
-        "--pearl-fork-salt",
-        "3"
-      ],
       "parser": "srbminer",
       "downgrade": true,
       "downgrade_reason": "smoke test of the marker path",
@@ -2353,6 +2953,25 @@ mod tests {
       "archive_url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/9.9.9/x.tar.gz",
       "archive_sha256": "412df2665bd292191586a3194e0212a38aba323ffb85cc983540785bda067fa8",
       "binary_path_in_archive": "SRBMiner-Multi-9-9-9/SRBMiner-MULTI"
+    },
+    {
+      "kind": "cpu-xmr",
+      "engine": "xmrig",
+      "version": "6.27.0",
+      "target": "x86_64-unknown-linux-gnu",
+      "filename": "xmrig",
+      "source_url": "https://github.com/xmrig/xmrig/releases/tag/v6.27.0",
+      "endorsed_by": "V",
+      "endorsed_at": "2026-08-15T00:00:00Z",
+      "extra_args": [
+        "--randomx-mode",
+        "light"
+      ],
+      "parser": "xmrig",
+      "sha256": "43224fd816f8416299aeff9d6e4cf5633c34113c9029a8347f95f66256c1a278",
+      "archive_url": "https://github.com/xmrig/xmrig/releases/download/v6.27.0/x.tar.gz",
+      "archive_sha256": "412df2665bd292191586a3194e0212a38aba323ffb85cc983540785bda067fa8",
+      "binary_path_in_archive": "xmrig-6.27.0/xmrig"
     }
   ]
 }
@@ -2363,12 +2982,16 @@ mod tests {
         let inv = e.invocation().expect("invocation");
         assert_eq!(inv.algorithm.as_deref(), Some("pearlhash2"));
         assert_eq!(inv.parser, Some(crate::stats::ParserKind::Srbminer));
-        assert_eq!(inv.extra_args.len(), 2);
+        assert!(inv.extra_args.is_empty());
         assert!(e.downgrade);
         assert_eq!(
             e.downgrade_reason.as_deref(),
             Some("smoke test of the marker path")
         );
+        let xmr = doc.engines[1].invocation().expect("invocation");
+        assert_eq!(xmr.extra_args.len(), 2);
+        assert_eq!(xmr.parser, Some(crate::stats::ParserKind::Xmr));
+        assert!(xmr.algorithm.is_none());
     }
 
     // ── The full pipeline, offline ─────────────────────────────────────────
@@ -2568,7 +3191,7 @@ mod tests {
             2,
             "3.6.0",
             &sha,
-            r#""algorithm":"pearlhash2","extra_args":["--pearl-fork-salt","3"],"parser":"generic","#,
+            r#""algorithm":"pearlhash2","parser":"generic","#,
         );
         let (bytes, sig, _pk) = sign(&json);
         let staged = engine_bytes.clone();
@@ -2578,19 +3201,71 @@ mod tests {
 
         let inv = effective_invocation(MinerKind::GpuPrl).expect("invocation in force");
         assert_eq!(inv.algorithm.as_deref(), Some("pearlhash2"));
-        assert_eq!(
-            inv.extra_args,
-            vec!["--pearl-fork-salt".to_string(), "3".to_string()]
-        );
         assert_eq!(inv.parser, Some(crate::stats::ParserKind::Generic));
+        assert!(
+            inv.extra_args.is_empty(),
+            "no extra argument has been reviewed for SRBMiner"
+        );
 
         // And it is visible to the miner, not just to the launch path.
         let status = status_for_current_platform();
         let prl = status.iter().find(|s| s.kind == "gpu-prl").expect("status");
         assert_eq!(prl.algorithm.as_deref(), Some("pearlhash2"));
         assert_eq!(prl.parser.as_deref(), Some("generic"));
-        assert_eq!(prl.extra_args, vec!["--pearl-fork-salt".to_string(), "3".to_string()]);
+        assert!(prl.extra_args.is_empty());
         assert!(prl.downgrade_reason.is_none());
+    }
+
+    /// THE UPGRADE PATH, which is where a validation change usually leaks: a
+    /// document that a PREVIOUS build accepted is sitting in the cache, correctly
+    /// signed, with an epoch above the floor — and it carries the argv the old
+    /// deny-list waved through. Shipping the fix must not leave that document in
+    /// force on every machine that already took it.
+    ///
+    /// It does not, because the cached document is re-validated on every load, and a
+    /// document is refused WHOLE: the client falls back to the pins compiled into it
+    /// rather than keeping the parts it still likes.
+    #[test]
+    fn a_document_a_previous_build_accepted_is_refused_after_the_rules_tighten() {
+        let env = TestEnv::new();
+        env.trust_test_key();
+        // Byte-for-byte the attack: an alias of --user/--pass the old deny-list did
+        // not name, on the engine whose reviewed list is empty.
+        let json = doc_for_this_platform_with(
+            2,
+            "3.6.0",
+            SHA_A,
+            r#""extra_args":["--userpass=5Gw3sAttackerAddress:zz"],"#,
+        );
+        let (bytes, sig, _pk) = sign(&json);
+        // Plant it exactly as a previous build would have left it, bypassing the
+        // acceptance path (which would refuse it now — that is the point).
+        std::fs::create_dir_all(pins_dir().unwrap()).unwrap();
+        std::fs::write(doc_path().unwrap(), &bytes).unwrap();
+        std::fs::write(sig_path().unwrap(), &sig).unwrap();
+        let mut st = load_state();
+        st.epoch_floor = 1;
+        save_state(&st).unwrap();
+        invalidate_cache();
+
+        assert!(
+            active_doc().is_none(),
+            "a cached document carrying unreviewed argv must not become active"
+        );
+        // …and whatever pin is in force is the compiled-in floor, not the document's.
+        if let Some(p) = effective_pin_for(MinerKind::GpuPrl) {
+            assert_eq!(p.source, PinSource::Embedded, "must fall back to the floor");
+        }
+        assert!(effective_invocation(MinerKind::GpuPrl)
+            .expect("the floor invocation is valid")
+            .is_default());
+        assert!(
+            load_state()
+                .last_error
+                .unwrap_or_default()
+                .contains("cached engine pin list rejected"),
+            "and the miner is told why"
+        );
     }
 
     /// A DELIBERATE downgrade is surfaced by the same status the CLI and `doctor`

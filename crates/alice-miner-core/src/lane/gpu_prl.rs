@@ -301,10 +301,11 @@ pub fn build_srbminer_pearl_launch_plan(
         args.push(SRBMINER_GPU_ID_FLAG.into());
         args.push(csv);
     }
-    // NOTE: a signed pin's EXTRA argv is deliberately NOT appended here. It is
-    // appended once, for every bundled lane, by `engine::with_pin_extra_args` — one
-    // place where publisher-supplied argv enters a launch, always after every flag
-    // this client owns.
+    // NOTE: a signed pin's EXTRA argv is deliberately NOT spliced in here. It is
+    // spliced once, for every bundled lane, by `engine::with_pin_extra_args` — one
+    // place where publisher-supplied argv enters a launch, ahead of every flag this
+    // client owns (see that function for why ordering is a default and not the
+    // guarantee; the guarantee is the per-engine allow-list in `engine_pins`).
     Ok(GpuLaunchPlan { program, args })
 }
 

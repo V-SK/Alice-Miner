@@ -1224,14 +1224,25 @@ fn bundled_kind_for(lane: Lane) -> crate::binaries::MinerKind {
 }
 
 /// Wrap a bundled lane's rebuild closure so the SIGNED engine pin's extra argv is
-/// appended to whatever the lane built.
+/// spliced into whatever the lane built.
 ///
-/// One place, all four bundled lanes, and always LAST — after every flag the client
-/// owns (pool, login, password, log file, device selection), so a publisher-supplied
-/// argument cannot shadow one of ours even on an engine whose own parsing is
-/// last-wins. `engine_pins::check_extra_args` already refuses those flags by name;
-/// this ordering means the invariant does not rest on that list being exhaustive for
-/// an engine we have not met yet.
+/// One place, all four bundled lanes, and always FIRST — *before* every flag the
+/// client owns (pool, login, password, log file, device selection).
+///
+/// Read the position honestly: it is a default chosen on evidence, **not** the
+/// invariant. Precedence belongs to the engine's own parser, so whichever end we
+/// pick is the winning end for one of {last-wins, first-wins} and the losing end for
+/// the other; no ordering can be safe against both. xmrig 6.26 — the only bundled
+/// engine whose binary lives in this repo, so the only one we can test — is
+/// last-wins (verified), and no bundled engine is known to be first-wins, so first
+/// is where a publisher token loses today. Until 2026-08-15 this appended, and said
+/// that end was safe "even on an engine whose own parsing is last-wins", which had
+/// it exactly backwards: an appended `--userpass=<attacker>` beat the client's own
+/// `-u`, and every share went to the publisher.
+///
+/// The actual invariant is `engine_pins::extra_arg_allowlist`: publisher argv can
+/// only name flags reviewed for that specific engine, so it does not matter who
+/// wins the tie. See `EngineInvocation::apply_extra_args`.
 ///
 /// Re-resolved on every rebuild (not captured), and fails the rebuild CLOSED if the
 /// pin's invocation stops validating — a lane that will not start with a reason beats
@@ -1678,11 +1689,18 @@ mod tests {
     use super::*;
 
     /// F6 AT THE LAUNCH BOUNDARY: extra argv carried by a SIGNED engine-pin
-    /// document reaches the argv a lane actually starts with — appended last,
-    /// after every flag the client owns, and without disturbing anything the lane
+    /// document reaches the argv a lane actually starts with — spliced in FIRST,
+    /// ahead of every flag the client owns, and without disturbing anything the lane
     /// built. `engine_pins` proves the document is accepted and that
     /// `effective_invocation` returns the fields; this proves the launch path
     /// consumes them, which is the half that makes the feature true.
+    ///
+    /// Ordering is load-bearing enough to assert here and not only in the unit test:
+    /// this wrapper is the ONE place publisher argv enters a real launch. Until
+    /// 2026-08-15 it appended, and an appended `--userpass=<attacker>` beat the
+    /// client's own `-u` on xmrig (verified against the binary in `release-assets/`).
+    /// The engine is `cpu-xmr` because that is the kind with a non-empty reviewed
+    /// argv allow-list — see `engine_pins::extra_arg_allowlist`.
     #[test]
     fn a_signed_pins_extra_argv_reaches_the_argv_a_lane_launches_with() {
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -1699,14 +1717,14 @@ mod tests {
 
         // Baseline: no document ⇒ the wrapper is a pass-through, so today's argv is
         // byte-for-byte what it was before any of this existed.
-        let built: Vec<String> = ["--algorithm", "pearlhash", "--pool", "p", "--gpu-id", "0"]
+        let built: Vec<String> = ["-o", "relay:3333", "-u", "VICTIM", "-p", "x"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let base = built.clone();
         let inner: crate::supervise::RebuildFn =
             Arc::new(move |_eps: &[Endpoint]| Ok((std::path::PathBuf::from("/bin/engine"), base.clone())));
-        let wrapped = with_pin_extra_args(crate::binaries::MinerKind::GpuPrl, inner.clone());
+        let wrapped = with_pin_extra_args(crate::binaries::MinerKind::CpuXmr, inner.clone());
         assert_eq!(wrapped(&[]).unwrap().1, built, "no pin ⇒ argv unchanged");
 
         // Now activate a signed document that adds two argv tokens.
@@ -1721,22 +1739,22 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move |_e| Ok(staged.clone())));
         let member = if cfg!(windows) {
-            "SRBMiner-Multi/SRBMiner-MULTI.exe"
+            "xmrig-9.9.9/xmrig.exe"
         } else {
-            "SRBMiner-Multi/SRBMiner-MULTI"
+            "xmrig-9.9.9/xmrig"
         };
         let doc = format!(
             r#"{{"schema":1,"product":"alice-miner-engines","epoch":2,"min_engine_epoch":1,
   "issued":"2026-08-15T00:00:00Z","engines":[
-  {{"kind":"gpu-prl","engine":"srbminer-multi","version":"9.9.9","target":"{target}",
+  {{"kind":"cpu-xmr","engine":"xmrig","version":"9.9.9","target":"{target}",
     "filename":"{filename}","sha256":"{sha}",
-    "extra_args":["--pearl-fork-salt","3"],
-    "archive_url":"https://github.com/doktor83/SRBMiner-Multi/releases/download/9.9.9/a.tar.gz",
+    "extra_args":["--randomx-mode","light"],
+    "archive_url":"https://github.com/xmrig/xmrig/releases/download/v9.9.9/a.tar.gz",
     "archive_sha256":"{sha}","binary_path_in_archive":"{member}",
-    "source_url":"https://github.com/doktor83/SRBMiner-Multi/releases/tag/9.9.9",
+    "source_url":"https://github.com/xmrig/xmrig/releases/tag/v9.9.9",
     "endorsed_at":"2026-08-15T00:00:00Z","endorsed_by":"V"}}]}}"#,
             target = crate::binaries::current_target_triple(),
-            filename = crate::binaries::MinerKind::GpuPrl.binary_name(),
+            filename = crate::binaries::MinerKind::CpuXmr.binary_name(),
         );
         let sig = B64.encode(sk.sign(doc.as_bytes()).to_bytes());
         let mut st = crate::engine_pins::load_state();
@@ -1745,22 +1763,13 @@ mod tests {
         let got = wrapped(&[]).unwrap().1;
         assert_eq!(
             got,
-            [
-                "--algorithm",
-                "pearlhash",
-                "--pool",
-                "p",
-                "--gpu-id",
-                "0",
-                "--pearl-fork-salt",
-                "3"
-            ],
-            "the pin's argv is appended LAST, after every flag the client owns"
+            ["--randomx-mode", "light", "-o", "relay:3333", "-u", "VICTIM", "-p", "x"],
+            "the pin's argv goes FIRST — the client's login flags are the last word"
         );
 
         // Another lane's engine is unaffected — the pin is per (kind, target).
-        let xmr = with_pin_extra_args(crate::binaries::MinerKind::CpuXmr, inner);
-        assert_eq!(xmr(&[]).unwrap().1, built);
+        let prl = with_pin_extra_args(crate::binaries::MinerKind::GpuPrl, inner);
+        assert_eq!(prl(&[]).unwrap().1, built);
 
         *crate::engine_pins::test_trust_key()
             .lock()

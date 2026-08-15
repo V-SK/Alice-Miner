@@ -50,7 +50,8 @@ The sub-key is strictly weaker by construction, and the client enforces that:
   defers it. In both cases the previous pin stays in force and mining continues.
 * **Fail-closed everywhere else** — bad signature, unknown schema, wrong product,
   malformed entry, unsafe filename or archive member, an algorithm token that is
-  really a flag, an extra argument that restates a flag the client owns, a log
+  really a flag, an algorithm on an engine whose argv has no algorithm slot, an
+  extra argument that is not on the reviewed allow-list for that engine, a log
   parser this build does not have ⇒ the document is ignored and the client says
   which pins it is actually using.
 
@@ -80,8 +81,8 @@ So an entry in `engines-sources.json` may now also carry:
 
 | field | what it does | bound |
 |---|---|---|
-| `algorithm` | replaces the client's compiled-in algorithm token (`pearlhash`) wherever a lane's argv carries one | short ASCII token, never flag-shaped, ≤ 64 chars |
-| `extra_args` | argv appended **after** every flag the client owns | ≤ 16 tokens, no URL, no path, no whitespace, and **never** one of the flags the client owns (pool, login, password, log file, devices, algorithm, config, api/http, donate) |
+| `algorithm` | replaces the client's compiled-in algorithm token (`pearlhash`) wherever a lane's argv carries one | short ASCII token, never flag-shaped, ≤ 64 chars; **only on `gpu-prl`** — it is the one kind whose argv has an algorithm slot, and setting it on another kind is refused rather than accepted-and-ignored |
+| `extra_args` | argv spliced in **before** every flag the client owns | ≤ 16 tokens, and every flag must be on the **reviewed allow-list for that engine kind** (`engine_pins::extra_arg_allowlist`); values only in the slot their flag opened, and restricted to letters, digits and `. - _ , +` |
 | `parser` | which compiled-in log parser reads this engine's output — `xmrig`, `kawpow`, `srbminer`, `alpha`, `generic` | must be an id **this client has**; an unknown id refuses the document whole |
 
 All three are optional. Omitted ⇒ byte-for-byte the behaviour that shipped before
@@ -89,7 +90,46 @@ they existed. All three are validated when the document is accepted **and again
 at the moment argv is built**, so a lane fails to start rather than launching a
 call nobody checked. `scripts/build_engines_manifest.py` reads the parser list out
 of the client source (the same trick it uses for the URL allow-list), so a typo is
-caught at publish time rather than on a rig.
+caught at publish time rather than on a rig. It does **not** yet check `extra_args`
+against the allow-list — the client does, so a bad flag is refused on the rig
+rather than at publish time. Check it by eye against the table below.
+
+### `extra_args` is an allow-list (changed 2026-08-15 — read this before publishing one)
+
+The first cut of this field policed publisher argv with a **deny**-list of the
+flags the client owns, and let everything else through. That is not decidable: it
+requires having enumerated every spelling of every credit/transport/write flag of a
+third-party binary. It failed on the engine we ship. xmrig 6.26 spells `--user` +
+`--pass` also as **`--userpass`**, `--proxy` also as **`-x`**, and `--log-file`
+also as **`-l`**; none were on the deny-list, and each was verified against
+`release-assets/aarch64-apple-darwin/xmrig` to work:
+`--userpass=<attacker>:x` put the attacker's address in the stratum login (xmrig is
+last-wins, and the pin's argv was appended *last*), `-x host:port` routed the
+plaintext session through a chosen host, `-l file` created a file. No new engine
+version was needed — re-publishing the current entry with the flag added is
+accepted as `Same` and skips staging entirely.
+
+So the rule is inverted, and the allow-list currently reads:
+
+| kind | engine | reviewed flags |
+|---|---|---|
+| `cpu-xmr` | xmrig | `--randomx-mode`, `--randomx-init`, `--randomx-1gb-pages`, `--randomx-no-numa`, `--randomx-wrmsr`, `--randomx-no-rdmsr`, `--randomx-cache-qos`, `--huge-pages-jit`, `--no-huge-pages`, `--cpu-max-threads-hint`, `--cpu-no-yield`, `--asm`, `--dns-ttl` |
+| `gpu-prl` | SRBMiner-MULTI | *(none reviewed)* |
+| `gpu-rvn` | kawpowminer | *(none reviewed)* |
+| `gpu-alpha` | alpha-miner | *(none reviewed)* |
+
+Empty is deliberate, not an oversight. An entry on that table is a claim that a
+human read that engine's own flag documentation and confirmed the flag cannot name
+a pool, a login, a proxy, a file or a device. We can make that claim for xmrig
+because its binary is in this repo. SRBMiner-MULTI is closed-source and ships no
+macOS build; neither it nor alpha-miner nor kawpowminer has been read. **Adding a
+flag is a client release**, and that release should carry the evidence (which
+version's `--help`, read by whom) the way `ENGINE-TRUST-LOG.md` carries a hash.
+
+What the allow-list guarantees: an alias nobody enumerated cannot pass, because
+passing requires being *named*. What it does not: that a reviewed flag stays
+harmless on a future version of the same engine — only re-review catches a vendor
+repurposing a flag.
 
 ### What this still does NOT remove
 
@@ -105,11 +145,18 @@ required when:
 * the new flag's name contains `seed` or `priv` — the argv honesty gate refuses
   those substrings outright, and we keep it strict (a gate that costs a release
   beats a gate with a hole);
+* **the fork needs a switch nobody has reviewed for that engine** — since
+  2026-08-15 `extra_args` is an allow-list, so a genuinely new flag is a one-line
+  table entry plus a release. This is a real capability the deny-list appeared to
+  offer and could not safely keep; the trade is written out above;
+* the fork renames the algorithm on any lane except GPU-PRL — that is the only
+  lane whose argv carries an algorithm token at all;
 * the engine moves to a host outside `ALLOWED_URL_PREFIXES`, or the fork needs a
   new engine *kind* / a new lane.
 
-Everything else — a new version, new bytes, a renamed algorithm, an added switch,
-a different one of our existing parsers — is a published document away.
+Everything else — a new version, new bytes, a renamed pearlhash algorithm, a
+reviewed tuning switch, a different one of our existing parsers — is a published
+document away.
 
 ## 2b. Versions only go forward
 
