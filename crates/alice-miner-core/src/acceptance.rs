@@ -1216,7 +1216,7 @@ pub fn unknown_acceptance_note() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::i18n::{set_lang, Lang, LANG_TEST_LOCK};
+    use crate::i18n::{set_lang, Lang};
 
     fn cfg_fast() -> AcceptanceConfig {
         AcceptanceConfig {
@@ -1529,7 +1529,6 @@ mod tests {
 
     #[test]
     fn halt_text_says_the_numbers_and_the_two_causes_differ() {
-        let _lock = LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_lang(Lang::En);
         let c = shutout();
         let net = halt_explanation(&c, Attribution::NetworkWide);
@@ -1557,7 +1556,6 @@ mod tests {
 
     #[test]
     fn halt_text_localizes_to_chinese() {
-        let _lock = LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_lang(Lang::Zh);
         let c = shutout();
         let net = halt_explanation(&c, Attribution::NetworkWide);

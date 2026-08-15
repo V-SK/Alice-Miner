@@ -1664,9 +1664,6 @@ mod tests {
     /// fix.
     #[test]
     fn a_safety_hold_never_reads_as_an_invitation_to_bypass_itself() {
-        let _g = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let safety = [
             Hold::Soaking { ready_in_s: 3600 },
             Hold::ClockAhead { ahead_by_s: 10 * 365 * 24 * 3600 },
@@ -1720,9 +1717,6 @@ mod tests {
     /// how long the thing has actually been public.
     #[test]
     fn a_withdrawal_inside_the_soak_floor_advises_against_installing() {
-        let _g = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
             crate::i18n::set_lang(lang);
             let s = describe_forward(&Some(newer("9.9.9", 2 * 3600)), false, false);
@@ -1748,9 +1742,6 @@ mod tests {
     /// they have — it is not a statement about which build they should take.
     #[test]
     fn a_withdrawal_past_the_soak_floor_states_facts_without_instructing() {
-        let _g = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
         let s = describe_forward(&Some(newer("9.9.9", 5 * 24 * 3600)), false, false);
         assert!(!reads_as_an_instruction(&s), "{s}");
@@ -1764,9 +1755,6 @@ mod tests {
     /// on the very thing it had just recommended.
     #[test]
     fn a_withdrawal_with_nowhere_to_go_says_so_and_points_at_the_releases_page() {
-        let _g = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
             crate::i18n::set_lang(lang);
             let s = describe_forward(&None, false, /* rollback_available */ false);
@@ -1792,9 +1780,6 @@ mod tests {
     /// leave a hole in the line.
     #[test]
     fn the_assembled_withdrawal_notice_warns_without_instructing() {
-        let _g = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
             crate::i18n::set_lang(lang);
             for (newer, reverted, lkg, may_act) in [
@@ -1834,9 +1819,6 @@ mod tests {
     /// setting would have done it.
     #[test]
     fn a_withdrawal_with_a_rollback_copy_in_hand_does_not_send_the_user_away() {
-        let _g = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
             crate::i18n::set_lang(lang);
             let s = describe_revoked(
@@ -1891,9 +1873,6 @@ mod tests {
 
     #[test]
     fn age_phrase_reads_in_the_unit_a_human_would_use() {
-        let _g = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
         assert_eq!(age_phrase(30), "less than a minute");
         assert_eq!(age_phrase(20 * 60), "20 minutes");
@@ -1950,9 +1929,6 @@ mod tests {
     /// and the hash-conflict guard had nothing to guard with.
     #[test]
     fn the_manual_path_records_the_sighting_and_reports_visibility() {
-        let _l = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
         with_state_dir("seen", |dir| {
             let m = test_manifest("9.9.9");
@@ -1980,9 +1956,6 @@ mod tests {
     /// on the MANUAL path exactly as it is on the automatic one.
     #[test]
     fn the_manual_path_refuses_a_republished_version() {
-        let _l = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
         with_state_dir("conflict", |dir| {
             // This machine saw 9.9.9 carrying "bb…" first.
@@ -2009,9 +1982,6 @@ mod tests {
     /// refusal: the user may still choose it, knowing what happened here.
     #[test]
     fn the_manual_path_asks_again_about_a_version_this_machine_rolled_back() {
-        let _l = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
         with_state_dir("pinned", |dir| {
             auto::pin(dir, "9.9.9");
@@ -2030,9 +2000,6 @@ mod tests {
     /// one, in the shape both front-ends actually call.
     #[test]
     fn the_manual_path_refuses_a_downgrade() {
-        let _l = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
         with_state_dir("downgrade", |dir| {
             // A perfectly ordinary, correctly-signed manifest — the only thing
@@ -2109,9 +2076,6 @@ mod tests {
     /// say so rather than proceed as if the check had passed.
     #[test]
     fn the_manual_path_says_when_it_could_not_record_what_it_was_offered() {
-        let _l = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
         let _g = crate::IDENTITY_ENV_LOCK
             .lock()
@@ -2159,9 +2123,6 @@ mod tests {
     /// the version it was published under, and that is ours to fix, not theirs.
     #[test]
     fn the_already_installed_line_stops_saying_restart_once_that_is_disproved() {
-        let _g = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
 
         let fresh = describe_hold("0.6.8", &Hold::AlreadyInstalled { installed_ago_s: 4 * 3600 });
@@ -2192,9 +2153,6 @@ mod tests {
     /// trial — and `--yes` must not reach that.
     #[test]
     fn the_manual_path_asks_before_re_applying_an_update_already_on_disk() {
-        let _l = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
         with_state_dir("already", |dir| {
             let m = test_manifest("9.9.9");
@@ -2229,9 +2187,6 @@ mod tests {
     /// someone to go and check their disk would be a guess wearing a diagnosis.
     #[test]
     fn the_manual_path_says_when_its_ledger_was_lost_rather_than_unwritable() {
-        let _l = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
         with_state_dir("ledgerreset", |dir| {
             // This machine had a record, and then the file stopped being readable.

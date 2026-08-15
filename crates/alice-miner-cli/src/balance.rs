@@ -409,18 +409,9 @@ mod tests {
     use alice_miner_core::i18n::{set_lang, Lang};
     use alice_miner_core::{CreditScore, CreditTotals};
 
-    /// These tests mutate the PROCESS-GLOBAL UI language, so they must not run
-    /// concurrently (Rust runs a crate's tests in parallel). Funnel them through one
-    /// mutex + set the language while holding it. Returns the guard so the caller keeps
-    /// the lock for the duration of the test.
-    // The PROCESS-GLOBAL language is shared by EVERY module's tests in this one test
-    // binary, so they serialize on the CRATE-wide lock (see `main.rs::LANG_TEST_LOCK`) —
-    // a module-private mutex would only order this module against itself.
-    fn lang_guard(l: Lang) -> std::sync::MutexGuard<'static, ()> {
-        let g = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        set_lang(l);
-        g
-    }
+    // These tests pin the UI language with `set_lang`, which is scoped to the calling
+    // thread; libtest gives each test its own, so no lock is involved — pinning a
+    // language here cannot be observed by any test running beside it.
 
     fn confirmed(total: u64, h24: u64) -> CreditState {
         CreditState::Confirmed {
@@ -437,7 +428,7 @@ mod tests {
     /// The credit bucket renders the cumulative COUNT (credit-only) — never a `$`/paid.
     #[test]
     fn credit_value_is_credit_only_count() {
-        let _g = lang_guard(Lang::En);
+        set_lang(Lang::En);
         let s = credit_value(&confirmed(873, 142));
         assert!(s.contains("873"), "{s}");
         assert!(s.contains("142"), "24h count: {s}");
@@ -450,7 +441,7 @@ mod tests {
     /// A bound PRL rebate shows the accrual + fingerprint, and NEVER a fabricated amount.
     #[test]
     fn prl_value_bound_shows_state_not_amount() {
-        let _g = lang_guard(Lang::En);
+        set_lang(Lang::En);
         let v = PrlRebateView {
             bound: true,
             payout_address_fingerprint: Some("prlfp_ab12".into()),
@@ -469,7 +460,7 @@ mod tests {
     /// An unbound rebate nudges the user to set a prl1p return address.
     #[test]
     fn prl_value_unbound_nudges_enrollment() {
-        let _g = lang_guard(Lang::En);
+        set_lang(Lang::En);
         let v = PrlRebateView { bound: false, ..Default::default() };
         let s = prl_value(Some(&v));
         assert!(s.contains("not bound"), "{s}");
@@ -480,7 +471,7 @@ mod tests {
     /// number), in both env states.
     #[test]
     fn alice_token_is_honest_pending() {
-        let _g = lang_guard(Lang::En);
+        set_lang(Lang::En);
         assert!(AliceToken::Pending.human().starts_with('0'));
         assert!(AliceToken::Pending.human().contains("not yet enabled"));
         assert!(AliceToken::PendingWithRpc.human().contains("chain RPC configured"));
@@ -490,7 +481,7 @@ mod tests {
     /// and never a `$`/paid/earned anywhere.
     #[test]
     fn render_has_three_buckets_and_no_fiat() {
-        let _g = lang_guard(Lang::En);
+        set_lang(Lang::En);
         let b = BalanceLookup {
             credit: confirmed(10, 10),
             prl_rebate: Some(PrlRebateView {
@@ -513,7 +504,7 @@ mod tests {
     /// The Chinese variant renders localized bucket labels (tr! honored).
     #[test]
     fn render_localizes_to_chinese() {
-        let _g = lang_guard(Lang::Zh);
+        set_lang(Lang::Zh);
         let b = BalanceLookup {
             credit: confirmed(5, 5),
             prl_rebate: None,

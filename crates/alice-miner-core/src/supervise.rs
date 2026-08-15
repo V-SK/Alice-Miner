@@ -5324,7 +5324,6 @@ mod tests {
     /// stays a bare number — we never invent a cause.
     #[test]
     fn crash_exit_codes_are_translated_into_plain_language() {
-        let _g = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
 
         const HEAP_CORRUPTION: i32 = 0xC000_0374u32 as i32;
@@ -5844,7 +5843,6 @@ mod tests {
     /// "Endpoint locked", never PRL-style "region … no auto-failover".)
     #[test]
     fn region_locked_message_relocalizes_even_when_snapshot_is_chinese() {
-        let _g = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let raw = "区域 hk.aliceprotocol.org:3333 已锁定 — 仅重试该区域、不自动切换(已 600s 无进展)";
         let (key, args) = status_from_legacy(raw).expect("parses the legacy region-lock string");
         // hk is a fixed pool (host:port), not a us/asia region → endpoint_locked.
@@ -5892,7 +5890,6 @@ mod tests {
     /// unknown key returns empty (so the caller falls back to the raw message).
     #[test]
     fn status_short_covers_all_keys_and_localizes() {
-        let _g = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let args = StatusArgs {
             endpoint: Some("us.aliceprotocol.org:3340".into()),
             region: Some("US".into()),
@@ -5948,9 +5945,6 @@ mod tests {
     /// a perfectly healthy HK relay.
     #[test]
     fn reachability_statuses_never_claim_our_relays_are_down() {
-        let _g = crate::i18n::LANG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let args = StatusArgs {
             endpoint: Some("us.aliceprotocol.org:3340".into()),
             region: Some("US".into()),
@@ -6558,7 +6552,6 @@ mod tests {
     #[test]
     fn all_shares_rejected_halts_the_lane_and_explains_it() {
         let _env = temp_home();
-        let _lock = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
         let rt = rt();
         rt.block_on(async {
@@ -7417,7 +7410,6 @@ mod tests {
     /// failure mode that matters here — he had already spent three days reinstalling.
     #[test]
     fn network_wide_and_local_only_halts_read_differently() {
-        let _lock = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
         let args = StatusArgs {
             shares_accepted: Some(0),
@@ -8130,7 +8122,6 @@ mod tests {
     #[test]
     fn a_failover_mid_period_never_reports_a_working_rig_as_a_shutout() {
         let _env = temp_home();
-        let _lock = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_lang(crate::i18n::Lang::En);
         let rt = rt();
         rt.block_on(async {
@@ -8428,7 +8419,6 @@ mod tests {
     /// with an `en` CLI reads it in Chinese (the i18n boundary rule).
     #[test]
     fn the_halt_relocalizes_from_the_key_not_the_baked_string() {
-        let _lock = crate::i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let args = StatusArgs {
             shares_accepted: Some(0),
             shares_rejected: Some(72),

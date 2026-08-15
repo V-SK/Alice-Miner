@@ -726,7 +726,6 @@ mod tests {
     /// token and never a `prl1p` collection address / upstream pool / core IP.
     #[test]
     fn companion_output_is_credit_only_and_leaks_no_secrets() {
-        let _g = LANG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for lang in [Lang::En, Lang::Zh] {
             i18n::set_lang(lang);
             // Drive the two user-facing renderers with synthetic values (no key, no net).
@@ -774,8 +773,4 @@ mod tests {
         )
     }
 
-    // Alias onto the CRATE-wide language lock: the process-global language is shared
-    // by every module's tests in this one test binary, so a module-private mutex would
-    // only order this module against itself (see `main.rs::LANG_TEST_LOCK`).
-    use crate::LANG_TEST_LOCK as LANG_LOCK;
 }

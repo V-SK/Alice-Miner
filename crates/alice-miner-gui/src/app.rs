@@ -2183,7 +2183,7 @@ impl eframe::App for MinerApp {
         // Mirror the GUI's language toggle into the shared core i18n so every
         // `tr!`-localized string (the titlebar pill, Settings labels, and any engine
         // status text) follows the user's EN/中 choice. One cheap atomic store/frame.
-        alice_miner_core::i18n::set_lang(if self.lang_zh {
+        alice_miner_core::i18n::set_process_lang(if self.lang_zh {
             alice_miner_core::i18n::Lang::Zh
         } else {
             alice_miner_core::i18n::Lang::En

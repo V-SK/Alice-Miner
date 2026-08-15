@@ -436,7 +436,6 @@ mod tests {
     /// rather say so than let you find out from a silent lane" promise, rendered.
     #[test]
     fn guide_explains_the_amd_verdict_instead_of_silently_recommending_xmr() {
-        let _g = LANG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         i18n::set_lang(Lang::En);
         let rdna2 = render_human(&amd_rdna2());
         assert!(rdna2.contains("RDNA2"), "names the architecture: {rdna2}");
@@ -480,7 +479,6 @@ mod tests {
     /// core IP — for EVERY device class.
     #[test]
     fn guide_output_is_credit_only_and_leaks_no_secrets() {
-        let _g = LANG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for cap in [
             nvidia_ampere(),
             nvidia_volta(),
@@ -517,7 +515,6 @@ mod tests {
     #[test]
     fn pearlhash_recommendation_routes_to_companion() {
         let human = {
-            let _g = LANG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             i18n::set_lang(Lang::En);
             let h = render_human(&nvidia_ampere());
             i18n::set_lang(Lang::En);
@@ -526,8 +523,4 @@ mod tests {
         assert!(human.contains("alice-miner companion --lane prl"));
     }
 
-    // Alias onto the CRATE-wide language lock: the process-global language is shared
-    // by every module's tests in this one test binary, so a module-private mutex would
-    // only order this module against itself (see `main.rs::LANG_TEST_LOCK`).
-    use crate::LANG_TEST_LOCK as LANG_LOCK;
 }

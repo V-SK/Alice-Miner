@@ -137,18 +137,9 @@ mod tests {
     use super::*;
     use alice_miner_core::i18n::{set_lang, Lang};
 
-    // `mode`/`endpoints` read the PROCESS-GLOBAL language; serialize the tests that pin
-    // a language so they can't observe each other's value (module convention, mirrors
-    // balance.rs / menu.rs). The STRUCTURAL matrix test below needs no lock — its
-    // assertions (failover / probed / authorities) are language-independent.
-    // The PROCESS-GLOBAL language is shared by EVERY module's tests in this one test
-    // binary, so they serialize on the CRATE-wide lock (see `main.rs::LANG_TEST_LOCK`) —
-    // a module-private mutex would only order this module against itself.
-    fn lang_guard(l: Lang) -> std::sync::MutexGuard<'static, ()> {
-        let g = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        set_lang(l);
-        g
-    }
+    // `mode`/`endpoints` read the current language. `set_lang` is scoped to the calling
+    // thread and libtest gives each test its own, so pinning one here is invisible to
+    // every test running beside it — no lock involved.
 
     /// The DECISION MATRIX (task ⑤): the failover flag, the probe flag, and the
     /// effective endpoint order for each of the four sources (lock / env / last-good /
@@ -200,7 +191,7 @@ mod tests {
     #[test]
     fn mode_and_endpoint_lines_bilingual() {
         // English.
-        let _g = lang_guard(Lang::En);
+        set_lang(Lang::En);
         let v = from_inputs(Some("asia".into()), None, None, None);
         assert!(v.mode.contains("locked to asia") && v.mode.contains("no auto-failover"));
         assert_eq!(endpoints_line(&v), "endpoints: asia.aliceprotocol.org:3340");

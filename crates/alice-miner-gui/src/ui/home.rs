@@ -1066,7 +1066,6 @@ mod tests {
     /// carries the full endpoint that the crowded status line omits.
     #[test]
     fn gui_renders_structured_status_in_current_language() {
-        let _g = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A Chinese-baked raw message (as a zh CLI would write) — must be IGNORED in
         // favour of the structured key when the UI is EN.
         let snap = status_snapshot(
@@ -1103,7 +1102,6 @@ mod tests {
     /// string). This is the exact reported bug: EN mode must not show Chinese.
     #[test]
     fn gui_relocalizes_legacy_chinese_message_in_en_mode() {
-        let _g = crate::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // No message_key (an old CLI) — only the baked ZH raw message.
         let snap = status_snapshot(
             Some("区域 hk.aliceprotocol.org:3333 已锁定 — 仅重试该区域、不自动切换(已 600s 无进展)"),
