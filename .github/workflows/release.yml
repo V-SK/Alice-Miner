@@ -37,10 +37,23 @@ jobs:
         run: cargo install cargo-audit --locked
       # Authoritative, continuously-updated advisory check over Cargo.lock.
       # Fails the job on a known vulnerability so a release can't ship one.
+      #
+      # NOTE: these flags ARE the suppression list. cargo-audit only auto-loads
+      # `.cargo/audit.toml`, which this repo does not have, so the root `audit.toml`
+      # is the written rationale and not a second config — the two must be kept in
+      # step by hand.
+      #
       # --ignore: documented-out-of-threat-model advisories (rationale in audit.toml).
       #   RUSTSEC-2026-0194/0195 (quick-xml <0.41 XML-DoS): quick-xml is a Linux-only,
       #   BUILD-TIME wayland-scanner dep parsing TRUSTED protocol XML — never runtime
       #   attacker input; absent from macOS/Windows binaries. See audit.toml.
+      #
+      # Nothing else is ignored. The v0.6.8 failure here was RUSTSEC-2026-0257
+      # (webbrowser <=1.2.1 `BROWSER` argument injection, reached via eframe →
+      # egui-winit) and it was FIXED, by bumping the lockfile to webbrowser 1.2.4 —
+      # not suppressed. The informational `unmaintained` warnings in this job's
+      # output (proc-macro-error2 et al.) do not affect its exit code; audit.toml
+      # says why each one is left visible rather than ignored.
       - name: Run cargo audit
         run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 

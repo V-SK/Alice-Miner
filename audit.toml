@@ -1,4 +1,11 @@
-# cargo-audit config (read by the `cargo audit` job in .github/workflows/release.yml).
+# The advisory record for the `cargo audit` job in .github/workflows/release.yml.
+#
+# NOTE ON HOW THIS FILE IS USED. cargo-audit only auto-loads `.cargo/audit.toml`,
+# which this repo does not have, so nothing here changes what the job does — the job
+# passes its suppressions as explicit `--ignore` flags. This file is the REASONING
+# those flags stand on, and the two must be kept in step: adding an id here does NOT
+# silence it in CI, and adding a `--ignore` there without a rationale here is exactly
+# the move that lets a real advisory through later.
 #
 # Each ignore MUST carry a rationale. We ignore ONLY advisories that are provably
 # out of our threat model — never to silence a real exposure.
@@ -22,3 +29,47 @@ ignore = [
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 ]
+
+# ── REVIEWED AND DELIBERATELY *NOT* IGNORED ───────────────────────────────────────
+#
+# Advisories we have looked at and decided against suppressing. They live here rather
+# than in `ignore` above on purpose: an entry in that list is a claim that the job WAS
+# failing on this and we chose to override it, and writing that down when it isn't true
+# is how the list stops meaning anything.
+#
+# RUSTSEC-2026-0257 — webbrowser <= 1.2.1, `BROWSER` argument injection on Unix.
+#   FIXED, NOT IGNORED. This is the advisory that actually failed the job on the first
+#   3-OS run of v0.6.8 (`error: 1 vulnerability found!`); it is a real advisory with a
+#   real patched version, not an informational warning. Chain:
+#   alice-miner-gui → eframe 0.34.3 → egui-winit 0.34.3 → webbrowser. egui-winit's
+#   requirement is `^1.0.5`, so Cargo.lock was bumped 1.2.1 → 1.2.4 on its own — no
+#   GUI-stack cascade, a three-line lockfile change. DO NOT re-pin webbrowser below
+#   1.2.2: the GUI opens hyperlinks through it, so this one does reach a shipped
+#   binary.
+#
+# RUSTSEC-2026-0173 — proc-macro-error2 2.0.1 is unmaintained.
+#   NOT ignored, because there is nothing to ignore: it is `informational =
+#   "unmaintained"`, which cargo-audit reports as a WARNING and which does not affect
+#   the exit code. Adding it to `--ignore` would change no outcome while recording a
+#   suppression that never happened.
+#     * What it is: a proc-macro diagnostics helper. The advisory has `patched = []` —
+#       no fixed version exists; upstream's own advice is to migrate off the crate.
+#     * Why it cannot reach a miner: the ONLY reverse dependency in this workspace is
+#       `subxt-macro` (alice-miner-{cli,gui} → alice-miner-core → alice-crypto →
+#       subxt-signer → subxt → subxt-macro), and subxt-macro is a `proc-macro = true`
+#       crate. proc-macro-error2 is therefore linked into a compiler plugin that runs
+#       inside rustc on the BUILD HOST, over the token stream of our own first-party
+#       source. It is not linked into AliceMiner on any target and never sees runtime,
+#       remote or user input. (Every published subxt-macro 0.50.x — through 0.50.3 —
+#       still depends on it, so there is no version to bump to either.)
+#     * What would change that, i.e. when this note stops applying and the advisory
+#       must be acted on rather than noted:
+#         1. `cargo tree -i proc-macro-error2 -e normal` starts showing a reverse
+#            dependency that is NOT marked `(proc-macro)` — that would be a real
+#            runtime path into a shipped binary;
+#         2. a non-informational advisory (an actual vulnerability, with a CVSS score
+#            and a patched range) is filed against it — that flips it from a warning
+#            to a job-failing error and none of the reasoning above applies;
+#         3. the job starts passing `--deny unmaintained` / `--deny warnings`, which
+#            escalates every informational advisory here. If we ever want that, it is
+#            a deliberate policy change and this crate must be dealt with first.
