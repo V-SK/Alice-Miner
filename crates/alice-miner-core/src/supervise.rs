@@ -6217,6 +6217,9 @@ mod tests {
                 launches: 1,
                 started_ok: true,
                 previous_productive: true,
+                // This machine WAS earning before the update — the baseline is known,
+                // which is what arms the rollback this test proves the guard prevents.
+                baseline_unknown: false,
                 failed_sessions: alice_release::auto::FAILED_SESSIONS_TO_ROLLBACK - 1,
             };
             let ran = alice_release::auto::MIN_JUDGED_SESSION.as_secs();
