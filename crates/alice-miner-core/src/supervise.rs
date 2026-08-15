@@ -4604,6 +4604,39 @@ mod tests {
         assert!(wait_for(s, 12, |st| st.halted).await, "must halt: {:?}", s.stats());
     }
 
+    /// Wait for a halted lane's engine to actually be REAPED.
+    ///
+    /// [`drive_to_halt`] returns as soon as `halted` is visible — which is the moment
+    /// the watchdog CONDEMNS the child, under the same lock that sets `halted`, not the
+    /// moment the child is gone. The teardown that follows is asynchronous: the
+    /// supervision loop notices the stop request on its next 400 ms tick, asks the child
+    /// to exit, waits out [`STOP_GRACE`], and only then force-kills. Until that lands the
+    /// lane is [`ProcState::Stopping`], which `LaneStats::running` reports as TRUE and
+    /// which `spawn_run` refuses a Start against ("lane is already running").
+    ///
+    /// On unix the request is a real SIGTERM and a well-behaved child exits on the spot,
+    /// so this is usually one tick and the window is invisible. On WINDOWS there is no
+    /// graceful phase at all — `OwnedChild::stop` says so in as many words — so EVERY
+    /// teardown burns the whole grace before `taskkill /T /F`, and the intermediate state
+    /// lasts ~5 s. A test that acted on the lane straight after the halt therefore took a
+    /// different code path there than the one it meant to test, and read the intermediate
+    /// state as a defect. (Reproducible on unix with a child that ignores SIGTERM, which
+    /// is how these three were diagnosed without a Windows machine.)
+    ///
+    /// Waiting weakens nothing. Everything these tests assert about the halt is asserted
+    /// AFTER this returns, and the refusal of a Start against a lane that is still busy
+    /// is a guarantee with its own test — see
+    /// [`a_user_start_refused_because_the_lane_is_busy_disarms_nothing`].
+    async fn wait_for_halt_teardown(s: &LaneSupervisor) {
+        // `!running` (not `state == Error`) on purpose: it is the TERMINAL condition
+        // this waits for, whichever terminal state the lane lands in.
+        assert!(
+            wait_for(s, 15, |st| !st.running).await,
+            "the halt must tear the engine down: {:?}",
+            s.stats()
+        );
+    }
+
     /// Wait (bounded) for the halt record to reach the disk — it is written after the
     /// child teardown, so `halted` becomes true slightly before the file exists.
     async fn wait_for_halt_record(lane: Lane) -> acceptance::HaltRecord {
@@ -7394,6 +7427,12 @@ mod tests {
 
             drive_to_halt(&s).await;
             assert_eq!(s.stats().activity, GuardCustody::Halted);
+            // The halt condemned the engine; let it actually be reaped before pressing
+            // Start. A Start against a lane that is still tearing down is REFUSED
+            // outright ("lane is already running") — correct, and a different guarantee
+            // with its own test. This one is about what a user Start does once it
+            // happens, so it has to be allowed to happen.
+            wait_for_halt_teardown(&s).await;
 
             // A user Start is the one action that means "I have dealt with it" — and it
             // hands the lane straight back, ladder and all.
@@ -7436,6 +7475,11 @@ mod tests {
             s.start_simple(program, args).expect("start");
             assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
             drive_to_halt(&s).await;
+            // The Start below must fail because the ENGINE could not be spawned — the
+            // case this test exists for. A Start issued while the halt is still tearing
+            // the old child down fails for an unrelated reason ("lane is already
+            // running"), never reaches the spawn, and so would test nothing.
+            wait_for_halt_teardown(&s).await;
             let recorded = wait_for_halt_record(Lane::Xmr).await;
             let armed_before = s.stats().message_args.and_then(|a| a.retry_in_s).expect("armed");
 
@@ -7651,8 +7695,20 @@ mod tests {
             }
             assert!(wait_for(&s, 12, |st| st.halted).await, "must halt: {:?}", s.stats());
 
+            // The halt must FINISH taking the engine down before "is anything bringing
+            // it back?" is a question with a meaning. Sampling `running` once after a
+            // fixed sleep did not ask that: on Windows the teardown is still in flight
+            // three seconds later (`ProcState::Stopping`, which reads as running), so
+            // the test read the engine the halt was in the middle of killing as one the
+            // crash ladder had resurrected. The engine going down is also what this test
+            // needs to be TRUE — an assertion that nothing restarted a lane that never
+            // stopped would pass for the wrong reason — so it is asserted, not slept
+            // through.
+            wait_for_halt_teardown(&s).await;
+
             // Give every automatic path (crash ladder, stall ladder, failover) ample
-            // time to misbehave.
+            // time to misbehave — the same window as before, now measured from the
+            // moment the lane is actually down rather than from the verdict.
             tokio::time::sleep(Duration::from_secs(3)).await;
             let st = s.stats();
             assert!(!st.running, "nothing may bring a halted lane back: {st:?}");
