@@ -4238,7 +4238,16 @@ fn apply_pending_halt_io(
             g.halt_probe_at = None;
         }
     }
-    if let Some(rec) = save_halt {
+    // RETIREMENT WINS. One `apply_log_line` can raise both flags: the retirement
+    // deliberately defers clearing `halt_probes`, and `probe_earned` is set behind
+    // `halt_probes > 0` — so a single cumulative summary line that both closes the
+    // first healthy period and carries the probe's first accepted share sets each.
+    // Writing the record after unlinking it re-creates the file the measurement
+    // just retired, leaving memory saying "mining" and the disk saying "halted on
+    // rung N". The next automatic start then re-adopts a halt a measurement had
+    // already lifted — verbatim the failure the unlink-before-clear ordering above
+    // was written to kill, re-entered through this arm of the same function.
+    if let Some(rec) = save_halt.filter(|_| !clear_halt) {
         // The re-probe has landed a share. Best-effort, like every other halt
         // write: a rig with an unwritable home loses only the across-restart half.
         if let Err(e) = acceptance::save_halt_record(&rec) {
@@ -8424,6 +8433,77 @@ mod tests {
     /// wall-clock dependency left is one-sided — `sleep` may overshoot and the period
     /// is already past its window floor when the shares arrive — and the submissions
     /// gate is exact, so the period closes on share 20 and on no other.
+    /// A retirement that ALSO earns must not resurrect the record it just retired.
+    ///
+    /// One `apply_log_line` can raise both staged flags. The retirement deliberately
+    /// defers clearing `halt_probes`, and `probe_earned` is set behind
+    /// `halt_probes > 0` — so a single CUMULATIVE summary line that both closes the
+    /// first healthy period and carries the probe's first accepted share sets each of
+    /// them. The sibling test below feeds share-by-share and never collides; every
+    /// bundled GPU parser and every bring-your-own lane reports periodic cumulative
+    /// totals, which is the shape that does.
+    ///
+    /// Without the guard, memory says "mining" and the disk says "halted on rung 2",
+    /// and the next automatic start re-adopts a halt a measurement had already
+    /// lifted — the failure the unlink-before-clear ordering was written to kill,
+    /// re-entered through the sibling arm of the same function.
+    #[test]
+    fn a_retirement_that_also_earns_does_not_resurrect_the_record() {
+        let _env = temp_home();
+        let s = LaneSupervisor::new(Lane::Xmr);
+        let cfg = fast_acceptance();
+        s.set_acceptance_config(cfg);
+        let rec = acceptance::HaltRecord::new(
+            Lane::Xmr,
+            &Collapse {
+                period: crate::acceptance::PeriodStat {
+                    accepted: 0,
+                    rejected: 30,
+                    elapsed: Duration::from_secs(900),
+                },
+                run_accepted: 0,
+                run_rejected: 30,
+                shutout: true,
+            },
+            Attribution::NetworkWide,
+            2,
+            acceptance::now_unix(),
+        );
+        acceptance::save_halt_record(&rec).expect("seed");
+        {
+            let mut g = s.inner.lock().unwrap();
+            g.halt_probes = 2;
+            g.halt_record = Some(rec);
+            g.acceptance.on_run_start(Instant::now());
+        }
+
+        // Warm baseline, then let the window elapse with nothing landing…
+        std::thread::sleep(cfg.warmup + Duration::from_millis(10));
+        feed(&s, "net      accepted (0/0) diff 100 (10 ms)");
+        std::thread::sleep(cfg.min_window + Duration::from_millis(30));
+        // …and close it with ONE cumulative line carrying the whole window. This is
+        // simultaneously the period's completion AND the probe's first accepted
+        // share, so both staged flags are raised by this single call.
+        feed(
+            &s,
+            &format!("net      accepted ({}/0) diff 100 (10 ms)", cfg.min_submissions),
+        );
+
+        assert_eq!(s.stats().acceptance, "healthy", "the recovery must be MEASURED");
+        assert_eq!(s.halt_probes(), 0, "memory retired the ladder");
+        assert_eq!(
+            s.stats().activity,
+            crate::acceptance::GuardCustody::Mining,
+            "and handed the lane back"
+        );
+        assert_eq!(
+            acceptance::load_halt_record(Lane::Xmr),
+            None,
+            "the disk must agree with memory — a record left here is re-adopted on \
+             the next automatic start, parking a lane a measurement already released"
+        );
+    }
+
     #[test]
     fn a_measured_healthy_period_retires_the_halt_and_its_ladder() {
         let _env = temp_home();
