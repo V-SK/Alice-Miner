@@ -96,6 +96,9 @@ RELEASE_KEY="${ALICE_RELEASE_KEY:-${HOME}/.alice-release/alice-update-ed25519.ke
 # Public URL prefix where these artifacts will be downloadable (pinned by V).
 # Mirrors alice-release::DEFAULT_UPDATE_URL's directory.
 BASE_URL="${ALICE_RELEASE_BASE_URL:-}"
+# Set by --allow-partial: build a deliberately incomplete platform set (local smoke
+# builds). A real release never sets it; see the platform guard.
+ALLOW_PARTIAL=""
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}';
@@ -191,6 +194,7 @@ while [[ $# -gt 0 ]]; do
     --security)      SECURITY=1; shift ;;
     --notes-file)    NOTES_FILE="$2"; shift 2 ;;
     --targets)       TARGETS="$2"; shift 2 ;;
+    --allow-partial) ALLOW_PARTIAL=1; shift ;;
     --out)           OUT_DIR="$2"; shift 2 ;;
     --repo)          REPO="$2"; shift 2 ;;
     --base-url)      BASE_URL="$2"; shift 2 ;;
@@ -256,7 +260,8 @@ fi
 # release (0.3.0); only raise it via --min-supported for a genuine forced-upgrade
 # (e.g. an incompatible manifest/protocol change), never per-release.
 [[ -z "${MIN_SUPPORTED}" ]] && MIN_SUPPORTED="0.3.0"
-# Default targets to the platform key matching the build host.
+# Default targets to the platform key matching the build host. Convenient for a
+# local one-platform smoke build; NEVER what a release wants (see the guard below).
 if [[ -z "${TARGETS}" ]]; then
   case "${HOST_TRIPLE}" in
     aarch64-apple-darwin)     TARGETS="macos-arm64" ;;
@@ -264,6 +269,43 @@ if [[ -z "${TARGETS}" ]]; then
     x86_64-unknown-linux-gnu) TARGETS="linux-x86_64" ;;
     *) echo "could not infer target from host '${HOST_TRIPLE}'; pass --targets" >&2; exit 1 ;;
   esac
+fi
+
+# A release must cover every platform this product ships on. Inferring ONE target
+# from the build host and publishing it is silent and catastrophic: the manifest
+# signs and publishes cleanly, and every client on a missing platform evaluates it
+# as "a version exists, you can't have it".
+#
+# It is worse than symmetric here. SRBMiner-MULTI has no macOS build, so a run on
+# this Mac that forgets --targets keeps the one platform that CANNOT mine PRL and
+# drops the two that are the entire audience for the fix. That is the exact shape
+# of the failure this release exists to repair, so it is refused rather than
+# warned about.
+RELEASE_PLATFORMS="macos-arm64 linux-x86_64 windows-x86_64"
+if [[ -z "${ALLOW_PARTIAL}" ]]; then
+  missing=""
+  for want in ${RELEASE_PLATFORMS}; do
+    case " ${TARGETS} " in *" ${want} "*) ;; *) missing="${missing} ${want}" ;; esac
+  done
+  if [[ -n "${missing}" ]]; then
+    echo "REFUSING: --targets is missing:${missing}" >&2
+    echo "  a release covers: ${RELEASE_PLATFORMS}" >&2
+    echo "  pass --targets \"${RELEASE_PLATFORMS}\"" >&2
+    echo "  (for a deliberate one-platform build, pass --allow-partial)" >&2
+    exit 2
+  fi
+fi
+
+# An unset --base-url yields RELATIVE artifact URLs. The manifest still builds,
+# hashes, signs and publishes — and then every client fails its https-only fetch.
+# Fail-closed, so no miner gets a broken install; but the release is dead on
+# arrival and the OFFLINE SIGNING CEREMONY has to be repeated, which is the
+# expensive part. Refuse before any of that happens.
+if [[ -z "${BASE_URL}" ]]; then
+  echo "REFUSING: --base-url is required — without it latest.json carries relative" >&2
+  echo "  URLs and every client's update fetch fails." >&2
+  echo "  pass --base-url \"https://github.com/V-SK/alice-miner/releases/latest/download\"" >&2
+  exit 2
 fi
 
 RELEASED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -297,6 +339,10 @@ for plat in ${TARGETS}; do
     [[ -f "${src}" ]] || { echo "missing pre-built artifact: ${src}" >&2; exit 1; }
     echo "Using pre-built CI artifact ${src}"
     cp "${src}" "${OUT_DIR}/${artifact}"
+    # CI builds the dmg alongside the macOS zip; carry it over when it is there so
+    # the published set matches what a local build produces.
+    _srcdmg="${src%.zip}.dmg"
+    [[ -f "${_srcdmg}" ]] && cp "${_srcdmg}" "${OUT_DIR}/$(basename "${_srcdmg}")"
     echo "  -> ${OUT_DIR}/${artifact}"
     continue
   fi
@@ -386,7 +432,13 @@ PLIST
         echo "  ✓ post-sign ${ename} == pin (${egot:0:12}…)"
       done
       # Zip the bundle preserving metadata (matches the in-app updater's ditto).
-      ( cd "${stage}" && ditto -c -k --keepParent "AliceMiner.app" "${OUT_DIR}/${artifact}" )
+      # --norsrc --noextattr: macOS 26 stamps com.apple.provenance on every file it
+      # writes, and it cannot be removed with `xattr -c`. Without these flags ditto
+      # preserves it as AppleDouble `._` sidecars inside the archive — 644 by nature,
+      # which trips the packaging gate's "every Contents/MacOS entry is 0755" check
+      # and reports a perfectly launchable bundle as broken. The bundle never had a
+      # resource fork or an xattr worth carrying.
+      ( cd "${stage}" && ditto -c -k --keepParent --norsrc --noextattr "AliceMiner.app" "${OUT_DIR}/${artifact}" )
       # Drag-to-/Applications disk image alongside the zip. See
       # scripts/make_macos_dmg.sh for why: it is about WHERE the app ends up
       # (App Translocation out of ~/Downloads), not about archive fidelity.
@@ -455,7 +507,7 @@ EOF
       echo "  · windows: xmrig.exe intentionally NOT bundled (on-demand download)"
       # zip via `ditto` on a macOS host, else `zip`.
       if command -v ditto >/dev/null 2>&1; then
-        ( cd "${stage}" && ditto -c -k --keepParent "AliceMiner" "${OUT_DIR}/${artifact}" )
+        ( cd "${stage}" && ditto -c -k --keepParent --norsrc --noextattr "AliceMiner" "${OUT_DIR}/${artifact}" )
       else
         ( cd "${stage}" && zip -r "${OUT_DIR}/${artifact}" "AliceMiner" >/dev/null )
       fi
@@ -596,6 +648,15 @@ fi
 
 # ── 6. Publish to GitHub Releases ───────────────────────────────────────────
 publish_files=( "${OUT_DIR}"/*.zip "${OUT_DIR}"/*.tar.gz "${OUT_DIR}/SHA256SUMS" "${OUT_DIR}/latest.json" )
+# The .dmg was built, passed the bundle gate and was hashed into SHA256SUMS — and
+# then never published, on every release to date. README and the v0.6.8 notes both
+# tell macOS users to PREFER it, so they were being sent after a file that does not
+# exist, on the release where App Translocation is called out as a support cost.
+# It is deliberately NOT in latest.json's artifacts[] (see the manifest step): the
+# zip drives self-update, the dmg is for a human doing a first install.
+for _dmg in "${OUT_DIR}"/*.dmg; do
+  [[ -f "${_dmg}" ]] && publish_files+=( "${_dmg}" )
+done
 [[ -f "${OUT_DIR}/latest.json.sig" ]] && publish_files+=( "${OUT_DIR}/latest.json.sig" )
 [[ -f "${OUT_DIR}/SHA256SUMS.sig" ]] && publish_files+=( "${OUT_DIR}/SHA256SUMS.sig" )
 
@@ -606,9 +667,14 @@ if [[ "${DO_PUBLISH}" -eq 1 ]]; then
   fi
   command -v gh >/dev/null 2>&1 || { echo "gh CLI not found" >&2; exit 1; }
   TAG="v${VERSION}"
-  repo_args=(); [[ -n "${REPO}" ]] && repo_args=(--repo "${REPO}")
+  # NOT `repo_args=(); "${repo_args[@]}"` — macOS ships bash 3.2, where expanding an
+  # EMPTY array under `set -u` is an unbound-variable error. That fires here, one
+  # line from the end, AFTER the build, the hashes, the manifest and the offline
+  # signature — and re-running the script starts with `rm -rf "${OUT_DIR}"`, so the
+  # signing ceremony would have to be repeated on the encrypted image. `${VAR:+…}`
+  # expands to nothing at all when REPO is unset, on every bash.
   echo "Creating GitHub release ${TAG}…"
-  gh release create "${TAG}" "${repo_args[@]}" \
+  gh release create "${TAG}" ${REPO:+--repo "${REPO}"} --verify-tag \
      --title "Alice Miner ${VERSION}" \
      --notes "${NOTES}" \
      "${publish_files[@]}"

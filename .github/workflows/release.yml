@@ -343,7 +343,7 @@ jobs:
           done
           [ "$gate_fail" = 0 ] || { echo "post-sign engine integrity check failed"; exit 1; }
           echo "Post-sign engine integrity OK."
-          ditto -c -k --keepParent "$APP" ${{ matrix.artifact }}
+          ditto -c -k --keepParent --norsrc --noextattr "$APP" ${{ matrix.artifact }}
           # Also ship a drag-to-/Applications disk image. The zip is fine as an
           # archive; what it cannot do is stop people double-clicking the app
           # inside ~/Downloads, where a quarantined bundle gets App-Translocated

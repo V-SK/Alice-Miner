@@ -196,7 +196,11 @@ if [[ "${ARTIFACT}" = *.zip ]]; then
   arch_modes="$(zipinfo "${ARTIFACT}" 2>/dev/null | awk '$NF !~ /(^|\/)__MACOSX\// && $NF ~ /Contents\/MacOS\/[^\/]+$/ {print $1, $NF}' || true)"
   if [[ -z "${arch_modes}" ]]; then
     warn "could not read Contents/MacOS entries from the archive listing"
-  elif printf '%s\n' "${arch_modes}" | awk '{ if ($1 !~ /^-rwxr-xr-x/) exit 1 }'; then
+  # AppleDouble sidecars (`._name`) are metadata, not executables, and are 644 by
+  # nature. They should not be in the archive at all (see --norsrc --noextattr at
+  # the ditto call) and their presence is warned about separately — but they must
+  # not make this check report a launchable bundle as broken.
+  elif printf '%s\n' "${arch_modes}" | grep -v '/\._' | awk '{ if ($1 !~ /^-rwxr-xr-x/) exit 1 }'; then
     ok "archive stores 0755 on every Contents/MacOS entry"
   else
     bad "archive does NOT store the exec bit on every Contents/MacOS entry:"
