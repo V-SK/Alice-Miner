@@ -538,12 +538,15 @@ struct Inner {
     /// (so a steady non-zero rate that never grows still eventually trips the
     /// watchdog only if shares ALSO stall; a healthy lane lands accepted shares).
     best_hashrate_hs: f64,
-    /// The accepted count at the last progress mark (a rise counts as progress).
+    /// The accepted count as of the last reading — a WITNESS, not a high-water mark:
+    /// it follows [`Self::accepted`] in both directions, and only a RISE is progress.
+    /// See [`track_progress_mark`] for why a maximum was the wrong structure once
+    /// [`fold_generic`] was allowed to walk the total back down.
     progress_accepted: u64,
-    /// The SUBMITTED count (accepted + rejected) at the last progress mark. A rise in
-    /// either counter is Layer-B progress, because both require a reply from the pool
-    /// — see [`note_submission_progress`] for why counting only ACCEPTS made Layer B
-    /// fight the acceptance guard.
+    /// The SUBMITTED count (accepted + rejected) as of the last reading, tracked the
+    /// same way. A rise in either counter is Layer-B progress, because both require a
+    /// reply from the pool — see [`note_submission_progress`] for why counting only
+    /// ACCEPTS made Layer B fight the acceptance guard.
     progress_submissions: u64,
     /// Number of Layer-B endpoint advances this run.
     failovers: u64,
@@ -4187,10 +4190,54 @@ fn note_hashrate_progress(g: &mut Inner, hr: f64) {
 /// is the layer that can actually see it.
 fn note_submission_progress(g: &mut Inner) {
     let submitted = g.accepted.saturating_add(g.rejected);
-    if submitted > g.progress_submissions {
-        g.progress_submissions = submitted;
+    if track_progress_mark(&mut g.progress_submissions, submitted) {
         g.last_progress_at = Some(Instant::now());
     }
+}
+
+/// Move a Layer-B liveness mark to the total it measures, and report whether that
+/// was PROGRESS (the total rose since we last looked).
+///
+/// **Why the mark TRACKS the total instead of being a high-water mark.** A maximum
+/// is only a safe way to ask "did this rise?" while the underlying counter cannot
+/// fall. It can. [`fold_generic`] deliberately adopts a rise at once and heals it
+/// back DOWN once two later readings corroborate the fall, and every last-wins
+/// bundled parser can read a lower cumulative value from a line it mis-read. The
+/// marks, though, were monotone and re-armed in exactly one place — `spawn_run` —
+/// so the moment a total fell beneath its mark, no later rise could ever beat it
+/// again: `last_progress_at` froze, the window expired, and the watchdog tore down a
+/// lane that was landing an accepted share on every line. That is the "watchdog's
+/// progress baseline became unbeatable" failure named in [`Inner::accepted`],
+/// re-entered through the heal instead of through the child/carry seam it was fixed
+/// at. It is not permanent — `spawn_run` re-arms from the healed total — but the
+/// mis-read is a property of the miner's OUTPUT FORMAT, so it re-freezes after every
+/// re-arm, burning [`RestartPolicy`] budget until the lane lands on the retry ladder.
+///
+/// So the mark is a WITNESS of the last reading, not a maximum: a rise is progress
+/// and re-arms the window; a fall is silently followed (a counter going backwards is
+/// not evidence of life); a flat reading is neither, which is the case the window
+/// exists for. Nothing about what Layer B catches changes: a lane that connects and
+/// hashes but SUBMITS nothing never moves either counter, so it still trips, and so
+/// does a genuinely dead one.
+///
+/// **What a mis-read can now do that it could not before.** Letting the mark follow
+/// the counter down means a counter that OSCILLATES — falls and re-climbs over ground
+/// it already covered — reads as fresh progress on every re-climb, so a generic lane
+/// whose format we misread in an oscillating way can hold Layer B off indefinitely
+/// even after it dies. The old structure caught that (one high-water mark, never
+/// beaten again) at the price of tearing down working rigs. This is the better half
+/// of the trade in both directions: a dead child is still reaped by
+/// [`Self::supervise_until_exit`] and the BUG#4 retry ladder, a lane whose shares stop
+/// being ACCEPTED is still halted by [`crate::acceptance`], and the failure we give up
+/// catching (Layer B being slow on a mis-reading bring-your-own miner that is already
+/// dead by other measures) is strictly less costly than the one we stop causing
+/// (Layer B killing a lane that is earning). Note the fold already damps the cheap
+/// version of this: a single low reading is HELD, so an alternating high/low format
+/// never moves the total down at all.
+fn track_progress_mark(mark: &mut u64, total: u64) -> bool {
+    let rose = total > *mark;
+    *mark = total;
+    rose
 }
 
 /// A rise in ACCEPTED shares is progress too (the strongest signal — the lane is
@@ -4203,8 +4250,10 @@ fn note_submission_progress(g: &mut Inner) {
 /// endpoint host, so the XMR/RVN relay (`hk.aliceprotocol.org`, not a region relay)
 /// never records anything.
 fn note_accepted_progress(g: &mut Inner, accepted: u64) {
-    if accepted > g.progress_accepted {
-        g.progress_accepted = accepted;
+    // Tracks the total in BOTH directions (see [`track_progress_mark`]), but only a
+    // RISE is an accepted share — so only a rise re-arms the watchdog, and only a rise
+    // may nominate a region as last-good.
+    if track_progress_mark(&mut g.progress_accepted, accepted) {
         g.last_progress_at = Some(Instant::now());
         // Record the region that produced this accepted share (once per region change).
         let host = g.endpoint_plan.current().host.clone();
@@ -5025,6 +5074,107 @@ mod tests {
         assert_eq!(s.stats().accepted, 13);
     }
 
+    /// R5: the heal must not leave Layer B's liveness marks stranded ABOVE the totals
+    /// they are derived from.
+    ///
+    /// `fold_generic` is allowed to walk a mis-read total back DOWN. The watchdog's
+    /// marks were monotone high-water marks re-armed only by `spawn_run`, so a
+    /// spurious high froze them above the healed total and EVERY later accepted share
+    /// became invisible to Layer B — `last_progress_at` never moved again and the
+    /// watchdog tore down a lane landing a share per line. That is the "unbeatable
+    /// progress baseline" this file's carry/child split was built to kill (see the
+    /// `Inner::accepted` doc), re-entered through the heal instead of the seam.
+    #[test]
+    fn a_healed_generic_total_does_not_strand_the_layer_b_progress_marks() {
+        let s = LaneSupervisor::with_backend(
+            Lane::GpuPrl,
+            EndpointPlan::single(Endpoint::plaintext("us.aliceprotocol.org", 3340)),
+            ParserKind::Generic,
+            None,
+        );
+        {
+            let mut g = s.inner.lock().unwrap();
+            // A mis-read line implants an absurd total; two consistent real readings
+            // heal it (the belt's documented behaviour, asserted above).
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:999999 r:0 30.0 mh/s");
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:39 r:0 30.0 mh/s");
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:40 r:0 30.0 mh/s");
+            assert_eq!(g.accepted, 40, "the belt healed the total");
+            // The invariant: a mark derived from a counter may never outrank it.
+            assert!(
+                g.progress_accepted <= g.accepted,
+                "accepted mark {} stranded above total {}",
+                g.progress_accepted,
+                g.accepted
+            );
+            assert!(
+                g.progress_submissions <= g.accepted.saturating_add(g.rejected),
+                "submissions mark {} stranded above total {}",
+                g.progress_submissions,
+                g.accepted.saturating_add(g.rejected)
+            );
+        }
+        // Age the mark, then land 28 further REAL accepted shares. The hashrate stays
+        // flat on purpose: `note_hashrate_progress` only fires on a NEW BEST, so a
+        // steady rig marks it once and never again — submissions are the only
+        // recurring liveness signal, which is precisely what the freeze removed.
+        {
+            let mut g = s.inner.lock().unwrap();
+            g.last_progress_at = Some(Instant::now() - Duration::from_secs(3_600));
+        }
+        for n in 41..=68u64 {
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Generic, &format!("shares a:{n} r:0 30.0 mh/s"));
+        }
+        let g = s.inner.lock().unwrap();
+        assert_eq!(g.accepted, 68, "the child really did land those shares");
+        assert!(
+            g.last_progress_at
+                .map(|t| t.elapsed() < Duration::from_secs(60))
+                .unwrap_or(false),
+            "28 accepted shares after a heal must re-arm the watchdog"
+        );
+    }
+
+    /// The other half of the R5 rule, and the reason the marks TRACK rather than
+    /// clamp-on-read: a counter going BACKWARDS is not evidence of life. The mark
+    /// follows the total down silently — no `last_progress_at`, no last-good region —
+    /// so a lane whose only "movement" is a re-baseline still trips the watchdog.
+    #[test]
+    fn a_falling_total_moves_the_mark_but_is_never_progress() {
+        // The pure decision, both directions.
+        let mut mark = 100u64;
+        assert!(track_progress_mark(&mut mark, 101), "a rise is progress");
+        assert_eq!(mark, 101);
+        assert!(!track_progress_mark(&mut mark, 12), "a fall is not progress");
+        assert_eq!(mark, 12, "but the mark must follow it down");
+        assert!(!track_progress_mark(&mut mark, 12), "a repeat is not progress");
+        assert!(track_progress_mark(&mut mark, 13), "and the next real share is");
+
+        // And through the real path: a corroborated re-baseline is not a re-arm.
+        let s = LaneSupervisor::with_backend(
+            Lane::GpuPrl,
+            EndpointPlan::single(Endpoint::plaintext("us.aliceprotocol.org", 3340)),
+            ParserKind::Generic,
+            None,
+        );
+        {
+            let mut g = s.inner.lock().unwrap();
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:999999 r:0 30.0 mh/s");
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:39 r:0 30.0 mh/s");
+            g.last_progress_at = Some(Instant::now() - Duration::from_secs(3_600));
+            // The line that ADOPTS the fall: the totals move down, nothing else does.
+            apply_log_line(&mut g, ParserKind::Generic, "shares a:40 r:0 30.0 mh/s");
+            assert_eq!(g.accepted, 40);
+            assert!(
+                g.last_progress_at
+                    .map(|t| t.elapsed() >= Duration::from_secs(600))
+                    .unwrap_or(true),
+                "adopting a lower total is a correction, not progress"
+            );
+        }
+    }
+
     /// T5: a supervisor built `with_backend` and an explicit `log_tail` path exposes
     /// that path to the tailer (rather than scanning argv), so a custom file-logging
     /// miner with a non-`--log-file` flag is still tailed.
@@ -5550,6 +5700,65 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+        });
+    }
+
+    /// R5, END TO END with a REAL child and a REAL rebuild closure: a generic lane
+    /// that lands an accepted share on every line must not be torn down, even after a
+    /// mis-read line spikes and then heals its total.
+    ///
+    /// The rebuild closure is the whole point of doing this end to end. `start_simple`
+    /// leaves `rebuild` at `None`, and the watchdog RETURNS on the spot when it has no
+    /// closure to rotate with (the `let Some(rebuild) = rebuild else { return }` arm) —
+    /// so a version of this test built on `start_simple` passes for the wrong reason,
+    /// which is exactly why the existing failover tests are blind to this.
+    #[cfg(unix)]
+    #[test]
+    fn layer_b_leaves_a_generic_lane_alone_while_it_lands_shares() {
+        let _env = spawn_env_guard();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::with_backend(
+                Lane::GpuPrl,
+                EndpointPlan::single(Endpoint::plaintext("us.aliceprotocol.org", 3340)),
+                ParserKind::Generic,
+                None,
+            );
+            // A 300ms no-progress window: a stranded mark trips it inside the test,
+            // a live one never lets it.
+            s.set_failover_timing(Duration::from_millis(300), Duration::from_millis(10));
+
+            // The engine: one mis-read summary line, then its real, rising counter —
+            // one landed share per line, with a FLAT hashrate (so the only recurring
+            // liveness signal is the submission counter).
+            let script = "echo 'shares a:999999 r:0 30.0 mh/s'; \
+                          i=1; while [ $i -le 400 ]; do \
+                          echo \"shares a:$i r:0 30.0 mh/s\"; i=$((i+1)); sleep 0.05; done";
+            let program = std::path::PathBuf::from("/bin/sh");
+            let args = vec!["-c".to_string(), script.to_string()];
+            s.start(program.clone(), args.clone(), fixed_rebuild(program, args))
+                .expect("start");
+
+            tokio::time::sleep(Duration::from_millis(1_800)).await;
+            let (generation, accepted, failovers) = {
+                let g = s.inner.lock().unwrap();
+                (g.generation, g.accepted, g.failovers)
+            };
+            s.request_stop();
+            for _ in 0..50 {
+                let st = s.stats().state;
+                if st == ProcState::Stopped || st == ProcState::Error {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            assert!(accepted >= 10, "the child must really have landed shares, saw {accepted}");
+            assert_eq!(
+                generation, 1,
+                "the watchdog tore down a lane landing a share per line \
+                 (generation {generation}, accepted {accepted}, failovers {failovers})"
+            );
         });
     }
 
