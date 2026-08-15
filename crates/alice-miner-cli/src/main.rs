@@ -2410,6 +2410,19 @@ fn cmd_start_with_unlock(
     // background-service mode (machine consumers get no banner). See `update::startup_banner`.
     update::startup_banner(args.json || args.from_service);
 
+    // F5 (acceptance halt): `--from-service` is the argv the launchd plist / systemd
+    // unit / logon task run and that a human never types, so it is the one honest
+    // signal that THIS start is a service manager relaunching us rather than a person
+    // asking to mine. Declaring it makes the lane HONOR a persisted acceptance halt
+    // (waiting out its bounded re-probe cooldown) instead of silently resuming a run
+    // that earns nothing — the reboot/KeepAlive loop that used to burn a fresh window
+    // every time. A human's `alice-miner start` keeps clearing the halt outright.
+    if args.from_service {
+        alice_miner_core::supervise::set_process_start_cause(
+            alice_miner_core::supervise::StartCause::Automatic,
+        );
+    }
+
     // Resolve the color / TUI decision ONCE (NO_COLOR / --no-color / TERM=dumb /
     // FORCE_COLOR + the TTY check). Drives both whether the in-place panel is used
     // and whether the line renderer emits ANSI — so a journal / pipe stays clean.

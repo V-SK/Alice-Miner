@@ -48,8 +48,16 @@
 //! un-halt a collapsed one. We take that trade deliberately: the failure it prevents
 //! (rolling back and permanently pinning an innocent client during an upstream
 //! outage, fleet-wide, unattended) is the one that actually happened.
+//!
+//! Its only other side effect is one small PUBLIC file per lane
+//! ([`halt_record_path`]) recording a halt and its evidence so the halt survives a
+//! reboot; it holds share counts and timestamps, no address and no secret, and an
+//! unreadable one is treated as "no halt" (fail-OPEN — see [`load_halt_record`]).
 
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use crate::lane::Lane;
 use crate::stats::ParserKind;
@@ -545,6 +553,249 @@ impl Attribution {
             Attribution::Unknown => "unknown",
         }
     }
+    /// The inverse of [`Self::key`]. Anything unrecognised — including a record
+    /// written by a future build that learned a fourth attribution — reads back as
+    /// [`Attribution::Unknown`], because "we do not know" is the only safe default
+    /// for a field whose whole job is deciding whom to blame.
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "network" => Attribution::NetworkWide,
+            "local" => Attribution::LocalOnly,
+            _ => Attribution::Unknown,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F5: a halt that outlives the process, and un-halts itself on a bounded ladder
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The halt above is decided in memory and, until this section existed, lived there
+// and nowhere else. That was wrong in BOTH directions at once:
+//
+//   * it OVER-persisted inside one process — a 10-minute upstream wobble (including
+//     one of our own relay deployments) stopped the whole fleet until a human
+//     pressed Start on every rig, trading "78 hours of wasted power" for "network
+//     hashrate at zero indefinitely";
+//   * it UNDER-persisted across processes — a reboot, a service restart or a
+//     self-update silently cleared it and burned another full window, and the rigs
+//     most often restarted by a supervisor are precisely the headless ones that
+//     burned three days in the first place.
+//
+// So the halt is written to disk WITH its evidence, and it lifts itself on a
+// bounded ladder: ~30 min, 1 h, 2 h, 4 h, then 6 h forever. Each rung costs one
+// window of electricity — that is the deliberate price of a fleet that can come
+// back without a human, and it is bounded (one window per rung, at most four
+// windows in the first ~7.5 h and then one per 6 h).
+
+/// On-disk schema for [`HaltRecord`]. Bump only on an INCOMPATIBLE change; a record
+/// whose schema this build does not recognise is ignored (treated as "no halt"),
+/// because refusing to mine on a file we cannot read would be a worse failure than
+/// re-measuring.
+pub const HALT_SCHEMA: u32 = 1;
+
+/// The FIRST automatic re-probe delay. Short enough that a transient upstream or
+/// relay wobble — the case that would otherwise park the whole fleet on a human —
+/// costs at most this plus one measuring window, and long enough that a real
+/// algorithm change is not re-probed every few minutes.
+pub const REPROBE_FIRST: Duration = Duration::from_secs(30 * 60);
+
+/// The ceiling on the doubling ladder. A pool that has rejected everything for six
+/// hours is not going to be fixed by probing it more often, and six hours bounds the
+/// steady-state waste at one window (~15 min) per 6 h ≈ 4% duty cycle.
+pub const REPROBE_CAP: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// How long to wait before re-probe number `probes + 1`, i.e. the delay that follows
+/// a halt after `probes` re-probes have already been spent.
+///
+/// `0 → 30 min`, `1 → 1 h`, `2 → 2 h`, `3 → 4 h`, `≥4 → 6 h` (the cap).
+pub fn reprobe_delay(probes: u32) -> Duration {
+    // `min(20)` keeps the shift inside `u64` no matter what a corrupt/hostile record
+    // claims; the cap below makes anything past rung 4 identical anyway.
+    let secs = REPROBE_FIRST
+        .as_secs()
+        .saturating_mul(1u64 << probes.min(20));
+    Duration::from_secs(secs.min(REPROBE_CAP.as_secs()))
+}
+
+/// Seconds since the UNIX epoch, or 0 if the clock is set before 1970. Wall clock is
+/// the ONLY clock that survives a reboot, so the persisted deadlines are stored in
+/// it — every consumer treats it as untrusted (see [`HaltRecord::resume`]).
+pub fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A halt, on disk. Carries the evidence — why, when, and what the numbers were —
+/// so a client that starts up hours later can explain itself instead of silently
+/// refusing to mine, and so a support report has the actual figures in it.
+///
+/// PUBLIC data only: share counts, timestamps and a lane name. No address, no key,
+/// nothing that identifies the machine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HaltRecord {
+    pub schema: u32,
+    /// The lane this halt belongs to ([`lane_wire_name`]).
+    pub lane: String,
+    /// Wall-clock seconds when the halt was decided.
+    pub halted_at: u64,
+    /// Wall-clock seconds at which the next automatic re-probe becomes due.
+    pub next_probe_at: u64,
+    /// How many automatic re-probes have already been LAUNCHED for this halt. The
+    /// rung of the ladder, and the only thing a clock jump may never reset.
+    pub probes: u32,
+    /// Run totals behind the halt (the numbers the user recognises).
+    pub run_accepted: u64,
+    pub run_rejected: u64,
+    /// The period that tipped it.
+    pub period_accepted: u64,
+    pub period_rejected: u64,
+    pub period_elapsed_s: u64,
+    /// Whether not one share was accepted.
+    pub shutout: bool,
+    /// Who the collapse was attributed to when it was published ([`Attribution::key`]).
+    pub attribution: String,
+    /// The client version that wrote the record — so a stale halt from an older build
+    /// is recognisable in a support report (and in a bug like this one).
+    pub version: String,
+}
+
+/// What a persisted halt means right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HaltResume {
+    /// The cooldown is over: spend one window re-measuring.
+    ProbeNow,
+    /// Still cooling down — wait this long (on a MONOTONIC timer) first.
+    Wait(Duration),
+}
+
+impl HaltRecord {
+    /// Build a record for a fresh halt on `lane`, after `probes` re-probes have
+    /// already been spent.
+    pub fn new(
+        lane: Lane,
+        c: &Collapse,
+        attribution: Attribution,
+        probes: u32,
+        now_unix: u64,
+    ) -> Self {
+        Self {
+            schema: HALT_SCHEMA,
+            lane: lane_wire_name(lane).to_string(),
+            halted_at: now_unix,
+            next_probe_at: now_unix.saturating_add(reprobe_delay(probes).as_secs()),
+            probes,
+            run_accepted: c.run_accepted,
+            run_rejected: c.run_rejected,
+            period_accepted: c.period.accepted,
+            period_rejected: c.period.rejected,
+            period_elapsed_s: c.period.elapsed.as_secs(),
+            shutout: c.shutout,
+            attribution: attribution.key().to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    /// The evidence, back in the shape the status/explanation renderers want.
+    pub fn collapse(&self) -> Collapse {
+        Collapse {
+            period: PeriodStat {
+                accepted: self.period_accepted,
+                rejected: self.period_rejected,
+                elapsed: Duration::from_secs(self.period_elapsed_s),
+            },
+            run_accepted: self.run_accepted,
+            run_rejected: self.run_rejected,
+            shutout: self.shutout,
+        }
+    }
+
+    /// The attribution this halt was published with.
+    pub fn attribution(&self) -> Attribution {
+        Attribution::from_key(&self.attribution)
+    }
+
+    /// Whether this record is about `lane` and readable by this build.
+    pub fn is_for(&self, lane: Lane) -> bool {
+        self.schema == HALT_SCHEMA && self.lane.eq_ignore_ascii_case(lane_wire_name(lane))
+    }
+
+    /// What to do about this halt at wall-clock `now`.
+    ///
+    /// Wall clock is not trustworthy across a reboot, so both directions are handled
+    /// explicitly and neither may produce a wrong ANSWER, only a differently-timed one:
+    ///
+    /// * **the clock jumped FORWARD** (or the machine really was off for a week):
+    ///   `now >= next_probe_at` ⇒ [`HaltResume::ProbeNow`]. A client that was off for
+    ///   a week does not sit out a cooldown that already elapsed — the cost of being
+    ///   wrong here is exactly one window, and the halt re-arms on the NEXT rung
+    ///   because `probes` is persisted;
+    /// * **the clock jumped BACKWARD** (an RTC that lost its battery, an NTP step, a
+    ///   dual-boot machine with a local-time BIOS clock): the stored deadline then
+    ///   sits absurdly far in the "future" and a naive wait would strand the rig
+    ///   halted for years. The remaining wait is therefore CLAMPED to the rung's own
+    ///   length — the longest this cooldown was ever entitled to be.
+    ///
+    /// The ladder itself is never touched here: `probes` only ever grows, and only
+    /// when a re-probe is actually launched, so no clock jump in either direction can
+    /// reset it to zero and turn the ladder into a 30-minute loop.
+    pub fn resume(&self, now: u64) -> HaltResume {
+        if now >= self.next_probe_at {
+            return HaltResume::ProbeNow;
+        }
+        let remaining = self.next_probe_at - now;
+        let rung = reprobe_delay(self.probes).as_secs();
+        HaltResume::Wait(Duration::from_secs(remaining.min(rung)))
+    }
+}
+
+/// Where a lane's halt record lives: `<alice home>/halt-<lane>.json`. One file per
+/// lane (a dual-mine run halts one lane without touching the other), next to
+/// `settings.json` and honoring `$ALICE_IDENTITY_DIR` exactly like it — so a test
+/// environment is isolated and a user can see and delete it.
+pub fn halt_record_path(lane: Lane) -> PathBuf {
+    crate::settings::alice_home().join(format!("halt-{}.json", lane_wire_name(lane)))
+}
+
+/// Read `lane`'s persisted halt, if any.
+///
+/// Fail-OPEN by construction: a missing file, an unreadable one, malformed JSON, a
+/// schema this build does not know, or a record for a different lane all yield
+/// `None` — i.e. "no halt", i.e. mine. Refusing to mine because we could not parse a
+/// file would let a corrupt byte park a rig indefinitely, which is a strictly worse
+/// failure than re-measuring for one window.
+pub fn load_halt_record(lane: Lane) -> Option<HaltRecord> {
+    let body = std::fs::read_to_string(halt_record_path(lane)).ok()?;
+    let rec: HaltRecord = serde_json::from_str(&body).ok()?;
+    rec.is_for(lane).then_some(rec)
+}
+
+/// Persist a halt record atomically (temp + rename), like [`crate::settings::save`].
+pub fn save_halt_record(rec: &HaltRecord) -> Result<PathBuf, String> {
+    let lane = rec.lane.clone();
+    let path = crate::settings::alice_home().join(format!("halt-{lane}.json"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let encoded =
+        serde_json::to_vec_pretty(rec).map_err(|e| format!("failed to serialize halt: {e}"))?;
+    let tmp = path.with_file_name(format!(".halt-{lane}.json.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, &encoded).map_err(|e| format!("failed to write halt record: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("failed to store halt record: {e}")
+    })?;
+    Ok(path)
+}
+
+/// Forget `lane`'s halt. Best-effort: the caller is either a user Start (which has
+/// already cleared the in-memory halt) or a recovered lane, and neither should fail
+/// because a file could not be unlinked.
+pub fn clear_halt_record(lane: Lane) {
+    let _ = std::fs::remove_file(halt_record_path(lane));
 }
 
 /// The network-wide acceptance rate for one lane, as reported by the public
@@ -1141,6 +1392,155 @@ mod tests {
         let line = halt_status_line(&c);
         assert!(line.contains("已停止"), "{line}");
         set_lang(Lang::En);
+    }
+
+    // ── F5: the persisted halt + its bounded re-probe ladder ────────────────
+
+    fn a_collapse() -> Collapse {
+        Collapse {
+            period: PeriodStat { accepted: 0, rejected: 72, elapsed: Duration::from_secs(900) },
+            run_accepted: 0,
+            run_rejected: 72,
+            shutout: true,
+        }
+    }
+
+    /// Run `f` with `$ALICE_IDENTITY_DIR` pointed at a private temp directory, so a
+    /// halt record never touches the developer's real `~/.alice` and two tests can
+    /// never see each other's file.
+    fn with_temp_home<F: FnOnce()>(f: F) {
+        let _g = crate::IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "alice-halt-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ALICE_IDENTITY_DIR", &dir);
+        f();
+        std::env::remove_var("ALICE_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ladder is 30m → 1h → 2h → 4h → 6h, and 6h is a CEILING, not a step: no
+    /// rung, however many re-probes have been spent, ever exceeds it or wraps.
+    #[test]
+    fn the_reprobe_ladder_doubles_then_caps_at_six_hours() {
+        assert_eq!(reprobe_delay(0), Duration::from_secs(30 * 60));
+        assert_eq!(reprobe_delay(1), Duration::from_secs(60 * 60));
+        assert_eq!(reprobe_delay(2), Duration::from_secs(2 * 3600));
+        assert_eq!(reprobe_delay(3), Duration::from_secs(4 * 3600));
+        // The doubling would be 8h here; the cap wins from this rung on.
+        assert_eq!(reprobe_delay(4), REPROBE_CAP);
+        for probes in [5u32, 9, 64, 1_000, u32::MAX] {
+            assert_eq!(reprobe_delay(probes), REPROBE_CAP, "rung {probes} must stay capped");
+        }
+    }
+
+    /// A halt whose cooldown has NOT elapsed waits — and a record written by a client
+    /// that then sat switched off for a week does NOT sit out a cooldown that is over.
+    #[test]
+    fn a_cooldown_that_already_elapsed_probes_immediately() {
+        let now = 1_800_000_000u64;
+        let rec = HaltRecord::new(Lane::GpuPrl, &a_collapse(), Attribution::NetworkWide, 0, now);
+        assert_eq!(rec.next_probe_at, now + 1800, "first rung is 30 min");
+        // One second in: nearly the whole cooldown remains.
+        assert_eq!(rec.resume(now + 1), HaltResume::Wait(Duration::from_secs(1799)));
+        // Exactly due, and long past due.
+        assert_eq!(rec.resume(now + 1800), HaltResume::ProbeNow);
+        assert_eq!(rec.resume(now + 7 * 86_400), HaltResume::ProbeNow, "a week off = probe now");
+    }
+
+    /// A clock that moved BACKWARDS must not strand a rig halted forever: the stored
+    /// deadline then looks years away, and the wait is clamped to the rung's own
+    /// length. And it must not reset the ladder either — the rung is `probes`, which
+    /// the clock cannot touch.
+    #[test]
+    fn a_backwards_clock_jump_neither_strands_the_miner_nor_resets_the_ladder() {
+        let now = 1_800_000_000u64;
+        // Halted on rung 3 (4 h) …
+        let rec = HaltRecord::new(Lane::Xmr, &a_collapse(), Attribution::Unknown, 3, now);
+        assert_eq!(rec.next_probe_at, now + 4 * 3600);
+        // … and then the RTC falls back to 2019: the deadline is now ~50 years away.
+        let bad_clock = 1_550_000_000u64;
+        match rec.resume(bad_clock) {
+            HaltResume::Wait(d) => {
+                assert_eq!(d, Duration::from_secs(4 * 3600), "clamped to the rung, not 50 years");
+                assert!(d <= REPROBE_CAP, "no wait may ever exceed the cap: {d:?}");
+            }
+            other => panic!("a backwards clock must still wait, got {other:?}"),
+        }
+        // The ladder position is unchanged — a clock jump cannot turn a 4 h rung back
+        // into a 30 min loop.
+        assert_eq!(rec.probes, 3);
+        assert_eq!(reprobe_delay(rec.probes), Duration::from_secs(4 * 3600));
+        // The same clamp holds on the capped rung.
+        let capped = HaltRecord::new(Lane::Xmr, &a_collapse(), Attribution::Unknown, 9, now);
+        assert_eq!(capped.resume(bad_clock), HaltResume::Wait(REPROBE_CAP));
+    }
+
+    /// The record round-trips through disk carrying the evidence a user needs to be
+    /// told WHY his rig is idle, months later if need be.
+    #[test]
+    fn a_halt_record_round_trips_with_its_evidence() {
+        with_temp_home(|| {
+            assert_eq!(load_halt_record(Lane::GpuPrl), None, "no file = no halt");
+            let rec = HaltRecord::new(
+                Lane::GpuPrl,
+                &a_collapse(),
+                Attribution::NetworkWide,
+                1,
+                1_800_000_000,
+            );
+            let path = save_halt_record(&rec).expect("save");
+            assert!(path.is_file());
+            let back = load_halt_record(Lane::GpuPrl).expect("load");
+            assert_eq!(back, rec);
+            // The numbers survive intact, and rebuild the exact collapse.
+            assert_eq!(back.collapse(), a_collapse());
+            assert_eq!(back.attribution(), Attribution::NetworkWide);
+            assert_eq!(back.run_rejected, 72);
+            assert!(!back.version.is_empty(), "a record must name the build that wrote it");
+            // It belongs to ONE lane: a dual-mine run must not read the other's halt.
+            assert_eq!(load_halt_record(Lane::Xmr), None);
+            clear_halt_record(Lane::GpuPrl);
+            assert_eq!(load_halt_record(Lane::GpuPrl), None, "cleared");
+        });
+    }
+
+    /// A record we cannot read is "no halt", never "refuse to mine": a corrupt byte
+    /// must not be able to park a rig indefinitely.
+    #[test]
+    fn an_unreadable_halt_record_fails_open() {
+        with_temp_home(|| {
+            let path = halt_record_path(Lane::Xmr);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            for body in ["", "not json", r#"{"schema":1}"#] {
+                std::fs::write(&path, body).unwrap();
+                assert_eq!(load_halt_record(Lane::Xmr), None, "body {body:?} must fail open");
+            }
+            // A record from a schema this build does not know is also ignored.
+            let mut rec =
+                HaltRecord::new(Lane::Xmr, &a_collapse(), Attribution::Unknown, 0, 1_800_000_000);
+            rec.schema = HALT_SCHEMA + 7;
+            std::fs::write(&path, serde_json::to_vec(&rec).unwrap()).unwrap();
+            assert_eq!(load_halt_record(Lane::Xmr), None, "unknown schema must fail open");
+            // …and so is a record filed under the wrong lane.
+            let mut wrong =
+                HaltRecord::new(Lane::Xmr, &a_collapse(), Attribution::Unknown, 0, 1_800_000_000);
+            wrong.lane = "gpu_prl".into();
+            std::fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+            assert_eq!(load_halt_record(Lane::Xmr), None, "wrong lane must fail open");
+        });
+    }
+
+    #[test]
+    fn attribution_keys_round_trip_and_unknown_is_the_fallback() {
+        for a in [Attribution::NetworkWide, Attribution::LocalOnly, Attribution::Unknown] {
+            assert_eq!(Attribution::from_key(a.key()), a);
+        }
+        assert_eq!(Attribution::from_key("something-new"), Attribution::Unknown);
+        assert_eq!(Attribution::from_key(""), Attribution::Unknown);
     }
 
     #[test]
