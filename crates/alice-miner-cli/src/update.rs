@@ -17,7 +17,9 @@
 //! check that `start` / `ai` / the menu call ONCE, printing a single one-line banner
 //! when a newer version exists. It NEVER blocks or delays mining: it spawns a thread
 //! with a short join deadline, uses a ~6h on-disk cache under `~/.alice`, and is
-//! disabled entirely by `ALICE_MINER_NO_UPDATE_CHECK=1`. Localized via [`tr!`].
+//! disabled entirely BOTH by the automatic-update mode `off` (`alice-miner update
+//! --auto off` — the setting we document as the opt-out) AND by
+//! `ALICE_MINER_NO_UPDATE_CHECK=1`. Localized via [`tr!`].
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -378,12 +380,12 @@ fn explain_mode(m: alice_miner_core::alice_release::auto::Mode) -> String {
     use alice_miner_core::alice_release::auto::Mode;
     match m {
         Mode::Off => tr!(
-            "Never check, never notify, never install. You are on your own for updates.",
-            "从不检查、不提示、不安装。更新完全由你自己负责。"
+            "Never check, never notify, never install — not even the one-line check when mining starts. Updating is entirely manual: run `alice-miner update` yourself.",
+            "从不检查、不提示、不安装 —— 连挖矿启动时的那一次检查也不做。更新完全靠手动:自己运行 `alice-miner update`。"
         )
         .to_string(),
         Mode::Notify => tr!(
-            "Check and tell you; install nothing. Nothing reaches this machine without you typing a command.",
+            "Check and tell you; install nothing. No software is installed on this machine without you typing a command.",
             "只检查并提示,不安装任何东西。没有你亲自输入命令,任何东西都不会装到本机。"
         )
         .to_string(),
@@ -704,11 +706,32 @@ const CHECK_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 /// up and letting mining proceed. Tiny — mining must NEVER be delayed by this.
 const STARTUP_CHECK_BUDGET: Duration = Duration::from_millis(600);
 
+/// What ONE [`startup_banner`] call actually did. Returned by [`startup_banner_run`]
+/// so the discipline below can be ASSERTED by a test instead of described in a
+/// comment — the banner's two observable effects (a line on stderr, a network
+/// request) are otherwise invisible from inside the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BannerRun {
+    /// Nothing happened at all: no print, no cache read, no network. `quiet`, the
+    /// opt-out env, or an automatic-update mode that is not allowed to check.
+    Suppressed,
+    /// A fresh cache answered it — no network was touched. `printed` says whether
+    /// the cached version was newer than this build.
+    Cached { printed: bool },
+    /// A network check was started (bounded by [`STARTUP_CHECK_BUDGET`]). `printed`
+    /// says whether it came back in time AND was newer.
+    Checked { printed: bool },
+}
+
 /// Print a ONE-LINE "a new version is available" banner at startup, if a newer
 /// version exists — WITHOUT ever blocking or delaying mining. Called once by `start`
 /// / `ai` / the menu.
 ///
 /// Discipline:
+///   * automatic-update mode `off` (`alice-miner update --auto off`) → no-op. `off`
+///     promises "never check, never notify"; this IS a check and IS a notification,
+///     so it is the first thing the mode has to switch off. It used to consult only
+///     the env var below, which made the documented opt-out not one.
 ///   * `ALICE_MINER_NO_UPDATE_CHECK=1` (or `--json` callers, who pass `quiet=true`) →
 ///     no-op.
 ///   * A fresh (< ~6h) cached result is used WITHOUT any network call.
@@ -718,15 +741,27 @@ const STARTUP_CHECK_BUDGET: Duration = Duration::from_millis(600);
 ///
 /// `quiet` suppresses the banner entirely (the `--json` / machine paths pass `true`).
 pub fn startup_banner(quiet: bool) {
+    let _ = startup_banner_run(quiet);
+}
+
+/// [`startup_banner`], reporting what it did. See [`BannerRun`].
+fn startup_banner_run(quiet: bool) -> BannerRun {
     if quiet || std::env::var_os(ENV_NO_UPDATE_CHECK).is_some() {
-        return;
+        return BannerRun::Suppressed;
+    }
+    // The mode gate. `autoupdate::tick` (the periodic guarded cycle) has always
+    // honored this; the startup banner did not, so a machine set to `off` still
+    // fetched the signed manifest and still printed "a new version is available".
+    // Read through `autoupdate::mode()` so env override → saved setting → default
+    // resolve exactly as they do everywhere else.
+    if !alice_miner_core::autoupdate::mode().checks() {
+        return BannerRun::Suppressed;
     }
     let current = release::current_version();
 
     // 1) A fresh cached "latest" wins with zero network.
     if let Some(latest) = read_cache_if_fresh() {
-        maybe_print(&latest, current);
-        return;
+        return BannerRun::Cached { printed: maybe_print(&latest, current) };
     }
 
     // 2) Kick a bounded background check. We do NOT join indefinitely: mining proceeds
@@ -747,25 +782,30 @@ pub fn startup_banner(quiet: bool) {
     });
 
     // Wait only the tiny budget; if it's not ready, move on silently (never block mining).
-    if let Ok(Some(latest)) = rx.recv_timeout(STARTUP_CHECK_BUDGET) {
-        maybe_print(&latest, current);
-    }
+    let printed = match rx.recv_timeout(STARTUP_CHECK_BUDGET) {
+        Ok(Some(latest)) => maybe_print(&latest, current),
+        _ => false,
+    };
+    BannerRun::Checked { printed }
 }
 
 /// Print the one-line banner iff `latest` is strictly newer than `current`.
-fn maybe_print(latest: &str, current: &str) {
-    if release::is_newer(latest, current) {
-        // A single, quiet, non-blocking line. Goes to STDERR so it never pollutes a
-        // captured stdout (the dashboard / any redirected output stays clean).
-        eprintln!(
-            "{}",
-            tr!(
-                "A new version v{V} is available · run `alice-miner update`",
-                "有新版 v{V} · 运行 `alice-miner update`"
-            )
-            .replace("{V}", latest)
-        );
+/// Returns whether it printed.
+fn maybe_print(latest: &str, current: &str) -> bool {
+    if !release::is_newer(latest, current) {
+        return false;
     }
+    // A single, quiet, non-blocking line. Goes to STDERR so it never pollutes a
+    // captured stdout (the dashboard / any redirected output stays clean).
+    eprintln!(
+        "{}",
+        tr!(
+            "A new version v{V} is available · run `alice-miner update`",
+            "有新版 v{V} · 运行 `alice-miner update`"
+        )
+        .replace("{V}", latest)
+    );
+    true
 }
 
 /// The cache file path: `<identity_dir>/update-check.json` (honors `$ALICE_IDENTITY_DIR`
@@ -895,6 +935,113 @@ mod tests {
             std::env::remove_var(ENV_NO_UPDATE_CHECK);
             // No cache file should have been written (we never checked).
             assert!(!cache_path().exists(), "opt-out must not write a cache");
+        });
+    }
+
+    // ── `--auto off` means off ────────────────────────────────────────────────
+    //
+    // `alice-miner update --auto off` answers, in its own words, "Never check,
+    // never notify, never install." It set a mode that `autoupdate::tick` honored
+    // and that the startup banner did not, so the very next `start` / `ai` /
+    // `train` / menu still fetched the signed manifest and still printed "a new
+    // version is available". The documented opt-out was not one, and the only
+    // real opt-out was an env var we never mention outside this file.
+    //
+    // Both halves of the promise are asserted, and each with a control that fails
+    // if the assertion ever stops discriminating: "never notify" against a cache
+    // that WOULD print, and "never check" against a listener that sees the
+    // connection.
+
+    /// Set the persisted mode the way `--auto <mode>` does (settings.json under the
+    /// temp `$ALICE_IDENTITY_DIR`), with the env override cleared so the saved value
+    /// is what resolves.
+    fn set_persisted_mode(m: alice_miner_core::alice_release::auto::Mode) {
+        std::env::remove_var(alice_miner_core::autoupdate::MODE_ENV);
+        alice_miner_core::autoupdate::set_mode(m).expect("persist mode");
+        assert_eq!(alice_miner_core::autoupdate::mode(), m, "mode must resolve to what we set");
+    }
+
+    /// "never notify": with a FRESH cache naming a newer version — the state in
+    /// which the banner definitely prints — `off` must print nothing.
+    #[test]
+    fn auto_update_off_suppresses_the_startup_banner() {
+        use alice_miner_core::alice_release::auto::Mode;
+        with_temp_dir(|| {
+            write_cache("99.9.9").expect("seed a fresh cache");
+
+            // Control: a mode that IS allowed to check prints from that cache, with
+            // no network. If this ever stops printing, the assertion below is
+            // passing for the wrong reason.
+            set_persisted_mode(Mode::Notify);
+            assert_eq!(
+                startup_banner_run(false),
+                BannerRun::Cached { printed: true },
+                "control: a checking mode must still print from a fresh cache"
+            );
+
+            set_persisted_mode(Mode::Off);
+            assert_eq!(
+                startup_banner_run(false),
+                BannerRun::Suppressed,
+                "`--auto off` promises 'never notify' — the startup banner is a notification"
+            );
+        });
+    }
+
+    /// "never check": `off` must not touch the network. Proved against a real
+    /// socket — the manifest URL is pointed at a local listener, so a check is
+    /// visible as an accepted TCP connection (the TLS handshake then fails, which
+    /// is irrelevant: the connection is the evidence).
+    #[test]
+    fn auto_update_off_makes_no_network_call_at_startup() {
+        use alice_miner_core::alice_release::auto::Mode;
+        use std::net::TcpListener;
+
+        /// Bind a throwaway listener and point the updater's manifest URL at it.
+        fn listen() -> TcpListener {
+            let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = l.local_addr().expect("addr").port();
+            l.set_nonblocking(true).expect("nonblocking");
+            std::env::set_var(
+                release::UPDATE_URL_ENV,
+                format!("https://127.0.0.1:{port}/latest.json"),
+            );
+            l
+        }
+        /// Did anything connect within `budget`?
+        fn connected(l: &TcpListener, budget: Duration) -> bool {
+            let deadline = std::time::Instant::now() + budget;
+            while std::time::Instant::now() < deadline {
+                if l.accept().is_ok() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        }
+
+        with_temp_dir(|| {
+            // Control first, on its own listener, so a late connection from the
+            // control can never be mistaken for one from the `off` run.
+            let control = listen();
+            set_persisted_mode(Mode::Notify);
+            startup_banner(false);
+            assert!(
+                connected(&control, Duration::from_secs(5)),
+                "control: a checking mode must reach the manifest URL (else this test proves nothing)"
+            );
+            drop(control);
+
+            let off = listen();
+            set_persisted_mode(Mode::Off);
+            startup_banner(false);
+            assert!(
+                !connected(&off, Duration::from_secs(2)),
+                "`--auto off` promises 'never check' — nothing may reach the network"
+            );
+            assert!(!cache_path().exists(), "and nothing may be written to the check cache");
+            drop(off);
+            std::env::remove_var(release::UPDATE_URL_ENV);
         });
     }
 
