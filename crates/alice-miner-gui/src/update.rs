@@ -782,6 +782,7 @@ mod tests {
             acceptance: "collapsed".to_string(),
             accept_pct: Some(0.0),
             halted: true,
+            activity: alice_miner_core::acceptance::GuardCustody::Halted,
         }
     }
 

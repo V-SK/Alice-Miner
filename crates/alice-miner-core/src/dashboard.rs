@@ -1413,6 +1413,7 @@ mod tests {
                 acceptance: "healthy".into(),
                 accept_pct: Some(99.3),
                 halted: false,
+                activity: crate::acceptance::GuardCustody::Mining,
             }],
             last_line: Some("accepted (142/1)".into()),
             message: None,

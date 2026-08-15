@@ -1881,6 +1881,7 @@ mod tests {
             acceptance: "healthy".into(),
             accept_pct: Some(99.0),
             halted: false,
+            activity: alice_miner_core::acceptance::GuardCustody::Mining,
         }
     }
 

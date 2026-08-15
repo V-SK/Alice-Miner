@@ -775,6 +775,7 @@ fn demo_dual_snapshot() -> Snapshot {
                 acceptance: "healthy".into(),
                 accept_pct: Some(99.3),
                 halted: false,
+                activity: alice_miner_core::acceptance::GuardCustody::Mining,
             },
             alice_miner_core::engine::LaneSnapshot {
                 lane: Lane::GpuPrl,
@@ -795,6 +796,7 @@ fn demo_dual_snapshot() -> Snapshot {
                 acceptance: "healthy".into(),
                 accept_pct: Some(100.0),
                 halted: false,
+                activity: alice_miner_core::acceptance::GuardCustody::Mining,
             },
         ],
         last_line: Some("accepted (142/1) diff 32001 (12 ms)".into()),
@@ -961,6 +963,7 @@ fn demo_prl_snapshot() -> Snapshot {
             acceptance: "healthy".into(),
             accept_pct: Some(100.0),
             halted: false,
+            activity: alice_miner_core::acceptance::GuardCustody::Mining,
         }],
         last_line: Some("accepted (64/0) pearlhash".into()),
         message: None,

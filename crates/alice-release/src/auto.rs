@@ -75,6 +75,10 @@
 //!   * [`SessionEvidence::MiningHalted`] — the acceptance guard (layer 3) stopped
 //!     mining on purpose. Its zero-accepted is *ours*, not the build's. Layer 3
 //!     halting must never be read here as "the new version does not earn".
+//!   * [`SessionEvidence::AcceptanceProbe`] — the guard is spending one deliberate
+//!     window RE-MEASURING a halted lane. The engine is running and the halt flag is
+//!     off (it must be, or the probe's own child could not start), so this session
+//!     looks exactly like an ordinary miner earning nothing — and it is not one.
 //!   * [`SessionEvidence::NetworkWide`] — the network-wide lane health says every
 //!     miner on this lane is being rejected. Blaming the local build for a
 //!     network-wide failure is never correct.
@@ -1041,6 +1045,14 @@ pub enum SessionEvidence {
     /// "the new version does not earn" is layer 2 mistaking layer 3's deliberate
     /// stop for a client failure.
     MiningHalted,
+    /// The acceptance guard is spending one bounded window RE-PROBING a halted lane:
+    /// the engine is up, the halt flag is deliberately off, and the run is measuring
+    /// rather than earning. Kept distinct from [`Self::MiningHalted`] because on the
+    /// wire they look nothing alike — a halted rig has no engine at all, a probing one
+    /// is indistinguishable from an ordinary miner that earns nothing — and the local
+    /// history log is the only place anybody will ever see which of the two spared a
+    /// build its rollback.
+    AcceptanceProbe,
     /// The network-wide lane health says every miner on this lane is being
     /// rejected right now. The local build cannot be the cause.
     NetworkWide,
@@ -1057,6 +1069,7 @@ impl SessionEvidence {
         match self {
             SessionEvidence::Judgeable => "judgeable",
             SessionEvidence::MiningHalted => "mining-halted",
+            SessionEvidence::AcceptanceProbe => "acceptance-probe",
             SessionEvidence::NetworkWide => "network-wide",
         }
     }
@@ -1977,7 +1990,11 @@ mod tests {
         arm(&app, "0.6.8", "0.6.7", true).unwrap();
         register_launch(&d, &app, "0.6.8");
 
-        for reason in [SessionEvidence::MiningHalted, SessionEvidence::NetworkWide] {
+        for reason in [
+            SessionEvidence::MiningHalted,
+            SessionEvidence::AcceptanceProbe,
+            SessionEvidence::NetworkWide,
+        ] {
             // Even WITH accepted shares on the clock: a session layer 3 disqualified
             // is not evidence in either direction.
             let v = note_session(
@@ -2062,7 +2079,11 @@ mod tests {
 
         assert_eq!(note_session(&d, &app, "0.6.8", long), SessionVerdict::NoChange);
         assert!(session_would_roll_back(&app, "0.6.8", &long), "now it would");
-        for reason in [SessionEvidence::MiningHalted, SessionEvidence::NetworkWide] {
+        for reason in [
+            SessionEvidence::MiningHalted,
+            SessionEvidence::AcceptanceProbe,
+            SessionEvidence::NetworkWide,
+        ] {
             assert!(
                 !session_would_roll_back(
                     &app,
@@ -2111,7 +2132,11 @@ mod tests {
             SessionAction::RollBack
         );
         // Layer 3 outranks BOTH the rollback and the commit.
-        for reason in [SessionEvidence::MiningHalted, SessionEvidence::NetworkWide] {
+        for reason in [
+            SessionEvidence::MiningHalted,
+            SessionEvidence::AcceptanceProbe,
+            SessionEvidence::NetworkWide,
+        ] {
             for accepted in [0, 99] {
                 assert_eq!(
                     judge_session(
@@ -2136,7 +2161,19 @@ mod tests {
         );
         assert!(SessionEvidence::default() == SessionEvidence::Judgeable);
         assert!(!SessionEvidence::Judgeable.abstains());
-        assert!(SessionEvidence::MiningHalted.abstains() && SessionEvidence::NetworkWide.abstains());
+        // Every reason a caller can give us abstains, and every one is a distinct key
+        // in the local history — the only place anybody will see WHICH of them spared a
+        // build its rollback.
+        let mut keys = std::collections::BTreeSet::new();
+        for e in [
+            SessionEvidence::MiningHalted,
+            SessionEvidence::AcceptanceProbe,
+            SessionEvidence::NetworkWide,
+        ] {
+            assert!(e.abstains(), "{e:?}");
+            assert!(keys.insert(e.key()), "duplicate history key for {e:?}");
+        }
+        assert!(!keys.contains(SessionEvidence::Judgeable.key()));
     }
 
     #[test]

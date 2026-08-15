@@ -24,6 +24,7 @@ use std::time::Duration;
 use alice_release::auto::{self, Decision, Hold, Mode};
 use alice_release as release;
 
+use crate::acceptance::GuardCustody;
 use crate::tr;
 
 /// Env override for the mode, for operators who manage a fleet with
@@ -689,9 +690,17 @@ pub fn confirm_start() {
 pub struct MiningEvidence {
     /// Accepted shares so far this session (the figure the probation judges).
     pub accepted: u64,
-    /// Any lane was HALTED or stopped by the acceptance guard. Once that happens
-    /// `accepted` is frozen by design, so the session says nothing about the build.
-    pub halted: bool,
+    /// What layer 3 is doing with this session's lanes, folded to the strongest
+    /// answer across them ([`GuardCustody::strongest`]).
+    ///
+    /// This replaced a bare `halted: bool`, and the replacement IS the F4 fix. The
+    /// boolean answered "is the engine stopped by the guard?"; layer 2 needs the
+    /// answer to "is this session's zero the guard's doing?", and those diverge for
+    /// the entire length of a re-probe — a run that deliberately clears `halted` (its
+    /// child could not otherwise start) and deliberately earns nothing while it
+    /// measures. Reading the boolean there rolled v0.6.8 back and pinned it during
+    /// exactly the upstream fork it was released to survive.
+    pub activity: GuardCustody,
     /// The lanes this session is mining — the input to the network-wide check.
     /// Empty means "we do not know which lane", and the check is skipped.
     pub lanes: Vec<crate::lane::Lane>,
@@ -703,7 +712,12 @@ impl MiningEvidence {
     pub fn from_snapshot(s: &crate::engine::Snapshot) -> Self {
         Self {
             accepted: s.shares_accepted,
-            halted: s.lanes.iter().any(|l| l.halted),
+            // `LaneSnapshot::activity()` folds in the older `halted` flag, so a lane
+            // row from a stream that predates the field still disqualifies its session.
+            activity: s
+                .lanes
+                .iter()
+                .fold(GuardCustody::Mining, |acc, l| acc.strongest(l.activity())),
             lanes: if s.lanes.is_empty() {
                 s.lane.into_iter().collect()
             } else {
@@ -712,11 +726,19 @@ impl MiningEvidence {
         }
     }
 
+    /// Whether this session may be held against — or credited to — the installed
+    /// build at all. False whenever layer 3 owns a lane, in either of its two ways.
+    pub fn judges_the_build(&self) -> bool {
+        self.activity.is_ordinary_mining()
+    }
+
     /// Whether this counts as "this machine is earning" for the purposes of the
     /// baseline a FUTURE update is judged against. A halted lane's frozen counter
-    /// is not evidence of current earning, however large it is.
+    /// is not evidence of current earning, however large it is; nor is a re-probe's,
+    /// which is a measurement the guard asked for rather than a session the machine
+    /// chose to run.
     pub fn counts_as_earning(&self) -> bool {
-        self.accepted > 0 && !self.halted
+        self.accepted > 0 && self.judges_the_build()
     }
 }
 
@@ -726,13 +748,30 @@ impl MiningEvidence {
 /// guards is testable: a halted lane abstains without ever touching the network,
 /// and the network is asked ONLY when a rollback is otherwise imminent — never
 /// once per tick.
-fn resolve_evidence(
-    halted: bool,
+///
+/// [`evidence_for_session`] is the same decision taken on a whole [`MiningEvidence`];
+/// [`note_session`] and the cross-layer tests both go through it, so a test can never
+/// assert against a classification that has drifted from the shipped one.
+pub(crate) fn evidence_for_session(
+    mining: &MiningEvidence,
     rollback_imminent: bool,
     network_wide: impl FnOnce() -> bool,
 ) -> auto::SessionEvidence {
-    if halted {
-        return auto::SessionEvidence::MiningHalted;
+    resolve_evidence(mining.activity, rollback_imminent, network_wide)
+}
+
+fn resolve_evidence(
+    activity: GuardCustody,
+    rollback_imminent: bool,
+    network_wide: impl FnOnce() -> bool,
+) -> auto::SessionEvidence {
+    // Exhaustive, no wildcard: a lane state that is neither ordinary mining nor one
+    // of these two must be classified here rather than falling through to
+    // "judgeable", which is the direction that costs a machine its build.
+    match activity {
+        GuardCustody::Halted => return auto::SessionEvidence::MiningHalted,
+        GuardCustody::Probing => return auto::SessionEvidence::AcceptanceProbe,
+        GuardCustody::Mining => {}
     }
     if rollback_imminent && network_wide() {
         return auto::SessionEvidence::NetworkWide;
@@ -750,7 +789,7 @@ fn resolve_evidence(
 /// reports — a session with accepted shares, a short one, a halted lane — are all
 /// `false` here and stay inline.
 pub fn session_may_consult_the_network(ran: Duration, mining: &MiningEvidence) -> bool {
-    !mining.halted
+    mining.judges_the_build()
         && mining.accepted == 0
         && !mining.lanes.is_empty()
         && ran.as_secs() >= auto::MIN_JUDGED_SESSION.as_secs()
@@ -777,13 +816,13 @@ pub fn note_session(ran: Duration, mining: &MiningEvidence) -> Option<String> {
     // Only THEN is it worth a network call to ask whether the whole network is
     // being rejected — the answer that makes blaming this build wrong.
     let rollback_imminent = counts_against
-        && !mining.halted
+        && mining.judges_the_build()
         && auto::session_would_roll_back(
             &app_path,
             version,
             &auto::SessionResult::judgeable(ran_secs, 0),
         );
-    let evidence = resolve_evidence(mining.halted, rollback_imminent, || {
+    let evidence = evidence_for_session(mining, rollback_imminent, || {
         crate::acceptance::any_lane_collapsed_network_wide(&mining.lanes)
     });
 
@@ -970,37 +1009,60 @@ mod tests {
 
         // A halted lane: not evidence, and no network call at all.
         assert_eq!(
-            resolve_evidence(true, false, ask(true)),
+            resolve_evidence(GuardCustody::Halted, false, ask(true)),
             auto::SessionEvidence::MiningHalted
         );
         assert_eq!(
-            resolve_evidence(true, true, ask(true)),
+            resolve_evidence(GuardCustody::Halted, true, ask(true)),
             auto::SessionEvidence::MiningHalted,
             "the local halt is conclusive on its own"
         );
         assert_eq!(asked(), 0, "a halted lane must not cost a request");
 
+        // A RE-PROBE is the case the old boolean could not express: the engine is up,
+        // the halt flag is off, and the run is measuring rather than earning. It must
+        // abstain on local knowledge alone — the network check cannot save it, because
+        // `attribute()` answers `Unknown` (never `NetworkWide`) for a single-miner lane,
+        // and PRL is a single-miner lane.
+        assert_eq!(
+            resolve_evidence(GuardCustody::Probing, true, ask(true)),
+            auto::SessionEvidence::AcceptanceProbe,
+            "a deliberate measurement is never evidence about the installed build"
+        );
+        assert_eq!(asked(), 0, "and it costs no request either");
+
         // Nothing imminent: still no request.
         assert_eq!(
-            resolve_evidence(false, false, ask(true)),
+            resolve_evidence(GuardCustody::Mining, false, ask(true)),
             auto::SessionEvidence::Judgeable
         );
         assert_eq!(asked(), 0, "the probe is not a per-tick call");
 
         // A rollback IS imminent and the whole network is down → abstain.
         assert_eq!(
-            resolve_evidence(false, true, ask(true)),
+            resolve_evidence(GuardCustody::Mining, true, ask(true)),
             auto::SessionEvidence::NetworkWide
         );
         assert_eq!(asked(), 1);
 
         // …and when the network is fine, the local build stays on trial.
         assert_eq!(
-            resolve_evidence(false, true, ask(false)),
+            resolve_evidence(GuardCustody::Mining, true, ask(false)),
             auto::SessionEvidence::Judgeable,
             "a healthy network must not suppress a real local failure"
         );
         assert_eq!(asked(), 2);
+
+        // Every activity is classified, and ONLY ordinary mining is judgeable — so a
+        // future variant cannot be added and silently fall through to "judge it".
+        for a in GuardCustody::ALL {
+            let e = resolve_evidence(a, false, ask(false));
+            assert_eq!(
+                e.abstains(),
+                !a.is_ordinary_mining(),
+                "{a:?} must abstain iff it is not ordinary mining"
+            );
+        }
     }
 
     /// The predicate both front-ends use to decide "inline or worker thread".
@@ -1015,7 +1077,7 @@ mod tests {
         let long = auto::MIN_JUDGED_SESSION;
         let base = MiningEvidence {
             accepted: 0,
-            halted: false,
+            activity: GuardCustody::Mining,
             lanes: vec![Lane::GpuPrl],
         };
 
@@ -1031,13 +1093,15 @@ mod tests {
             ),
             "the per-tick earning report must stay inline"
         );
-        assert!(
-            !session_may_consult_the_network(
-                long,
-                &MiningEvidence { halted: true, ..base.clone() }
-            ),
-            "a halted lane is decided locally — no request, no thread"
-        );
+        for a in [GuardCustody::Halted, GuardCustody::Probing] {
+            assert!(
+                !session_may_consult_the_network(
+                    long,
+                    &MiningEvidence { activity: a, ..base.clone() }
+                ),
+                "{a:?} is decided locally — no request, no thread"
+            );
+        }
         assert!(
             !session_may_consult_the_network(
                 long,
@@ -1054,7 +1118,7 @@ mod tests {
         use crate::engine::{EngineState, LaneSnapshot, Snapshot};
         use crate::lane::Lane;
 
-        let lane_row = |lane: Lane, halted: bool| LaneSnapshot {
+        let lane_row = |lane: Lane, activity: GuardCustody| LaneSnapshot {
             lane,
             state: EngineState::Running,
             hashrate_hs: None,
@@ -1071,28 +1135,52 @@ mod tests {
             fan_pct: None,
             acceptance: "collapsed".to_string(),
             accept_pct: None,
-            halted,
+            halted: activity == GuardCustody::Halted,
+            activity,
         };
 
         let mut s = Snapshot::idle();
         s.shares_accepted = 7;
         s.lane = Some(Lane::GpuPrl);
-        s.lanes = vec![lane_row(Lane::GpuPrl, false)];
+        s.lanes = vec![lane_row(Lane::GpuPrl, GuardCustody::Mining)];
         let e = MiningEvidence::from_snapshot(&s);
-        assert!(!e.halted);
+        assert!(e.judges_the_build());
         assert_eq!(e.lanes, vec![Lane::GpuPrl]);
         assert!(e.counts_as_earning(), "a running lane with accepted shares earns");
 
         // ANY halted lane disqualifies the session: in dual mode the accepted
         // counter can no longer be attributed to a lane that is still allowed to run.
-        s.lanes = vec![lane_row(Lane::Xmr, false), lane_row(Lane::GpuPrl, true)];
+        s.lanes = vec![
+            lane_row(Lane::Xmr, GuardCustody::Mining),
+            lane_row(Lane::GpuPrl, GuardCustody::Halted),
+        ];
         let e = MiningEvidence::from_snapshot(&s);
-        assert!(e.halted);
+        assert_eq!(e.activity, GuardCustody::Halted);
+        assert!(!e.judges_the_build());
         assert_eq!(e.lanes, vec![Lane::Xmr, Lane::GpuPrl]);
         assert!(
             !e.counts_as_earning(),
             "a frozen counter behind a halt is not proof this machine is earning"
         );
+
+        // …and so does a lane that is merely RE-PROBING, which is the one the old
+        // `halted` boolean reported as an ordinary miner earning nothing.
+        s.lanes = vec![
+            lane_row(Lane::Xmr, GuardCustody::Mining),
+            lane_row(Lane::GpuPrl, GuardCustody::Probing),
+        ];
+        let e = MiningEvidence::from_snapshot(&s);
+        assert_eq!(e.activity, GuardCustody::Probing);
+        assert!(!e.judges_the_build(), "a measurement is not evidence about the build");
+        assert!(!e.counts_as_earning());
+
+        // An OLDER `--json` stream carries `halted` and no `activity` at all. It must
+        // still disqualify: the two fields can only ever agree upward.
+        let mut legacy = lane_row(Lane::GpuPrl, GuardCustody::Mining);
+        legacy.halted = true;
+        assert_eq!(legacy.activity(), GuardCustody::Halted);
+        s.lanes = vec![legacy];
+        assert!(!MiningEvidence::from_snapshot(&s).judges_the_build());
 
         // A snapshot with no per-lane rows still names its lane for the network check.
         s.lanes.clear();
