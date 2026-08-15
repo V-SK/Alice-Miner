@@ -473,6 +473,13 @@ struct Inner {
     /// not the run's) and so a relaunch has an unambiguous zero to start from.
     child_accepted: u64,
     child_rejected: u64,
+    /// How much of the current child's counter the CHILD has stood behind — the
+    /// newest reading a later reading met or passed (see [`fold_generic`]). Always
+    /// `<= child_accepted` / `child_rejected`, and zeroed with them on every
+    /// (re)spawn. Only the [`ParserKind::Generic`] belt moves it; for every bundled
+    /// parser it simply tracks the counter, because they never dispute a reading.
+    child_accepted_confirmed: u64,
+    child_rejected_confirmed: u64,
     last_line: String,
     /// When the current run started (for uptime).
     started_at: Option<std::time::Instant>,
@@ -621,6 +628,13 @@ struct Inner {
     /// releasing the lock (disk I/O off the stats hot-path — same pattern as
     /// [`Self::pending_good_region`]).
     pending_halt_clear: bool,
+    /// Set when the halt record in memory has changed in a way the disk must learn
+    /// about right now — currently only [`HaltRecord::probe_earned`] flipping true,
+    /// i.e. the moment a re-probe first lands an accepted share. Drained by the
+    /// log-pump task, which writes it AFTER releasing the lock, exactly like
+    /// [`Self::pending_halt_clear`]. Set once per probe, so this is not a write per
+    /// share.
+    pending_halt_persist: bool,
 
     /// How far the log-file tail ([`tail_log_file_into`]) has read, and in WHICH file.
     ///
@@ -674,6 +688,64 @@ fn adopt_child_rejected(g: &mut Inner, raw: u64) {
 /// is adopted, so an isolated low reading leaves no residue.
 ///
 /// Pure + platform-independent, so the whole decision table is unit-tested.
+/// [`fold_cumulative`], plus the fact the seam needs: how much of the child's
+/// counter the child has actually STOOD BEHIND.
+///
+/// `fold_cumulative` adopts a rise at once, which is right — cumulative counters
+/// rise, and holding every one of them would make the user's totals lag reality by
+/// a line. But it means the newest value is always PROVISIONAL: the belt learns a
+/// rise was a mis-read only from the readings that follow it. Inside a run that is
+/// enough, and a spurious high heals in two lines. Across the seam it was not:
+/// `spawn_run` froze the provisional value into `carry_accepted`, the child side
+/// went to zero, and from then on every reading was a rise from zero — so the belt
+/// could never see a fall again and the bogus number sat in the carry for the rest
+/// of the run, with `counts_as_earning()` reporting the machine as earning on it.
+///
+/// `confirmed` is the newest value some LATER reading has met or passed. A rise
+/// confirms the value it rose from; a corroborated fall confirms the new base it
+/// was read at twice; a lone low reading (the disputed case) confirms nothing.
+/// It is therefore behind `current` by at most one line's increment, and it is the
+/// value the belt would still stand behind if the next reading contradicted the
+/// current one — which is exactly the question a dying child poses.
+fn fold_generic(
+    current: u64,
+    confirmed: &mut u64,
+    pending: &mut Option<u64>,
+    new: u64,
+) -> u64 {
+    let folded = fold_cumulative(current, pending, new);
+    if new >= current {
+        // The counter reached or passed `current`: the child has now read a value
+        // at least that high twice.
+        *confirmed = current;
+    } else if folded == new {
+        // A corroborated fall — two consistent readings of a new, lower base. The
+        // confirmed floor must come down with it or it would outrank the counter.
+        *confirmed = new;
+    }
+    folded
+}
+
+/// What a child whose counter is DISPUTED contributes to the run when it dies.
+///
+/// A pending candidate means the child's own last reading contradicted the value we
+/// are holding, and only a second consistent reading could have settled which of
+/// the two was the mis-read. The child does not get to produce one. Neither
+/// candidate can be trusted — picking the high one makes a spurious spike permanent,
+/// picking the low one is the "one mis-read line walks the totals backwards" bug the
+/// belt exists to stop — so the run carries what the child last CONFIRMED, which
+/// sits below both and is wrong by at most one reading's worth in either direction.
+///
+/// With no dispute open there is nothing to resolve and the child's counter carries
+/// over unchanged, which is every bundled parser (they never set `pending`) and the
+/// overwhelming majority of generic ones.
+fn resolve_disputed_child(child: u64, confirmed: u64, pending: Option<u64>) -> u64 {
+    match pending {
+        Some(_) => confirmed.min(child),
+        None => child,
+    }
+}
+
 fn fold_cumulative(current: u64, pending: &mut Option<u64>, new: u64) -> u64 {
     if new >= current {
         *pending = None;
@@ -767,6 +839,8 @@ impl LaneSupervisor {
                 carry_rejected: 0,
                 child_accepted: 0,
                 child_rejected: 0,
+                child_accepted_confirmed: 0,
+                child_rejected_confirmed: 0,
                 last_line: String::new(),
                 started_at: None,
                 stop_requested: false,
@@ -805,6 +879,7 @@ impl LaneSupervisor {
                 halt_probe_at: None,
                 reprobe_override: None,
                 pending_halt_clear: false,
+                pending_halt_persist: false,
                 log_tail_at: None,
             })),
         }
@@ -1054,6 +1129,9 @@ impl LaneSupervisor {
                 HaltGate::Waiting => return Ok(()),
                 // The cooldown elapsed while we were off — spend one window.
                 HaltGate::ProbeNow => return self.launch_reprobe_now(program, args),
+                // A probe that was landing shares was cut short by the restart:
+                // finish measuring it instead of sitting out a cooldown.
+                HaltGate::ResumeProbe => return self.resume_reprobe(program, args),
                 HaltGate::None => {}
             },
         }
@@ -1180,6 +1258,27 @@ impl LaneSupervisor {
                 g.halt_record = Some(rec);
                 return HaltGate::ProbeNow;
             }
+            // R4-2: the cooldown has not elapsed — but the probe that IS on this
+            // rung was landing accepted shares when the process died. That evidence
+            // is about the pool, and it is the only thing in this record that
+            // postdates the halt. Keeping the rung it cost while throwing away what
+            // it measured is what parked a working lane for up to six hours; a lane
+            // whose submission rate cannot complete a period between restarts never
+            // escaped at all. Resume the MEASUREMENT rather than the cooldown, on
+            // the SAME rung — this is the interrupted probe continuing, not a new
+            // one, so it is not charged again.
+            //
+            // It cannot loop for free: `resume_probe` clears the flag, so a second
+            // resume needs a second accepted share, i.e. fresh evidence each time.
+            // A pool rejecting everything (the August case) earns none and walks
+            // the ladder exactly as before.
+            HaltResume::Wait(_) if rec.probe_earned => {
+                let mut g = self.inner.lock().expect("mutex");
+                g.halted = true;
+                g.halt_probes = rec.probes;
+                g.halt_record = Some(rec);
+                return HaltGate::ResumeProbe;
+            }
             HaltResume::Wait(d) => d,
         };
 
@@ -1229,6 +1328,43 @@ impl LaneSupervisor {
         Ok(())
     }
 
+    /// Continue a re-probe the last process did not get to finish, on the rung it was
+    /// already charged for.
+    ///
+    /// The difference from [`Self::launch_reprobe_now`] is the whole point: no rung is
+    /// spent. The ladder exists to bound how much power a REJECTING pool costs, and
+    /// this path is only reachable when the record says the pool accepted at least one
+    /// share from the probe now being resumed — so charging for it would be charging
+    /// for evidence of health.
+    ///
+    /// The flag IS cleared (and the clearing persisted), so the next restart needs a
+    /// fresh accepted share to take this path again.
+    fn resume_reprobe(
+        &self,
+        program: std::path::PathBuf,
+        args: Vec<String>,
+    ) -> Result<(), String> {
+        let rec = {
+            let mut g = self.inner.lock().expect("mutex");
+            g.halt_probe_at = None;
+            g.halted = false; // the gates must let this one child through
+            if let Some(rec) = g.halt_record.as_mut() {
+                rec.probe_earned = false;
+            }
+            g.halt_record.clone()
+        };
+        if let Some(rec) = &rec {
+            if let Err(e) = acceptance::save_halt_record(rec) {
+                log_verbose("halt record not persisted", &e);
+            }
+        }
+        self.spawn_run(program, args, RunKind::Probe)?;
+        if let Some(rec) = rec {
+            self.publish_reprobe_status(&rec);
+        }
+        Ok(())
+    }
+
     /// Advance the ladder by one rung and persist it. Returns the updated record.
     fn charge_reprobe(&self) -> Option<HaltRecord> {
         let rec = {
@@ -1239,6 +1375,9 @@ impl LaneSupervisor {
                 rec.probes = probes;
                 rec.next_probe_at = acceptance::now_unix()
                     .saturating_add(acceptance::reprobe_delay(probes).as_secs());
+                // A NEW window has earned nothing yet. The flag is always about the
+                // probe in flight, never about one that has already been spent.
+                rec.probe_earned = false;
             }
             g.halt_probe_at = None;
             g.halted = false; // the gates must let this one child through
@@ -1469,8 +1608,27 @@ impl LaneSupervisor {
             // progress baseline, the acceptance monitor's open period and the user's
             // visible numbers with them. The child's counter is now tracked apart from
             // the run's and added to a carry, so the two can never be confused again.
+            //
+            // R4: what the dying child contributes is resolved BEFORE its counter is
+            // thrown away. A generic-parser reading that the child itself
+            // contradicted, and did not live long enough to settle, is not a value
+            // this run may adopt for good — see [`resolve_disputed_child`]. With no
+            // dispute open (every bundled parser, and a generic one whose last
+            // reading was a rise) this is the child's counter unchanged.
+            let carried_accepted = resolve_disputed_child(
+                g.child_accepted,
+                g.child_accepted_confirmed,
+                g.generic_accepted_pending,
+            );
+            let carried_rejected = resolve_disputed_child(
+                g.child_rejected,
+                g.child_rejected_confirmed,
+                g.generic_rejected_pending,
+            );
             g.child_accepted = 0;
             g.child_rejected = 0;
+            g.child_accepted_confirmed = 0;
+            g.child_rejected_confirmed = 0;
             if kind.resets_counters() {
                 g.accepted = 0;
                 g.rejected = 0;
@@ -1498,8 +1656,13 @@ impl LaneSupervisor {
                 // seam: it never sees the regression that used to make it re-baseline a
                 // half-finished period down to zero and then call a working rig a total
                 // shutout on the replacement's first twenty submissions.
-                g.carry_accepted = g.accepted;
-                g.carry_rejected = g.rejected;
+                g.carry_accepted = g.carry_accepted.saturating_add(carried_accepted);
+                g.carry_rejected = g.carry_rejected.saturating_add(carried_rejected);
+                // The run totals ARE the carry until the replacement reads its first
+                // line, and they must agree with it — including when resolving a
+                // dispute moved the carry below what the run was showing.
+                g.accepted = g.carry_accepted;
+                g.rejected = g.carry_rejected;
                 // A failover deliberately carries the evidence over — see
                 // `AcceptanceMonitor::on_failover` for why resetting here would
                 // reproduce the incident.
@@ -1588,7 +1751,7 @@ impl LaneSupervisor {
             while let Some(line) = log_rx.recv().await {
                 // Parse under the lock, then persist any new last-good region AFTER
                 // releasing it (disk I/O off the stats hot-path).
-                let (persist_region, clear_halt) = {
+                let (persist_region, clear_halt, save_halt) = {
                     let mut g = inner_for_logs.lock().expect("mutex");
                     if g.generation != gen {
                         break; // superseded by a newer run
@@ -1596,7 +1759,14 @@ impl LaneSupervisor {
                     apply_log_line(&mut g, parser, &line.text);
                     let clear = g.pending_halt_clear;
                     g.pending_halt_clear = false;
-                    (g.pending_good_region.take(), clear)
+                    // Take the record to write while we still hold the lock; the
+                    // write itself happens below, off it.
+                    let save = g
+                        .pending_halt_persist
+                        .then(|| g.halt_record.clone())
+                        .flatten();
+                    g.pending_halt_persist = false;
+                    (g.pending_good_region.take(), clear, save)
                 };
                 if let Some(tag) = persist_region {
                     // Best-effort: remember the region that just landed an accepted
@@ -1609,6 +1779,14 @@ impl LaneSupervisor {
                     // That is the only evidence that retires a persisted halt (and its
                     // ladder); everything else is a guess.
                     acceptance::clear_halt_record(lane_for_logs);
+                }
+                if let Some(rec) = save_halt {
+                    // The re-probe has landed a share. Best-effort, like every other
+                    // halt write: a rig with an unwritable home loses only the
+                    // across-restart half of this.
+                    if let Err(e) = acceptance::save_halt_record(&rec) {
+                        log_verbose("halt record not persisted", &e);
+                    }
                 }
             }
         });
@@ -2620,6 +2798,9 @@ enum HaltGate {
     /// A halt whose cooldown already elapsed while the machine was off — spend one
     /// window now rather than sit out a wait that is over.
     ProbeNow,
+    /// A halt whose cooldown has NOT elapsed, but whose re-probe was landing accepted
+    /// shares when the process died. Finish that measurement, on the same rung.
+    ResumeProbe,
 }
 
 /// The status line for a run that is a deliberate re-check of a halted lane.
@@ -3618,15 +3799,19 @@ fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
                 // value plus the carry.
                 if let Some(a) = sample.accepted {
                     let mut pending = g.generic_accepted_pending;
-                    let folded = fold_cumulative(g.child_accepted, &mut pending, a);
+                    let mut confirmed = g.child_accepted_confirmed;
+                    let folded = fold_generic(g.child_accepted, &mut confirmed, &mut pending, a);
                     g.generic_accepted_pending = pending;
+                    g.child_accepted_confirmed = confirmed;
                     adopt_child_accepted(g, folded);
                     note_accepted_progress(g, g.accepted);
                 }
                 if let Some(r) = sample.rejected {
                     let mut pending = g.generic_rejected_pending;
-                    let folded = fold_cumulative(g.child_rejected, &mut pending, r);
+                    let mut confirmed = g.child_rejected_confirmed;
+                    let folded = fold_generic(g.child_rejected, &mut confirmed, &mut pending, r);
                     g.generic_rejected_pending = pending;
+                    g.child_rejected_confirmed = confirmed;
                     adopt_child_rejected(g, folded);
                 }
                 apply_telemetry(g, &sample);
@@ -3652,6 +3837,24 @@ fn apply_log_line(g: &mut Inner, parser: ParserKind, raw: &str) {
         g.halt_record = None;
         g.halt_probe_at = None;
         g.pending_halt_clear = true;
+    }
+    // R4-2: an accepted share landed by a RE-PROBE is a fact about the pool, and
+    // the only fact in the record gathered after the halt. It does not lift the
+    // halt — that still takes a measured healthy period, above — but it must
+    // outlive the process, because the rung the probe cost already does. Without
+    // it, a relaunch mid-probe finds a record holding the punishment and none of
+    // the evidence, and parks a working lane for up to six hours.
+    //
+    // `halt_probes > 0 && !halted` is exactly [`GuardCustody::Probing`]; a probe
+    // run zeroes the counters, so any accepted share at all is this probe's.
+    // Written once per probe: the flag is already true after the first.
+    if g.halt_probes > 0 && !g.halted && g.accepted > 0 {
+        if let Some(rec) = g.halt_record.as_mut() {
+            if !rec.probe_earned {
+                rec.probe_earned = true;
+                g.pending_halt_persist = true;
+            }
+        }
     }
     g.last_line = line;
 }
@@ -4202,15 +4405,23 @@ mod tests {
     /// the real path rather than poking the monitor directly — including the pump's
     /// post-lock step (the deferred disk work it stages).
     fn feed(s: &LaneSupervisor, line: &str) {
-        let clear = {
+        let (clear, save) = {
             let mut g = s.inner.lock().unwrap();
             apply_log_line(&mut g, ParserKind::Xmr, line);
             let c = g.pending_halt_clear;
             g.pending_halt_clear = false;
-            c
+            let save = g
+                .pending_halt_persist
+                .then(|| g.halt_record.clone())
+                .flatten();
+            g.pending_halt_persist = false;
+            (c, save)
         };
         if clear {
             acceptance::clear_halt_record(s.lane);
+        }
+        if let Some(rec) = save {
+            let _ = acceptance::save_halt_record(&rec);
         }
     }
 
@@ -4640,6 +4851,100 @@ mod tests {
         let mut p = Some(7);
         assert_eq!(fold_cumulative(42, &mut p, 42), 42);
         assert_eq!(p, None);
+    }
+
+    /// R4-3, the pure half. `fold_cumulative` adopts a rise at once, so the newest
+    /// value is always PROVISIONAL — the belt only learns a rise was a mis-read from
+    /// the readings that follow it. `fold_generic` names the part that is not
+    /// provisional, and `resolve_disputed_child` is what the seam carries when the
+    /// child dies with the question open.
+    #[test]
+    fn fold_generic_tracks_what_the_child_has_actually_stood_behind() {
+        let (mut p, mut c) = (None, 0u64);
+        // A rise confirms the value it rose FROM, never the value it rose to.
+        assert_eq!(fold_generic(0, &mut c, &mut p, 10), 10);
+        assert_eq!(c, 0);
+        assert_eq!(fold_generic(10, &mut c, &mut p, 11), 11);
+        assert_eq!(c, 10, "10 was met by a later reading; 11 has not been");
+        // A mis-read spike is adopted (nothing yet says otherwise) but confirms only
+        // the honest value underneath it.
+        assert_eq!(fold_generic(11, &mut c, &mut p, 999_999), 999_999);
+        assert_eq!(c, 11);
+        // One contradicting reading opens a dispute and confirms nothing.
+        assert_eq!(fold_generic(999_999, &mut c, &mut p, 12), 999_999);
+        assert_eq!((p, c), (Some(12), 11));
+        // With the dispute open, the seam carries the confirmed floor — not the
+        // spike (which would be permanent) and not the lone low reading (which is
+        // the "one mis-read line walks the totals backwards" bug).
+        assert_eq!(resolve_disputed_child(999_999, c, p), 11);
+        // The corroborated fall brings the floor down with the counter.
+        assert_eq!(fold_generic(999_999, &mut c, &mut p, 13), 13);
+        assert_eq!((p, c), (None, 13));
+        // …and with no dispute open the child's counter carries over untouched,
+        // which is every bundled parser.
+        assert_eq!(resolve_disputed_child(13, c, None), 13);
+        assert_eq!(resolve_disputed_child(700, 0, None), 700);
+    }
+
+    /// R4-3. **A REGRESSION OF THE CARRY/CHILD SPLIT.** A generic (bring-your-own)
+    /// miner mis-reads one line into an absurd cumulative count. In-run that heals:
+    /// two consistent lower readings re-baseline it. But `spawn_run(Failover)` froze
+    /// the disputed value into `carry_accepted` and zeroed the child side, so every
+    /// later reading was a rise from zero — the belt could never see a fall again,
+    /// the bogus number sat in the carry for the rest of the run, and
+    /// `counts_as_earning()` reported the machine as earning on the strength of it.
+    /// Before the split the belt could still heal it.
+    #[test]
+    fn a_failover_does_not_launder_a_disputed_generic_reading_into_the_carry() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let s = LaneSupervisor::with_backend(
+                Lane::GpuPrl,
+                EndpointPlan::single(Endpoint::plaintext("us.aliceprotocol.org", 3340)),
+                ParserKind::Generic,
+                None,
+            );
+            let (program, args) = idle_child();
+            s.start_simple(program.clone(), args.clone()).expect("start");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+            let g_feed = |line: &str| {
+                let mut g = s.inner.lock().unwrap();
+                apply_log_line(&mut g, ParserKind::Generic, line);
+            };
+            g_feed("shares a:9 r:0 30.0 mh/s");
+            g_feed("shares a:10 r:0 30.0 mh/s");
+            g_feed("shares a:999999 r:0 30.0 mh/s"); // one mis-read line
+            g_feed("shares a:11 r:0 30.0 mh/s"); // contradicted — not yet corroborated
+            assert_eq!(s.stats().accepted, 999_999, "held, pending corroboration");
+
+            // …and the engine dies (or Layer B rotates) before the second reading
+            // that would have settled it.
+            s.spawn_run(program, args, RunKind::Failover).expect("relaunch");
+            assert!(wait_for(&s, 5, |st| st.state == ProcState::Running).await);
+            {
+                let g = s.inner.lock().unwrap();
+                assert_eq!(
+                    g.carry_accepted, 10,
+                    "the carry takes what the child CONFIRMED, not what it disputed"
+                );
+                assert_eq!(g.accepted, 10, "and the run totals agree with the carry");
+                assert_eq!(g.child_accepted, 0);
+            }
+
+            // The replacement counts up from its own zero and the run continues from
+            // a number that is within one reading of the truth — for good, not until
+            // the next seam.
+            for i in 1..=4u64 {
+                g_feed(&format!("shares a:{i} r:0 30.0 mh/s"));
+            }
+            assert_eq!(
+                s.stats().accepted,
+                14,
+                "10 carried + 4 from the replacement — the spike is gone"
+            );
+            s.request_stop();
+        });
     }
 
     /// REGRESSION (Bug 3): with the GENERIC parser, the cumulative share counters
@@ -7260,6 +7565,109 @@ mod tests {
             assert!(second.halted_at >= first.halted_at, "and it is the NEW halt's evidence");
 
             s.request_stop();
+        });
+    }
+
+    /// R4-2. **THE EVIDENCE MUST SURVIVE THE RESTART THE WAY THE PUNISHMENT DOES.**
+    ///
+    /// `charge_reprobe` spends a rung and writes it to disk BEFORE the probe starts,
+    /// so the cost of a probe outlives the process. What the probe MEASURED did not:
+    /// `spawn_run(Probe)` zeroes the acceptance monitor, and a completed period needs
+    /// twenty submissions — hours on a slow lane. A service relaunch inside that window
+    /// found a record holding the rung and none of the evidence, so `adopt_persisted_halt`
+    /// parked the lane with NO ENGINE for up to the six-hour cap, on a pool that had
+    /// been accepting every share a moment earlier. Worse in the tail: a lane whose
+    /// submission rate cannot complete a period between automatic restarts never left
+    /// `Probing` at all, so layer 2 abstained for good.
+    ///
+    /// One durable bool fixes the asymmetry: an accepted share landed by the probe now
+    /// in flight. It does not lift the halt — only a measured healthy period does that
+    /// — it decides whether a restart resumes the MEASUREMENT or the cooldown.
+    #[test]
+    fn a_probe_that_was_landing_shares_resumes_after_a_restart_instead_of_parking() {
+        let _env = temp_home();
+        let rt = rt();
+        rt.block_on(async {
+            let first = LaneSupervisor::new(Lane::Xmr);
+            first.set_acceptance_config(fast_acceptance());
+            // Compress only the in-process countdown; the PERSISTED rungs stay the
+            // production 30 min / 1 h, which is what the restart below reads.
+            first.set_reprobe_timing(Duration::from_millis(300));
+            let (program, args) = idle_child();
+            first.start_simple(program.clone(), args.clone()).expect("start");
+            assert!(wait_for(&first, 5, |st| st.state == ProcState::Running).await);
+            drive_to_halt(&first).await;
+            wait_for_halt_record(Lane::Xmr).await;
+
+            // The halt lifts itself into a re-probe, charging rung 1 first.
+            assert!(
+                wait_for(&first, 10, |st| st.state == ProcState::Running).await,
+                "the halt must lift itself: {:?}",
+                first.stats()
+            );
+            assert_eq!(first.halt_probes(), 1, "the rung is spent, and persisted");
+            assert!(
+                !acceptance::load_halt_record(Lane::Xmr).expect("recorded").probe_earned,
+                "a freshly charged rung has earned nothing yet"
+            );
+
+            // The pool is accepting again — but three shares is nowhere near the
+            // twenty submissions a completed period needs, so no verdict exists.
+            for i in 1..=3u64 {
+                feed(&first, &format!("net      accepted ({i}/0) diff 100 (10 ms)"));
+            }
+            assert_eq!(first.stats().accepted, 3, "the probe IS landing shares");
+            assert_ne!(first.stats().acceptance, "healthy", "and has reached no verdict");
+            let mid = acceptance::load_halt_record(Lane::Xmr).expect("recorded");
+            assert!(mid.probe_earned, "…and that reached the disk: {mid:?}");
+            assert_eq!(mid.probes, 1, "without spending another rung");
+
+            // The process dies mid-measurement (reboot / re-login / service relaunch).
+            first.request_stop();
+            drop(first);
+
+            let second = LaneSupervisor::new(Lane::Xmr);
+            second.set_acceptance_config(fast_acceptance());
+            second.set_reprobe_timing(Duration::from_millis(300));
+            second
+                .start_simple_with_cause(program.clone(), args.clone(), StartCause::Automatic)
+                .expect("automatic start");
+            assert!(
+                wait_for(&second, 5, |st| st.state == ProcState::Running).await,
+                "a probe that was landing shares must be finished, not parked: {:?}",
+                second.stats()
+            );
+            assert_eq!(
+                second.halt_probes(),
+                1,
+                "the SAME rung — this is the interrupted probe continuing, not a new one"
+            );
+            assert_eq!(
+                second.stats().activity,
+                GuardCustody::Probing,
+                "the guard still owns the lane until a period is measured"
+            );
+            let after = acceptance::load_halt_record(Lane::Xmr).expect("recorded");
+            assert_eq!(after.probes, 1, "and no rung was charged for resuming");
+            assert!(
+                !after.probe_earned,
+                "the evidence is CONSUMED: a second resume needs a second share"
+            );
+
+            // …and with the flag consumed and no new share, the next restart parks
+            // exactly as it did before — the ladder is not a free loop.
+            second.request_stop();
+            drop(second);
+            let third = LaneSupervisor::new(Lane::Xmr);
+            third.set_acceptance_config(fast_acceptance());
+            third
+                .start_simple_with_cause(program, args, StartCause::Automatic)
+                .expect("automatic start");
+            let st = third.stats();
+            assert!(!st.running, "no fresh evidence ⇒ the cooldown is honoured: {st:?}");
+            assert_eq!(third.pid(), None);
+            assert!(st.halted);
+            third.request_stop();
         });
     }
 

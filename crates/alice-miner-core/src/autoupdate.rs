@@ -547,6 +547,19 @@ fn describe_hold(version: &str, hold: &Hold) -> String {
                 format!("有新版本 v{version}。一切正常,你无需做任何事:本机会先等待一天再自动安装新版本,好让问题先在最早安装的机器上暴露(还剩约 {h} 小时)。`alice-miner update` 可以立刻安装,那等于由你来当第一批试用者,而不是等别人先试。")
             )
         }
+        // NOT a soak, and it must not borrow the soak's reassurance. The wait here
+        // is however far the clock and the ledger disagree — years, on a box that
+        // came up in the wrong decade — so "waits a day, nothing to do" would be
+        // the client saying nothing is wrong while nothing will ever install again.
+        // The remedy is the system clock, and it is a remedy, so it is named; the
+        // bypass is mentioned without being offered as the fix.
+        Hold::ClockAhead { ahead_by_s } => {
+            let age = age_phrase(*ahead_by_s);
+            tr!(
+                format!("v{version} is available but was NOT installed automatically: this machine's own update ledger records having first seen it {age} in the FUTURE. A version cannot be seen before it exists, so the system clock and that record disagree — either the clock has gone backwards since, or it was ahead when the record was written. Nothing about the release is wrong. The waiting period is measured from that record, so until the two agree NOTHING will install here on its own, including a security release. Check the system time (a dead clock battery, a BIOS keeping local time, or a clock set forward by hand). `alice-miner update` still works and will say the same thing before it installs anything."),
+                format!("有新版本 v{version},但未自动安装:本机的更新台账把「首次见到该版本」记在了{age}之后 —— 也就是未来。任何版本都不可能在它存在之前被看到,所以系统时钟和这条记录对不上:要么时钟后来被调回去了,要么写下这条记录时时钟就是快的。版本本身没有问题。观察期正是从那条记录开始计算的,因此在两者一致之前,本机不会自动安装任何版本,安全更新也一样。请检查系统时间(主板电池没电、BIOS 使用本地时间,或有人手动把时钟调快了)。`alice-miner update` 仍可使用,并会在安装前给出同样的提示。")
+            )
+        }
         Hold::Rollout { bucket, pct } => tr!(
             format!("v{version} is available and is going to {pct}% of machines first; this one is in group {bucket} and is not in that slice yet. Nothing is wrong and there is nothing to do — a staged rollout exists so a bad build stops at the first slice instead of reaching everyone. `alice-miner update` would install it immediately, which opts this machine out of that."),
             format!("有新版本 v{version},正在先向 {pct}% 的机器放量;本机分组为 {bucket},尚未轮到。一切正常,你无需做任何事 —— 分批放量的意义在于让有问题的版本止步于第一批,而不是一次铺到所有人。`alice-miner update` 可以立刻安装,那等于让本机退出这一保护。")
@@ -1210,6 +1223,7 @@ mod tests {
             Hold::NotifyOnly,
             Hold::NotSecurity,
             Hold::Soaking { ready_in_s: 3600 },
+            Hold::ClockAhead { ahead_by_s: 10 * 365 * 24 * 3600 },
             Hold::Rollout { bucket: 42, pct: 10 },
             Hold::Pinned,
             Hold::Revoked,
@@ -1228,6 +1242,46 @@ mod tests {
             assert!(s.contains("0.6.8"), "hold line must name the version: {s}");
             assert!(s.len() > 40, "hold line must actually explain: {s}");
         }
+    }
+
+    /// R4-1c. A hold that will not lift on its own must not borrow the soak's
+    /// reassurance. `Hold::Soaking` says "nothing is wrong and there is nothing to
+    /// do: this machine waits a day" — true of a soak, and false of a machine whose
+    /// ledger is dated a decade out, where the honest sentence is that nothing will
+    /// install again until someone looks at the clock.
+    #[test]
+    fn a_clock_disagreement_never_reads_like_an_ordinary_soak() {
+        let _g = crate::i18n::LANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let decade = 10 * 365 * 24 * 3600;
+        for (lang, reassurance, clock, security) in [
+            (
+                crate::i18n::Lang::En,
+                "Nothing is wrong and there is nothing to do",
+                "system time",
+                "security release",
+            ),
+            (crate::i18n::Lang::Zh, "一切正常", "系统时间", "安全更新"),
+        ] {
+            crate::i18n::set_lang(lang);
+            let s = describe_hold("0.6.8", &Hold::ClockAhead { ahead_by_s: decade });
+            assert!(
+                !s.contains(reassurance),
+                "a hold that will not lift must not claim nothing is wrong ({lang:?}): {s}"
+            );
+            assert!(
+                s.contains(clock),
+                "…and it must point at the clock, the one thing a user can act on ({lang:?}): {s}"
+            );
+            assert!(
+                s.contains(security),
+                "…and say the emergency channel is off too ({lang:?}): {s}"
+            );
+            // The gap is named in the user's units, not in seconds.
+            assert!(s.contains("3650"), "({lang:?}): {s}");
+        }
+        crate::i18n::set_lang(crate::i18n::Lang::En);
     }
 
     #[test]
@@ -1615,6 +1669,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let safety = [
             Hold::Soaking { ready_in_s: 3600 },
+            Hold::ClockAhead { ahead_by_s: 10 * 365 * 24 * 3600 },
             Hold::Rollout { bucket: 42, pct: 10 },
             Hold::Pinned,
             Hold::LedgerUnwritable,
@@ -2028,6 +2083,7 @@ mod tests {
                 period_rejected: 500,
                 period_elapsed_s: 900,
                 shutout: true,
+                probe_earned: false,
                 attribution: "upstream".to_string(),
                 version: "0.6.8".to_string(),
             };

@@ -131,6 +131,30 @@ type Result<T> = std::result::Result<T, UpdateError>;
 /// locally, on a clock the manifest cannot move.
 pub const SOAK_FLOOR: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How far a recorded sighting may sit in the FUTURE of the current clock before
+/// the hold stops being called an ordinary soak.
+///
+/// A sighting cannot really happen after now, so any positive gap is this machine
+/// disagreeing with its own record. A few minutes of it is an NTP step and makes
+/// the wait a few minutes longer — nothing a user needs to hear about. Past that
+/// the wait is no longer bounded by the soak at all, and reporting it as one is a
+/// lie with a number in it. See [`Hold::ClockAhead`].
+pub const CLOCK_AHEAD_TOLERANCE: Duration = Duration::from_secs(10 * 60);
+
+/// How close two of this machine's own clock readings must be for one to
+/// CORROBORATE the other when the ledger floor is drawn (see [`note_seen`]).
+///
+/// Generous on purpose, in the direction that keeps the guardrail: a wide window
+/// means MORE readings support each other, so an honest high-water mark survives a
+/// clock that has gone backwards. What it will never support is a reading nothing
+/// else on this machine has ever come near — a boot in the wrong decade, a restored
+/// snapshot, a clock somebody set forward — which is the reading that would
+/// otherwise floor every future sighting for good.
+///
+/// Ninety days is comfortably longer than the gap between two releases, so a rig
+/// that has seen any two versions in a quarter keeps its floor.
+pub const CLOCK_AGREEMENT: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
 /// A mining session must run at least this long before "zero accepted shares"
 /// counts as evidence against the build. Below this the sample is meaningless —
 /// engines take minutes to warm up and share intervals of several minutes are
@@ -265,6 +289,22 @@ pub enum Hold {
     NotSecurity,
     /// Still inside the soak window; `ready_in_s` seconds to go.
     Soaking { ready_in_s: u64 },
+    /// This machine's own ledger records having first SEEN this version at a
+    /// moment that is still in the future, by `ahead_by_s` seconds.
+    ///
+    /// Kept apart from [`Self::Soaking`] because it is not one, and because the
+    /// soak's sentence — "nothing is wrong and there is nothing to do, this
+    /// machine waits a day" — would be false in the one way that matters: this
+    /// wait is not a day and is not bounded by the soak. Nothing will install
+    /// here, including a security release, until the two agree.
+    ///
+    /// It is reached whenever the clock and the ledger disagree, in either
+    /// direction — a clock that has gone backwards since the sighting, or a
+    /// sighting written while the clock was ahead — and the client cannot tell
+    /// those apart from local data alone. So it says what it can actually see
+    /// and points at the system clock, rather than picking one and being
+    /// confidently wrong.
+    ClockAhead { ahead_by_s: u64 },
     /// This machine's bucket is outside the current rollout slice.
     Rollout { bucket: u8, pct: u8 },
     /// This exact version already failed its health probation here.
@@ -504,6 +544,23 @@ pub fn decide(input: &Input<'_>) -> Decision {
         LedgerStatus::Intact => {}
         LedgerStatus::Unwritable => return notify(Hold::LedgerUnwritable),
         LedgerStatus::Reset => return notify(Hold::LedgerReset),
+    }
+
+    // 4a. Before the soak: is the anchor in the FUTURE of now? A machine cannot
+    //     have first seen something after the present, so this is the clock and
+    //     the ledger disagreeing, and `now < ready_at` would be satisfied by an
+    //     amount of time that has nothing to do with the soak — years of it, on a
+    //     box that came up in the wrong decade. Reporting that as "waits a day"
+    //     would be the client saying nothing is wrong while nothing will ever
+    //     install again, which is the disease this whole module treats.
+    //
+    //     Note the direction: this only ever REPORTS a hold that was happening
+    //     anyway. It never shortens one — the soak below still runs on the same
+    //     anchor — so it cannot be used to talk a machine into an early install.
+    if input.first_seen_unix > input.now_unix.saturating_add(CLOCK_AHEAD_TOLERANCE.as_secs()) {
+        return notify(Hold::ClockAhead {
+            ahead_by_s: input.first_seen_unix - input.now_unix,
+        });
     }
 
     // 4. Soak. Anchored on OUR first sighting, floored by OUR constant; the
@@ -860,9 +917,37 @@ pub fn rollout_id(state_dir: &Path) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Seen {
     pub version: String,
+    /// The moment the soak is anchored on: what the clock said, floored by what
+    /// the ledger already knew (see [`note_seen`]).
     pub first_seen_unix: u64,
+    /// What the clock ACTUALLY said when this record was written, before any
+    /// flooring — the raw reading, kept apart from the value derived from it.
+    ///
+    /// This is the whole of what lets a bad reading heal. Once a floor is
+    /// applied, every later `first_seen_unix` is a copy of it, so the ledger can
+    /// never contradict itself and a single wrong reading is permanent. The raw
+    /// readings can: they go on telling the truth underneath a floor that does
+    /// not, and [`note_seen`] draws the floor from them.
+    ///
+    /// `0` on a record written before this field existed ⇒ "not known", and
+    /// [`Self::reading`] falls back to `first_seen_unix`, i.e. the earlier
+    /// behaviour. No ledger in the field has one: this file is new in 0.6.8.
+    #[serde(default)]
+    pub clock_unix: u64,
     /// The artifact sha256 for THIS platform when we first saw the version.
     pub sha256: String,
+}
+
+impl Seen {
+    /// The raw clock reading behind this record — the only value in it that is an
+    /// OBSERVATION rather than something derived from one.
+    pub fn reading(&self) -> u64 {
+        if self.clock_unix > 0 {
+            self.clock_unix
+        } else {
+            self.first_seen_unix
+        }
+    }
 }
 
 fn seen_path(state_dir: &Path) -> PathBuf {
@@ -962,6 +1047,67 @@ impl Sighting {
     }
 }
 
+/// The moment a new sighting is floored up to: the newest reading this machine
+/// has taken that AT LEAST ONE OTHER of its own readings agrees with.
+///
+/// ## Why a plain high-water mark was not enough
+///
+/// The floor exists so a clock that reads EARLIER than something already written
+/// down cannot buy soak credit for time that has not passed. `max` over the ledger
+/// does that, and it is monotone-safe — but it is monotone in BOTH senses, and the
+/// second one is the bug. One reading from a clock that is AHEAD (an RTC that comes
+/// up in the wrong decade, a restored VM snapshot, a clock somebody set forward)
+/// goes into the ledger once, and from then on it floors the sighting of every
+/// future version, for good: the machine holds in [`Hold::Soaking`] until real time
+/// reaches a date it will not reach, and auto-update — including the security-only
+/// emergency channel — is dead on that rig with nothing to say so and no way back.
+///
+/// A cap does not fix it. Clamping the floor to "at most X ahead of the current
+/// reading" defeats the floor outright in the case it was written for, because the
+/// clock error there is years, not minutes.
+///
+/// ## What does fix it, and what it costs
+///
+/// The two hypotheses — "the clock is behind now" and "that reading was ahead
+/// then" — are indistinguishable from one reading. They are not indistinguishable
+/// from several. A clock that has gone backwards leaves a ledger full of readings
+/// that agree with EACH OTHER and disagree with the present; a reading taken while
+/// the clock was ahead is a lone outlier that nothing else on the machine has ever
+/// come near. So the floor is drawn only from readings that something else
+/// corroborates, and the outlier is left out of it:
+///
+///   * a backwards clock still meets the honest high-water mark and gets no credit
+///     — the defence is unchanged wherever the ledger holds two readings inside
+///     [`CLOCK_AGREEMENT`] of each other, which is any rig that has seen two
+///     releases in a quarter;
+///   * a lone forward reading floors nothing, so the next version soaks normally;
+///   * when nothing corroborates anything — a ledger of one, the first sighting
+///     ever — we fall back to the plain high-water mark, i.e. the old behaviour,
+///     which is the safe direction. That case is temporary by construction: this
+///     sighting adds a second reading, so the very next one can break the tie.
+///
+/// Note the input: [`Seen::reading`], never `first_seen_unix`. A floored record is
+/// a copy of the floor, so a ledger of them corroborates itself and nothing would
+/// ever heal. The raw readings are the only entries that can disagree with a floor,
+/// which is exactly why they are kept.
+fn ledger_floor(entries: &[Seen], reading: u64) -> u64 {
+    let mut readings: Vec<u64> = entries.iter().map(Seen::reading).collect();
+    readings.push(reading);
+    let agreement = CLOCK_AGREEMENT.as_secs();
+    let corroborated = readings
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| {
+            readings
+                .iter()
+                .enumerate()
+                .any(|(j, other)| j != *i && r.abs_diff(*other) <= agreement)
+        })
+        .map(|(_, r)| *r)
+        .max();
+    corroborated.unwrap_or_else(|| readings.iter().copied().max().unwrap_or(0))
+}
+
 /// Record that we have seen `version` carrying `sha256`, and return the record
 /// this machine holds — the FIRST one, never overwritten — together with whether
 /// the ledger accepted it.
@@ -972,13 +1118,13 @@ impl Sighting {
 /// write is reported rather than swallowed: an unwritable state directory used
 /// to disarm that check permanently and invisibly.
 ///
-/// The recorded timestamp is also floored by the newest timestamp already in
-/// this machine's own ledger. A clock that reads EARLIER than something this
-/// machine has already written down is a clock that went backwards (a dead RTC
-/// at boot, a dual-boot BIOS in local time), and anchoring a soak window on it
-/// would credit the version with time that has not passed. Moving the anchor
-/// forward can only ever make the soak longer, so the clamp is safe in the one
-/// direction it acts.
+/// The recorded timestamp is also floored by the newest moment already in this
+/// machine's own ledger ([`ledger_floor`]). A clock that reads EARLIER than
+/// something this machine has already written down is a clock that went backwards
+/// (a dead RTC at boot, a dual-boot BIOS in local time), and anchoring a soak
+/// window on it would credit the version with time that has not passed. Moving the
+/// anchor forward can only ever make the soak longer, so the clamp is safe in the
+/// one direction it acts.
 pub fn note_seen(state_dir: &Path, version: &str, sha256: &str) -> Sighting {
     let LedgerRead {
         entries: mut all,
@@ -1009,10 +1155,11 @@ pub fn note_seen(state_dir: &Path, version: &str, sha256: &str) -> Sighting {
             }),
         );
     }
-    let floor = all.iter().map(|s| s.first_seen_unix).max().unwrap_or(0);
+    let reading = now_unix();
     let rec = Seen {
         version: crate::normalize_version(version).to_string(),
-        first_seen_unix: now_unix().max(floor),
+        first_seen_unix: reading.max(ledger_floor(&all, reading)),
+        clock_unix: reading,
         sha256: sha256.to_ascii_lowercase(),
     };
     all.push(rec.clone());
@@ -2068,6 +2215,9 @@ mod tests {
         let ahead = Seen {
             version: "0.6.7".into(),
             first_seen_unix: now + 3600,
+            // The reading the clock ACTUALLY took at the time, i.e. an honest
+            // record: what has gone wrong since is the clock, not this entry.
+            clock_unix: now + 3600,
             sha256: "cc".repeat(32),
         };
         std::fs::write(
@@ -2084,6 +2234,137 @@ mod tests {
             s.seen.first_seen_unix,
             now + 3600
         );
+    }
+
+    /// R4-1a. The floor above is monotone-safe and, until this test, **unbounded in
+    /// the other direction**. One reading from a clock that is AHEAD — an RTC that
+    /// comes up in the wrong decade, a restored VM snapshot, a user who set the clock
+    /// forward — lands in the ledger, and because the floor is a `max` over the whole
+    /// ledger it then floors the sighting of EVERY later version, forever. The machine
+    /// sits in `Hold::Soaking` until real time reaches a date it will not reach, so
+    /// auto-update — including the security-only emergency channel this release exists
+    /// to create — is dead on that rig with no self-heal.
+    ///
+    /// The repair keeps the backdating defence (a lone honest high-water still floors
+    /// a backwards clock — see the test above) and drops only the reading that NOTHING
+    /// ELSE this machine has ever read agrees with.
+    #[test]
+    fn one_forward_clock_reading_does_not_floor_every_later_sighting_forever() {
+        let d = tmp("clockahead");
+        let now = now_unix();
+        let decade = 10 * 365 * 24 * 3600;
+        let seen = |v: &str, t: u64| Seen {
+            version: v.into(),
+            first_seen_unix: t,
+            clock_unix: t,
+            sha256: "cc".repeat(32),
+        };
+        std::fs::write(
+            d.join("update-seen.json"),
+            serde_json::to_vec(&vec![
+                // Two ordinary sightings, on a clock that was working.
+                seen("0.6.5", now - 60 * 86_400),
+                seen("0.6.6", now - 30 * 86_400),
+                // …then the box came up in the wrong decade for one boot.
+                seen("0.6.7", now + decade),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+
+        let s = note_seen(&d, "0.6.8", &"aa".repeat(32));
+        assert!(s.on_record());
+        assert!(
+            s.seen.first_seen_unix <= now + 60,
+            "a single un-corroborated future reading must not floor this sighting: \
+             {} is {} days past now",
+            s.seen.first_seen_unix,
+            s.seen.first_seen_unix.saturating_sub(now) / 86_400
+        );
+        // …and the record still says what the clock actually read, so the next
+        // sighting has one more honest reading to agree with.
+        assert!(s.seen.clock_unix >= now, "the raw reading is kept: {:?}", s.seen);
+    }
+
+    /// R4-1a, the other direction — the half the repair must NOT cost us. A clock
+    /// that has gone backwards by years meets a ledger whose readings agree with
+    /// EACH OTHER, and those still floor the sighting exactly as before. This is the
+    /// case the floor was written for (a dead RTC boots in the wrong year, NTP then
+    /// corrects it, and `now - first_seen` would otherwise clear the whole soak), so
+    /// it is tested next to the case that broke it.
+    #[test]
+    fn a_ledger_that_agrees_with_itself_still_floors_a_backwards_clock() {
+        let d = tmp("clockbackcorrob");
+        let now = now_unix();
+        let six_years = 6 * 365 * 86_400;
+        let seen = |v: &str, t: u64| Seen {
+            version: v.into(),
+            first_seen_unix: t,
+            clock_unix: t,
+            sha256: "cc".repeat(32),
+        };
+        // Two honest sightings taken when the clock was right; the clock has since
+        // fallen back six years, which is what `now` now reads.
+        std::fs::write(
+            d.join("update-seen.json"),
+            serde_json::to_vec(&vec![
+                seen("0.6.5", now + six_years),
+                seen("0.6.6", now + six_years + 30 * 86_400),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+
+        let s = note_seen(&d, "0.6.8", &"aa".repeat(32));
+        assert_eq!(
+            s.seen.first_seen_unix,
+            now + six_years + 30 * 86_400,
+            "two readings that agree with each other must still floor a backwards clock"
+        );
+        // …and a sighting that has to be floored that far is not a soak; it is the
+        // clock, and the policy says so rather than counting down six years.
+        let m = manifest("0.6.8");
+        let i = Input {
+            now_unix: now,
+            first_seen_unix: s.seen.first_seen_unix,
+            ..input(&m, &[])
+        };
+        assert!(matches!(
+            decide(&i),
+            Decision::Notify { hold: Hold::ClockAhead { .. }, .. }
+        ));
+    }
+
+    /// R4-1b. The half of the same defect that lives in the pure policy: an anchor in
+    /// the FUTURE of `now` is not a soak, and `Hold::Soaking` renders as "nothing is
+    /// wrong and there is nothing to do". A hold that will never lift must be able to
+    /// say so.
+    #[test]
+    fn a_sighting_dated_in_the_future_is_reported_as_a_clock_disagreement() {
+        let m = manifest("0.6.8");
+        let mut i = input(&m, &[]);
+        let decade = 10 * 365 * 24 * 3600;
+        i.first_seen_unix = i.now_unix + decade;
+        match decide(&i) {
+            Decision::Notify { hold: Hold::ClockAhead { ahead_by_s }, .. } => {
+                assert_eq!(ahead_by_s, decade);
+            }
+            other => panic!("a sighting in the future must not read as a soak, got {other:?}"),
+        }
+        // A trivially-ahead anchor is still an ordinary soak: a few minutes of skew
+        // only makes the wait a few minutes longer, and saying "your clock is wrong"
+        // about that would be its own dishonesty.
+        i.first_seen_unix = i.now_unix + 60;
+        assert!(
+            matches!(decide(&i), Decision::Notify { hold: Hold::Soaking { .. }, .. }),
+            "small skew is a longer soak, not a fault: {:?}",
+            decide(&i)
+        );
+        // The user's own settings still outrank it — a machine set to `off` hears the
+        // reason it actually cares about.
+        i.first_seen_unix = i.now_unix + decade;
+        i.mode = Mode::Off;
+        assert!(matches!(decide(&i), Decision::Notify { hold: Hold::ModeOff, .. }));
     }
 
     // ── revocation ──────────────────────────────────────────────────────────

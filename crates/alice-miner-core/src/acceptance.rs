@@ -807,6 +807,27 @@ pub struct HaltRecord {
     pub period_elapsed_s: u64,
     /// Whether not one share was accepted.
     pub shutout: bool,
+    /// Whether the re-probe currently on this rung has landed at least one
+    /// ACCEPTED share.
+    ///
+    /// The one fact in this record gathered AFTER the halt, and the reason it is
+    /// here rather than in memory: the rung a probe costs is charged and persisted
+    /// before the probe starts, so it survives a reboot; what the probe measured
+    /// did not, and a service relaunch found a record that remembered only the
+    /// punishment. The lane was then parked for up to the six-hour cap on a pool
+    /// that had been accepting every share a moment earlier — and a lane too slow
+    /// to complete a period between restarts never escaped at all.
+    ///
+    /// A bool, not a count: the question this answers is "is there any evidence
+    /// the pool started accepting again", and one accepted share answers it. The
+    /// verdict still belongs to a measured period; this only decides whether the
+    /// interrupted measurement is resumed or the cooldown is.
+    ///
+    /// Reset whenever a new rung is charged ([`HaltRecord::new`] and
+    /// `charge_reprobe`), so it is always about the probe now in flight. Zero on a
+    /// record written by a build that predates the field.
+    #[serde(default)]
+    pub probe_earned: bool,
     /// Who the collapse was attributed to when it was published ([`Attribution::key`]).
     pub attribution: String,
     /// The client version that wrote the record — so a stale halt from an older build
@@ -845,6 +866,9 @@ impl HaltRecord {
             period_rejected: c.period.rejected,
             period_elapsed_s: c.period.elapsed.as_secs(),
             shutout: c.shutout,
+            // A fresh halt is a fresh rung: whatever the probe that led here
+            // measured has already been judged, and judged badly.
+            probe_earned: false,
             attribution: attribution.key().to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
