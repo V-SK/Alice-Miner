@@ -18,7 +18,7 @@ pub mod parse_srbminer;
 pub use parse_alpha::parse_alpha;
 pub use parse_generic::parse_generic;
 pub use parse_kawpow::{parse_kawpow, KawpowSample};
-pub use parse_srbminer::parse_srbminer;
+pub use parse_srbminer::{parse_srbminer, SrbLine, SrbScope};
 
 use crate::lane::Lane;
 

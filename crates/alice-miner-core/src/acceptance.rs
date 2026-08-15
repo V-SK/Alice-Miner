@@ -262,6 +262,51 @@ impl LaneVerdict {
             LaneVerdict::Collapsed(_) => "collapsed",
         }
     }
+
+    /// Whether the guard has actually FORMED AN OPINION about this lane — i.e.
+    /// whether a completed period has been judged at all.
+    ///
+    /// This is the other half of the question the auto-updater asks, and the half a
+    /// custody state cannot answer. [`GuardCustody`] says who OWNS the lane; this says
+    /// whether the guard has anything to say about it. Three verdicts are the client
+    /// admitting it does not know:
+    ///
+    /// * [`Self::Warmup`] — inside the cold-start grace, deliberately not looking;
+    /// * [`Self::Gathering`] — warm and looking, but the period has reached neither
+    ///   [`MIN_WINDOW`] nor [`MIN_SUBMISSIONS`]. A rig submitting slower than about one
+    ///   share a minute lives here for HOURS, and a lane whose relay is unreachable —
+    ///   connected, hashing, submitting nothing — lives here forever;
+    /// * [`Self::Unknown`] — this engine cannot report rejections at all, so no
+    ///   acceptance rate can ever be computed on this machine.
+    ///
+    /// A zero-accepted stretch in any of those is UNMEASURED, not measured-as-bad, and
+    /// nothing may be judged on it — least of all the installed client build, which is
+    /// what [`crate::autoupdate::MiningEvidence`] uses this for.
+    ///
+    /// Exhaustive on purpose, like [`GuardCustody::is_ordinary_mining`]: a seventh
+    /// verdict cannot be added without somebody deciding here which side it falls on.
+    pub fn is_conclusive(&self) -> bool {
+        match self {
+            LaneVerdict::Warmup | LaneVerdict::Unknown | LaneVerdict::Gathering => false,
+            LaneVerdict::Healthy(_) | LaneVerdict::Degrading(_) | LaneVerdict::Collapsed(_) => true,
+        }
+    }
+}
+
+/// [`LaneVerdict::is_conclusive`] asked of the WIRE key a lane snapshot carries
+/// ([`LaneVerdict::key`]), which is how the auto-updater sees it.
+///
+/// Anything unrecognised — the empty string an older stream leaves behind, a verdict a
+/// future build learned and this one has not — reads as NOT conclusive. "We do not
+/// know what the guard thinks" is the same answer as "the guard does not know", and
+/// both must stop layer 2 from blaming the build. The alternative default (treat an
+/// unreadable verdict as a judgement) is the direction that uninstalls a release.
+pub fn verdict_key_is_conclusive(key: &str) -> bool {
+    match key {
+        "healthy" | "degrading" | "collapsed" => true,
+        // "warmup" | "unknown" | "gathering" | "" | anything else
+        _ => false,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1693,6 +1738,50 @@ mod tests {
         }
         assert!(GuardCustody::Mining.is_mining());
         assert!(!GuardCustody::Probing.is_mining());
+    }
+
+    // ── "has the guard actually formed an opinion?" ──────────────────────────
+
+    /// The three verdicts in which the client does NOT know are exactly the three it
+    /// must never let anything be judged on. Enumerated over every variant, with the
+    /// wire key kept in lock-step with the in-memory answer — the auto-updater only
+    /// ever sees the key, so a drift between the two is a silent hole.
+    #[test]
+    fn only_a_reached_verdict_is_conclusive() {
+        let p = PeriodStat { accepted: 5, rejected: 1, elapsed: Duration::from_secs(600) };
+        let collapse = Collapse { period: p, run_accepted: 0, run_rejected: 40, shutout: true };
+        let all = [
+            (LaneVerdict::Warmup, false),
+            (LaneVerdict::Unknown, false),
+            (LaneVerdict::Gathering, false),
+            (LaneVerdict::Healthy(p), true),
+            (LaneVerdict::Degrading(p), true),
+            (LaneVerdict::Collapsed(collapse), true),
+        ];
+        for (v, want) in &all {
+            assert_eq!(v.is_conclusive(), *want, "{v:?}");
+            assert_eq!(
+                verdict_key_is_conclusive(v.key()),
+                *want,
+                "the wire key must answer identically for {v:?}"
+            );
+        }
+        // Every variant is covered: `key()` is exhaustive, so six distinct keys here
+        // means a seventh verdict shows up as a missing row rather than as a silent
+        // "not conclusive" (which is safe) or "conclusive" (which is not).
+        let mut keys: Vec<&str> = all.iter().map(|(v, _)| v.key()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), 6, "one row per verdict variant");
+    }
+
+    /// A key this build cannot read — an older stream's empty string, a future
+    /// build's new verdict — is NOT a judgement.
+    #[test]
+    fn an_unreadable_verdict_key_is_never_treated_as_a_judgement() {
+        for key in ["", "  ", "healthyish", "collapsed-v2", "settled", "HEALTHY"] {
+            assert!(!verdict_key_is_conclusive(key), "{key:?} must not read as a verdict");
+        }
     }
 
     #[test]

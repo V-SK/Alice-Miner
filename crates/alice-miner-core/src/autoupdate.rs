@@ -895,6 +895,24 @@ pub struct MiningEvidence {
     /// measures. Reading the boolean there rolled v0.6.8 back and pinned it during
     /// exactly the upstream fork it was released to survive.
     pub activity: GuardCustody,
+    /// At least one of this session's lanes is one the acceptance guard has reached
+    /// NO verdict about — warm-up, an incomplete period, or an engine that cannot
+    /// report pool rejections at all
+    /// ([`crate::acceptance::verdict_key_is_conclusive`]).
+    ///
+    /// This is the second half of the F4 question, and [`Self::activity`] cannot
+    /// carry it. Custody says who OWNS the lane, and the guard only takes custody
+    /// AFTER it has concluded something — which needs a full window AND twenty
+    /// submissions, i.e. hours on a slow rig and never at all on a lane whose relay
+    /// is unreachable. Between "the pool is rejecting everything" and "the guard can
+    /// say so", custody honestly reports `Mining` and the session is a plain
+    /// zero-accepted stretch: two of those roll the build back and pin it forever,
+    /// and the network-wide backstop cannot intervene because `LaneHealth::attribute`
+    /// answers `Unknown`, never `NetworkWide`, for a single-miner lane.
+    ///
+    /// `false` is the wire/`Default` answer — "nothing says we are undecided" — so a
+    /// snapshot that carries no lane rows behaves exactly as it did before.
+    pub guard_undecided: bool,
     /// The lanes this session is mining — the input to the network-wide check.
     /// Empty means "we do not know which lane", and the check is skipped.
     pub lanes: Vec<crate::lane::Lane>,
@@ -912,6 +930,13 @@ impl MiningEvidence {
                 .lanes
                 .iter()
                 .fold(GuardCustody::Mining, |acc, l| acc.strongest(l.activity())),
+            // ANY lane the guard has not judged makes the session's zero unmeasured.
+            // The lane row already carries the verdict key, so nothing new goes on the
+            // wire; an unreadable key counts as undecided (see the classifier).
+            guard_undecided: s
+                .lanes
+                .iter()
+                .any(|l| !crate::acceptance::verdict_key_is_conclusive(&l.acceptance)),
             lanes: if s.lanes.is_empty() {
                 s.lane.into_iter().collect()
             } else {
@@ -922,6 +947,12 @@ impl MiningEvidence {
 
     /// Whether this session may be held against — or credited to — the installed
     /// build at all. False whenever layer 3 owns a lane, in either of its two ways.
+    ///
+    /// Deliberately NOT widened to cover [`Self::guard_undecided`]. An undecided lane
+    /// is being mined normally: its accepted shares are real and must still commit a
+    /// probation and refresh the earning baseline ([`Self::counts_as_earning`]). It is
+    /// only its ZERO that means nothing, and that asymmetry is resolved one layer up,
+    /// in [`resolve_evidence`], where the share count is in scope.
     pub fn judges_the_build(&self) -> bool {
         self.activity.is_ordinary_mining()
     }
@@ -951,22 +982,50 @@ pub(crate) fn evidence_for_session(
     rollback_imminent: bool,
     network_wide: impl FnOnce() -> bool,
 ) -> auto::SessionEvidence {
-    resolve_evidence(mining.activity, rollback_imminent, network_wide)
+    resolve_evidence(
+        mining.activity,
+        mining.guard_undecided,
+        mining.accepted,
+        rollback_imminent,
+        network_wide,
+    )
 }
 
 fn resolve_evidence(
     activity: GuardCustody,
+    guard_undecided: bool,
+    accepted: u64,
     rollback_imminent: bool,
     network_wide: impl FnOnce() -> bool,
 ) -> auto::SessionEvidence {
-    // Exhaustive, no wildcard: a lane state that is neither ordinary mining nor one
-    // of these two must be classified here rather than falling through to
-    // "judgeable", which is the direction that costs a machine its build.
+    // 1. Custody. Exhaustive, no wildcard: a lane state that is neither ordinary
+    //    mining nor one of these two must be classified here rather than falling
+    //    through to "judgeable", which is the direction that costs a machine its
+    //    build. Checked first because it holds even WITH accepted shares on the
+    //    clock — a halted lane's counter is frozen, and a probe's belongs to the
+    //    guard's measurement, not to the session.
     match activity {
         GuardCustody::Halted => return auto::SessionEvidence::MiningHalted,
         GuardCustody::Probing => return auto::SessionEvidence::AcceptanceProbe,
         GuardCustody::Mining => {}
     }
+    // 2. A real accepted share on a lane that is mining on its own account is proof
+    //    the build works, whatever the guard has or has not concluded — and it is the
+    //    one outcome that ends a trial honestly. It must be reached BEFORE the
+    //    undecided gate below, or a slow rig that is quietly earning would abstain
+    //    forever instead of committing.
+    if accepted > 0 {
+        return auto::SessionEvidence::Judgeable;
+    }
+    // 3. Nothing accepted — so the question is whether that zero MEANS anything, and
+    //    it does not until the guard has judged a period. `Gathering`, `Warmup` and
+    //    "this engine cannot report rejections" are all the client not knowing, and
+    //    the client must not act as though it does.
+    if guard_undecided {
+        return auto::SessionEvidence::AcceptanceUndecided;
+    }
+    // 4. A measured zero, about to cost the build its life: this is the one moment
+    //    worth a network round-trip.
     if rollback_imminent && network_wide() {
         return auto::SessionEvidence::NetworkWide;
     }
@@ -980,10 +1039,11 @@ fn resolve_evidence(
 /// Deliberately a SUPERSET of the condition that actually probes: it is cheap and
 /// pure (no disk), and being wrong in this direction costs one idle thread, while
 /// being wrong the other way costs a ten-second freeze. The overwhelmingly common
-/// reports — a session with accepted shares, a short one, a halted lane — are all
-/// `false` here and stay inline.
+/// reports — a session with accepted shares, a short one, a halted lane, a lane the
+/// guard has reached no verdict about — are all `false` here and stay inline.
 pub fn session_may_consult_the_network(ran: Duration, mining: &MiningEvidence) -> bool {
     mining.judges_the_build()
+        && !mining.guard_undecided
         && mining.accepted == 0
         && !mining.lanes.is_empty()
         && ran.as_secs() >= auto::MIN_JUDGED_SESSION.as_secs()
@@ -1205,13 +1265,16 @@ mod tests {
         };
         let asked = || counter.load(Ordering::Relaxed);
 
+        // `guard_undecided`: false everywhere below except where the case is about it.
+        const DECIDED: bool = false;
+
         // A halted lane: not evidence, and no network call at all.
         assert_eq!(
-            resolve_evidence(GuardCustody::Halted, false, ask(true)),
+            resolve_evidence(GuardCustody::Halted, DECIDED, 0, false, ask(true)),
             auto::SessionEvidence::MiningHalted
         );
         assert_eq!(
-            resolve_evidence(GuardCustody::Halted, true, ask(true)),
+            resolve_evidence(GuardCustody::Halted, DECIDED, 0, true, ask(true)),
             auto::SessionEvidence::MiningHalted,
             "the local halt is conclusive on its own"
         );
@@ -1223,7 +1286,7 @@ mod tests {
         // `attribute()` answers `Unknown` (never `NetworkWide`) for a single-miner lane,
         // and PRL is a single-miner lane.
         assert_eq!(
-            resolve_evidence(GuardCustody::Probing, true, ask(true)),
+            resolve_evidence(GuardCustody::Probing, DECIDED, 0, true, ask(true)),
             auto::SessionEvidence::AcceptanceProbe,
             "a deliberate measurement is never evidence about the installed build"
         );
@@ -1231,21 +1294,21 @@ mod tests {
 
         // Nothing imminent: still no request.
         assert_eq!(
-            resolve_evidence(GuardCustody::Mining, false, ask(true)),
+            resolve_evidence(GuardCustody::Mining, DECIDED, 0, false, ask(true)),
             auto::SessionEvidence::Judgeable
         );
         assert_eq!(asked(), 0, "the probe is not a per-tick call");
 
         // A rollback IS imminent and the whole network is down → abstain.
         assert_eq!(
-            resolve_evidence(GuardCustody::Mining, true, ask(true)),
+            resolve_evidence(GuardCustody::Mining, DECIDED, 0, true, ask(true)),
             auto::SessionEvidence::NetworkWide
         );
         assert_eq!(asked(), 1);
 
         // …and when the network is fine, the local build stays on trial.
         assert_eq!(
-            resolve_evidence(GuardCustody::Mining, true, ask(false)),
+            resolve_evidence(GuardCustody::Mining, DECIDED, 0, true, ask(false)),
             auto::SessionEvidence::Judgeable,
             "a healthy network must not suppress a real local failure"
         );
@@ -1254,13 +1317,69 @@ mod tests {
         // Every activity is classified, and ONLY ordinary mining is judgeable — so a
         // future variant cannot be added and silently fall through to "judge it".
         for a in GuardCustody::ALL {
-            let e = resolve_evidence(a, false, ask(false));
+            let e = resolve_evidence(a, DECIDED, 0, false, ask(false));
             assert_eq!(
                 e.abstains(),
                 !a.is_ordinary_mining(),
                 "{a:?} must abstain iff it is not ordinary mining"
             );
         }
+    }
+
+    /// **The hole the custody fix did not cover: a lane the guard has NOT concluded
+    /// about.**
+    ///
+    /// Custody can only report `Probing`/`Halted` once a halt exists, and a halt needs
+    /// a completed period — ten minutes AND twenty submissions. Below roughly one
+    /// submission a minute that takes hours, and a lane whose relay is unreachable
+    /// never gets there at all. Meanwhile two 20-minute zero-accepted sessions roll a
+    /// build back and pin it permanently, and the network-wide backstop cannot save it
+    /// (`LaneHealth::attribute` answers `Unknown`, never `NetworkWide`, for a
+    /// single-miner lane — and PRL is one).
+    ///
+    /// So an undecided lane's ZERO must abstain, without a network call, while an
+    /// accepted share on the same lane must still be judged (and committed).
+    #[test]
+    fn a_lane_the_guard_has_not_judged_is_not_evidence_against_the_build_either() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let asked = AtomicU32::new(0);
+        let counter = &asked;
+        let ask = move |answer: bool| {
+            move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                answer
+            }
+        };
+        let asked = || counter.load(Ordering::Relaxed);
+        const UNDECIDED: bool = true;
+
+        // The exact shape that used to uninstall v0.6.8: mining normally, nothing
+        // accepted, a rollback one report away — and the guard with nothing to say.
+        assert_eq!(
+            resolve_evidence(GuardCustody::Mining, UNDECIDED, 0, true, ask(true)),
+            auto::SessionEvidence::AcceptanceUndecided
+        );
+        assert_eq!(asked(), 0, "decided locally — a single-miner lane cannot be asked about");
+        assert!(auto::SessionEvidence::AcceptanceUndecided.abstains());
+
+        // An accepted share ends the trial honestly, undecided or not. This is the
+        // gate that keeps a slow-but-earning rig from abstaining forever.
+        assert_eq!(
+            resolve_evidence(GuardCustody::Mining, UNDECIDED, 1, false, ask(true)),
+            auto::SessionEvidence::Judgeable,
+            "a real accepted share is proof about the build regardless of the verdict"
+        );
+        assert_eq!(asked(), 0);
+
+        // Custody still outranks it: a halted or probing lane's counter is not the
+        // session's to spend, however many shares it shows.
+        for (a, want) in [
+            (GuardCustody::Halted, auto::SessionEvidence::MiningHalted),
+            (GuardCustody::Probing, auto::SessionEvidence::AcceptanceProbe),
+        ] {
+            assert_eq!(resolve_evidence(a, UNDECIDED, 99, true, ask(true)), want, "{a:?}");
+        }
+        assert_eq!(asked(), 0);
     }
 
     /// The predicate both front-ends use to decide "inline or worker thread".
@@ -1276,6 +1395,7 @@ mod tests {
         let base = MiningEvidence {
             accepted: 0,
             activity: GuardCustody::Mining,
+            guard_undecided: false,
             lanes: vec![Lane::GpuPrl],
         };
 
@@ -1306,6 +1426,13 @@ mod tests {
                 &MiningEvidence { lanes: Vec::new(), ..base.clone() }
             ),
             "with no lane there is nothing to ask about"
+        );
+        assert!(
+            !session_may_consult_the_network(
+                long,
+                &MiningEvidence { guard_undecided: true, ..base.clone() }
+            ),
+            "a lane the guard has not judged abstains locally — no request, no thread"
         );
     }
 
@@ -1385,6 +1512,64 @@ mod tests {
         assert_eq!(MiningEvidence::from_snapshot(&s).lanes, vec![Lane::GpuPrl]);
         s.lane = None;
         assert!(MiningEvidence::from_snapshot(&s).lanes.is_empty());
+        assert!(
+            !MiningEvidence::from_snapshot(&s).guard_undecided,
+            "no lane rows must behave exactly as it did before this field existed"
+        );
+    }
+
+    /// The verdict half of the same derivation: whether the guard has CONCLUDED
+    /// anything about each lane, read out of the key the lane row already carries.
+    #[test]
+    fn mining_evidence_reads_the_guards_verdict_out_of_the_snapshot() {
+        use crate::engine::{EngineState, LaneSnapshot, Snapshot};
+        use crate::lane::Lane;
+
+        let row = |lane: Lane, acceptance: &str| LaneSnapshot {
+            lane,
+            state: EngineState::Running,
+            hashrate_hs: None,
+            hashrate_60s_hs: None,
+            hashrate_15m_hs: None,
+            shares_accepted: 0,
+            shares_rejected: 0,
+            uptime_s: 0,
+            endpoint: None,
+            failovers: 0,
+            temp_c: None,
+            power_w: None,
+            util_pct: None,
+            fan_pct: None,
+            acceptance: acceptance.to_string(),
+            accept_pct: None,
+            halted: false,
+            activity: GuardCustody::Mining,
+        };
+
+        let mut s = Snapshot::idle();
+        s.lane = Some(Lane::GpuPrl);
+
+        // A judged lane: the session's zero is a measurement, so it may be judged.
+        s.lanes = vec![row(Lane::GpuPrl, "healthy")];
+        assert!(!MiningEvidence::from_snapshot(&s).guard_undecided);
+
+        // The three "we do not know" verdicts, each on its own.
+        for key in ["warmup", "gathering", "unknown"] {
+            s.lanes = vec![row(Lane::GpuPrl, key)];
+            assert!(
+                MiningEvidence::from_snapshot(&s).guard_undecided,
+                "{key} is the client not knowing"
+            );
+        }
+
+        // Dual mine: ONE unjudged lane is enough. The accepted counter is a whole-
+        // snapshot figure, so a zero cannot be attributed to the judged lane alone.
+        s.lanes = vec![row(Lane::Xmr, "healthy"), row(Lane::GpuPrl, "gathering")];
+        assert!(MiningEvidence::from_snapshot(&s).guard_undecided);
+
+        // An older stream carries no verdict at all. That is not a judgement either.
+        s.lanes = vec![row(Lane::GpuPrl, "")];
+        assert!(MiningEvidence::from_snapshot(&s).guard_undecided);
     }
 
     #[test]
