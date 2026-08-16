@@ -108,18 +108,26 @@ jobs:
 
       # Cross-cutting gates (PLAN §8): the credit-only / honesty / reward-wording
       # invariants are unit tests — run the whole workspace so they guard the build.
+      # `--locked` on every cargo invocation below. Without it CI re-resolves the
+      # dependency graph on each run — the logs literally say "Updating crates.io
+      # index" — so the tests that gate a release, and the binaries that release
+      # SHIPS, were built from a dependency set that could differ from Cargo.lock
+      # and from each other. `cargo update --dry-run` here offers 180 packages a
+      # newer compatible version, so the drift is not theoretical. Verifying one
+      # thing and shipping another is the exact shape of the failure this release
+      # exists to repair.
       - name: Test (workspace)
-        run: cargo test --workspace --target ${{ matrix.target }}
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
 
       - name: Clippy (workspace, warnings = errors)
-        run: cargo clippy --workspace --tests --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --workspace --tests --locked --target ${{ matrix.target }} -- -D warnings
 
       - name: Build (alice-miner-gui + alice-miner-cli)
         # Ship BOTH the desktop GUI and the headless CLI (the CLI is the
         # performance/throughput path for headless GPU/ASIC rigs).
         run: |
-          cargo build --release --target ${{ matrix.target }} -p alice-miner-gui
-          cargo build --release --target ${{ matrix.target }} -p alice-miner-cli
+          cargo build --release --locked --target ${{ matrix.target }} -p alice-miner-gui
+          cargo build --release --locked --target ${{ matrix.target }} -p alice-miner-cli
 
       # ----------------------------------------------------------------------
       # Stage bundled mining engines (the "bundle the miner" half).

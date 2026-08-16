@@ -7908,11 +7908,19 @@ mod tests {
             );
 
             // Nobody touches anything: the lane comes back on its own.
+            //
+            // Wait for the state this test actually ASSERTS, not a proxy for it. The
+            // child going Running and the status line being written are two separate
+            // steps, so waiting on the first and asserting the second leaves a gap
+            // that widens on a slow machine — it failed on the Windows CI runner with
+            // `message_key: None` while every other assertion here held.
             assert!(
-                wait_for(&s, 10, |st| st.state == ProcState::Running).await,
-                "the halt must lift itself: {:?}",
+                wait_for(&s, 10, |st| st.message_key.as_deref() == Some("acceptance_reprobe"))
+                    .await,
+                "the halt must lift itself and say it is a re-check: {:?}",
                 s.stats()
             );
+            assert_eq!(s.stats().state, ProcState::Running, "the probe child is up");
             assert!(!s.stats().halted, "the re-probe run is measuring, not halted");
             assert_eq!(s.halt_probes(), 1, "one window charged to the ladder");
             assert_eq!(
