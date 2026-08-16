@@ -3863,14 +3863,38 @@ mod tests {
     /// --soak-hours 48 --revoke "0.6.6" --security` emits. If someone changes the
     /// shell here-doc and not the struct (or the reverse), this fails — which is
     /// better than discovering it when a revocation silently does not apply.
+    ///
+    /// `artifacts[]` therefore carries ALL THREE platforms, because a real manifest
+    /// does: `release.sh` REFUSES to publish a partial set (`RELEASE_PLATFORMS`), on
+    /// the grounds that a client on a missing platform reads the release as "a version
+    /// exists, you can't have it". This fixture used to carry `macos-arm64` alone, and
+    /// that is precisely the verdict it got — `Hold::NoArtifact` rather than
+    /// `Hold::Soaking` — on the Linux and Windows runners, deterministically, since
+    /// `artifact_for_current_platform` is compiled per target. It read as an
+    /// intermittent cross-platform flake only because CI runs `cargo test` WITHOUT
+    /// `--no-fail-fast`: `alice-miner-gui` is tested first, so on any run where an
+    /// earlier crate failed, this crate was never reached at all and the failure
+    /// appeared to move between platforms.
     #[test]
     fn the_manifest_the_release_script_emits_drives_the_policy() {
-        let json = br#"{"schema":1,"product":"alice-miner","version":"0.6.8","min_supported":"0.3.0","released":"2026-08-14T00:00:00Z","notes":"n","artifacts":[{"platform":"macos-arm64","url":"https://example.invalid/a.zip","sha256":"aa","size":1}],"rollout_pct":25,"soak_hours":48,"revoked":["0.6.6"],"security":true}"#;
+        let json = br#"{"schema":1,"product":"alice-miner","version":"0.6.8","min_supported":"0.3.0","released":"2026-08-14T00:00:00Z","notes":"n","artifacts":[{"platform":"macos-arm64","url":"https://example.invalid/a.zip","sha256":"aa","size":1},{"platform":"linux-x86_64","url":"https://example.invalid/a.tar.gz","sha256":"bb","size":2},{"platform":"windows-x86_64","url":"https://example.invalid/a.zip","sha256":"cc","size":3}],"rollout_pct":25,"soak_hours":48,"revoked":["0.6.6"],"security":true}"#;
         let m = crate::parse_verified_manifest(json).expect("release.sh output must parse");
         assert_eq!(m.rollout_pct, Some(25));
         assert_eq!(m.soak_hours, Some(48));
         assert!(m.is_security());
         assert!(m.is_revoked("0.6.6"));
+
+        // The whole point of a full `artifacts[]`: whichever platform is running this,
+        // it can see itself in the release. Asserted rather than assumed, so a fixture
+        // trimmed back to one platform fails HERE — naming the reason — instead of as
+        // a policy verdict nobody can place, on the two runners that are the entire
+        // audience for a PRL fix.
+        assert!(
+            m.artifact_for_current_platform().is_some(),
+            "release.sh publishes macos-arm64 + linux-x86_64 + windows-x86_64 and refuses \
+             a partial set; a fixture claiming to be its output must cover {} too",
+            crate::current_platform()
+        );
 
         // …and the policy actually reads them: 48h > the 24h floor, so a version
         // seen 30h ago is still soaking.

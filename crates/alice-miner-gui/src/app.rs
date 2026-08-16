@@ -2359,6 +2359,59 @@ fn terminal_stop_notice(report: &CliStopReport) -> Option<String> {
 mod tests {
     use super::*;
 
+    // ── the race these two exist to catch ───────────────────────────────────
+    //
+    // REGRESSION GUARD, and the pair that DEMONSTRATED the bug. `alice-miner-core`
+    // carries the same pair for `set_lang`; this one is for `set_process_lang`,
+    // because only a FRONT-END crate calls that, and this is the binary where the
+    // damage showed up.
+    //
+    // The writer below does exactly what `MinerApp::set_lang_zh` does — the EN/中
+    // chip's PROCESS-wide switch — and nothing else. While that write reached the
+    // process global from a test thread, it changed the answer under every English-
+    // asserting test running beside it: three consecutive 3-OS CI runs failed on
+    // `ui::dashboard::tests::a_halted_lane_reads_stopped_not_rolling` ("已停止 ·
+    // 份额被拒绝") and `accepted_card_alpha_shows_submitted_count_not_pct`
+    // (left "已提交", right "Submitted"). Neither test mentions the language.
+    //
+    // The real writer was `the_language_the_user_picks_survives_the_window_closing`
+    // below, whose 中文 window is ~2.4ms wide in a ~1s binary — narrow enough that
+    // a 10-core Mac never lands a reader inside it and a 2-core CI runner does.
+    // These two make the window as wide as the test run, so the question is settled
+    // in milliseconds instead of in CI runs.
+    //
+    // If either of these flakes, `set_process_lang` has been made process-wide from
+    // a test thread again.
+
+    /// The writer half: flips the PROCESS language as fast as it can, for as long as
+    /// the reader below is asserting English.
+    #[test]
+    fn a_process_language_writer_running_concurrently_disturbs_no_one() {
+        use alice_miner_core::i18n::{set_process_lang, Lang};
+        for _ in 0..20_000 {
+            set_process_lang(Lang::Zh);
+            std::thread::yield_now();
+            set_process_lang(Lang::En);
+        }
+    }
+
+    /// The reader half: asserts English while setting no language and holding no lock,
+    /// using the very `tr!` pair one of the CI failures reported.
+    ///
+    /// There are 46 such tests in the workspace — 30 in `alice-miner-cli`, 12 in
+    /// `alice-miner-core`, 4 here. That is a measurement, not a grep: flip `CURRENT`'s
+    /// initialiser to 中文 and exactly those 46 go red. None of them can be made
+    /// responsible for this, which is why the fix is in `set_process_lang` and not in
+    /// any of them.
+    #[test]
+    fn a_reader_that_never_mentions_the_language_is_never_disturbed() {
+        use alice_miner_core::tr;
+        for i in 0..20_000 {
+            assert_eq!(tr!("Submitted", "已提交"), "Submitted", "iteration {i}");
+            std::thread::yield_now();
+        }
+    }
+
     const PHRASE: &str =
         "harvest copper lunar ribbon orbit tundra cipher meadow violet anchor summit frost \
 hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut zephyr";
@@ -4278,8 +4331,25 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
     /// next launch never read one (nothing ever called `settings::load()` or looked at
     /// `LANG`), so the choice died twice over.
     ///
-    /// This test moves the PROCESS language, so it holds the crate-wide env lock for
-    /// its whole body and restores the English default on the way out.
+    /// It holds the crate-wide env lock for its whole body, because it moves
+    /// `$ALICE_IDENTITY_DIR` and the locale vars, which are process globals.
+    ///
+    /// It does NOT need to hold anything for the language, and could not usefully:
+    /// this test is the one that used to break the binary. It drives the real EN/中
+    /// chip, so it calls `i18n::set_process_lang`, and while that reached the process
+    /// global from a test thread it held the whole binary in 中文 for ~2.4ms — long
+    /// enough for two `ui::dashboard` tests that assert English and set no language to
+    /// read their strings inside the window and fail three 3-OS CI runs in a row. A
+    /// lock here would not have helped; those tests would have had to take it too, and
+    /// there is no reason they would ever think to. `set_process_lang` is now scoped to
+    /// the calling thread when it is not the front-end's, so the reach is gone.
+    ///
+    /// What that costs this test is worth naming: the chip's PROCESS-wide reach is real
+    /// in the shipped binary but out of frame here, so the assertions below are about
+    /// the calling thread. The reach itself is covered where it can be: `i18n`'s
+    /// `an_override_is_thread_scoped_and_workers_read_the_process_language` (a thread
+    /// with no override reads the process cell) and `tests/cli.rs`, which runs the REAL
+    /// binary and reads the 中文 rollback warning back off a worker thread.
     #[test]
     fn the_language_the_user_picks_survives_the_window_closing() {
         use alice_miner_core::i18n::{init_startup_lang, lang, set_process_lang, Lang};
@@ -4317,8 +4387,9 @@ hazard pioneer velvet cradle ginger lantern marble pottery sunset timber walnut 
         assert_eq!(
             lang(),
             Lang::Zh,
-            "and so does the PROCESS — the engine, updater and log-pump threads read \
-             their `tr!` strings from here, not from the app struct"
+            "and the chip went through `i18n`, not through a field on the app — which \
+             is what puts the engine, updater and log-pump threads on the same language \
+             in the shipped binary"
         );
         let raw = std::fs::read_to_string(home.join("settings.json"))
             .expect("the chip must WRITE the preference, not just hold it");

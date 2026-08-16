@@ -1168,13 +1168,32 @@ fn lang_selfcheck() {
     if std::env::var_os(ENV_LANG_SELFCHECK).is_none() {
         return;
     }
+    let mut ok = true;
     if alice_miner_core::i18n::text_selected_before_language_resolved() {
+        ok = false;
         eprintln!(
             "lang-selfcheck: FAIL — user-facing text was selected before the UI language was \
              resolved; a 中文 user read it in English. Move the producer below \
              `i18n::init_startup_lang()` in main()."
         );
-    } else {
+    }
+    // The second half of the same bargain, and the one no reviewer can check by
+    // reading: the language has to be installed PROCESS-wide, or the threads that
+    // format text off `main` — the engine supervisor's failover status, the updater's
+    // rollback notice — keep answering in English however correctly `main` resolved.
+    // `i18n::set_process_lang` is process-wide only when it is reached from the
+    // front-end thread, so this asks the REAL binary, on each OS CI builds for,
+    // whether that was true here rather than taking the mechanism's word for it.
+    if alice_miner_core::i18n::process_lang_set_off_front_end_thread() {
+        ok = false;
+        eprintln!(
+            "lang-selfcheck: FAIL — the UI language was installed from a thread that is not \
+             the front-end's, so it reached only that thread; every worker that formats text \
+             (the failover status, the rollback notice) still answers in English. Resolve the \
+             language on the thread running main()."
+        );
+    }
+    if ok {
         eprintln!("lang-selfcheck: ok");
     }
 }

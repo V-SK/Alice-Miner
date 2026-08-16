@@ -55,6 +55,21 @@
 //! READER tests took it too, and they did not. Thread-scoping makes the lock
 //! unnecessary rather than mandatory, so the next test author is safe without knowing
 //! any of this.
+//!
+//! ## Picking the wrong one of the two is not a hazard either
+//!
+//! Which matters, because a test does not always get to choose: the honest way to test
+//! a front-end's startup resolution or its EN/中 chip is to CALL them, and what they
+//! call is [`set_process_lang`]. So the process-wide setter is process-wide only when
+//! it is reached from the FRONT-END thread — the one running `main`. Reached from any
+//! other thread it scopes to that thread, and libtest gives every test its own named
+//! thread, in parallel and `--test-threads=1` mode alike.
+//!
+//! The result is the property the reader tests need and cannot state for themselves: a
+//! test that never mentions the language cannot be affected by one that does, whichever
+//! setter that one used, without either test knowing anything. `on_front_end_thread`
+//! carries the argument for why no production caller is on the other side of that line,
+//! and why CI checks it on each OS rather than asserting it.
 
 use std::cell::Cell;
 use std::str::FromStr;
@@ -146,6 +161,40 @@ thread_local! {
     static THREAD_LANG: Cell<Option<Lang>> = const { Cell::new(None) };
 }
 
+/// Whether the calling thread is the process's FRONT-END thread — the one that runs
+/// `main`, and in production the ONLY thread that ever resolves a language.
+///
+/// This is the whole of the test-isolation mechanism, so it is worth being precise
+/// about what it can and cannot mistake:
+///
+///   * `Some("main")` — std names the thread that runs `main` exactly this, on every
+///     platform, and both front-ends resolve the language synchronously inside `main`.
+///     The CLI: `init_startup_lang`, `resolve_language`, `cmd_lang` and the launcher
+///     menu, all called straight from `fn main` with no thread between (the one
+///     `thread::spawn` in that file is the pool-stats poller, which touches no
+///     language). The GUI: `init_startup_lang`, plus the EN/中 chip, which is drawn by
+///     the eframe event loop — and winit PANICS if that loop is created off the main
+///     thread, so a GUI whose chip ran anywhere else would not open a window at all.
+///     Process-wide.
+///   * `Some(_)` — a thread somebody NAMED. libtest names every test thread after the
+///     test it runs, so this is what a test looks like from in here, and nothing in
+///     production reaches this function on a named thread. Thread-scoped.
+///   * `None` — an unnamed thread. libtest never produces one, so this cannot be a
+///     test; it is some worker that has been handed the front-end's job. Treated as
+///     production, so the failure direction is "a miner still sees his language"
+///     rather than "a miner silently reads English".
+///
+/// The `Some("main")` half is not taken on trust: [`set_process_lang`] records when it
+/// is false ([`process_lang_set_off_front_end_thread`]), the CLI reports that under
+/// `ALICE_MINER_LANG_SELFCHECK`, and `tests/cli.rs` drives the REAL binary — on all
+/// three OSes in CI — and additionally asserts that a 中文 user's rollback warning,
+/// which is formatted off the main thread, comes out in 中文. If std named the main
+/// thread something else on some platform, that test fails loudly there instead of
+/// shipping English.
+fn on_front_end_thread() -> bool {
+    !matches!(std::thread::current().name(), Some(name) if name != "main")
+}
+
 /// Set the PROCESS-WIDE language — **the production setter**. The front-end calls this
 /// ONCE at startup, via [`init_startup_lang`], as the first statement of `main`; after
 /// that only an explicit user action moves it (the CLI's `lang` subcommand and
@@ -157,12 +206,37 @@ thread_local! {
 /// [`text_selected_before_language_resolved`], so call it only when that is true —
 /// which is another way of saying: resolve, then set, then print.
 ///
-/// TESTS SHOULD NOT CALL THIS. A test that moves the process-wide language changes the
-/// answer for every other test running at that moment — use [`set_lang`], which is
-/// scoped to the calling thread.
+/// ## Called off the front-end thread, this is scoped to that thread
+///
+/// …and that is what makes the test suite safe rather than careful. The process
+/// language is one machine-wide cell, and `cargo test` puts a whole crate's tests in
+/// ONE process; a test that reached that cell changed the answer under every English-
+/// asserting test running beside it — which is not a thing those tests can defend
+/// against, because they never mention the language at all. That is exactly how it
+/// failed: `alice-miner-gui`'s "the language the user picks survives the window
+/// closing" drives the real EN/中 chip, so it came through here, and it held the
+/// process in 中文 for ~2.4ms of a ~1s test binary. Two `ui::dashboard` tests read
+/// their `tr!` strings inside that window on the CI runners and asserted English
+/// against 中文.
+///
+/// Making the write thread-scoped whenever it does not come from the front-end thread
+/// closes that at the mechanism: libtest gives every test its own NAMED thread (in
+/// parallel AND `--test-threads=1` mode alike), and no production caller is on one, so
+/// the process-wide cell is unreachable from a test and CANNOT be moved out from under
+/// a reader. Nothing has to be added to the reader, or to the writer, or remembered by
+/// whoever writes the next test — which is the specific way the `LANG_TEST_LOCK` this
+/// replaced used to fail (see the note at the foot of this module).
+///
+/// A test that wants a language should still say [`set_lang`]: it says what it means,
+/// and it does not latch [`process_lang_resolved`].
 pub fn set_process_lang(lang: Lang) {
-    CURRENT.store(lang.to_u8(), Ordering::Relaxed);
     AUDIT.mark_resolved();
+    if on_front_end_thread() {
+        CURRENT.store(lang.to_u8(), Ordering::Relaxed);
+    } else {
+        AUDIT.note_off_front_end_set();
+        set_lang(lang);
+    }
 }
 
 /// Set the language for the CALLING THREAD ONLY, leaving every other thread on the
@@ -217,6 +291,7 @@ pub fn lang() -> Lang {
 struct ResolveAudit {
     resolved: AtomicBool,
     read_early: AtomicBool,
+    off_front_end_set: AtomicBool,
 }
 
 impl ResolveAudit {
@@ -224,6 +299,7 @@ impl ResolveAudit {
         Self {
             resolved: AtomicBool::new(false),
             read_early: AtomicBool::new(false),
+            off_front_end_set: AtomicBool::new(false),
         }
     }
 
@@ -241,12 +317,25 @@ impl ResolveAudit {
         }
     }
 
+    /// A PROCESS-wide language set arrived from a thread that is not the front-end's
+    /// (see [`on_front_end_thread`]) and was scoped to that thread instead. Normal and
+    /// expected in a test binary — every test runs on such a thread, which is the
+    /// point. In the REAL binary it means some worker has been handed the front-end's
+    /// job and the language it installed reached only itself, so the CLI reports it.
+    fn note_off_front_end_set(&self) {
+        self.off_front_end_set.store(true, Ordering::Relaxed);
+    }
+
     fn resolved(&self) -> bool {
         self.resolved.load(Ordering::Relaxed)
     }
 
     fn read_before_resolve(&self) -> bool {
         self.read_early.load(Ordering::Relaxed)
+    }
+
+    fn set_off_front_end(&self) -> bool {
+        self.off_front_end_set.load(Ordering::Relaxed)
     }
 }
 
@@ -266,6 +355,21 @@ pub fn process_lang_resolved() -> bool {
 /// `ALICE_MINER_LANG_SELFCHECK` so a test can ask the real binary.
 pub fn text_selected_before_language_resolved() -> bool {
     AUDIT.read_before_resolve()
+}
+
+/// Whether any [`set_process_lang`] in this process came from a thread that is not the
+/// front-end's, and was therefore scoped to that thread rather than made process-wide.
+///
+/// TRUE is the norm inside a test binary — libtest runs every test on its own named
+/// thread, and that scoping is exactly what keeps one test's language off another's.
+/// In the REAL binary `false` is the contract, and `true` means one of two things,
+/// both of which end with a 中文 user reading English on some other thread: a
+/// front-end resolved the language somewhere other than `main`, or std did not name
+/// the main thread `"main"` on this platform. The CLI prints this under
+/// `ALICE_MINER_LANG_SELFCHECK` so CI can put the question to the real binary on each
+/// OS instead of taking the mechanism on trust.
+pub fn process_lang_set_off_front_end_thread() -> bool {
+    AUDIT.set_off_front_end()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -405,6 +509,12 @@ macro_rules! tr {
 // orders (`autoupdate.rs` lang-then-identity, `supervise.rs` identity-then-lang), an
 // AB-BA inversion that deadlocked the whole `alice-miner-core` test binary under a
 // high `--test-threads`.
+//
+// DO NOT BRING A LOCK BACK to close the `set_process_lang` hole either — that is the
+// same mistake wearing a different hat, and it re-opens the same AB-BA cycle the
+// moment one holder also wants `IDENTITY_ENV_LOCK`. The hole is closed by SCOPE (see
+// `on_front_end_thread`), which needs no mutual exclusion at all: there is nothing to
+// serialise once two tests cannot reach the same cell.
 
 #[cfg(test)]
 mod tests {
@@ -496,6 +606,62 @@ mod tests {
             assert_eq!(tr!("Starting miner", "启动矿工"), "Starting miner", "iteration {i}");
             std::thread::yield_now();
         }
+    }
+
+    /// The setter a front-end calls is the one a test of that front-end has to call
+    /// too, so it must be safe from a test thread — and "safe" means the process-wide
+    /// cell does not move, because that cell is what every OTHER test in the binary
+    /// reads when it never mentioned a language.
+    ///
+    /// This is the mechanism the CI failure needed. Three consecutive 3-OS runs failed
+    /// in `alice-miner-gui` on tests that assert English and set no language, because
+    /// the test that drives the real EN/中 chip came through `set_process_lang` and
+    /// held the process in 中文 for ~2.4ms.
+    #[test]
+    fn a_process_wide_set_from_a_test_thread_cannot_move_the_process_language() {
+        // Whatever the rest of this binary is doing, an unrelated thread's view is the
+        // process value, and this test is about to try to move it.
+        let before = std::thread::spawn(lang).join().unwrap();
+
+        set_process_lang(Lang::Zh);
+        assert_eq!(lang(), Lang::Zh, "the calling thread still gets what it asked for");
+
+        let on_worker = std::thread::spawn(lang).join().unwrap();
+        assert_eq!(
+            on_worker, before,
+            "but a test CANNOT move the process-wide language — that is the cell every \
+             English-asserting test in this binary reads, and none of them can defend it"
+        );
+        assert!(
+            process_lang_set_off_front_end_thread(),
+            "and the attempt is on record, which is what the CLI's real-binary \
+             self-check reports"
+        );
+
+        clear_lang_override();
+    }
+
+    /// The rule that produces the isolation above, stated on its own so a change to it
+    /// fails HERE rather than as a flake somewhere downstream: libtest names every test
+    /// thread after its test, and that name is not `main`.
+    ///
+    /// Production is the other side of this: the front-ends resolve the language
+    /// synchronously inside `main`. Nothing in a test binary can check THAT — which is
+    /// why `lang_selfcheck` asks the real binary, on every OS, instead.
+    #[test]
+    fn a_libtest_thread_is_never_mistaken_for_the_front_end() {
+        assert_eq!(
+            std::thread::current().name(),
+            Some("i18n::tests::a_libtest_thread_is_never_mistaken_for_the_front_end"),
+            "libtest names a test's thread after the test — its FULL path, not the bare \
+             fn name; the isolation rests on that name existing and not being `main`"
+        );
+        assert!(!on_front_end_thread(), "so a test is never the front-end thread");
+
+        // An unnamed worker is not a test either, and is treated as production — the
+        // fail-safe direction (a miner keeps his language; he never silently reads
+        // English because a thread happened to be anonymous).
+        assert!(std::thread::spawn(on_front_end_thread).join().unwrap());
     }
 
     /// Both halves of the contract, stated directly: an override belongs to the thread
